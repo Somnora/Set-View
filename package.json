@@ -1,0 +1,25 @@
+{
+  "name": "setview",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "AR previsualization & shot-blocking tool for filmmakers (WebXR, Quest 3)",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types test/domain.test.ts",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "@types/three": "^0.180.0",
+    "@types/webxr": "^0.5.24",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3"
+  }
+}
