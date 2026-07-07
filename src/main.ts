@@ -301,7 +301,12 @@ class App {
     if (sceneId === this.sceneData.id) {
       this.sceneData.scan = null;
       this.syncLocation();
-      this.markDirty();
+      // Record the undo snapshot, then flush immediately: a debounced save here
+      // would be silently cancelled by any other landing op's saveNow (shared
+      // timer), leaving the scan on disk for a subsequent export/duplicate to
+      // re-embed. Every sibling landing mutation saves immediately; match them.
+      this.history.record(this.sceneData);
+      this.persistence.saveNow(this.sceneData);
     } else {
       const scene = this.persistence.loadScene(sceneId);
       if (!scene) return;

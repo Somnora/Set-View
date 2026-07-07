@@ -70,6 +70,7 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Frame lines ON: right stick steps focal length instead of snap-turning (no conflict); left stick still glides.
 - [ ] Full-scale teleport: aim at a far floor point, click thumbstick → quick 150 ms fade, scene shifts so that point is at your feet. No smooth slide, no nausea.
 - [ ] Wrist **Re-align** snaps content back to true room registration after any mix of walk / glide / turn / teleport.
+- [ ] **Teleport-then-Mini (regression):** thumbstick-click to teleport, and immediately (within the fade) press **Y** to Miniature. The diorama shows correctly on the platform — the scene does *not* pop back to life-size overlapping the room, and the platform isn't left empty.
 - [ ] **Comfort:** a few minutes of glide + snap-turn shouldn't induce sickness at the default speed. If smooth strafe feels too much, `LOCOMOTION_SPEED` in `main.ts` is the knob; snap-turn (vs smooth-turn) is already the comfort default.
 
 ## Phase 4 — Keyframes & playback
@@ -83,6 +84,7 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Scrub the wrist slider: timeline jogs smoothly both directions; pause/play resumes from the playhead.
 - [ ] **⏹ Stop** returns actors to their placed (rest) positions.
 - [ ] **Clear-mid-scrub (regression):** scrub an actor to a mid-path pose (so it sits away from its placed spot), then wrist **Clear KF**. The actor snaps back to its authored rest position (not left frozen mid-path), and afterward still tracks the real floor when you walk (it isn't stuck ignoring anchor drift).
+- [ ] **Delete-after-playback (regression):** with one keyframed actor and one plain anchored actor, press **▶ Play** and let it run to the end (don't press Stop), then delete the keyframed actor. Walk a loop — the remaining actor still holds to the real floor (deleting the last keyframed actor must not freeze anchor drift for everyone else).
 - [ ] Wrist **⧉ Dup** on a selected actor with a path: a new-colored clone appears ~0.6 m over with the whole path copied; on a camera: a clone with the identical lens/format one step over.
 - [ ] Wrist **↶ Undo** reverses the last action (place / move / keyframe / delete / duplicate / camera commit); **↷ Redo** re-applies it. Both buttons are highlighted only when there's something to undo/redo. Delete an actor, Undo → it returns with its keyframes and notes intact.
 - [ ] Repeat playback while in **Miniature** view — identical blocking in the diorama.

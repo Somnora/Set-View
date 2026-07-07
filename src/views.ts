@@ -162,7 +162,11 @@ export class ViewManager {
     const delta = new THREE.Vector3(headPos.x - targetWorld.x, 0, headPos.z - targetWorld.z);
     this.startFade(() => {
       this.teleportOffset.add(delta);
-      this.applyFullTransform();
+      // Guard the deferred transform against a mid-fade switch to miniature
+      // (the fade fires ~75ms later): applyFullTransform would stomp the mini
+      // scale/parking. The offset is still accumulated, so returning to full
+      // later applies it via set(). Mirrors the same guard in realign().
+      if (this.mode !== 'mini') this.applyFullTransform();
     });
   }
 

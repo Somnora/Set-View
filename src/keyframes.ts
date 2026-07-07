@@ -84,6 +84,12 @@ export class KeyframeSystem {
     }
     this.timelines.delete(actorId);
     this.recomputeDuration();
+    // If removing this actor leaves nothing playable while a held pose is still
+    // applied (e.g. Play ran to the end, then the last keyframed actor is
+    // deleted without pressing Stop), `active` would stay true forever and
+    // globally suppress anchor drift correction. Clear the held-pose state so
+    // remaining actors resume tracking their anchors.
+    if (this.posesApplied && this.duration <= 0) this.stop();
   }
 
   play(): void {
