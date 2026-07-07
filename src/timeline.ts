@@ -27,6 +27,24 @@ export function lerpAngle(a: number, b: number, u: number): number {
   return a + d * u;
 }
 
+export interface MoveStats {
+  marks: number;
+  /** Total path length across all keyframe segments (meters). */
+  distanceM: number;
+  /** Playback duration at `speed` (seconds), incl. min per-segment beat. */
+  durationS: number;
+  /** Average speed over the move (m/s); 0 for a static/one-mark actor. */
+  avgSpeed: number;
+}
+
+/** Summary numbers for one actor's blocking move. Pure; unit-testable. */
+export function moveStats(kfs: TransformKeyframe[], speed = WALK_SPEED_MS): MoveStats {
+  let d = 0;
+  for (let i = 1; i < kfs.length; i++) d += dist(kfs[i - 1].position, kfs[i].position);
+  const { duration } = buildTimeline(kfs, speed);
+  return { marks: kfs.length, distanceM: d, durationS: duration, avgSpeed: duration > 0 ? d / duration : 0 };
+}
+
 export function buildTimeline(kfs: TransformKeyframe[], speed = WALK_SPEED_MS): Timeline {
   const times: number[] = [];
   let t = 0;

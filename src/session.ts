@@ -68,6 +68,8 @@ export class SessionManager {
   private controllerHitSources = new Map<XRInputSource, XRHitTestSource>();
   private log: LogFn;
   private anchorsBroken = false;
+  /** Scratch for the current hit point (lastHit.point aliases this). */
+  private readonly hitPoint = new THREE.Vector3();
 
   constructor(renderer: THREE.WebGLRenderer, log: LogFn) {
     this.renderer = renderer;
@@ -166,22 +168,42 @@ export class SessionManager {
     const refSpace = this.renderer.xr.getReferenceSpace();
     if (!refSpace) return;
 
-    const trySource = (source: XRHitTestSource, kind: HitInfo['source']): boolean => {
-      const results = frame.getHitTestResults(source);
-      if (!results.length) return false;
-      const pose = results[0].getPose(refSpace);
-      if (!pose) return false;
-      const p = pose.transform.position;
-      this.lastHit = { point: new THREE.Vector3(p.x, p.y, p.z), source: kind };
-      return true;
-    };
-
-    const entries = Array.from(this.controllerHitSources.entries());
-    entries.sort((a) => (a[0].handedness === preferredHand ? -1 : 1));
-    for (const [, hts] of entries) {
-      if (trySource(hts, 'controller')) break;
+    // Preferred hand first, then any other controller, then viewer gaze — no
+    // array/closure/sort allocations per frame (a plain two-pass loop).
+    let hit = false;
+    for (const [src, hts] of this.controllerHitSources) {
+      if (src.handedness !== preferredHand) continue;
+      if (this.trySource(frame, refSpace, hts, 'controller')) {
+        hit = true;
+        break;
+      }
     }
-    if (!this.lastHit && this.viewerHitSource) trySource(this.viewerHitSource, 'viewer');
+    if (!hit) {
+      for (const [src, hts] of this.controllerHitSources) {
+        if (src.handedness === preferredHand) continue;
+        if (this.trySource(frame, refSpace, hts, 'controller')) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (!hit && this.viewerHitSource) this.trySource(frame, refSpace, this.viewerHitSource, 'viewer');
+  }
+
+  private trySource(
+    frame: XRFrame,
+    refSpace: XRReferenceSpace,
+    source: XRHitTestSource,
+    kind: HitInfo['source'],
+  ): boolean {
+    const results = frame.getHitTestResults(source);
+    if (!results.length) return false;
+    const pose = results[0].getPose(refSpace);
+    if (!pose) return false;
+    const p = pose.transform.position;
+    this.hitPoint.set(p.x, p.y, p.z);
+    this.lastHit = { point: this.hitPoint, source: kind };
+    return true;
   }
 
   /** Positions the reticle at the last hit (flat on the floor). */
@@ -221,32 +243,37 @@ export class SessionManager {
     }
   }
 
-  /** World-space anchor position this frame, or null if not tracked. */
-  anchorPosition(frame: XRFrame, anchor: XRAnchor): THREE.Vector3 | null {
+  /**
+   * World-space anchor position this frame, written into `out`, or null if not
+   * tracked. `out` avoids a per-anchor allocation in the per-frame loop.
+   */
+  anchorPosition(frame: XRFrame, anchor: XRAnchor, out: THREE.Vector3): THREE.Vector3 | null {
     const refSpace = this.renderer.xr.getReferenceSpace();
     if (!refSpace) return null;
     try {
       const pose = frame.getPose(anchor.anchorSpace, refSpace);
       if (!pose) return null;
       const p = pose.transform.position;
-      return new THREE.Vector3(p.x, p.y, p.z);
+      return out.set(p.x, p.y, p.z);
     } catch {
       return null;
     }
   }
 
-  /** Fresh head pose from the XR frame (position + orientation), or null. */
-  viewerPose(frame: XRFrame): { position: THREE.Vector3; quaternion: THREE.Quaternion } | null {
+  /**
+   * Writes the fresh head pose into `outPos`/`outQuat`. Returns true on
+   * success. Out-params avoid two throwaway allocations every frame.
+   */
+  viewerPose(frame: XRFrame, outPos: THREE.Vector3, outQuat: THREE.Quaternion): boolean {
     const refSpace = this.renderer.xr.getReferenceSpace();
-    if (!refSpace) return null;
+    if (!refSpace) return false;
     const pose = frame.getViewerPose(refSpace);
-    if (!pose) return null;
+    if (!pose) return false;
     const p = pose.transform.position;
     const o = pose.transform.orientation;
-    return {
-      position: new THREE.Vector3(p.x, p.y, p.z),
-      quaternion: new THREE.Quaternion(o.x, o.y, o.z, o.w),
-    };
+    outPos.set(p.x, p.y, p.z);
+    outQuat.set(o.x, o.y, o.z, o.w);
+    return true;
   }
 }
 

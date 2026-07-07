@@ -5,7 +5,7 @@
 
 import './style.css';
 import * as THREE from 'three';
-import { addNote, createScene, type SceneData } from './model.ts';
+import { addNote, createScene, type CameraSetupData, type SceneData } from './model.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
@@ -19,6 +19,9 @@ import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, type UIPan
 // Tune on-headset if the panel sits awkwardly (see TESTING.md).
 const WRIST_POS = new THREE.Vector3(0.0, 0.05, 0.16);
 const WRIST_ROT_X = -1.05; // radians, tilt toward the face
+
+// Reused each frame while dragging to avoid a Vector3 clone per frame.
+const _pt = new THREE.Vector3();
 
 type PlaceMode = 'actor' | 'camera';
 
@@ -63,6 +66,14 @@ class App {
   private fpsFrames = 0;
   private fpsLast = 0;
   private wristRefreshLast = 0;
+
+  // Bumped on any add/remove of an actor or camera; caches below key off it so
+  // per-frame hover/hidden lists rebuild only when the scene structure changes.
+  private contentVersion = 0;
+  private hiddenCache: THREE.Object3D[] | null = null;
+  private hiddenCacheVersion = -1;
+  private hoverTargets: THREE.Object3D[] = [];
+  private hoverTargetsVersion = -1;
 
   constructor() {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -136,7 +147,22 @@ class App {
           else this.debug.log('import failed: not a SetView scene JSON');
         });
       },
+      onRename: (id, name) => {
+        this.persistence.renameScene(id, name);
+        if (this.sceneData.id === id) this.sceneData.name = name;
+        this.refreshLanding();
+      },
+      onExportFloorplan: (id) => this.persistence.exportFloorplan(id),
+      onExportShotList: (id) => this.persistence.exportShotList(id),
+      getScene: (id) =>
+        id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
+      onUpdateCamera: (sceneId, cameraId, patch) => this.updateCamera(sceneId, cameraId, patch),
     });
+
+    this.persistence.onError = (m) => {
+      this.debug.log(m);
+      this.wrist.setStatus(m);
+    };
 
     this.wireSubsystems();
     this.loadScene(this.sceneData);
@@ -158,6 +184,25 @@ class App {
     this.loadScene(scene);
   }
 
+  /** Applies a camera edit from the landing-page editor (out-of-session). */
+  private updateCamera(sceneId: string, cameraId: string, patch: Partial<CameraSetupData>): void {
+    if (sceneId === this.sceneData.id) {
+      const cam = this.sceneData.cameras.find((c) => c.id === cameraId);
+      if (!cam) return;
+      Object.assign(cam, patch);
+      this.cams.setScene(this.sceneData); // rebuild gizmos with the new lens/format
+      this.contentVersion++;
+      this.persistence.saveNow(this.sceneData);
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      const cam = scene?.cameras.find((c) => c.id === cameraId);
+      if (!scene || !cam) return;
+      Object.assign(cam, patch);
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
+  }
+
   private loadScene(data: SceneData): void {
     this.sceneData = data;
     this.persistence.setCurrent(data.id);
@@ -168,6 +213,7 @@ class App {
     this.actors.setScene(data);
     this.keyframes.setScene(data);
     this.cams.setScene(data);
+    this.contentVersion++;
     this.refreshLanding();
     this.refreshWristState();
     if (data.actors.length || data.cameras.length) {
@@ -349,6 +395,7 @@ class App {
       const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
       const face = Math.atan2(viewerLocal.x - local.x, viewerLocal.z - local.z);
       const obj = this.actors.spawn({ x: local.x, y: local.y, z: local.z }, face);
+      this.contentVersion++;
       if (!this.views.isShifted) this.pendingReanchorActors.push(obj);
       this.selectActor(obj.data.id);
       this.debug.log(`placed ${obj.data.name}${this.session.features.anchors ? ' (anchoring)' : ''}`);
@@ -356,8 +403,9 @@ class App {
     } else {
       // Camera placement: drop the gizmo at the user's head pose.
       const obj = this.cams.placeAtPose(this.lastViewerPos.clone(), this.lastViewerQuat.clone());
+      this.contentVersion++;
       if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
-      this.debug.log(`placed ${obj.data.name} at head (${obj.data.lensFocalLength}mm)`);
+      this.debug.log(`placed ${obj.data.name} at head (${Math.round(obj.data.lensFocalLength)}mm)`);
       this.markDirty();
     }
   }
@@ -414,9 +462,10 @@ class App {
   private onButtonA(): void {
     if (this.cams.eyesMode) {
       const obj = this.cams.placeAtPose(this.lastViewerPos.clone(), this.lastViewerQuat.clone());
+      this.contentVersion++;
       if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
       this.cams.flashFrameLabel(`✓ ${obj.data.name} committed`);
-      this.debug.log(`committed ${obj.data.name} (${obj.data.lensFocalLength}mm ${obj.data.aspect})`);
+      this.debug.log(`committed ${obj.data.name} (${Math.round(obj.data.lensFocalLength)}mm ${obj.data.aspect})`);
       this.markDirty();
     } else if (this.views.mode === 'camera') {
       this.capturePhoto();
@@ -453,6 +502,7 @@ class App {
     if (this.hover?.kind === 'camera') {
       this.debug.log(`deleted camera`);
       this.cams.remove(this.hover.id);
+      this.contentVersion++;
       this.hover = null;
       this.markDirty();
       return;
@@ -466,6 +516,7 @@ class App {
     this.debug.log(`deleted ${obj?.data.name ?? 'actor'}`);
     this.keyframes.removeActor(id);
     this.actors.remove(id);
+    this.contentVersion++;
     if (this.selectedActorId === id) this.selectActor(null);
     this.hover = null;
     this.markDirty();
@@ -539,9 +590,11 @@ class App {
     this.wrist.setStatus(`${sel}${cam ? ` · ${cam.data.name} ${cam.data.lensFocalLength}mm` : ''}`);
   }
 
-  /** Everything that must not appear in the virtual camera's frame. */
+  /** Everything that must not appear in the virtual camera's frame. Cached and
+   *  rebuilt only when actors/cameras are added or removed. */
   private hiddenForVirtualCamera(): THREE.Object3D[] {
-    return [
+    if (this.hiddenCache && this.hiddenCacheVersion === this.contentVersion) return this.hiddenCache;
+    this.hiddenCache = [
       this.session.reticle,
       ...this.input.hudObjects(),
       this.wrist.group,
@@ -555,6 +608,8 @@ class App {
       ...this.actors.overlayObjects(),
       ...this.cams.overlayObjects(),
     ];
+    this.hiddenCacheVersion = this.contentVersion;
+    return this.hiddenCache;
   }
 
   // --- per-frame loop ----------------------------------------------------------------
@@ -570,11 +625,7 @@ class App {
     this.input.poll();
     const pointer = this.input.pointerHand();
 
-    const viewer = this.session.viewerPose(frame);
-    if (viewer) {
-      this.lastViewerPos.copy(viewer.position);
-      this.lastViewerQuat.copy(viewer.quaternion);
-    }
+    this.session.viewerPose(frame, this.lastViewerPos, this.lastViewerQuat);
 
     // Deferred anchor creation (queued from input events, needs a live frame).
     for (const obj of this.pendingReanchorActors.splice(0)) this.actors.reanchor(obj, frame);
@@ -601,7 +652,7 @@ class App {
     const axes = this.input.axes(pointer);
     if (this.draggedActor) {
       if (this.session.lastHit) {
-        const local = this.contentRoot.worldToLocal(this.session.lastHit.point.clone());
+        const local = this.contentRoot.worldToLocal(_pt.copy(this.session.lastHit.point));
         this.actors.applyPose(
           this.draggedActor,
           { x: local.x, y: local.y, z: local.z },
@@ -665,8 +716,11 @@ class App {
   private updateHover(rc: THREE.Raycaster | null): void {
     let next: { kind: 'actor' | 'camera'; id: string } | null = null;
     if (rc && !this.draggedActor && !this.draggedCamera && !this.miniGrabbing) {
-      const targets = [...this.actors.raycastTargets(), ...this.cams.raycastTargets()];
-      const hits = rc.intersectObjects(targets, true);
+      if (this.hoverTargetsVersion !== this.contentVersion) {
+        this.hoverTargets = [...this.actors.raycastTargets(), ...this.cams.raycastTargets()];
+        this.hoverTargetsVersion = this.contentVersion;
+      }
+      const hits = rc.intersectObjects(this.hoverTargets, true);
       for (const hit of hits) {
         const actorId = findActorId(hit.object);
         if (actorId) {

@@ -11,6 +11,11 @@ import * as THREE from 'three';
 export type Hand = 'left' | 'right';
 export type Button = 'a' | 'b' | 'x' | 'y' | 'thumbclick';
 
+// Reused each frame by raycaster() so pointing costs zero allocations.
+const _origin = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _rotMat = new THREE.Matrix4();
+
 // xr-standard gamepad button indices.
 const BTN_THUMBSTICK = 3;
 const BTN_AX = 4; // A on right controller, X on left
@@ -126,25 +131,23 @@ export class InputManager {
   poll(): void {
     const session = this.renderer.xr.getSession();
     if (!session) return;
-    for (const src of Array.from(session.inputSources)) {
+    for (const src of session.inputSources) {
       if (!src.gamepad || (src.handedness !== 'left' && src.handedness !== 'right')) continue;
       const hand = src.handedness as Hand;
       const st = this.state[hand];
       const gp = src.gamepad;
-
-      const check = (index: number, name: Button) => {
-        const pressed = gp.buttons[index]?.pressed ?? false;
-        const key = String(index);
-        if (pressed && !st.buttons[key]) this.events.onButtonDown?.(hand, name);
-        st.buttons[key] = pressed;
-      };
-      check(BTN_THUMBSTICK, 'thumbclick');
-      check(BTN_AX, hand === 'right' ? 'a' : 'x');
-      check(BTN_BY, hand === 'right' ? 'b' : 'y');
-
+      this.checkButton(hand, st, gp, BTN_THUMBSTICK, 'thumbclick');
+      this.checkButton(hand, st, gp, BTN_AX, hand === 'right' ? 'a' : 'x');
+      this.checkButton(hand, st, gp, BTN_BY, hand === 'right' ? 'b' : 'y');
       st.axes.x = gp.axes[AXIS_X] ?? 0;
       st.axes.y = gp.axes[AXIS_Y] ?? 0;
     }
+  }
+
+  private checkButton(hand: Hand, st: HandState, gp: Gamepad, index: number, name: Button): void {
+    const pressed = gp.buttons[index]?.pressed ?? false;
+    if (pressed && !st.buttons[index]) this.events.onButtonDown?.(hand, name);
+    st.buttons[index] = pressed;
   }
 
   axes(hand: Hand): { x: number; y: number } {
@@ -213,11 +216,9 @@ export class InputManager {
     const space = this.raySpace(hand);
     if (!space || !this.state[hand].connected) return null;
     space.updateMatrixWorld();
-    const origin = new THREE.Vector3().setFromMatrixPosition(space.matrixWorld);
-    const dir = new THREE.Vector3(0, 0, -1).applyMatrix4(
-      new THREE.Matrix4().extractRotation(space.matrixWorld),
-    );
-    out.set(origin, dir.normalize());
+    _origin.setFromMatrixPosition(space.matrixWorld);
+    _dir.set(0, 0, -1).applyMatrix4(_rotMat.extractRotation(space.matrixWorld));
+    out.set(_origin, _dir.normalize());
     return out;
   }
 }

@@ -14,15 +14,27 @@ import * as THREE from 'three';
 import {
   aspectValue,
   createCameraSetup,
+  DEFAULT_FORMAT_ID,
+  DEFAULT_TSTOP,
+  sensorFormat,
   stepFocal,
+  vecDistance,
   type AspectName,
   type CameraSetupData,
   type FocalLength,
   type SceneData,
 } from './model.ts';
-import { frameSizeAtDistance, vFovDeg } from './lens.ts';
+import { depthOfFieldFor, dFovDeg, frameSizeAtDistance, hFovDeg, vFovDeg } from './lens.ts';
 import type { SessionManager } from './session.ts';
 import { disposeTree, makeLabel, type Label } from './ui.ts';
+
+/** Formats a distance in meters as e.g. '3.4m' or '∞'. */
+function m(v: number): string {
+  return v === Infinity ? '∞' : `${v.toFixed(v < 10 ? 1 : 0)}m`;
+}
+
+/** Reused each frame by updateFromAnchors to avoid per-camera allocations. */
+const _scratchAnchor = new THREE.Vector3();
 
 const FRAME_LINE_DIST = 1.4; // meters from the eye
 const MONITOR_IMG_W = 0.6; // meters
@@ -51,6 +63,9 @@ export class CameraSystem {
   eyesFocal: FocalLength = 35;
   /** Aspect used for frame lines and for newly committed cameras. */
   currentAspect: AspectName = '2.39:1';
+  /** Format/stop applied to newly committed cameras (edit per-camera later). */
+  currentFormat: string = DEFAULT_FORMAT_ID;
+  currentTStop: number = DEFAULT_TSTOP;
   onChange: () => void = () => {};
 
   private scene: SceneData;
@@ -65,6 +80,9 @@ export class CameraSystem {
   private frameRect = new THREE.Group();
   private frameLabel: Label;
   private frameLabelFlashUntil = 0;
+  // Reused across renderPass frames to avoid per-frame allocations.
+  private readonly visRestore: [THREE.Object3D, boolean][] = [];
+  private readonly prevColor = new THREE.Color();
 
   constructor(scene: SceneData, session: SessionManager, contentRoot: THREE.Group) {
     this.scene = scene;
@@ -155,6 +173,8 @@ export class CameraSystem {
       { x: q.x, y: q.y, z: q.z, w: q.w },
       focal,
       this.currentAspect,
+      this.currentTStop,
+      this.currentFormat,
     );
     const obj = this.buildGizmo(data);
     this.setActive(data.id);
@@ -197,7 +217,7 @@ export class CameraSystem {
     if (!obj) return;
     obj.data.lensFocalLength = stepFocal(obj.data.lensFocalLength, dir);
     this.rebuildFrustum(obj);
-    obj.label.setText(`${obj.data.name} · ${obj.data.lensFocalLength}mm`);
+    obj.label.setText(`${obj.data.name} · ${Math.round(obj.data.lensFocalLength)}mm`);
     this.refreshMonitorInfo();
     this.onChange();
   }
@@ -241,9 +261,11 @@ export class CameraSystem {
   updateFromAnchors(frame: XRFrame, skipId: string | null): void {
     for (const obj of this.objects.values()) {
       if (!obj.anchor || obj.data.id === skipId) continue;
-      const p = this.session.anchorPosition(frame, obj.anchor);
+      const p = this.session.anchorPosition(frame, obj.anchor, _scratchAnchor);
       if (!p) continue;
-      obj.data.position = { x: p.x, y: p.y, z: p.z };
+      obj.data.position.x = p.x;
+      obj.data.position.y = p.y;
+      obj.data.position.z = p.z;
       obj.root.position.copy(p);
     }
   }
@@ -322,12 +344,14 @@ export class CameraSystem {
     const h = Math.round(w / aspect);
     const rt = new THREE.WebGLRenderTarget(w, h);
     rt.texture.colorSpace = THREE.SRGBColorSpace;
-    this.poseRtCamera(obj);
-    this.renderPass(renderer, scene3, rt, hidden);
-
     const pixels = new Uint8Array(w * h * 4);
-    renderer.readRenderTargetPixels(rt, 0, 0, w, h, pixels);
-    rt.dispose();
+    try {
+      this.poseRtCamera(obj);
+      this.renderPass(renderer, scene3, rt, hidden);
+      renderer.readRenderTargetPixels(rt, 0, 0, w, h, pixels);
+    } finally {
+      rt.dispose(); // never leak the RT, even if the render throws
+    }
 
     const canvas = document.createElement('canvas');
     canvas.width = w;
@@ -342,12 +366,19 @@ export class CameraSystem {
     ctx.putImageData(img, 0, 0);
 
     const stamp = new Date();
-    const slate = `${sceneName}  ·  ${obj.data.name}  ·  ${obj.data.lensFocalLength}mm S35  ·  ${obj.data.aspect}  ·  ${stamp.toLocaleString()}`;
+    const fmt = sensorFormat(obj.data.formatId);
+    const hd = hFovDeg(obj.data.lensFocalLength, fmt);
+    const dist = this.nearestActorDistance(obj.data);
+    const dof = dist !== null ? depthOfFieldFor(obj.data, dist) : null;
+    const optics =
+      `${Math.round(obj.data.lensFocalLength)}mm ${fmt.short} · T${obj.data.tStop} · ${obj.data.aspect} · H${hd.toFixed(1)}°` +
+      (dof ? ` · focus ${m(dist!)} · DOF ${m(dof.nearM)}–${m(dof.farM)}` : '');
+    const slate = `${sceneName}  ·  ${obj.data.name}  ·  ${optics}  ·  ${stamp.toLocaleString()}`;
     const barH = 56;
     ctx.fillStyle = 'rgba(0,0,0,0.72)';
     ctx.fillRect(0, h - barH, w, barH);
     ctx.fillStyle = '#e8ecf3';
-    ctx.font = '500 26px ui-monospace, monospace';
+    ctx.font = '500 24px ui-monospace, monospace';
     ctx.textBaseline = 'middle';
     ctx.fillText(slate, 24, h - barH / 2);
 
@@ -370,9 +401,39 @@ export class CameraSystem {
     const d = obj.data;
     this.rtCamera.position.set(d.position.x, d.position.y, d.position.z);
     this.rtCamera.quaternion.set(d.rotation.x, d.rotation.y, d.rotation.z, d.rotation.w);
-    this.rtCamera.fov = vFovDeg(d.lensFocalLength, d.aspect);
+    this.rtCamera.fov = vFovDeg(d.lensFocalLength, d.aspect, sensorFormat(d.formatId));
     this.rtCamera.aspect = aspectValue(d.aspect);
     this.rtCamera.updateProjectionMatrix();
+  }
+
+  /** Distance (m) from a camera to the nearest actor's feet, or null. */
+  private nearestActorDistance(cam: CameraSetupData): number | null {
+    let best: number | null = null;
+    for (const a of this.scene.actors) {
+      const d = vecDistance(cam.position, a.position);
+      if (best === null || d < best) best = d;
+    }
+    return best;
+  }
+
+  /**
+   * Full cinematographer readout for a camera: lens, format, aspect, angle of
+   * view, and — when there's a subject to focus on — depth of field and the
+   * frame width at that distance.
+   */
+  private cameraReadout(cam: CameraSetupData): string {
+    const fmt = sensorFormat(cam.formatId);
+    const h = hFovDeg(cam.lensFocalLength, fmt);
+    const dia = dFovDeg(cam.lensFocalLength, cam.aspect, fmt);
+    let s = `${cam.name} · ${Math.round(cam.lensFocalLength)}mm ${fmt.short} · ${cam.aspect} · T${cam.tStop}`;
+    s += `\nAoV H${h.toFixed(1)}° Ø${dia.toFixed(1)}°`;
+    const dist = this.nearestActorDistance(cam);
+    if (dist !== null) {
+      const dof = depthOfFieldFor(cam, dist);
+      const fw = frameSizeAtDistance(cam.lensFocalLength, cam.aspect, dist, fmt).width;
+      s += ` · subj ${m(dist)}\nDOF ${m(dof.nearM)}–${m(dof.farM)} · frame ${fw.toFixed(1)}m wide`;
+    }
+    return s;
   }
 
   private renderPass(
@@ -381,28 +442,33 @@ export class CameraSystem {
     rt: THREE.WebGLRenderTarget,
     hidden: THREE.Object3D[],
   ): void {
-    const restore: [THREE.Object3D, boolean][] = hidden.map((o) => [o, o.visible]);
+    // Snapshot state we're about to mutate. The restore runs in `finally` so a
+    // single render throw (context loss, shader error) can never leave
+    // xr.enabled=false — which would freeze/black the headset for the rest of
+    // the session — nor leave HUD objects hidden or the RT bound.
+    for (const o of hidden) this.visRestore.push([o, o.visible]);
     for (const o of hidden) o.visible = false;
     this.monitorGrid.visible = true;
 
     const xrWas = renderer.xr.enabled;
-    renderer.xr.enabled = false;
     const prevTarget = renderer.getRenderTarget();
-    const prevColor = new THREE.Color();
-    renderer.getClearColor(prevColor);
+    renderer.getClearColor(this.prevColor);
     const prevAlpha = renderer.getClearAlpha();
 
-    renderer.setRenderTarget(rt);
-    renderer.setClearColor(0x101318, 1);
-    renderer.clear();
-    renderer.render(scene3, this.rtCamera);
-
-    renderer.setRenderTarget(prevTarget);
-    renderer.setClearColor(prevColor, prevAlpha);
-    renderer.xr.enabled = xrWas;
-
-    this.monitorGrid.visible = false;
-    for (const [o, v] of restore) o.visible = v;
+    try {
+      renderer.xr.enabled = false;
+      renderer.setRenderTarget(rt);
+      renderer.setClearColor(0x101318, 1);
+      renderer.clear();
+      renderer.render(scene3, this.rtCamera);
+    } finally {
+      renderer.setRenderTarget(prevTarget);
+      renderer.setClearColor(this.prevColor, prevAlpha);
+      renderer.xr.enabled = xrWas;
+      this.monitorGrid.visible = false;
+      for (const [o, v] of this.visRestore) o.visible = v;
+      this.visRestore.length = 0;
+    }
   }
 
   private refreshRT(): void {
@@ -425,10 +491,8 @@ export class CameraSystem {
   private refreshMonitorInfo(): void {
     const obj = this.active;
     this.monitorInfo.setText(
-      obj
-        ? `${obj.data.name} · ${obj.data.lensFocalLength}mm S35 · ${obj.data.aspect}`
-        : 'NO CAMERA — turn on Frame Lines, walk, press A',
-      { fontPx: 30, mono: true },
+      obj ? this.cameraReadout(obj.data) : 'NO CAMERA — turn on Frame Lines, walk, press A',
+      { fontPx: 28, mono: true },
     );
   }
 
@@ -453,7 +517,7 @@ export class CameraSystem {
       new THREE.LineBasicMaterial({ color: 0x66ccff, transparent: true, opacity: 0.7 }),
     );
 
-    const label = makeLabel(`${data.name} · ${data.lensFocalLength}mm`, 0.055);
+    const label = makeLabel(`${data.name} · ${Math.round(data.lensFocalLength)}mm`, 0.055);
     label.sprite.position.y = 0.16;
 
     root.add(body, lens, accent, frustum, label.sprite);
@@ -470,7 +534,12 @@ export class CameraSystem {
   /** Sightline cone: 4 edges + frame rectangle at 0.6 m, sized by the lens. */
   private rebuildFrustum(obj: CamObject): void {
     const depth = 0.6;
-    const { width, height } = frameSizeAtDistance(obj.data.lensFocalLength, obj.data.aspect, depth);
+    const { width, height } = frameSizeAtDistance(
+      obj.data.lensFocalLength,
+      obj.data.aspect,
+      depth,
+      sensorFormat(obj.data.formatId),
+    );
     const hw = width / 2;
     const hh = height / 2;
     const o = new THREE.Vector3(0, 0, 0);
@@ -491,7 +560,8 @@ export class CameraSystem {
   private rebuildFrameLines(): void {
     disposeTree(this.frameRect); // focal steps rebuild this — free GPU buffers
     this.frameRect.clear();
-    const { width, height } = frameSizeAtDistance(this.eyesFocal, this.currentAspect, FRAME_LINE_DIST);
+    const fmt = sensorFormat(this.currentFormat);
+    const { width, height } = frameSizeAtDistance(this.eyesFocal, this.currentAspect, FRAME_LINE_DIST, fmt);
     const hw = width / 2;
     const hh = height / 2;
     const z = -FRAME_LINE_DIST;
@@ -541,8 +611,14 @@ export class CameraSystem {
     }
     this.frameRect.add(rect, cross);
 
-    this.frameLabel.setText(`${this.eyesFocal}mm · ${this.currentAspect}`, { fontPx: 36, mono: true });
-    this.frameLabel.sprite.position.set(hw * 0.72, -hh - 0.055 * width, z);
+    const h = hFovDeg(this.eyesFocal, fmt);
+    const fw = frameSizeAtDistance(this.eyesFocal, this.currentAspect, FRAME_LINE_DIST, fmt).width;
+    this.frameLabel.setText(
+      `${Math.round(this.eyesFocal)}mm ${fmt.short} · ${this.currentAspect} · H${h.toFixed(0)}° · ${fw.toFixed(1)}m @ ${FRAME_LINE_DIST}m`,
+      { fontPx: 34, mono: true },
+    );
+    this.frameLabel.sprite.position.set(0, -hh - 0.06 * width, z);
+    this.frameLabel.sprite.center.set(0.5, 0.5);
   }
 }
 

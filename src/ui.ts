@@ -5,13 +5,23 @@
 
 import * as THREE from 'three';
 import type { SupportReport } from './session.ts';
+import {
+  ASPECT_NAMES,
+  SENSOR_FORMATS,
+  TRIPOD_HEIGHTS,
+  type CameraSetupData,
+  type SceneData,
+} from './model.ts';
 
 // --- shared helpers ---------------------------------------------------------
 
 export function disposeTree(root: THREE.Object3D): void {
   root.traverse((o) => {
     const mesh = o as THREE.Mesh;
-    if (mesh.geometry) mesh.geometry.dispose();
+    // Sprites share a single module-level geometry in three.js — disposing it
+    // would free the VBO out from under every other live sprite. Only their
+    // per-instance material + texture are ours to release.
+    if (mesh.geometry && !(o as unknown as { isSprite?: boolean }).isSprite) mesh.geometry.dispose();
     const mats = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
     for (const m of mats) {
       const anyM = m as THREE.Material & { map?: THREE.Texture | null };
@@ -19,6 +29,13 @@ export function disposeTree(root: THREE.Object3D): void {
       m.dispose();
     }
   });
+}
+
+/** Disposes a Sprite's material + texture (its geometry is shared — leave it). */
+export function disposeSprite(sprite: THREE.Sprite): void {
+  const mat = sprite.material as THREE.SpriteMaterial;
+  mat.map?.dispose();
+  mat.dispose();
 }
 
 export interface LabelStyle {
@@ -476,6 +493,12 @@ export interface LandingCallbacks {
   onDelete: (id: string) => void;
   onExport: (id: string) => void;
   onImport: (file: File) => void;
+  onRename: (id: string, name: string) => void;
+  onExportFloorplan: (id: string) => void;
+  onExportShotList: (id: string) => void;
+  /** Full scene for the inline camera editor, or null. */
+  getScene: (id: string) => SceneData | null;
+  onUpdateCamera: (sceneId: string, cameraId: string, patch: Partial<CameraSetupData>) => void;
 }
 
 export class Landing {
@@ -528,6 +551,20 @@ export class Landing {
     const help = el('details', 'help', wrap);
     el('summary', '', help, 'Controls cheat-sheet');
     el('pre', '', help, CONTROLS_CHEATSHEET);
+
+    // Keyboard shortcuts (desktop prep): Enter = Enter AR, N = new scene.
+    window.addEventListener('keydown', (e) => {
+      if (this.root.style.display === 'none') return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable))
+        return;
+      if (e.key === 'Enter' && !this.enterBtn.disabled) {
+        e.preventDefault();
+        this.cb.onEnter();
+      } else if (e.key.toLowerCase() === 'n') {
+        this.cb.onNew();
+      }
+    });
   }
 
   setDiagnostics(report: SupportReport): void {
@@ -543,7 +580,10 @@ export class Landing {
   }
 
   refreshScenes(scenes: SceneSummary[], currentId: string | null): void {
-    this.listEl.innerHTML = '<h2>Scenes</h2>';
+    this.listEl.innerHTML = '';
+    const h2 = document.createElement('h2');
+    h2.textContent = 'Scenes';
+    this.listEl.appendChild(h2);
     if (!scenes.length) {
       const p = document.createElement('p');
       p.className = 'empty';
@@ -554,14 +594,18 @@ export class Landing {
     for (const s of scenes) {
       const row = document.createElement('div');
       row.className = 'scene' + (s.id === currentId ? ' current' : '');
+
+      const head = document.createElement('div');
+      head.className = 'scene-head';
       const info = document.createElement('button');
       info.className = 'load';
       info.innerHTML = `<b>${escapeHtml(s.name)}</b><span>${s.actors} actors · ${s.cameras} cams · ${new Date(
         s.updatedAt,
       ).toLocaleString()}</span>`;
       info.onclick = () => this.cb.onSelect(s.id);
-      row.appendChild(info);
+      head.appendChild(info);
       for (const [label, fn] of [
+        ['Rename', (id: string) => this.promptRename(id, s.name)],
         ['Dup', this.cb.onDuplicate],
         ['Export', this.cb.onExport],
         ['Del', this.cb.onDelete],
@@ -570,10 +614,137 @@ export class Landing {
         b.className = 'small';
         b.textContent = label;
         b.onclick = () => fn(s.id);
-        row.appendChild(b);
+        head.appendChild(b);
       }
+      row.appendChild(head);
+
+      // Expandable prep panel: exports + inline camera editor.
+      const det = document.createElement('details');
+      det.className = 'prep';
+      const sum = document.createElement('summary');
+      sum.textContent = 'Shots & exports';
+      det.appendChild(sum);
+      det.appendChild(this.buildPrepPanel(s.id));
+      row.appendChild(det);
+
       this.listEl.appendChild(row);
     }
+  }
+
+  private promptRename(id: string, current: string): void {
+    const name = window.prompt('Scene name (used on slates and export filenames):', current);
+    if (name !== null && name.trim()) this.cb.onRename(id, name.trim());
+  }
+
+  /** Export buttons + a per-camera editor (lens/format/aspect/T-stop/height). */
+  private buildPrepPanel(sceneId: string): HTMLElement {
+    const panel = document.createElement('div');
+    panel.className = 'prep-body';
+
+    const exports = document.createElement('div');
+    exports.className = 'bar';
+    for (const [label, fn] of [
+      ['⬇ Floorplan PNG', this.cb.onExportFloorplan],
+      ['⬇ Shot List', this.cb.onExportShotList],
+    ] as const) {
+      const b = document.createElement('button');
+      b.className = 'small';
+      b.textContent = label;
+      b.onclick = () => fn(sceneId);
+      exports.appendChild(b);
+    }
+    panel.appendChild(exports);
+
+    const scene = this.cb.getScene(sceneId);
+    if (!scene || scene.cameras.length === 0) {
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = 'No cameras yet — commit one in AR to edit its lens here.';
+      panel.appendChild(p);
+      return panel;
+    }
+    for (const cam of scene.cameras) panel.appendChild(this.buildCameraEditor(sceneId, cam));
+    return panel;
+  }
+
+  private buildCameraEditor(sceneId: string, cam: CameraSetupData): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'cam-edit';
+    const name = document.createElement('b');
+    name.textContent = cam.name;
+    row.appendChild(name);
+
+    const patch = (p: Partial<CameraSetupData>) => this.cb.onUpdateCamera(sceneId, cam.id, p);
+
+    const field = (label: string, input: HTMLElement) => {
+      const l = document.createElement('label');
+      l.className = 'field';
+      const span = document.createElement('span');
+      span.textContent = label;
+      l.appendChild(span);
+      l.appendChild(input);
+      row.appendChild(l);
+    };
+
+    const num = (value: number, step: number, min: number, max: number, apply: (n: number) => void) => {
+      const i = document.createElement('input');
+      i.type = 'number';
+      i.value = String(value);
+      i.step = String(step);
+      i.min = String(min);
+      i.max = String(max);
+      i.onchange = () => {
+        const n = Number(i.value);
+        if (Number.isFinite(n)) apply(n);
+      };
+      return i;
+    };
+    const select = (opts: readonly { value: string; label: string }[], value: string, apply: (v: string) => void) => {
+      const sel = document.createElement('select');
+      for (const o of opts) {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        if (o.value === value) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      sel.onchange = () => apply(sel.value);
+      return sel;
+    };
+
+    field('Lens mm', num(Math.round(cam.lensFocalLength), 1, 8, 400, (n) => patch({ lensFocalLength: n })));
+    field(
+      'Format',
+      select(
+        SENSOR_FORMATS.map((f) => ({ value: f.id, label: f.short })),
+        cam.formatId,
+        (v) => patch({ formatId: v }),
+      ),
+    );
+    field(
+      'Aspect',
+      select(
+        ASPECT_NAMES.map((a) => ({ value: a, label: a })),
+        cam.aspect,
+        (v) => patch({ aspect: v as CameraSetupData['aspect'] }),
+      ),
+    );
+    field('T-stop', num(cam.tStop, 0.1, 0.7, 32, (n) => patch({ tStop: n })));
+    field('Height m', num(Number(cam.position.y.toFixed(2)), 0.1, 0, 4, (n) => patch({ position: { ...cam.position, y: n } })));
+
+    // Tripod-height presets.
+    field(
+      'Preset',
+      select(
+        [{ value: '', label: '—' }, ...TRIPOD_HEIGHTS.map((t) => ({ value: String(t.y), label: t.name }))],
+        '',
+        (v) => {
+          if (v) patch({ position: { ...cam.position, y: Number(v) } });
+        },
+      ),
+    );
+
+    return row;
   }
 
   show(visible: boolean): void {
@@ -598,7 +769,12 @@ LEFT controller
   Y ............... cycle view: full-scale → miniature → camera
   Wrist menu ...... point at the panel above your left wrist and pull trigger
 
-Hands (no controllers): pinch = trigger (place/select). Menu needs controllers.`;
+Hands (no controllers): pinch = trigger (place/select). Menu needs controllers.
+
+Desktop prep (no headset)
+  Rename scenes · edit each camera's lens / format / aspect / T-stop / height
+  Export a top-down floorplan PNG or a Markdown shot list (per scene)
+  Keys: Enter = Enter AR · N = New Scene`;
 
 // --- note editor (dom-overlay) --------------------------------------------------
 

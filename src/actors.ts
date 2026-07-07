@@ -12,7 +12,10 @@ import * as THREE from 'three';
 import type { ActorData, SceneData, Vec3 } from './model.ts';
 import { createActor } from './model.ts';
 import type { SessionManager } from './session.ts';
-import { disposeTree, makeLabel, type Label } from './ui.ts';
+import { disposeSprite, disposeTree, makeLabel, type Label } from './ui.ts';
+
+/** Reused each frame by updateFromAnchors to avoid per-actor allocations. */
+const _scratchAnchor = new THREE.Vector3();
 
 export interface ActorObject {
   data: ActorData;
@@ -118,9 +121,11 @@ export class ActorManager {
   updateFromAnchors(frame: XRFrame): void {
     for (const obj of this.objects.values()) {
       if (!obj.anchor || obj.overridden) continue;
-      const p = this.session.anchorPosition(frame, obj.anchor);
+      const p = this.session.anchorPosition(frame, obj.anchor, _scratchAnchor);
       if (!p) continue; // tracking lost this frame — hold last pose
-      obj.data.position = { x: p.x, y: p.y, z: p.z };
+      obj.data.position.x = p.x;
+      obj.data.position.y = p.y;
+      obj.data.position.z = p.z;
       obj.root.position.copy(p);
     }
   }
@@ -140,6 +145,8 @@ export class ActorManager {
 
   /** Rebuilds the floating note cards beside an actor. */
   refreshNotes(obj: ActorObject): void {
+    // Free the previous cards' textures/materials — clear() only detaches them.
+    for (const child of obj.noteGroup.children) disposeSprite(child as THREE.Sprite);
     obj.noteGroup.clear();
     obj.data.notes.forEach((note, i) => {
       const text = note.kind === 'dialogue' ? `“${note.text}”` : note.text;

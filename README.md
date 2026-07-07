@@ -96,19 +96,32 @@ The **wrist menu** floats above your **left** controller — point at it with th
 |---|---|
 | Wrist **+ Note** (actor selected) | dom-overlay text input (system keyboard); dialogue in quotes, action beats plain |
 | Wrist **Notes** | Toggle all note cards |
-| **A** (in Cam View) / wrist **📷 Capture** | Download the active camera's frame as PNG — 1920 px wide, burned-in slate (`scene-camera-focal-timestamp.png`) |
+| **A** (in Cam View) / wrist **📷 Capture** | Download the active camera's frame as PNG — 1920 px wide, burned-in slate with lens/format/T-stop/AoV/DOF (`scene-camera-focal-timestamp.png`) |
 | Landing page | Scene list: load / duplicate / delete / export JSON / import JSON. Autosaves to localStorage. |
 
 **Hands (no controllers):** pinch = trigger (place/select on the gaze/hand-ray reticle). The wrist menu and buttons need controllers — noted limitation.
 
+### Desktop prep (no headset)
+
+The landing page is a full prep surface you can use at a laptop before ever putting the headset on:
+
+| Action | How |
+|---|---|
+| **Rename a scene** | *Rename* on the scene row — the name is the slate and the export filename, so label it `INT-KITCHEN-Sc14` |
+| **Edit any camera** | Expand **Shots & exports** → per-camera **lens (mm)**, **format**, **aspect**, **T-stop**, and **height** (with tripod-height presets: low hat / low / waist / eye / high). Edits persist immediately. |
+| **Export a floorplan** | **⬇ Floorplan PNG** — a printable top-down blocking diagram: actor dots + facing, numbered dashed keyframe paths, camera icons with FOV wedges, 1 m grid + scale bar |
+| **Export a shot list** | **⬇ Shot List** — a Markdown table (lens/format/aspect/stop/AoV/height/subject/DOF per camera) plus a per-actor blocking summary (marks, travel distance, move duration) and notes |
+| **Keyboard** | **Enter** = Enter AR (when supported) · **N** = New Scene |
+
 ## Pragmatic choices & known limitations
 
 - **The virtual monitor shows virtual content only.** Passthrough camera pixels cannot be captured or re-projected by WebXR (by design, for privacy), so you cannot "zoom the real world". Camera View is therefore a *director's-viewfinder overlay*: actors composited over a neutral dark background with a subtle grid floor for spatial context. To judge the real location through a lens, use **Frame Lines** (eyes-as-camera) and physically stand at the camera position — that's the workflow the tool optimizes for. Exported PNGs show the same virtual-only frame.
-- **Lens math:** Super 35 modeled as a constant **24.89 mm-wide** gate across all aspect ratios (horizontal FOV depends only on focal length, like a real director's finder). Vertical FOV follows from the aspect.
+- **Lens math is real and format-aware.** Selectable capture formats — **Super 35** (24.89 mm gate), **Full-Frame/VV** (36 mm), **Super 16** (12.52 mm), and **S35 2× anamorphic** — each with its own circle of confusion. Horizontal angle of view is set by the format's gate width × anamorphic squeeze (a 2× anamorphic 50 mm frames like a 25 mm spherical); vertical follows from the aspect (a shared-width finder convention). Focal length is a **free millimetre value** (store real primes like 27/40/65 mm); the thumbstick still snaps through the 16/24/35/50/85/135 preset set. Readouts and the burned-in slate show **angle of view** (H/Ø°), **depth of field** (near–far, ∞ past hyperfocal) at the nearest actor, and the **frame width at the subject** ("at 4.2 m the frame is 3.0 m wide"). All of this is pure math in `lens.ts`, covered by unit tests (`npm test`).
 - **Anchors are position-only.** Orientation comes from the data model. Yaw drift on a standing figure is negligible; position drift is what kills the illusion, and that's what anchors correct.
 - **Scene restore is relative to session start.** `local-floor` origin is set where you begin each AR session (persistent anchors are out of scope for v1). Re-entering a saved scene, stand roughly where you originally started, facing the same way. Within one session, placements are anchor-locked to the real room.
 - **Teleport de-registers AR on purpose.** In passthrough you physically exist in the room, so "teleport" shifts the *virtual content* to you (e.g. to stand at a far camera position without walking). Objects placed while shifted are not anchored. **Re-align** restores true registration and re-anchoring.
 - **Notes need dom-overlay.** Quest and Android XR browsers support it; if a session lacks it, the note button explains instead of failing.
+- **Your work is warned before it's lost.** An autosave failure (e.g. localStorage full) now surfaces on the wrist status line and debug log with a prompt to *Export this scene to JSON* — it no longer fails silently. Imported scene JSON is deep-validated (every actor/camera), so a malformed file is rejected up front instead of crashing the loaded scene.
 - **No depth occlusion** of virtual actors by real objects, no 3D scan import, no multi-user, no audio — explicitly out of scope for v1.
 - **Performance budget:** flat-shaded Lambert primitives, no shadows, no postprocessing, foveation 1.0, one 1024-wide render-target pass only while Camera View is open. Designed to hold 72 fps on Quest 3; watch the fps readout on the wrist panel.
 
@@ -116,19 +129,21 @@ The **wrist menu** floats above your **left** controller — point at it with th
 
 ```
 src/
-  model.ts        Scene data model — PURE data, fully typed (design source of truth)
-  lens.ts         Super-35 lens math — PURE
-  timeline.ts     Keyframe timing/interpolation — PURE
+  model.ts        Scene data model + sensor formats — PURE data, fully typed (design source of truth)
+  lens.ts         Lens math: FOV, angle of view, depth of field — PURE, format-aware
+  timeline.ts     Keyframe timing/interpolation + move stats — PURE
+  plan.ts         Floorplan projection + shot-list text — PURE (feeds exporters)
   session.ts      WebXR session, feature detection, hit-test, anchors, reset logging
   input.ts        Controllers + hands: trigger/grip/buttons/sticks with edge detection
   actors.ts       Humanoid meshes, floor-locking, labels, notes cards, walk cycle
   keyframes.ts    Keyframe capture, footprints/paths, playback driving actors
   cameraView.ts   Camera gizmos, virtual monitor (RTT), frame lines, PNG capture
   views.ts        Full-scale / miniature / camera view, teleport, fades
-  ui.ts           Wrist panel, labels, debug log, drift marker, landing page, note editor
-  persistence.ts  localStorage autosave, scene list, JSON export/import
+  ui.ts           Wrist panel, labels, debug log, drift marker, landing page + camera editor, note editor
+  exporters.ts    Floorplan PNG + Markdown shot-list rendering/download (consumes plan.ts)
+  persistence.ts  localStorage autosave, scene list, JSON export/import, rename/update
   main.ts         Wiring + the per-frame loop + input routing
-test/domain.test.ts  Node-runnable tests for the pure domain modules
+test/domain.test.ts  Node-runnable tests for the pure domain modules (31 tests)
 ```
 
 ## Port-to-Unity notes
@@ -137,9 +152,10 @@ The domain core (`model.ts`, `lens.ts`, `timeline.ts`) is deliberately renderer-
 
 | Module | Unity equivalent |
 |---|---|
-| `model.ts` | Plain C# classes + `[Serializable]`; `SceneData` ⇄ JSON via `JsonUtility`/Newtonsoft |
-| `lens.ts` | Static `LensMath`; `Camera.usePhysicalProperties` + `sensorSize = (24.89, h)` gives the same FOV natively |
+| `model.ts` | Plain C# classes + `[Serializable]`; `SceneData` ⇄ JSON via `JsonUtility`/Newtonsoft; `SENSOR_FORMATS` → a `ScriptableObject` table |
+| `lens.ts` | Static `LensMath`; `Camera.usePhysicalProperties` + `sensorSize = (gateWidth, h)` gives the same FOV natively; DOF/hyperfocal are the same closed forms |
 | `timeline.ts` | Static `Timeline` class; or bake into an `AnimationClip` at author-time |
+| `plan.ts` | Static plan/shot-list generator — pure, ports verbatim (drive an editor window or a printable canvas) |
 | `session.ts` | AR Foundation `ARSession` + `ARRaycastManager` (hit-test) + `ARAnchorManager` (anchors) |
 | `input.ts` | Unity XR Interaction Toolkit `InputActionReferences` (trigger/grip/primary/secondary/stick) |
 | `actors.ts` | Actor prefab (primitives), `ARAnchor` per actor, `TextMeshPro` labels, Animator for walk bob |

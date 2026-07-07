@@ -70,14 +70,76 @@ export function aspectValue(a: AspectName): number {
   }
 }
 
+/** Convenient stepping presets. Focal length itself is a free mm value so a
+ *  DP can store real primes (18/27/40/65/100) or a zoom setting. */
 export const FOCAL_LENGTHS = [16, 24, 35, 50, 85, 135] as const;
-export type FocalLength = (typeof FOCAL_LENGTHS)[number];
+/** A focal length in millimeters. Free value; FOCAL_LENGTHS is only for steps. */
+export type FocalLength = number;
 
-export function stepFocal(f: FocalLength, dir: 1 | -1): FocalLength {
-  const i = FOCAL_LENGTHS.indexOf(f);
-  const next = Math.min(FOCAL_LENGTHS.length - 1, Math.max(0, i + dir));
-  return FOCAL_LENGTHS[next];
+/**
+ * Snaps to the nearest preset, then steps one preset in `dir`. A stored
+ * non-preset value (e.g. 27mm) steps to the sensible neighbour (24 or 35).
+ */
+export function stepFocal(f: number, dir: 1 | -1): number {
+  const p = FOCAL_LENGTHS;
+  let i = 0;
+  for (let k = 1; k < p.length; k++) {
+    if (Math.abs(p[k] - f) < Math.abs(p[i] - f)) i = k;
+  }
+  if (Math.abs(p[i] - f) < 1e-6) {
+    i = Math.min(p.length - 1, Math.max(0, i + dir));
+  } else if (dir > 0 && p[i] < f) {
+    i = Math.min(p.length - 1, i + 1);
+  } else if (dir < 0 && p[i] > f) {
+    i = Math.max(0, i - 1);
+  }
+  return p[i];
 }
+
+/**
+ * A capture format. Horizontal angle of view depends on the physical gate
+ * width and the anamorphic squeeze (2x anamorphic on a 50mm frames like a 25mm
+ * spherical). cocMm is the circle of confusion used for depth-of-field.
+ */
+export interface SensorFormat {
+  id: string;
+  name: string;
+  /** Compact label for slates/readouts. */
+  short: string;
+  /** Horizontal gate width in mm. */
+  gateWidthMm: number;
+  /** Circle of confusion in mm (DOF). */
+  cocMm: number;
+  /** Anamorphic squeeze (1 = spherical, 2 = 2x anamorphic). */
+  squeeze: number;
+}
+
+export const SENSOR_FORMATS: readonly SensorFormat[] = [
+  { id: 'super35', name: 'Super 35', short: 'S35', gateWidthMm: 24.89, cocMm: 0.025, squeeze: 1 },
+  { id: 'fullframe', name: 'Full Frame / VV', short: 'FF', gateWidthMm: 36.0, cocMm: 0.029, squeeze: 1 },
+  { id: 'super16', name: 'Super 16', short: 'S16', gateWidthMm: 12.52, cocMm: 0.015, squeeze: 1 },
+  { id: 'anamorphic35', name: 'S35 Anamorphic 2×', short: 'ANA2×', gateWidthMm: 24.89, cocMm: 0.025, squeeze: 2 },
+];
+
+export const DEFAULT_FORMAT_ID = 'super35';
+export const DEFAULT_TSTOP = 2.8;
+
+export function sensorFormat(id: string): SensorFormat {
+  return SENSOR_FORMATS.find((f) => f.id === id) ?? SENSOR_FORMATS[0];
+}
+
+/** Tripod-height presets (meters) so a DP can author low/high/overhead shots. */
+export interface TripodHeight {
+  name: string;
+  y: number;
+}
+export const TRIPOD_HEIGHTS: readonly TripodHeight[] = [
+  { name: 'Low hat', y: 0.3 },
+  { name: 'Low', y: 0.6 },
+  { name: 'Waist', y: 1.1 },
+  { name: 'Eye', y: 1.6 },
+  { name: 'High', y: 2.4 },
+];
 
 export interface CameraSetupData {
   id: string;
@@ -86,8 +148,13 @@ export interface CameraSetupData {
   position: Vec3;
   /** Full orientation (cameras are not floor-locked). */
   rotation: Quat;
+  /** Focal length in mm (free value). */
   lensFocalLength: FocalLength;
   aspect: AspectName;
+  /** Aperture as a T-stop (≈ f-number for DOF). */
+  tStop: number;
+  /** SensorFormat id (see SENSOR_FORMATS). */
+  formatId: string;
 }
 
 export interface SceneData {
@@ -148,15 +215,22 @@ export function createCameraSetup(
   rotation: Quat,
   lensFocalLength: FocalLength,
   aspect: AspectName,
+  tStop: number = DEFAULT_TSTOP,
+  formatId: string = DEFAULT_FORMAT_ID,
 ): CameraSetupData {
-  const letter = String.fromCharCode(65 + (scene.cameras.length % 26)); // A, B, C...
+  // First unused letter (A, B, C...) so deleting a middle camera never yields
+  // a duplicate name on the next add.
+  let i = 0;
+  while (scene.cameras.some((c) => c.name === `CAM ${String.fromCharCode(65 + (i % 26))}`)) i++;
   const cam: CameraSetupData = {
     id: uid(),
-    name: `CAM ${letter}`,
+    name: `CAM ${String.fromCharCode(65 + (i % 26))}`,
     position: { ...position },
     rotation: { ...rotation },
     lensFocalLength,
     aspect,
+    tStop,
+    formatId,
   };
   scene.cameras.push(cam);
   return cam;
@@ -175,7 +249,64 @@ export function addKeyframe(actor: ActorData, position: Vec3, rotationY: number)
   return true;
 }
 
-/** Basic shape check used when importing scene JSON from disk. */
+/** Euclidean distance between two scene-space points (meters). Pure. */
+export function vecDistance(a: Vec3, b: Vec3): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dz = b.z - a.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function isFiniteNum(n: unknown): n is number {
+  return typeof n === 'number' && Number.isFinite(n);
+}
+function isVec3(v: unknown): v is Vec3 {
+  const p = v as Vec3;
+  return !!p && typeof p === 'object' && isFiniteNum(p.x) && isFiniteNum(p.y) && isFiniteNum(p.z);
+}
+function isQuat(v: unknown): v is Quat {
+  const q = v as Quat;
+  return (
+    !!q && typeof q === 'object' && isFiniteNum(q.x) && isFiniteNum(q.y) && isFiniteNum(q.z) && isFiniteNum(q.w)
+  );
+}
+function isActorData(v: unknown): boolean {
+  const a = v as ActorData;
+  return (
+    !!a &&
+    typeof a === 'object' &&
+    typeof a.id === 'string' &&
+    typeof a.name === 'string' &&
+    typeof a.color === 'string' &&
+    isVec3(a.position) &&
+    isFiniteNum(a.rotationY) &&
+    Array.isArray(a.keyframes) &&
+    a.keyframes.every(
+      (k) => isVec3((k as TransformKeyframe)?.position) && isFiniteNum((k as TransformKeyframe)?.rotationY),
+    ) &&
+    Array.isArray(a.notes)
+  );
+}
+function isCameraData(v: unknown): boolean {
+  const c = v as CameraSetupData;
+  return (
+    !!c &&
+    typeof c === 'object' &&
+    typeof c.id === 'string' &&
+    typeof c.name === 'string' &&
+    isVec3(c.position) &&
+    isQuat(c.rotation) &&
+    isFiniteNum(c.lensFocalLength) &&
+    (ASPECT_NAMES as readonly string[]).includes(c.aspect)
+  );
+}
+
+/**
+ * Deep shape check used when importing scene JSON from disk — validates every
+ * actor and camera so a malformed file can't crash the renderer on load.
+ * Note: tStop/formatId are intentionally NOT required (older exports lack
+ * them); normalizeScene() fills their defaults.
+ */
 export function isSceneData(v: unknown): v is SceneData {
   const s = v as SceneData;
   return (
@@ -185,6 +316,19 @@ export function isSceneData(v: unknown): v is SceneData {
     typeof s.id === 'string' &&
     typeof s.name === 'string' &&
     Array.isArray(s.actors) &&
-    Array.isArray(s.cameras)
+    s.actors.every(isActorData) &&
+    Array.isArray(s.cameras) &&
+    s.cameras.every(isCameraData)
   );
+}
+
+/** Fills defaults for fields absent from older scene JSON. Mutates + returns. */
+export function normalizeScene(s: SceneData): SceneData {
+  for (const c of s.cameras) {
+    if (!isFiniteNum(c.tStop) || c.tStop <= 0) c.tStop = DEFAULT_TSTOP;
+    if (typeof c.formatId !== 'string' || !SENSOR_FORMATS.some((f) => f.id === c.formatId)) {
+      c.formatId = DEFAULT_FORMAT_ID;
+    }
+  }
+  return s;
 }

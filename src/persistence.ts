@@ -3,7 +3,8 @@
 // No backend — everything stays on the device.
 // ---------------------------------------------------------------------------
 
-import { createScene, isSceneData, uid, type SceneData } from './model.ts';
+import { createScene, isSceneData, normalizeScene, uid, type SceneData } from './model.ts';
+import { downloadFloorplan, downloadShotList } from './exporters.ts';
 
 const INDEX_KEY = 'setview.sceneIndex';
 const CURRENT_KEY = 'setview.currentScene';
@@ -19,6 +20,8 @@ export interface SceneIndexEntry {
 
 export class Persistence {
   private saveTimer: number | null = null;
+  /** Notified when a save fails (e.g. storage full) so the UI can warn. */
+  onError: (msg: string) => void = () => {};
 
   listScenes(): SceneIndexEntry[] {
     try {
@@ -35,7 +38,7 @@ export class Persistence {
       const raw = localStorage.getItem(SCENE_PREFIX + id);
       if (!raw) return null;
       const data = JSON.parse(raw);
-      return isSceneData(data) ? data : null;
+      return isSceneData(data) ? normalizeScene(data) : null;
     } catch {
       return null;
     }
@@ -72,7 +75,10 @@ export class Persistence {
     }, 800);
   }
 
-  saveNow(scene: SceneData): void {
+  /** Persists a scene. Returns false on failure (e.g. storage full) and fires
+   *  onError so the caller can warn the user — silent loss on a headset with no
+   *  console is otherwise unrecoverable. */
+  saveNow(scene: SceneData): boolean {
     scene.updatedAt = Date.now();
     try {
       localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
@@ -85,9 +91,25 @@ export class Persistence {
         cameras: scene.cameras.length,
       });
       localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+      return true;
     } catch (e) {
       console.warn('[setview] save failed', e);
+      this.onError('⚠ storage full — Export this scene to JSON to avoid losing it');
+      return false;
     }
+  }
+
+  /** Renames a scene (updates the stored scene + index). */
+  renameScene(id: string, name: string): boolean {
+    const scene = this.loadScene(id);
+    if (!scene) return false;
+    scene.name = name.trim() || scene.name;
+    return this.saveNow(scene);
+  }
+
+  /** Persists edits made to a scene outside a session (e.g. landing editor). */
+  updateScene(scene: SceneData): boolean {
+    return this.saveNow(normalizeScene(scene));
   }
 
   deleteScene(id: string): void {
@@ -122,10 +144,23 @@ export class Persistence {
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
   }
 
+  /** Downloads a printable top-down blocking floorplan (PNG). */
+  exportFloorplan(id: string): void {
+    const scene = this.loadScene(id);
+    if (scene) downloadFloorplan(scene);
+  }
+
+  /** Downloads a Markdown shot list (cameras + blocking). */
+  exportShotList(id: string): void {
+    const scene = this.loadScene(id);
+    if (scene) downloadShotList(scene);
+  }
+
   async importScene(file: File): Promise<SceneData | null> {
     try {
       const data = JSON.parse(await file.text());
       if (!isSceneData(data)) return null;
+      normalizeScene(data);
       // Fresh id so an import never clobbers an existing scene.
       data.id = uid();
       data.name = `${data.name} (imported)`;

@@ -81,7 +81,7 @@ body {
 
 #landing .scene {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 8px;
   background: #141821;
   border: 1px solid #232936;
@@ -91,6 +91,12 @@ body {
 }
 
 #landing .scene.current { border-color: #2e5bd7; }
+
+#landing .scene-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
 #landing .scene .load {
   flex: 1;
@@ -107,6 +113,50 @@ body {
 }
 
 #landing .scene .load span { color: #7d8697; font-size: 12px; }
+
+/* --- per-scene prep panel (exports + camera editor) --- */
+#landing .prep { font-size: 13px; }
+#landing .prep > summary {
+  cursor: pointer;
+  color: #8ab4ff;
+  padding: 2px 2px 6px;
+  user-select: none;
+}
+#landing .prep-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 2px 2px;
+}
+#landing .prep-body .bar { margin: 0 0 4px; flex-wrap: wrap; }
+#landing .cam-edit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px;
+  background: #0f1219;
+  border: 1px solid #232936;
+  border-radius: 8px;
+}
+#landing .cam-edit > b { color: #bfe6ff; min-width: 54px; }
+#landing .cam-edit .field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: #7d8697;
+}
+#landing .cam-edit .field input,
+#landing .cam-edit .field select {
+  background: #0b0d12;
+  color: #e8ecf3;
+  border: 1px solid #333c4e;
+  border-radius: 6px;
+  padding: 5px 6px;
+  font-size: 13px;
+}
+#landing .cam-edit .field input[type='number'] { width: 68px; }
 
 #landing .help { margin-top: 24px; color: #9aa3b2; }
 #landing .help pre {

@@ -6,6 +6,19 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 ---
 
+## Verified headset-free (this build, before QA)
+
+Checked on the dev machine — no headset needed:
+
+- [x] `npm test` — **31** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **floorplan projection**, **shot-list text**, timeline + move stats.
+- [x] `npx tsc --noEmit` clean · `npm run build` bundles (19 modules).
+- [x] Landing page boots in headless Chrome (canvas created, correct `immersive-ar unavailable` diagnostics on desktop, scene list + per-camera editor render, no error fallback).
+- [x] Floorplan PNG rasterizes (`toDataURL`) and shot-list Markdown builds in a real browser via the dev server — no runtime errors, anamorphic format surfaced.
+
+The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop/height editing; floorplan & shot-list export; Enter/N keys) is fully usable and verifiable at a laptop before the headset is available.
+
+---
+
 ## Phase 0 — Boot & passthrough
 
 - [ ] Landing page loads over HTTPS; diagnostic box says *immersive-ar supported*; **Enter AR** enabled.
@@ -31,9 +44,11 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 ## Phase 2 — Camera View & lenses
 
-- [ ] Wrist **Frame Lines**: white frame rectangle + darkened letterbox border + `35mm · 2.39:1` readout appear centered in your view at ~1.4 m.
-- [ ] Thumbstick left/right steps 16 → 24 → 35 → 50 → 85 → 135 mm; the rectangle visibly shrinks as focal length grows (16 mm fills most of your view; 135 mm is a small distant rect).
+- [ ] Wrist **Frame Lines**: white frame rectangle + darkened letterbox border + a readout like `35mm S35 · 2.39:1 · H39° · 1.0m @ 1.4m` (lens, format, aspect, horizontal AoV, frame width at 1.4 m) appear centered in your view.
+- [ ] Thumbstick left/right steps 16 → 24 → 35 → 50 → 85 → 135 mm; the rectangle visibly shrinks as focal length grows (16 mm fills most of your view; 135 mm is a small distant rect); the AoV/width numbers update.
 - [ ] Wrist **Aspect** cycles 2.39:1 / 16:9 / 4:3 — frame height changes, width stays (constant-gate behavior).
+- [ ] Camera-View monitor readout shows the full line: name · lens · format · aspect · T-stop, AoV (H/Ø°), subject distance, **DOF near–far**, and frame width. (Format/T-stop are set per camera on the desktop prep page; defaults S35 / T2.8.)
+- [ ] Committing a camera on **Full-Frame** vs **Super 35** at the same focal length gives a visibly wider frame on FF (verify after setting format on the landing page, re-entering AR).
 - [ ] Walk until two placed actors compose nicely, press **A** → label flashes `✓ CAM A committed`, gizmo with sightline cone appears at your head position.
 - [ ] **Y** to Camera View: floating monitor shows the frame from CAM A — actor positions/sizes in-frame should match what you saw through the frame lines (this is the fidelity check: stand behind the gizmo and compare).
 - [ ] Thumbstick steps focal length live in Camera View: FOV change is obvious and the readout under the monitor updates.
