@@ -280,6 +280,12 @@ export class CameraSystem {
     obj.anchor = null;
     const p = obj.data.position;
     void this.session.createAnchor(frame, new THREE.Vector3(p.x, p.y, p.z)).then((anchor) => {
+      // Deleted / replaced / re-anchored while createAnchor was in flight —
+      // don't leak an anchor onto a dead object (see ActorManager.reanchor).
+      if (this.objects.get(obj.data.id) !== obj) {
+        anchor?.delete?.();
+        return;
+      }
       obj.anchor = anchor;
     });
   }

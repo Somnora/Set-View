@@ -114,6 +114,13 @@ export class ActorManager {
     obj.anchor = null;
     const p = obj.data.position;
     void this.session.createAnchor(frame, new THREE.Vector3(p.x, p.y, p.z)).then((anchor) => {
+      // The object may have been deleted, replaced by setScene, or re-anchored
+      // again while createAnchor was in flight. If it's no longer the live
+      // object for its id, delete the fresh anchor instead of leaking it.
+      if (this.objects.get(obj.data.id) !== obj) {
+        anchor?.delete?.();
+        return;
+      }
       obj.anchor = anchor;
     });
   }

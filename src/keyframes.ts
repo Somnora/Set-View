@@ -64,10 +64,14 @@ export class KeyframeSystem {
   clear(actorId: string): void {
     const data = this.scene.actors.find((a) => a.id === actorId);
     if (!data) return;
+    // Stop BEFORE emptying keyframes: stop() only un-freezes + restores actors
+    // that still have keyframes, so clearing first would strand this actor at a
+    // scrubbed/played pose with overridden stuck true (it would then be skipped
+    // by anchor drift correction for the rest of the session).
+    this.stop();
     data.keyframes = [];
     this.rebuildForActor(data);
     this.recomputeDuration();
-    this.stop();
     this.onChange();
   }
 

@@ -34,6 +34,7 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Each new actor gets a distinct color and name (Actor 1, Actor 2, …).
 - [ ] Grip-grab an actor and drag: it follows the reticle **staying on the floor** (no lift, no tilt); thumbstick rotates its facing while held.
 - [ ] Wrist **Delete** removes the pointed-at actor.
+- [ ] **Delete-mid-drag (regression):** grip-grab an actor, and *while still holding grip* aim at the wrist **Delete** and pull trigger. The actor vanishes cleanly, the drag ends immediately (reticle/placement return without releasing grip), and no ghost lingers — releasing grip afterward does nothing.
 - [ ] **THE DRIFT LOOP:** place one actor in the middle of the room. Toggle wrist **Drift** — a 1 m cyan grid appears at the session origin with a floating readout. Now walk a full loop around the room (~10 m), looking away and back, crouching once.
   - [ ] The actor's feet stay visually planted — **no sliding, no floating, no pogo**. Sub-centimeter shimmer is acceptable; visible skating is a FAIL.
   - [ ] Compare: the drift grid is *unanchored* on purpose (raw tracking), actors are *anchored* — if anchors are working, actors should hold at least as well as the grid.
@@ -81,6 +82,7 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Wrist **Pace − / +**: the readout steps (0.4–3.0 m/s) and the *same* blocking plays back visibly slower/faster; the scrub playhead keeps its relative position.
 - [ ] Scrub the wrist slider: timeline jogs smoothly both directions; pause/play resumes from the playhead.
 - [ ] **⏹ Stop** returns actors to their placed (rest) positions.
+- [ ] **Clear-mid-scrub (regression):** scrub an actor to a mid-path pose (so it sits away from its placed spot), then wrist **Clear KF**. The actor snaps back to its authored rest position (not left frozen mid-path), and afterward still tracks the real floor when you walk (it isn't stuck ignoring anchor drift).
 - [ ] Wrist **⧉ Dup** on a selected actor with a path: a new-colored clone appears ~0.6 m over with the whole path copied; on a camera: a clone with the identical lens/format one step over.
 - [ ] Wrist **↶ Undo** reverses the last action (place / move / keyframe / delete / duplicate / camera commit); **↷ Redo** re-applies it. Both buttons are highlighted only when there's something to undo/redo. Delete an actor, Undo → it returns with its keyframes and notes intact.
 - [ ] Repeat playback while in **Miniature** view — identical blocking in the diorama.

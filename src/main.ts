@@ -783,6 +783,11 @@ class App {
   }
 
   private deleteTarget(): void {
+    // End any in-progress drag first: deleting the grabbed object mid-drag
+    // would otherwise leave draggedActor/Camera pointing at a disposed root
+    // (phantom per-frame applyPose, and a leaked anchor queued on release).
+    // Mirrors restoreScene. No-op when nothing is being manipulated.
+    this.cancelActiveManipulation();
     if (this.hover?.kind === 'camera') {
       this.debug.log(`deleted camera`);
       this.cams.remove(this.hover.id);
