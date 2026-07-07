@@ -753,6 +753,10 @@ class App {
       const obj = this.draggedActor;
       this.draggedActor = null;
       obj.overridden = this.keyframes.active && obj.data.keyframes.length > 0;
+      // Reconcile the rig: a stance changed mid-drag was skipped (overridden
+      // was true) — re-pose now that the drag is over so the visual matches
+      // data.stance. Only touches limb rotations, not the just-set placement.
+      if (!obj.overridden) this.actors.applyStance(obj);
       if (!this.views.isShifted) this.pendingReanchorActors.push(obj);
       this.markDirty();
     }

@@ -143,11 +143,17 @@ export class DofPass {
 
     const prevXr = renderer.xr.enabled;
     const prevTarget = renderer.getRenderTarget();
-    renderer.xr.enabled = false;
-    renderer.setRenderTarget(out);
-    renderer.render(this.scene, this.camera);
-    renderer.setRenderTarget(prevTarget);
-    renderer.xr.enabled = prevXr;
+    // try/finally so a throw here (context loss, shader error) can never leave
+    // xr.enabled=false — that would black/freeze the headset for the rest of
+    // the session (mirrors cameraView.renderPass).
+    try {
+      renderer.xr.enabled = false;
+      renderer.setRenderTarget(out);
+      renderer.render(this.scene, this.camera);
+    } finally {
+      renderer.setRenderTarget(prevTarget);
+      renderer.xr.enabled = prevXr;
+    }
   }
 
   dispose(): void {

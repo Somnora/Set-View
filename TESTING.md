@@ -10,9 +10,10 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 Checked on the dev machine — no headset needed:
 
-- [x] `npm test` — **60** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete + 27-camera hang guard**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **undo/redo history** (record/undo/redo, fresh-object isolation, redo-clear, bounded depth), **duplicate actor/camera** (fresh id/name, deep copy, offset), **move pace** normalization, **floorplan projection**, **shot-list text**, timeline + move stats, **locomotion** (glide deadzone/clamp, pivot-rotation identities), **location scans** (base64 vs Node reference, column-major vertex transforms, bounds/counts summary, binary codec round-trip incl. >65k-vertex index path, corrupt-input rejection, scan-summary scene validation).
+- [x] `npm test` — **74** domain tests pass: lens FOV, **depth of field / hyperfocal**, **circle of confusion** (focus-plane zero, aperture/focal scaling, degenerate-input guards), **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete + 27-camera hang guard**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **undo/redo history** (record/undo/redo, fresh-object isolation, redo-clear, bounded depth), **duplicate actor/camera** (fresh id/name, deep copy, offset), **move pace** normalization, **stance/pose** (all 10 poses present + unique + finite, standing-neutral, seated/lying differ, cycle wraps, validation/normalize/duplicate/round-trip), **floorplan projection**, **shot-list text**, timeline + move stats, **locomotion** (glide deadzone/clamp, pivot-rotation identities), **location scans** (base64 vs Node reference, column-major vertex transforms, bounds/counts summary, binary codec round-trip incl. >65k-vertex index path, corrupt-input rejection, scan-summary scene validation).
 - [x] `npx tsc --noEmit` clean · `npm run build` bundles.
 - [x] Landing page boots in headless Chrome (canvas created, correct `immersive-ar unavailable` diagnostics on desktop, scene list + per-camera editor render, no error fallback).
+- [x] **DOF shader compiles + runs headless** — `test/dof-smoke.html` builds a WebGL2 (swiftshader) context, renders a depth+color target, runs the `DofPass`, reads back a pixel: `DOF-SMOKE PASS` (a GLSL error can't hide until on-headset).
 - [x] Floorplan PNG rasterizes (`toDataURL`) and shot-list Markdown builds in a real browser via the dev server — no runtime errors, anamorphic format surfaced.
 
 The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop/height editing; floorplan & shot-list export; Enter/N keys) is fully usable and verifiable at a laptop before the headset is available.
@@ -89,6 +90,17 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Wrist **↶ Undo** reverses the last action (place / move / keyframe / delete / duplicate / camera commit); **↷ Redo** re-applies it. Both buttons are highlighted only when there's something to undo/redo. Delete an actor, Undo → it returns with its keyframes and notes intact.
 - [ ] Repeat playback while in **Miniature** view — identical blocking in the diorama.
 - [ ] fps ≥ 70 with 4 actors playing.
+
+## Phase 4b — Stance & depth of field
+
+- [ ] Select an actor, wrist **Stance ▸** → the button label flashes the pose short-name and cycles through all 10: standing → lean L → lean R → seated (chair) → seated (lounge) → seated (cross) → lie up → lie down → side L → side R → back to standing. Each pose visibly changes the gray-box figure (leans tilt; seated lowers the hips with bent knees; lying swings the body flat on the floor).
+- [ ] Sanity the four laying poses read as intended (flat face-up vs face-down; on-side facing left vs right). Tune the first-pass angles in `pose.ts` (`STANCES`) if a pose reads wrong — the numbers are on-headset-tunable by design.
+- [ ] A seated/lying actor **stays posed** as you walk around it (stance persists; it doesn't pop back to standing).
+- [ ] Give a seated actor a blocking path and **Play**: it stands to walk the path, then re-settles into its stance at the end (walking figures are always upright).
+- [ ] **Undo** after a stance change reverts the pose; the desktop prep page shows a per-actor **Stance** dropdown that matches (set it there without the headset too).
+- [ ] Wrist **DOF** toggle (in Camera View with an actor in frame): with a foreground actor in focus and something at a very different distance, toggling DOF **on** softens the far/near element while the actor stays sharp; **off** returns a fully sharp frame. Lower the camera's **T-stop** (prep page) → shallower focus (more blur); a longer lens → more blur.
+- [ ] **📷 Capture** with DOF on: the PNG shows the same blur as the monitor.
+- [ ] **Perf:** DOF on + Camera View open + a few actors → fps ≥ 70. If it sags, DOF is off by default for a reason; leave it off while composing and flick it on to check focus. The blur cap is `maxCoCPx` in `cameraView.ts`.
 
 ## Phase 5 — Notes, persistence, export
 
