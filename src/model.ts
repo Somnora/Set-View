@@ -219,12 +219,14 @@ export function createCameraSetup(
   formatId: string = DEFAULT_FORMAT_ID,
 ): CameraSetupData {
   // First unused letter (A, B, C...) so deleting a middle camera never yields
-  // a duplicate name on the next add.
+  // a duplicate name on the next add. Past 26 cameras, fall back to a numeric
+  // suffix (bounded — never spin looking for a free letter that can't exist).
   let i = 0;
-  while (scene.cameras.some((c) => c.name === `CAM ${String.fromCharCode(65 + (i % 26))}`)) i++;
+  while (i < 26 && scene.cameras.some((c) => c.name === `CAM ${String.fromCharCode(65 + i)}`)) i++;
+  const name = i < 26 ? `CAM ${String.fromCharCode(65 + i)}` : `CAM ${scene.cameras.length + 1}`;
   const cam: CameraSetupData = {
     id: uid(),
-    name: `CAM ${String.fromCharCode(65 + (i % 26))}`,
+    name,
     position: { ...position },
     rotation: { ...rotation },
     lensFocalLength,
@@ -297,6 +299,7 @@ function isCameraData(v: unknown): boolean {
     isVec3(c.position) &&
     isQuat(c.rotation) &&
     isFiniteNum(c.lensFocalLength) &&
+    c.lensFocalLength > 0 &&
     (ASPECT_NAMES as readonly string[]).includes(c.aspect)
   );
 }
@@ -325,6 +328,7 @@ export function isSceneData(v: unknown): v is SceneData {
 /** Fills defaults for fields absent from older scene JSON. Mutates + returns. */
 export function normalizeScene(s: SceneData): SceneData {
   for (const c of s.cameras) {
+    if (!isFiniteNum(c.lensFocalLength) || c.lensFocalLength <= 0) c.lensFocalLength = 35;
     if (!isFiniteNum(c.tStop) || c.tStop <= 0) c.tStop = DEFAULT_TSTOP;
     if (typeof c.formatId !== 'string' || !SENSOR_FORMATS.some((f) => f.id === c.formatId)) {
       c.formatId = DEFAULT_FORMAT_ID;

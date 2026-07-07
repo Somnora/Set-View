@@ -555,6 +555,7 @@ export class Landing {
     // Keyboard shortcuts (desktop prep): Enter = Enter AR, N = new scene.
     window.addEventListener('keydown', (e) => {
       if (this.root.style.display === 'none') return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return; // let Cmd/Ctrl+N etc. through
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable))
         return;
@@ -694,8 +695,15 @@ export class Landing {
       i.min = String(min);
       i.max = String(max);
       i.onchange = () => {
+        if (i.value.trim() === '') {
+          i.value = String(value); // cleared field — restore, don't apply 0
+          return;
+        }
         const n = Number(i.value);
-        if (Number.isFinite(n)) apply(n);
+        if (!Number.isFinite(n)) return;
+        const clamped = Math.min(max, Math.max(min, n)); // min/max attrs don't clamp .value
+        i.value = String(clamped);
+        apply(clamped);
       };
       return i;
     };

@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import {
   addKeyframe,
+  addNote,
   createActor,
   createCameraSetup,
   createScene,
@@ -25,12 +26,14 @@ import {
   dFovDeg,
   frameSizeAtDistance,
   hFovDeg,
+  hFovRad,
   hyperfocalM,
   vFovDeg,
 } from '../src/lens.ts';
 import { buildTimeline, lerpAngle, moveStats, sampleTimeline } from '../src/timeline.ts';
 import {
   buildShotList,
+  cameraHalfFovRad,
   cameraYaw,
   floorplanLayout,
   nearestActorDistance,
@@ -384,6 +387,61 @@ test('buildShotList emits camera + blocking details', () => {
   const empty = buildShotList(createScene('Empty'));
   assert.ok(empty.includes('No cameras'));
   assert.ok(empty.includes('No actors'));
+});
+
+test('buildShotList: static mark, notes, and ∞ DOF past hyperfocal', () => {
+  const s = createScene('S');
+  const a = createActor(s, { x: 0, y: 0, z: 10 }, 0);
+  addKeyframe(a, { x: 0, y: 0, z: 10 }, 0); // one mark → static
+  addNote(a, 'dialogue', 'Hello there');
+  // 24mm T4 with subject ~10m is past the 5.78m hyperfocal → far = ∞
+  createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 24, '2.39:1', 4, 'super35');
+  const md = buildShotList(s);
+  assert.ok(md.includes('static (1 mark)'), 'single-mark actor');
+  assert.ok(md.includes('“Hello there”'), 'dialogue note quoted');
+  assert.ok(md.includes('∞'), 'infinite DOF far limit');
+  assert.ok(!/NaN/.test(md), 'no NaN anywhere in the export');
+});
+
+test('cameraHalfFovRad is half the horizontal FOV for the camera format', () => {
+  const s = createScene('S');
+  const cam = createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+  approx(cameraHalfFovRad(cam), hFovRad(35, 'super35') / 2, 1e-9);
+});
+
+test('planBounds falls back to a ±1m box for an empty scene', () => {
+  const b = planBounds(createScene('empty'));
+  assert.deepEqual(b, { minX: -1, maxX: 1, minZ: -1, maxZ: 1 });
+});
+
+// --- regression guards for the pre-QA review fixes -----------------------------
+
+test('camera naming: 27th camera falls back to a numeric suffix (no hang)', () => {
+  const s = createScene('Big');
+  for (let i = 0; i < 26; i++) createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+  assert.equal(s.cameras[25].name, 'CAM Z');
+  const c27 = createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+  assert.equal(c27.name, 'CAM 27'); // must terminate — not spin forever
+});
+
+test('normalizeScene repairs a zero/negative focal length (editor/import guard)', () => {
+  const s = createScene('S');
+  const c = createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+  c.lensFocalLength = 0;
+  normalizeScene(s);
+  assert.equal(c.lensFocalLength, 35);
+  c.lensFocalLength = -10;
+  normalizeScene(s);
+  assert.equal(c.lensFocalLength, 35);
+});
+
+test('isSceneData rejects a non-positive focal length on import', () => {
+  const s = createScene('S');
+  createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+  const json = JSON.parse(JSON.stringify(s)) as SceneData;
+  assert.ok(isSceneData(json));
+  json.cameras[0].lensFocalLength = 0;
+  assert.ok(!isSceneData(json), 'focal 0 rejected');
 });
 
 console.log(`\n${passed} tests passed`);

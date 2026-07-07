@@ -210,6 +210,25 @@ export class CameraSystem {
     this.refreshMonitorInfo();
   }
 
+  /**
+   * Re-syncs one camera's visuals from its (externally mutated) data — used by
+   * the landing-page editor. Cheaper and less side-effecting than setScene: no
+   * teardown, and the active camera is preserved.
+   */
+  refreshCamera(id: string): void {
+    const obj = this.objects.get(id);
+    if (!obj) return;
+    const d = obj.data;
+    obj.root.position.set(d.position.x, d.position.y, d.position.z);
+    obj.root.quaternion.set(d.rotation.x, d.rotation.y, d.rotation.z, d.rotation.w);
+    obj.label.setText(`${obj.data.name} · ${Math.round(d.lensFocalLength)}mm`);
+    this.rebuildFrustum(obj);
+    if (this.activeId === id) {
+      this.refreshRT();
+      this.refreshMonitorInfo();
+    }
+  }
+
   // --- lens & aspect controls --------------------------------------------------
 
   stepActiveFocal(dir: 1 | -1): void {
@@ -445,17 +464,19 @@ export class CameraSystem {
     // Snapshot state we're about to mutate. The restore runs in `finally` so a
     // single render throw (context loss, shader error) can never leave
     // xr.enabled=false — which would freeze/black the headset for the rest of
-    // the session — nor leave HUD objects hidden or the RT bound.
+    // the session — nor leave HUD objects hidden or the RT bound. All mutations
+    // live inside the try so any throw is fully unwound. renderPass is
+    // intentionally NOT re-entrant (single setAnimationLoop caller), so the
+    // shared visRestore/prevColor scratch is safe.
     for (const o of hidden) this.visRestore.push([o, o.visible]);
-    for (const o of hidden) o.visible = false;
-    this.monitorGrid.visible = true;
-
     const xrWas = renderer.xr.enabled;
     const prevTarget = renderer.getRenderTarget();
     renderer.getClearColor(this.prevColor);
     const prevAlpha = renderer.getClearAlpha();
 
     try {
+      for (const o of hidden) o.visible = false;
+      this.monitorGrid.visible = true;
       renderer.xr.enabled = false;
       renderer.setRenderTarget(rt);
       renderer.setClearColor(0x101318, 1);

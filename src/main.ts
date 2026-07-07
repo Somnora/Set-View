@@ -5,7 +5,7 @@
 
 import './style.css';
 import * as THREE from 'three';
-import { addNote, createScene, type CameraSetupData, type SceneData } from './model.ts';
+import { addNote, createScene, normalizeScene, type CameraSetupData, type SceneData } from './model.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
@@ -190,15 +190,15 @@ class App {
       const cam = this.sceneData.cameras.find((c) => c.id === cameraId);
       if (!cam) return;
       Object.assign(cam, patch);
-      this.cams.setScene(this.sceneData); // rebuild gizmos with the new lens/format
-      this.contentVersion++;
+      normalizeScene(this.sceneData); // repair any out-of-range value before it's used
+      this.cams.refreshCamera(cameraId); // targeted visual sync; keeps active camera
       this.persistence.saveNow(this.sceneData);
     } else {
       const scene = this.persistence.loadScene(sceneId);
       const cam = scene?.cameras.find((c) => c.id === cameraId);
       if (!scene || !cam) return;
       Object.assign(cam, patch);
-      this.persistence.updateScene(scene);
+      this.persistence.updateScene(scene); // updateScene normalizes
     }
     this.refreshLanding();
   }
