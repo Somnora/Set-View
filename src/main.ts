@@ -252,6 +252,23 @@ class App {
   }
 
   /**
+   * Ends any in-progress manipulation before the objects under it are torn
+   * down (undo/redo can fire mid-drag via the wrist trigger). A grabbed camera
+   * root is re-parented back into the gizmo group so setScene can remove +
+   * dispose it cleanly instead of orphaning a disposed mesh on the controller
+   * ray; the miniature grab is released.
+   */
+  private cancelActiveManipulation(): void {
+    if (this.draggedCamera) this.cams.gizmoGroup.attach(this.draggedCamera.root);
+    this.draggedActor = null;
+    this.draggedCamera = null;
+    if (this.miniGrabbing) {
+      this.views.miniGrabEnd();
+      this.miniGrabbing = false;
+    }
+  }
+
+  /**
    * Re-loads a scene from an undo/redo snapshot into the live managers without
    * touching the history stacks (mirrors loadScene minus history.reset and the
    * current-id switch, plus re-anchoring if a session is running).
@@ -260,8 +277,11 @@ class App {
     this.sceneData = data;
     this.selectedActorId = null;
     this.hover = null;
-    this.draggedActor = null;
-    this.draggedCamera = null;
+    this.cancelActiveManipulation();
+    // Drop reanchor entries queued for the objects we're about to dispose —
+    // otherwise the loop would create (and leak) anchors on detached objects.
+    this.pendingReanchorActors.length = 0;
+    this.pendingReanchorCams.length = 0;
     this.actors.setScene(data);
     this.keyframes.setScene(data);
     this.cams.setScene(data);
