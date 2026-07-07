@@ -79,6 +79,13 @@ export class Persistence {
    *  onError so the caller can warn the user — silent loss on a headset with no
    *  console is otherwise unrecoverable. */
   saveNow(scene: SceneData): boolean {
+    // Cancel any pending debounced save: this write is authoritative, and a
+    // stale timer could otherwise overwrite it with an older scene object
+    // (e.g. an undo landing inside the 800ms window after a mutation).
+    if (this.saveTimer !== null) {
+      window.clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
     scene.updatedAt = Date.now();
     try {
       localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));

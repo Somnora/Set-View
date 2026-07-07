@@ -5,7 +5,16 @@
 
 import './style.css';
 import * as THREE from 'three';
-import { addNote, createScene, normalizeScene, type CameraSetupData, type SceneData } from './model.ts';
+import {
+  addNote,
+  createScene,
+  duplicateActor,
+  duplicateCameraSetup,
+  normalizeScene,
+  type CameraSetupData,
+  type SceneData,
+} from './model.ts';
+import { History } from './history.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
@@ -34,6 +43,7 @@ class App {
 
   private debug = new DebugLog();
   private persistence = new Persistence();
+  private history = new History();
   private sceneData: SceneData;
 
   private session: SessionManager;
@@ -157,6 +167,7 @@ class App {
       getScene: (id) =>
         id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
       onUpdateCamera: (sceneId, cameraId, patch) => this.updateCamera(sceneId, cameraId, patch),
+      onSetPace: (sceneId, walkSpeed) => this.setScenePace(sceneId, walkSpeed),
     });
 
     this.persistence.onError = (m) => {
@@ -203,6 +214,22 @@ class App {
     this.refreshLanding();
   }
 
+  /** Sets a scene's move pace from the landing-page editor (out-of-session). */
+  private setScenePace(sceneId: string, walkSpeed: number): void {
+    if (sceneId === this.sceneData.id) {
+      this.sceneData.walkSpeed = walkSpeed;
+      this.keyframes.setWalkSpeed();
+      this.refreshWristState();
+      this.persistence.saveNow(this.sceneData);
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      if (!scene) return;
+      scene.walkSpeed = walkSpeed;
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
+  }
+
   private loadScene(data: SceneData): void {
     this.sceneData = data;
     this.persistence.setCurrent(data.id);
@@ -214,6 +241,7 @@ class App {
     this.keyframes.setScene(data);
     this.cams.setScene(data);
     this.contentVersion++;
+    this.history.reset(data);
     this.refreshLanding();
     this.refreshWristState();
     if (data.actors.length || data.cameras.length) {
@@ -223,11 +251,58 @@ class App {
     }
   }
 
+  /**
+   * Re-loads a scene from an undo/redo snapshot into the live managers without
+   * touching the history stacks (mirrors loadScene minus history.reset and the
+   * current-id switch, plus re-anchoring if a session is running).
+   */
+  private restoreScene(data: SceneData): void {
+    this.sceneData = data;
+    this.selectedActorId = null;
+    this.hover = null;
+    this.draggedActor = null;
+    this.draggedCamera = null;
+    this.actors.setScene(data);
+    this.keyframes.setScene(data);
+    this.cams.setScene(data);
+    this.contentVersion++;
+    this.persistence.saveNow(data);
+    if (this.session.session && !this.views.isShifted) {
+      for (const obj of this.actors.all()) this.pendingReanchorActors.push(obj);
+      for (const obj of this.cams.all()) this.pendingReanchorCams.push(obj);
+    }
+    this.refreshLanding();
+    this.refreshWristState();
+  }
+
+  private undo(): void {
+    const data = this.history.undo();
+    if (!data) {
+      this.debug.log('nothing to undo');
+      return;
+    }
+    this.restoreScene(data);
+    this.debug.log('↶ undo');
+  }
+
+  private redo(): void {
+    const data = this.history.redo();
+    if (!data) {
+      this.debug.log('nothing to redo');
+      return;
+    }
+    this.restoreScene(data);
+    this.debug.log('↷ redo');
+  }
+
   private refreshLanding(): void {
     this.landing.refreshScenes(this.persistence.listScenes(), this.sceneData.id);
   }
 
+  /** Records an undo snapshot and schedules a debounced save. Call after every
+   *  committed mutation (this is the single mutation-commit signal). */
   private markDirty(): void {
+    this.history.record(this.sceneData);
     this.persistence.markDirty(this.sceneData);
   }
 
@@ -314,6 +389,21 @@ class App {
         break;
       case 'delete':
         this.deleteTarget();
+        break;
+      case 'dup':
+        this.duplicateTarget();
+        break;
+      case 'undo':
+        this.undo();
+        break;
+      case 'redo':
+        this.redo();
+        break;
+      case 'pace-slow':
+        this.adjustPace(-0.2);
+        break;
+      case 'pace-fast':
+        this.adjustPace(+0.2);
         break;
       case 'drift': {
         const on = !this.driftMarker.group.visible;
@@ -522,6 +612,45 @@ class App {
     this.markDirty();
   }
 
+  /** Clones the hovered/selected actor or camera a short step away. */
+  private duplicateTarget(): void {
+    if (this.hover?.kind === 'camera') {
+      const data = duplicateCameraSetup(this.sceneData, this.hover.id);
+      if (!data) return;
+      const obj = this.cams.adopt(data);
+      this.contentVersion++;
+      if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
+      this.debug.log(`duplicated → ${data.name}`);
+      this.refreshWristState();
+      this.markDirty();
+      return;
+    }
+    const id = this.hover?.kind === 'actor' ? this.hover.id : this.selectedActorId;
+    if (!id) {
+      this.debug.log('Dup: point at (or select) an actor or camera first');
+      return;
+    }
+    const data = duplicateActor(this.sceneData, id);
+    if (!data) return;
+    const obj = this.actors.adopt(data);
+    this.keyframes.addActor(data);
+    this.contentVersion++;
+    if (!this.views.isShifted) this.pendingReanchorActors.push(obj);
+    this.selectActor(data.id);
+    this.debug.log(`duplicated → ${data.name}`);
+    this.markDirty();
+  }
+
+  /** Steps the scene's playback pace and re-derives move timing. */
+  private adjustPace(delta: number): void {
+    const next = Math.min(3.0, Math.max(0.4, Math.round((this.sceneData.walkSpeed + delta) * 10) / 10));
+    if (next === this.sceneData.walkSpeed) return;
+    this.sceneData.walkSpeed = next;
+    this.keyframes.setWalkSpeed();
+    this.refreshWristState();
+    this.markDirty();
+  }
+
   private openNoteEditor(): void {
     const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
     if (!obj) {
@@ -583,11 +712,14 @@ class App {
     this.wrist.setToggle('drift', this.driftMarker.group.visible);
     this.wrist.setLabel('play', this.keyframes.playing ? '⏸ Pause' : '▶ Play');
     this.wrist.setLabel('aspect', this.cams.currentAspect);
+    this.wrist.setLabel('pace', `${this.sceneData.walkSpeed.toFixed(1)} m/s`);
+    this.wrist.setToggle('undo', this.history.canUndo);
+    this.wrist.setToggle('redo', this.history.canRedo);
     const sel = this.selectedActorId
       ? (this.actors.get(this.selectedActorId)?.data.name ?? '—')
       : '—';
     const cam = this.cams.active;
-    this.wrist.setStatus(`${sel}${cam ? ` · ${cam.data.name} ${cam.data.lensFocalLength}mm` : ''}`);
+    this.wrist.setStatus(`${sel}${cam ? ` · ${cam.data.name} ${Math.round(cam.data.lensFocalLength)}mm` : ''}`);
   }
 
   /** Everything that must not appear in the virtual camera's frame. Cached and

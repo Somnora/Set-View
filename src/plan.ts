@@ -143,7 +143,7 @@ export function buildShotList(scene: SceneData, header = ''): string {
     lines.push('_No actors yet._');
   } else {
     for (const a of scene.actors) {
-      const ms = moveStats(a.keyframes);
+      const ms = moveStats(a.keyframes, scene.walkSpeed);
       if (a.keyframes.length <= 1) {
         lines.push(`- **${a.name}** — static (${a.keyframes.length} mark)`);
       } else {

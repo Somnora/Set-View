@@ -75,6 +75,11 @@ export class ActorManager {
     return this.buildObject(data);
   }
 
+  /** Builds the visual for actor data already added to the scene (duplicate). */
+  adopt(data: ActorData): ActorObject {
+    return this.buildObject(data);
+  }
+
   remove(id: string): void {
     const obj = this.objects.get(id);
     if (!obj) return;

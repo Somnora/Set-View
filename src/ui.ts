@@ -460,6 +460,16 @@ export function buildWristPanel(): UIPanel {
     ],
     [{ id: 'scrub', label: '', slider: true }],
     [
+      { id: 'pace-slow', label: 'Pace −' },
+      { id: 'pace', label: '1.4 m/s' },
+      { id: 'pace-fast', label: 'Pace +' },
+    ],
+    [
+      { id: 'undo', label: '↶ Undo' },
+      { id: 'redo', label: '↷ Redo' },
+      { id: 'dup', label: '⧉ Dup' },
+    ],
+    [
       { id: 'addnote', label: '+ Note' },
       { id: 'notes', label: 'Notes' },
     ],
@@ -499,6 +509,7 @@ export interface LandingCallbacks {
   /** Full scene for the inline camera editor, or null. */
   getScene: (id: string) => SceneData | null;
   onUpdateCamera: (sceneId: string, cameraId: string, patch: Partial<CameraSetupData>) => void;
+  onSetPace: (sceneId: string, walkSpeed: number) => void;
 }
 
 export class Landing {
@@ -657,6 +668,38 @@ export class Landing {
     panel.appendChild(exports);
 
     const scene = this.cb.getScene(sceneId);
+    if (scene) {
+      const pace = document.createElement('div');
+      pace.className = 'cam-edit';
+      const b = document.createElement('b');
+      b.textContent = 'Scene';
+      pace.appendChild(b);
+      const l = document.createElement('label');
+      l.className = 'field';
+      const span = document.createElement('span');
+      span.textContent = 'Move pace m/s';
+      const i = document.createElement('input');
+      i.type = 'number';
+      i.value = String(scene.walkSpeed.toFixed(1));
+      i.step = '0.1';
+      i.min = '0.4';
+      i.max = '3';
+      i.onchange = () => {
+        if (i.value.trim() === '') {
+          i.value = String(scene.walkSpeed.toFixed(1));
+          return;
+        }
+        const n = Number(i.value);
+        if (!Number.isFinite(n)) return;
+        const clamped = Math.min(3, Math.max(0.4, n));
+        i.value = String(clamped.toFixed(1));
+        this.cb.onSetPace(sceneId, clamped);
+      };
+      l.appendChild(span);
+      l.appendChild(i);
+      pace.appendChild(l);
+      panel.appendChild(pace);
+    }
     if (!scene || scene.cameras.length === 0) {
       const p = document.createElement('p');
       p.className = 'empty';
@@ -776,6 +819,9 @@ LEFT controller
   X ............... toggle placement mode (actor / camera)
   Y ............... cycle view: full-scale → miniature → camera
   Wrist menu ...... point at the panel above your left wrist and pull trigger
+  Undo / Redo ..... step back / forward through placement & keyframe edits
+  Dup ............. clone the pointed-at (or selected) actor / camera
+  Pace − / + ...... slow down / speed up blocking playback (per scene)
 
 Hands (no controllers): pinch = trigger (place/select). Menu needs controllers.
 

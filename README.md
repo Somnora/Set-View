@@ -86,10 +86,18 @@ The **wrist menu** floats above your **left** controller — point at it with th
 | Input | Action |
 |---|---|
 | **B** (actor selected) | Store its current position/facing as the next keyframe (max 5, numbered footprints + dotted path) |
-| Wrist **▶ Play / ⏸ Pause** | Play all actors' blocking simultaneously (walking speed ≈ 1.4 m/s, procedural walk) |
+| Wrist **▶ Play / ⏸ Pause** | Play all actors' blocking simultaneously (procedural walk) |
 | Wrist slider | Scrub/jog the timeline |
 | Wrist **⏹ Stop** | Stop & return actors to their placed positions |
 | Wrist **Clear KF** | Clear the selected actor's keyframes |
+| Wrist **Pace − / +** | Set the scene's playback pace (0.4–3.0 m/s); a slow cross vs a quick exit reads completely differently |
+
+### Anywhere — undo, duplicate
+
+| Input | Action |
+|---|---|
+| Wrist **↶ Undo / ↷ Redo** | Step back/forward through every placement, move, keyframe, delete, and camera edit (bounded 40-deep). A mis-drop or accidental Delete is fully recoverable. |
+| Wrist **⧉ Dup** | Clone the pointed-at (or selected) actor or camera a short step away — copies the full blocking path / the exact lens, format, aspect, and T-stop |
 
 ### Phase 5 — notes, capture, scenes
 | Input | Action |
@@ -109,6 +117,7 @@ The landing page is a full prep surface you can use at a laptop before ever putt
 |---|---|
 | **Rename a scene** | *Rename* on the scene row — the name is the slate and the export filename, so label it `INT-KITCHEN-Sc14` |
 | **Edit any camera** | Expand **Shots & exports** → per-camera **lens (mm)**, **format**, **aspect**, **T-stop**, and **height** (with tripod-height presets: low hat / low / waist / eye / high). Edits persist immediately. |
+| **Set move pace** | The scene's **Move pace (m/s)** field in the same panel — drives blocking playback timing and the shot-list durations |
 | **Export a floorplan** | **⬇ Floorplan PNG** — a printable top-down blocking diagram: actor dots + facing, numbered dashed keyframe paths, camera icons with FOV wedges, 1 m grid + scale bar |
 | **Export a shot list** | **⬇ Shot List** — a Markdown table (lens/format/aspect/stop/AoV/height/subject/DOF per camera) plus a per-actor blocking summary (marks, travel distance, move duration) and notes |
 | **Keyboard** | **Enter** = Enter AR (when supported) · **N** = New Scene |
@@ -132,6 +141,7 @@ src/
   model.ts        Scene data model + sensor formats — PURE data, fully typed (design source of truth)
   lens.ts         Lens math: FOV, angle of view, depth of field — PURE, format-aware
   timeline.ts     Keyframe timing/interpolation + move stats — PURE
+  history.ts      Undo/redo snapshot stack over SceneData — PURE
   plan.ts         Floorplan projection + shot-list text — PURE (feeds exporters)
   session.ts      WebXR session, feature detection, hit-test, anchors, reset logging
   input.ts        Controllers + hands: trigger/grip/buttons/sticks with edge detection

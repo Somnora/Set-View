@@ -182,6 +182,13 @@ export class CameraSystem {
     return obj;
   }
 
+  /** Builds a gizmo for camera data already added to the scene (duplicate). */
+  adopt(data: CameraSetupData): CamObject {
+    const obj = this.buildGizmo(data);
+    this.setActive(data.id);
+    return obj;
+  }
+
   remove(id: string): void {
     const obj = this.objects.get(id);
     if (!obj) return;

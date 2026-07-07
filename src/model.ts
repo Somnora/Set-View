@@ -165,6 +165,8 @@ export interface SceneData {
   updatedAt: number;
   actors: ActorData[];
   cameras: CameraSetupData[];
+  /** Playback pace for blocking moves (m/s); drives segment timing. */
+  walkSpeed: number;
 }
 
 // --- factories --------------------------------------------------------------
@@ -189,16 +191,37 @@ export function uid(): string {
 
 export function createScene(name: string): SceneData {
   const now = Date.now();
-  return { version: 1, id: uid(), name, createdAt: now, updatedAt: now, actors: [], cameras: [] };
+  return {
+    version: 1,
+    id: uid(),
+    name,
+    createdAt: now,
+    updatedAt: now,
+    actors: [],
+    cameras: [],
+    walkSpeed: WALK_SPEED_MS,
+  };
+}
+
+/** First unused "Actor N" name for a scene. */
+export function nextActorName(scene: SceneData): string {
+  let n = scene.actors.length + 1;
+  while (scene.actors.some((a) => a.name === `Actor ${n}`)) n++;
+  return `Actor ${n}`;
+}
+
+/** First unused "CAM X" name (letters A–Z, then a numeric suffix). */
+export function nextCameraName(scene: SceneData): string {
+  let i = 0;
+  while (i < 26 && scene.cameras.some((c) => c.name === `CAM ${String.fromCharCode(65 + i)}`)) i++;
+  return i < 26 ? `CAM ${String.fromCharCode(65 + i)}` : `CAM ${scene.cameras.length + 1}`;
 }
 
 /** Creates an actor with a unique name and the next palette color. */
 export function createActor(scene: SceneData, position: Vec3, rotationY: number): ActorData {
-  let n = scene.actors.length + 1;
-  while (scene.actors.some((a) => a.name === `Actor ${n}`)) n++;
   const actor: ActorData = {
     id: uid(),
-    name: `Actor ${n}`,
+    name: nextActorName(scene),
     color: ACTOR_PALETTE[scene.actors.length % ACTOR_PALETTE.length],
     position: { ...position },
     rotationY,
@@ -207,6 +230,32 @@ export function createActor(scene: SceneData, position: Vec3, rotationY: number)
   };
   scene.actors.push(actor);
   return actor;
+}
+
+/** Deep-clones an actor into the scene: new id, unique name, offset pose. */
+export function duplicateActor(scene: SceneData, id: string): ActorData | null {
+  const src = scene.actors.find((a) => a.id === id);
+  if (!src) return null;
+  const copy: ActorData = JSON.parse(JSON.stringify(src));
+  copy.id = uid();
+  copy.color = ACTOR_PALETTE[scene.actors.length % ACTOR_PALETTE.length];
+  copy.position = { x: src.position.x + 0.6, y: src.position.y, z: src.position.z };
+  for (const k of copy.keyframes) k.position.x += 0.6; // shift the whole path
+  copy.name = nextActorName(scene);
+  scene.actors.push(copy);
+  return copy;
+}
+
+/** Deep-clones a camera into the scene: new id, unique name, offset position. */
+export function duplicateCameraSetup(scene: SceneData, id: string): CameraSetupData | null {
+  const src = scene.cameras.find((c) => c.id === id);
+  if (!src) return null;
+  const copy: CameraSetupData = JSON.parse(JSON.stringify(src));
+  copy.id = uid();
+  copy.position = { x: src.position.x + 0.4, y: src.position.y, z: src.position.z };
+  copy.name = nextCameraName(scene);
+  scene.cameras.push(copy);
+  return copy;
 }
 
 export function createCameraSetup(
@@ -327,6 +376,7 @@ export function isSceneData(v: unknown): v is SceneData {
 
 /** Fills defaults for fields absent from older scene JSON. Mutates + returns. */
 export function normalizeScene(s: SceneData): SceneData {
+  if (!isFiniteNum(s.walkSpeed) || s.walkSpeed <= 0) s.walkSpeed = WALK_SPEED_MS;
   for (const c of s.cameras) {
     if (!isFiniteNum(c.lensFocalLength) || c.lensFocalLength <= 0) c.lensFocalLength = 35;
     if (!isFiniteNum(c.tStop) || c.tStop <= 0) c.tStop = DEFAULT_TSTOP;

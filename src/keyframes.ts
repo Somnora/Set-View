@@ -55,6 +55,12 @@ export class KeyframeSystem {
     return 'ok';
   }
 
+  /** Registers a newly added actor (e.g. a duplicate) for viz + playback. */
+  addActor(data: ActorData): void {
+    this.rebuildForActor(data);
+    this.recomputeDuration();
+  }
+
   clear(actorId: string): void {
     const data = this.scene.actors.find((a) => a.id === actorId);
     if (!data) return;
@@ -135,7 +141,7 @@ export class KeyframeSystem {
     for (const obj of this.actors.all()) {
       const kfs = obj.data.keyframes;
       if (kfs.length === 0) continue;
-      const tl = this.timelines.get(obj.data.id) ?? buildTimeline(kfs);
+      const tl = this.timelines.get(obj.data.id) ?? buildTimeline(kfs, this.scene.walkSpeed);
       const s = sampleTimeline(kfs, tl, this.t);
       if (!s) continue;
       obj.overridden = true;
@@ -152,10 +158,19 @@ export class KeyframeSystem {
   private recomputeDuration(): void {
     this.duration = 0;
     for (const a of this.scene.actors) {
-      const tl = buildTimeline(a.keyframes);
+      const tl = buildTimeline(a.keyframes, this.scene.walkSpeed);
       this.timelines.set(a.id, tl);
       this.duration = Math.max(this.duration, tl.duration);
     }
+  }
+
+  /** Re-derive timings after the scene's move pace changes. */
+  setWalkSpeed(): void {
+    const wasPlaying = this.playing;
+    const u = this.normalizedT;
+    this.recomputeDuration();
+    this.t = u * this.duration; // keep the playhead's relative position
+    this.playing = wasPlaying;
   }
 
   /** Numbered ghost footprints + dotted path for one actor. */

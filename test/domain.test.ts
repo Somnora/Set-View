@@ -12,14 +12,18 @@ import {
   createScene,
   DEFAULT_FORMAT_ID,
   DEFAULT_TSTOP,
+  duplicateActor,
+  duplicateCameraSetup,
   isSceneData,
   MAX_KEYFRAMES,
   normalizeScene,
   sensorFormat,
   stepFocal,
   vecDistance,
+  WALK_SPEED_MS,
   type SceneData,
 } from '../src/model.ts';
+import { History } from '../src/history.ts';
 import {
   depthOfField,
   depthOfFieldFor,
@@ -442,6 +446,128 @@ test('isSceneData rejects a non-positive focal length on import', () => {
   assert.ok(isSceneData(json));
   json.cameras[0].lensFocalLength = 0;
   assert.ok(!isSceneData(json), 'focal 0 rejected');
+});
+
+// --- duplication ----------------------------------------------------------------
+
+test('duplicateActor: new id, unique name, offset pose, independent deep copy', () => {
+  const s = createScene('T');
+  const a = createActor(s, { x: 1, y: 0, z: 2 }, 0.5);
+  addKeyframe(a, { x: 1, y: 0, z: 2 }, 0.5);
+  addKeyframe(a, { x: 1, y: 0, z: 4 }, 0.5);
+  addNote(a, 'action', 'enters');
+  const dup = duplicateActor(s, a.id)!;
+  assert.notEqual(dup.id, a.id);
+  assert.equal(dup.name, 'Actor 2');
+  approx(dup.position.x, 1.6); // offset +0.6
+  approx(dup.keyframes[1].position.x, 1.6); // whole path shifted
+  assert.equal(s.actors.length, 2); // original + duplicate
+  // deep copy: mutating the dup must not touch the original
+  dup.notes[0].text = 'changed';
+  assert.equal(a.notes[0].text, 'enters');
+  assert.equal(duplicateActor(s, 'nope'), null);
+});
+
+test('duplicateCameraSetup: new id, unique name, copied optics, offset', () => {
+  const s = createScene('T');
+  const c = createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 85, '16:9', 4, 'fullframe');
+  const dup = duplicateCameraSetup(s, c.id)!;
+  assert.notEqual(dup.id, c.id);
+  assert.equal(dup.name, 'CAM B');
+  assert.equal(dup.lensFocalLength, 85);
+  assert.equal(dup.aspect, '16:9');
+  assert.equal(dup.tStop, 4);
+  assert.equal(dup.formatId, 'fullframe');
+  approx(dup.position.x, 0.4);
+  assert.equal(duplicateCameraSetup(s, 'nope'), null);
+});
+
+// --- move pace ------------------------------------------------------------------
+
+test('createScene defaults walkSpeed; normalizeScene repairs a bad pace', () => {
+  const s = createScene('T');
+  assert.equal(s.walkSpeed, WALK_SPEED_MS);
+  s.walkSpeed = 0;
+  normalizeScene(s);
+  assert.equal(s.walkSpeed, WALK_SPEED_MS);
+  s.walkSpeed = -1;
+  normalizeScene(s);
+  assert.equal(s.walkSpeed, WALK_SPEED_MS);
+  // a legacy scene JSON with no walkSpeed field is filled in
+  const legacy = JSON.parse(JSON.stringify(s)) as Record<string, unknown>;
+  delete legacy.walkSpeed;
+  normalizeScene(legacy as unknown as SceneData);
+  assert.equal((legacy as unknown as SceneData).walkSpeed, WALK_SPEED_MS);
+});
+
+// --- undo / redo (History) ------------------------------------------------------
+
+function sceneWithActors(n: number): SceneData {
+  const s = createScene('H');
+  for (let i = 0; i < n; i++) createActor(s, { x: i, y: 0, z: 0 }, 0);
+  return s;
+}
+
+test('History: record/undo/redo restores exact scene state', () => {
+  const h = new History();
+  const s0 = sceneWithActors(0);
+  h.reset(s0);
+  assert.equal(h.canUndo, false);
+  assert.equal(h.canRedo, false);
+
+  const s1 = sceneWithActors(1);
+  h.record(s1);
+  const s2 = sceneWithActors(2);
+  h.record(s2);
+  assert.equal(h.canUndo, true);
+
+  const u1 = h.undo()!; // → s1
+  assert.equal(u1.actors.length, 1);
+  const u0 = h.undo()!; // → s0
+  assert.equal(u0.actors.length, 0);
+  assert.equal(h.canUndo, false);
+  assert.equal(h.canRedo, true);
+
+  const r1 = h.redo()!; // → s1
+  assert.equal(r1.actors.length, 1);
+  assert.equal(h.undo()!.actors.length, 0); // back to s0
+});
+
+test('History: undo/redo return fresh objects, not shared references', () => {
+  const h = new History();
+  h.reset(sceneWithActors(0));
+  h.record(sceneWithActors(1));
+  const a = h.undo()!;
+  a.name = 'mutated';
+  h.redo(); // advance forward again
+  const c = h.undo()!;
+  assert.notEqual(c.name, 'mutated'); // mutating a restored scene never leaks back
+});
+
+test('History: a new record clears the redo stack', () => {
+  const h = new History();
+  h.reset(sceneWithActors(0));
+  h.record(sceneWithActors(1));
+  h.undo();
+  assert.equal(h.canRedo, true);
+  h.record(sceneWithActors(3)); // branch off
+  assert.equal(h.canRedo, false);
+  assert.equal(h.redo(), null);
+});
+
+test('History: no-op record on unchanged scene, and bounded depth', () => {
+  const h = new History();
+  const s = sceneWithActors(1);
+  h.reset(s);
+  h.record(s); // identical snapshot → no history entry
+  assert.equal(h.canUndo, false);
+
+  const small = new History(3);
+  small.reset(sceneWithActors(0));
+  for (let i = 1; i <= 10; i++) small.record(sceneWithActors(i));
+  let steps = 0;
+  while (small.undo()) steps++;
+  assert.equal(steps, 3); // capped at the limit, never unbounded
 });
 
 console.log(`\n${passed} tests passed`);

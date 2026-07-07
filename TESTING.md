@@ -10,7 +10,7 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 Checked on the dev machine — no headset needed:
 
-- [x] `npm test` — **31** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **floorplan projection**, **shot-list text**, timeline + move stats.
+- [x] `npm test` — **44** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete + 27-camera hang guard**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **undo/redo history** (record/undo/redo, fresh-object isolation, redo-clear, bounded depth), **duplicate actor/camera** (fresh id/name, deep copy, offset), **move pace** normalization, **floorplan projection**, **shot-list text**, timeline + move stats.
 - [x] `npx tsc --noEmit` clean · `npm run build` bundles (19 modules).
 - [x] Landing page boots in headless Chrome (canvas created, correct `immersive-ar unavailable` diagnostics on desktop, scene list + per-camera editor render, no error fallback).
 - [x] Floorplan PNG rasterizes (`toDataURL`) and shot-list Markdown builds in a real browser via the dev server — no runtime errors, anamorphic format surfaced.
@@ -72,8 +72,11 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Repeat for Actor 2 (2–3 keyframes crossing Actor 1's path).
 - [ ] 6th **B** on one actor flashes `MAX 5 KFs` and stores nothing.
 - [ ] Wrist **▶ Play**: both actors walk their paths **simultaneously**, ~1.4 m/s, legs/arms swinging, slight bob; they face their direction of travel and settle into the keyframed facing on arrival.
+- [ ] Wrist **Pace − / +**: the readout steps (0.4–3.0 m/s) and the *same* blocking plays back visibly slower/faster; the scrub playhead keeps its relative position.
 - [ ] Scrub the wrist slider: timeline jogs smoothly both directions; pause/play resumes from the playhead.
 - [ ] **⏹ Stop** returns actors to their placed (rest) positions.
+- [ ] Wrist **⧉ Dup** on a selected actor with a path: a new-colored clone appears ~0.6 m over with the whole path copied; on a camera: a clone with the identical lens/format one step over.
+- [ ] Wrist **↶ Undo** reverses the last action (place / move / keyframe / delete / duplicate / camera commit); **↷ Redo** re-applies it. Both buttons are highlighted only when there's something to undo/redo. Delete an actor, Undo → it returns with its keyframes and notes intact.
 - [ ] Repeat playback while in **Miniature** view — identical blocking in the diorama.
 - [ ] fps ≥ 70 with 4 actors playing.
 
