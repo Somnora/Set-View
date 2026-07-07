@@ -10,8 +10,8 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 Checked on the dev machine — no headset needed:
 
-- [x] `npm test` — **44** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete + 27-camera hang guard**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **undo/redo history** (record/undo/redo, fresh-object isolation, redo-clear, bounded depth), **duplicate actor/camera** (fresh id/name, deep copy, offset), **move pace** normalization, **floorplan projection**, **shot-list text**, timeline + move stats.
-- [x] `npx tsc --noEmit` clean · `npm run build` bundles (19 modules).
+- [x] `npm test` — **54** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete + 27-camera hang guard**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **undo/redo history** (record/undo/redo, fresh-object isolation, redo-clear, bounded depth), **duplicate actor/camera** (fresh id/name, deep copy, offset), **move pace** normalization, **floorplan projection**, **shot-list text**, timeline + move stats, **location scans** (base64 vs Node reference, column-major vertex transforms, bounds/counts summary, binary codec round-trip incl. >65k-vertex index path, corrupt-input rejection, scan-summary scene validation).
+- [x] `npx tsc --noEmit` clean · `npm run build` bundles.
 - [x] Landing page boots in headless Chrome (canvas created, correct `immersive-ar unavailable` diagnostics on desktop, scene list + per-camera editor render, no error fallback).
 - [x] Floorplan PNG rasterizes (`toDataURL`) and shot-list Markdown builds in a real browser via the dev server — no runtime errors, anamorphic format surfaced.
 
@@ -88,10 +88,26 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Duplicate & Delete work from the scene list; Export downloads `.setview.json`; Import brings it back as a new scene.
 - [ ] In Camera View, press **A** (or wrist 📷): PNG downloads named like `scene-1-cam-a-35mm-20260704-193212.png`; open it: 1920 px wide, correct aspect (e.g. 1920×803 for 2.39:1), slate bar burned in at the bottom (scene, camera, focal, aspect, date).
 
+## Phase 6 — Location scan & walkthrough
+
+Prereq: Space Setup done on the headset (Settings → Environment Setup → Space Setup). Quest 3 / 3S class device; the session log line should read `mesh=yes`.
+
+- [ ] Wrist **Scan Room** → within a second or two the log shows `✓ scanned N meshes · X.Xk tris · W×D m` and the room appears as a translucent **Ghost** overlay. **Walk the room edges**: ghost walls/furniture should hug the real ones (this is the scan-registration test — same stakes as the Phase 1 drift loop).
+- [ ] If the log says `no room mesh yet — asking the system to run room capture…`, the OS room-capture flow should appear; complete it and the scan should land when you return.
+- [ ] Wrist **Loc:** cycles Hidden → Ghost → Solid. Solid: the gray-box room replaces passthrough geometry visually; actors placed earlier still sit correctly on the floor.
+- [ ] **Occlusion sanity (Solid):** put an actor behind a scanned wall — the wall hides the actor. Switch to Ghost — the actor shows through.
+- [ ] **Camera View:** with Loc set to Hidden, open Camera View — the monitor still shows the scanned set behind the actors. 📷 Capture: the PNG includes the room.
+- [ ] **Miniature:** Y-cycle to Mini with a scan present — the diorama includes the dollhouse room, centered on the platform. Set Ghost if the walls block your view of the actors.
+- [ ] **Walkthrough (the location-scout payoff):** exit AR, walk to a *different* room, Enter AR, load the scene, set **Loc: Solid** → the scanned location surrounds you at full scale; teleport (stick-click) to move through it; place actors/cameras inside it and frame shots.
+- [ ] **Persistence:** restart the browser → scene list shows `· location scan`; load it → scan reappears (IndexedDB). Export JSON → file is several MB; Import on any device → scan restores.
+- [ ] **Undo:** re-scan the room, then wrist **↶ Undo** → the previous scan comes back. **Remove scan** on the landing page → prep panel shows "no scan"; Undo (in AR) restores it.
+- [ ] **Scan while teleported** is refused with a log message ("Re-align first") — expected, not a bug.
+
 ## Performance sweep (any phase)
 
 - [ ] 6 actors + 3 cameras + Camera View open: fps readout ≥ 70, no heat warnings in 10 min.
 - [ ] If fps sags: close Camera View (kills the RTT pass) and re-check — if that recovers it, lower `RT_BASE_W` in `cameraView.ts`.
+- [ ] With a location scan **Solid** + Camera View open (worst case: room drawn twice — eyes + RTT): fps ≥ 70. If it sags, set Loc to Hidden while composing and rely on the monitor, or Ghost only for spot checks.
 
 ## Known tuning knobs (edit & hot-reload)
 

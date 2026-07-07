@@ -36,6 +36,7 @@ export interface XRFeatureFlags {
   anchors: boolean;
   handTracking: boolean;
   domOverlay: boolean;
+  meshDetection: boolean;
   referenceSpace: 'local-floor' | 'local';
 }
 
@@ -55,6 +56,7 @@ export class SessionManager {
     anchors: false,
     handTracking: false,
     domOverlay: false,
+    meshDetection: false,
     referenceSpace: 'local',
   };
 
@@ -81,7 +83,7 @@ export class SessionManager {
   async start(overlayRoot: HTMLElement, onEnd: () => void): Promise<void> {
     const init: XRSessionInit = {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['anchors', 'hand-tracking', 'dom-overlay', 'local-floor'],
+      optionalFeatures: ['anchors', 'hand-tracking', 'dom-overlay', 'local-floor', 'mesh-detection'],
       domOverlay: { root: overlayRoot },
     };
     const session = await navigator.xr!.requestSession('immersive-ar', init);
@@ -94,6 +96,7 @@ export class SessionManager {
       anchors: enabled.length ? has('anchors') : true, // optimistic; first failure flips anchorsBroken
       handTracking: has('hand-tracking'),
       domOverlay: enabled.length ? has('dom-overlay') : !!session.domOverlayState,
+      meshDetection: has('mesh-detection'),
       referenceSpace: 'local',
     };
 
@@ -145,8 +148,26 @@ export class SessionManager {
 
     this.log(
       `session started · ref=${this.features.referenceSpace}` +
-        ` · anchors=${this.features.anchors ? 'yes' : 'no'} · overlay=${this.features.domOverlay ? 'yes' : 'no'}`,
+        ` · anchors=${this.features.anchors ? 'yes' : 'no'} · overlay=${this.features.domOverlay ? 'yes' : 'no'}` +
+        ` · mesh=${this.features.meshDetection ? 'yes' : 'no'}`,
     );
+  }
+
+  /**
+   * Asks the OS to (re)run room capture (Space Setup). The platform may only
+   * honor this once per session and may ignore it if the room is already set
+   * up. Resolves false when unavailable.
+   */
+  async requestRoomCapture(): Promise<boolean> {
+    const s = this.session;
+    if (!s || typeof s.initiateRoomCapture !== 'function') return false;
+    try {
+      await s.initiateRoomCapture();
+      return true;
+    } catch (e) {
+      this.log(`room capture request failed: ${(e as Error).message}`);
+      return false;
+    }
   }
 
   private async addControllerHitSource(src: XRInputSource): Promise<void> {

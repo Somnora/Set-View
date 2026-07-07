@@ -1,0 +1,64 @@
+<!doctype html>
+<!-- Browser smoke test for the scan storage path (IndexedDB structured-clone
+     of typed arrays + codec round trip). Serve via `npm run dev`, then open
+
+       https://localhost:5173/test/scan-store.html
+
+     in a NORMAL browser tab (dev machine or headset) and read the verdict:
+       SCAN-STORE PASS  — IndexedDB round trip + codec verified
+       SCAN-STORE SKIP  — IndexedDB unavailable; memory fallback engaged
+                          (codec still verified). Headless Chrome on macOS
+                          lands here: its IndexedDB never completes an open,
+                          which is exactly what the ScanStore watchdog covers.
+       SCAN-STORE FAIL  — real regression; message says where. -->
+<html>
+  <head><meta charset="utf-8" /><title>scan-store smoke</title></head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      import { decodeScan, encodeScan, isLocationScan, summarizeScan } from '../src/scan.ts';
+      import { ScanStore } from '../src/scanStore.ts';
+
+      const out = document.getElementById('out');
+      const scan = {
+        version: 1,
+        id: 'smoke-scan',
+        capturedAt: Date.now(),
+        meshes: [
+          {
+            label: 'global mesh',
+            positions: new Float32Array([0, 0, 0, 2, 0, 0, 2, 2.4, 0, 0, 2.4, -3]),
+            indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
+          },
+        ],
+      };
+
+      try {
+        // Codec first — pure, environment-independent.
+        const decoded = decodeScan(encodeScan(scan));
+        if (!decoded || decoded.meshes[0].indices.length !== 6) throw new Error('codec round-trip failed');
+        const s = summarizeScan(decoded);
+        if (s.vertices !== 4 || s.triangles !== 2) throw new Error('summary wrong');
+
+        const store = new ScanStore();
+        const stored = await store.putScan(scan);
+        if (!stored) {
+          out.textContent = 'SCAN-STORE SKIP (IndexedDB unavailable — memory fallback engaged, codec verified)';
+        } else {
+          // Read back through a SECOND store instance so the in-memory
+          // fallback can't mask an IndexedDB failure.
+          const store2 = new ScanStore();
+          const back = await store2.getScan('smoke-scan');
+          if (!back || !isLocationScan(back)) throw new Error('getScan returned nothing valid');
+          if (back.meshes[0].positions[9] !== 0 || back.meshes[0].positions[11] !== -3)
+            throw new Error('typed arrays corrupted through IndexedDB');
+          await store2.deleteScan('smoke-scan');
+          if (await store2.getScan('smoke-scan')) throw new Error('delete did not remove the blob');
+          out.textContent = 'SCAN-STORE PASS';
+        }
+      } catch (e) {
+        out.textContent = `SCAN-STORE FAIL: ${e.message}`;
+      }
+    </script>
+  </body>
+</html>

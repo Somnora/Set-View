@@ -99,6 +99,16 @@ The **wrist menu** floats above your **left** controller — point at it with th
 | Wrist **↶ Undo / ↷ Redo** | Step back/forward through every placement, move, keyframe, delete, and camera edit (bounded 40-deep). A mis-drop or accidental Delete is fully recoverable. |
 | Wrist **⧉ Dup** | Clone the pointed-at (or selected) actor or camera a short step away — copies the full blocking path / the exact lens, format, aspect, and T-stop |
 
+### Location scan — capture the room, walk it later
+
+| Input | Action |
+|---|---|
+| Wrist **Scan Room** | Captures the headset's **Scene Mesh** (the room reconstruction the Quest builds from its cameras and depth sensor during Space Setup) into the current scene as untextured gray-box geometry, in the same meters/y-up scene space actors live in. If the room has no mesh yet, SetView asks the system to run room capture on the spot. Press again to cancel. |
+| Wrist **Loc: Hidden / Ghost / Solid** | Cycles how the scanned location renders: **Hidden** (default on location — the real room is right there in passthrough), **Ghost** (translucent overlay to verify scan/world alignment), **Solid** (opaque gray-box set — the walkthrough mode). |
+| Anywhere later | Load the scene and set **Loc: Solid** — the scanned room surrounds you at full scale. Teleport through it, place actors and cameras inside it, and frame shots against real geometry from the location scout. The **miniature** view becomes a dollhouse of the room (use Ghost there if walls block sightlines). |
+| Camera View / **📷 Capture** | The virtual monitor and exported PNGs always include the scanned set, even while your own view of it is Hidden — the monitor can finally show the *location*, not just the actors. |
+| Landing page | The **Shots & exports** panel shows the scan (size, triangle count, capture date) with **Remove scan**. Scene **Export JSON** embeds the geometry, so a scan travels with the file to another headset; import restores it. |
+
 ### Phase 5 — notes, capture, scenes
 | Input | Action |
 |---|---|
@@ -131,7 +141,10 @@ The landing page is a full prep surface you can use at a laptop before ever putt
 - **Teleport de-registers AR on purpose.** In passthrough you physically exist in the room, so "teleport" shifts the *virtual content* to you (e.g. to stand at a far camera position without walking). Objects placed while shifted are not anchored. **Re-align** restores true registration and re-anchoring.
 - **Notes need dom-overlay.** Quest and Android XR browsers support it; if a session lacks it, the note button explains instead of failing.
 - **Your work is warned before it's lost.** An autosave failure (e.g. localStorage full) now surfaces on the wrist status line and debug log with a prompt to *Export this scene to JSON* — it no longer fails silently. Imported scene JSON is deep-validated (every actor/camera), so a malformed file is rejected up front instead of crashing the loaded scene.
-- **No depth occlusion** of virtual actors by real objects, no 3D scan import, no multi-user, no audio — explicitly out of scope for v1.
+- **Location scans are geometry-only, by the platform's design.** WebXR exposes the Quest's room reconstruction (Scene Mesh) but never its camera pixels, so scans are untextured gray-box meshes with semantic tints (walls/floor/furniture) — a *previz set*, not a photoreal twin. Scan fidelity is the OS's Space Setup mesh (roughly 5–10 cm detail): right for blocking and sightlines, not for surveying. Photoreal Gaussian-splat/photogrammetry import is a possible v2 (the storage + scene-space plumbing this feature added is the same path a GLB import would use).
+- **Scans restore relative to session start, like everything else.** The scan is stored in scene space, so its alignment on reload follows the same rule as actors: start the session standing where you originally stood. On location with the scan Ghosted you can see the registration directly.
+- **Scan storage is IndexedDB** (geometry is far too big for localStorage). The scene JSON keeps only a summary; **Export JSON embeds the full geometry** (validated binary, base64) so scenes travel between devices. If storage fails, the wrist warns and the scan lives in memory for the session — export to keep it.
+- **No depth occlusion** of virtual actors by real objects, no photoreal scan import, no multi-user, no audio — explicitly out of scope for v1.
 - **Performance budget:** flat-shaded Lambert primitives, no shadows, no postprocessing, foveation 1.0, one 1024-wide render-target pass only while Camera View is open. Designed to hold 72 fps on Quest 3; watch the fps readout on the wrist panel.
 
 ## Repo layout
@@ -143,7 +156,11 @@ src/
   timeline.ts     Keyframe timing/interpolation + move stats — PURE
   history.ts      Undo/redo snapshot stack over SceneData — PURE
   plan.ts         Floorplan projection + shot-list text — PURE (feeds exporters)
-  session.ts      WebXR session, feature detection, hit-test, anchors, reset logging
+  scan.ts         Location-scan data + binary/base64 codec + transforms — PURE
+  session.ts      WebXR session, feature detection, hit-test, anchors, room capture, reset logging
+  scanner.ts      Reads the Scene Mesh (mesh-detection) off a live XRFrame into scene space
+  location.ts     Renders the scanned room: hidden/ghost/solid + camera-pass override
+  scanStore.ts    IndexedDB blob store for scan geometry (with in-memory fallback)
   input.ts        Controllers + hands: trigger/grip/buttons/sticks with edge detection
   actors.ts       Humanoid meshes, floor-locking, labels, notes cards, walk cycle
   keyframes.ts    Keyframe capture, footprints/paths, playback driving actors
@@ -151,9 +168,9 @@ src/
   views.ts        Full-scale / miniature / camera view, teleport, fades
   ui.ts           Wrist panel, labels, debug log, drift marker, landing page + camera editor, note editor
   exporters.ts    Floorplan PNG + Markdown shot-list rendering/download (consumes plan.ts)
-  persistence.ts  localStorage autosave, scene list, JSON export/import, rename/update
+  persistence.ts  localStorage autosave, scene list, JSON export/import (scan-embedding), rename/update
   main.ts         Wiring + the per-frame loop + input routing
-test/domain.test.ts  Node-runnable tests for the pure domain modules (31 tests)
+test/domain.test.ts  Node-runnable tests for the pure domain modules (54 tests)
 ```
 
 ## Port-to-Unity notes
@@ -166,7 +183,9 @@ The domain core (`model.ts`, `lens.ts`, `timeline.ts`) is deliberately renderer-
 | `lens.ts` | Static `LensMath`; `Camera.usePhysicalProperties` + `sensorSize = (gateWidth, h)` gives the same FOV natively; DOF/hyperfocal are the same closed forms |
 | `timeline.ts` | Static `Timeline` class; or bake into an `AnimationClip` at author-time |
 | `plan.ts` | Static plan/shot-list generator — pure, ports verbatim (drive an editor window or a printable canvas) |
+| `scan.ts` | Plain C# `ScanMesh` structs + a static binary codec (`BinaryReader`/`Writer` replace `DataView`, same layout) |
 | `session.ts` | AR Foundation `ARSession` + `ARRaycastManager` (hit-test) + `ARAnchorManager` (anchors) |
+| `scanner.ts` / `location.ts` | `ARMeshManager` (Meta OpenXR scene mesh) → `Mesh` assets; display modes are material swaps |
 | `input.ts` | Unity XR Interaction Toolkit `InputActionReferences` (trigger/grip/primary/secondary/stick) |
 | `actors.ts` | Actor prefab (primitives), `ARAnchor` per actor, `TextMeshPro` labels, Animator for walk bob |
 | `keyframes.ts` | MonoBehaviour playing `Timeline` samples; footprint prefabs + `LineRenderer` (dashed material) |

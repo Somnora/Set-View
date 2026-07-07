@@ -140,6 +140,26 @@ Then, in another terminal (macOS path shown; adjust for your OS):
 self-signed. `--enable-unsafe-swiftshader` gives headless Chrome a software GL
 context so the Three.js renderer initializes.
 
+## A3b. Scan storage smoke test (headed browser)
+
+`test/scan-store.html` verifies the location-scan storage path end-to-end in a
+real browser: IndexedDB round trip of the typed-array geometry, the binary/
+base64 codec, and delete. With `npm run dev` running, open
+
+```
+https://localhost:5173/test/scan-store.html
+```
+
+in a **normal browser tab** and read the verdict line: `SCAN-STORE PASS`
+(IndexedDB verified), `SCAN-STORE SKIP` (IndexedDB unavailable — the memory
+fallback engaged, codec still verified), or `SCAN-STORE FAIL` (real bug).
+
+This one is *not* headless-able: headless Chrome (macOS, observed Chrome 138)
+never completes `indexedDB.open`, which is precisely the pathology the
+ScanStore's 4 s watchdog exists for — in the app it degrades to an in-memory
+scan plus a wrist warning instead of hanging. The same fallback contract is
+unit-tested in Node (`npm test`, which has no IndexedDB at all).
+
 ## A4. What CANNOT be tested without a headset
 
 These need the Quest and are deferred to Part B / TESTING.md:
@@ -149,6 +169,10 @@ These need the Quest and are deferred to Part B / TESTING.md:
 - Frame-line fidelity, the virtual monitor, PNG capture *from a live session*.
 - Controller ergonomics, wrist-panel placement, hand-tracking fallback.
 - Real-world framerate (the 72 fps budget).
+- **Location scanning** (Scan Room reads the platform's Scene Mesh, which only
+  exists on-device; requires Space Setup completed in Quest Settings). The
+  scan *codec, storage plumbing, validation, and export/import format* are all
+  unit-tested headset-free; the capture + registration is Phase 6 in TESTING.md.
 
 ---
 
@@ -225,7 +249,11 @@ Run **TESTING.md** top to bottom. It's ordered by build phase and gated:
 - **Phase 3** — full/miniature/camera views, teleport, re-align.
 - **Phase 4** — keyframes, playback, **pace ±**, **duplicate**, **undo/redo**.
 - **Phase 5** — notes, persistence, PNG capture.
-- **Performance sweep** — hold ≥ 70 fps with a few actors playing back.
+- **Phase 6** — **location scan**: Scan Room on location (needs Space Setup
+  done in Quest Settings first), ghost-alignment walk, hidden/ghost/solid,
+  solid walkthrough in a different room, JSON export/import with geometry.
+- **Performance sweep** — hold ≥ 70 fps with a few actors playing back; repeat
+  with the scan **Solid** + Camera View open (worst case).
 
 Record pass/fail and any drift/fidelity/ergonomics notes; those drive the next
 iteration.

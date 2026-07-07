@@ -450,6 +450,10 @@ export function buildWristPanel(): UIPanel {
       { id: 'view-camera', label: 'Cam View' },
     ],
     [
+      { id: 'scan', label: 'Scan Room', flex: 1.4 },
+      { id: 'location', label: 'Loc: Hidden' },
+    ],
+    [
       { id: 'framelines', label: 'Frame Lines', flex: 1.4 },
       { id: 'aspect', label: '2.39:1' },
     ],
@@ -493,6 +497,7 @@ export interface SceneSummary {
   updatedAt: number;
   actors: number;
   cameras: number;
+  hasScan?: boolean;
 }
 
 export interface LandingCallbacks {
@@ -506,6 +511,7 @@ export interface LandingCallbacks {
   onRename: (id: string, name: string) => void;
   onExportFloorplan: (id: string) => void;
   onExportShotList: (id: string) => void;
+  onRemoveScan: (id: string) => void;
   /** Full scene for the inline camera editor, or null. */
   getScene: (id: string) => SceneData | null;
   onUpdateCamera: (sceneId: string, cameraId: string, patch: Partial<CameraSetupData>) => void;
@@ -611,9 +617,9 @@ export class Landing {
       head.className = 'scene-head';
       const info = document.createElement('button');
       info.className = 'load';
-      info.innerHTML = `<b>${escapeHtml(s.name)}</b><span>${s.actors} actors · ${s.cameras} cams · ${new Date(
-        s.updatedAt,
-      ).toLocaleString()}</span>`;
+      info.innerHTML = `<b>${escapeHtml(s.name)}</b><span>${s.actors} actors · ${s.cameras} cams${
+        s.hasScan ? ' · location scan' : ''
+      } · ${new Date(s.updatedAt).toLocaleString()}</span>`;
       info.onclick = () => this.cb.onSelect(s.id);
       head.appendChild(info);
       for (const [label, fn] of [
@@ -699,6 +705,32 @@ export class Landing {
       l.appendChild(i);
       pace.appendChild(l);
       panel.appendChild(pace);
+
+      // Location scan status + remove.
+      const scanRow = document.createElement('div');
+      scanRow.className = 'cam-edit';
+      const sb = document.createElement('b');
+      sb.textContent = 'Location';
+      scanRow.appendChild(sb);
+      const info = document.createElement('span');
+      info.className = 'scan-info';
+      if (scene.scan) {
+        const sc = scene.scan;
+        const size = `${(sc.boundsMax.x - sc.boundsMin.x).toFixed(1)}×${(sc.boundsMax.z - sc.boundsMin.z).toFixed(1)} m`;
+        info.textContent = `scan: ${Math.round(sc.triangles / 1000)}k tris · ${size} · ${new Date(
+          sc.capturedAt,
+        ).toLocaleDateString()}`;
+        scanRow.appendChild(info);
+        const rm = document.createElement('button');
+        rm.className = 'small';
+        rm.textContent = 'Remove scan';
+        rm.onclick = () => this.cb.onRemoveScan(sceneId);
+        scanRow.appendChild(rm);
+      } else {
+        info.textContent = 'no scan — use Scan Room on the wrist menu while on location';
+        scanRow.appendChild(info);
+      }
+      panel.appendChild(scanRow);
     }
     if (!scene || scene.cameras.length === 0) {
       const p = document.createElement('p');
@@ -822,6 +854,8 @@ LEFT controller
   Undo / Redo ..... step back / forward through placement & keyframe edits
   Dup ............. clone the pointed-at (or selected) actor / camera
   Pace − / + ...... slow down / speed up blocking playback (per scene)
+  Scan Room ....... capture the room's Scene Mesh into this scene
+  Loc: … .......... location display: Hidden → Ghost → Solid
 
 Hands (no controllers): pinch = trigger (place/select). Menu needs controllers.
 

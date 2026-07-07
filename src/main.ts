@@ -15,6 +15,9 @@ import {
   type SceneData,
 } from './model.ts';
 import { History } from './history.ts';
+import { summarizeScan } from './scan.ts';
+import { captureScanFromFrame } from './scanner.ts';
+import { LocationRenderer } from './location.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
@@ -31,6 +34,13 @@ const WRIST_ROT_X = -1.05; // radians, tilt toward the face
 
 // Reused each frame while dragging to avoid a Vector3 clone per frame.
 const _pt = new THREE.Vector3();
+// Reused for the world → scene-space re-basing at scan capture.
+const _worldToScene = new THREE.Matrix4();
+
+/** Give the platform this long to surface tracked meshes before giving up. */
+const SCAN_TIMEOUT_MS = 30_000;
+/** If nothing is tracked after this long, ask the OS to run room capture. */
+const SCAN_ROOM_CAPTURE_AFTER_MS = 2_000;
 
 type PlaceMode = 'actor' | 'camera';
 
@@ -52,6 +62,7 @@ class App {
   private keyframes: KeyframeSystem;
   private cams: CameraSystem;
   private views: ViewManager;
+  private location = new LocationRenderer();
   private wrist: UIPanel;
   private wristMount = new THREE.Group();
   private landing: Landing;
@@ -68,6 +79,12 @@ class App {
   private notesVisible = true;
   private pendingReanchorActors: ActorObject[] = [];
   private pendingReanchorCams: CamObject[] = [];
+  /** Non-null while waiting for the platform's Scene Mesh to capture. */
+  private pendingScan: { startedAt: number; roomCaptureRequested: boolean } | null = null;
+  /** Blob id currently loaded into the location renderer. */
+  private displayedScanId: string | null = null;
+  /** Invalidates stale async scan-blob loads (scene switches, undo). */
+  private locationSyncToken = 0;
   private lastViewerPos = new THREE.Vector3(0, 1.6, 0);
   private lastViewerQuat = new THREE.Quaternion();
 
@@ -118,6 +135,9 @@ class App {
     this.cams = new CameraSystem(this.sceneData, this.session, this.contentRoot);
     this.scene3.add(this.cams.monitor);
     this.camera.add(this.cams.frameLines);
+    // Scanned location lives under contentRoot: teleport walkthrough, the
+    // miniature diorama, and camera framing all see the room where the actors are.
+    this.contentRoot.add(this.location.group);
     this.views = new ViewManager(this.contentRoot, this.camera);
     this.scene3.add(this.views.platform);
     this.driftMarker = new DriftMarker(this.debug);
@@ -142,15 +162,16 @@ class App {
         if (data) this.loadScene(data);
       },
       onDuplicate: (id) => {
-        const copy = this.persistence.duplicateScene(id);
-        if (copy) this.loadScene(copy);
+        void this.persistence.duplicateScene(id).then((copy) => {
+          if (copy) this.loadScene(copy);
+        });
       },
       onDelete: (id) => {
         this.persistence.deleteScene(id);
         if (this.sceneData.id === id) this.newScene('Scene 1');
         this.refreshLanding();
       },
-      onExport: (id) => this.persistence.exportScene(id),
+      onExport: (id) => void this.persistence.exportScene(id),
       onImport: (file) => {
         void this.persistence.importScene(file).then((data) => {
           if (data) this.loadScene(data);
@@ -164,6 +185,7 @@ class App {
       },
       onExportFloorplan: (id) => this.persistence.exportFloorplan(id),
       onExportShotList: (id) => this.persistence.exportShotList(id),
+      onRemoveScan: (id) => this.removeScan(id),
       getScene: (id) =>
         id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
       onUpdateCamera: (sceneId, cameraId, patch) => this.updateCamera(sceneId, cameraId, patch),
@@ -177,6 +199,9 @@ class App {
 
     this.wireSubsystems();
     this.loadScene(this.sceneData);
+    // Sweep scan blobs no scene references (left behind by re-scans/undo —
+    // deliberately deferred to launch so in-session undo can restore them).
+    void this.persistence.pruneOrphanScans();
 
     void checkSupport().then((report) => this.landing.setDiagnostics(report));
     window.addEventListener('beforeunload', () => this.persistence.saveNow(this.sceneData));
@@ -230,6 +255,126 @@ class App {
     this.refreshLanding();
   }
 
+  /**
+   * Brings the location renderer in line with sceneData.scan, loading the
+   * geometry blob from the store when it isn't already displayed. Async loads
+   * are token-guarded so a scene switch or undo mid-load can't apply stale
+   * geometry.
+   */
+  private syncLocation(): void {
+    const summary = this.sceneData.scan;
+    const token = ++this.locationSyncToken;
+    if (!summary) {
+      this.displayedScanId = null;
+      this.location.setScan(null);
+      return;
+    }
+    if (summary.id === this.displayedScanId) return;
+    void this.persistence.scans.getScan(summary.id).then((scan) => {
+      if (token !== this.locationSyncToken) return; // superseded
+      if (!scan) {
+        this.displayedScanId = null;
+        this.location.setScan(null);
+        this.debug.log('⚠ scan geometry missing for this scene (Remove scan on the landing page to clear)');
+        return;
+      }
+      this.displayedScanId = scan.id;
+      this.location.setScan(scan);
+      this.refreshWristState();
+    });
+  }
+
+  /** Drops a scene's scan summary (landing page). The geometry blob is kept
+   *  until the next launch so an in-session undo can restore it. */
+  private removeScan(sceneId: string): void {
+    if (sceneId === this.sceneData.id) {
+      this.sceneData.scan = null;
+      this.syncLocation();
+      this.markDirty();
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      if (!scene) return;
+      scene.scan = null;
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
+  }
+
+  /** Wrist "Scan Room": starts (or cancels) waiting for the platform mesh. */
+  private toggleScan(): void {
+    if (this.pendingScan) {
+      this.pendingScan = null;
+      this.debug.log('scan cancelled');
+      this.refreshWristState();
+      return;
+    }
+    if (!this.session.session) return;
+    if (!this.session.features.meshDetection) {
+      this.debug.log('mesh detection unavailable — needs a Quest 3/3S-class device with Space Setup done');
+      return;
+    }
+    if (this.views.mode !== 'full' || this.views.isShifted) {
+      this.debug.log('scan needs Full view at true alignment — press Re-align first');
+      return;
+    }
+    this.pendingScan = { startedAt: performance.now(), roomCaptureRequested: false };
+    this.debug.log('scanning — reading the room mesh…');
+    this.refreshWristState();
+  }
+
+  /** Per-frame while a scan is pending: snapshot the Scene Mesh when tracked. */
+  private updatePendingScan(frame: XRFrame, time: number): void {
+    const pending = this.pendingScan;
+    if (!pending) return;
+    // Teleporting or leaving Full view mid-scan would bake that transform into
+    // the captured geometry — cancel instead of misregistering the room.
+    if (this.views.mode !== 'full' || this.views.isShifted) {
+      this.pendingScan = null;
+      this.debug.log('scan cancelled — view changed during capture (Re-align and rescan)');
+      this.refreshWristState();
+      return;
+    }
+    const refSpace = this.renderer.xr.getReferenceSpace();
+    if (!refSpace) return;
+    this.contentRoot.updateMatrixWorld();
+    _worldToScene.copy(this.contentRoot.matrixWorld).invert();
+    const scan = captureScanFromFrame(frame, refSpace, _worldToScene);
+    if (scan) {
+      this.pendingScan = null;
+      const summary = summarizeScan(scan);
+      void this.persistence.scans.putScan(scan); // fire-and-forget; onError warns
+      this.sceneData.scan = summary; // old blob (if any) stays until next-launch prune
+      this.displayedScanId = scan.id;
+      this.locationSyncToken++; // kill any in-flight stale load
+      this.location.setScan(scan);
+      this.location.setMode('ghost'); // show alignment over passthrough for confirmation
+      this.markDirty();
+      this.refreshLanding();
+      this.refreshWristState();
+      this.debug.log(
+        `✓ scanned ${scan.meshes.length} mesh${scan.meshes.length === 1 ? '' : 'es'} · ` +
+          `${(summary.triangles / 1000).toFixed(1)}k tris · ` +
+          `${(summary.boundsMax.x - summary.boundsMin.x).toFixed(1)}×${(summary.boundsMax.z - summary.boundsMin.z).toFixed(1)} m`,
+      );
+      return;
+    }
+    const waited = time - pending.startedAt;
+    if (!pending.roomCaptureRequested && waited > SCAN_ROOM_CAPTURE_AFTER_MS) {
+      pending.roomCaptureRequested = true;
+      this.debug.log('no room mesh yet — asking the system to run room capture…');
+      void this.session.requestRoomCapture().then((ok) => {
+        if (!ok && this.pendingScan) {
+          this.debug.log('room capture unavailable — run Space Setup in Quest Settings, then rescan');
+        }
+      });
+    }
+    if (waited > SCAN_TIMEOUT_MS) {
+      this.pendingScan = null;
+      this.debug.log('scan timed out — finish Space Setup (Settings → Environment Setup) and retry');
+      this.refreshWristState();
+    }
+  }
+
   private loadScene(data: SceneData): void {
     this.sceneData = data;
     this.persistence.setCurrent(data.id);
@@ -241,6 +386,8 @@ class App {
     this.keyframes.setScene(data);
     this.cams.setScene(data);
     this.contentVersion++;
+    this.pendingScan = null;
+    this.syncLocation();
     this.history.reset(data);
     this.refreshLanding();
     this.refreshWristState();
@@ -286,6 +433,8 @@ class App {
     this.keyframes.setScene(data);
     this.cams.setScene(data);
     this.contentVersion++;
+    this.pendingScan = null;
+    this.syncLocation();
     this.persistence.saveNow(data);
     if (this.session.session && !this.views.isShifted) {
       for (const obj of this.actors.all()) this.pendingReanchorActors.push(obj);
@@ -425,6 +574,19 @@ class App {
       case 'pace-fast':
         this.adjustPace(+0.2);
         break;
+      case 'scan':
+        this.toggleScan();
+        break;
+      case 'location': {
+        if (!this.location.hasScan) {
+          this.debug.log('no location scan in this scene yet — press Scan Room');
+          break;
+        }
+        const mode = this.location.cycleMode();
+        this.debug.log(`location: ${mode}`);
+        this.refreshWristState();
+        break;
+      }
       case 'drift': {
         const on = !this.driftMarker.group.visible;
         this.driftMarker.group.visible = on;
@@ -474,6 +636,7 @@ class App {
   private onSessionEnd(): void {
     this.renderer.setAnimationLoop(null);
     this.keyframes.stop();
+    this.pendingScan = null;
     this.noteEditor.close();
     this.persistence.saveNow(this.sceneData);
     document.getElementById('overlay')!.hidden = true;
@@ -690,7 +853,13 @@ class App {
   }
 
   private capturePhoto(): void {
-    const name = this.cams.capture(this.renderer, this.scene3, this.hiddenForVirtualCamera(), this.sceneData.name);
+    this.location.beginCameraPass(); // captures frame the scanned set too
+    let name: string | null;
+    try {
+      name = this.cams.capture(this.renderer, this.scene3, this.hiddenForVirtualCamera(), this.sceneData.name);
+    } finally {
+      this.location.endCameraPass();
+    }
     this.debug.log(name ? `saved ${name}` : 'capture: no active camera');
   }
 
@@ -716,6 +885,12 @@ class App {
     }
     for (const c of this.sceneData.cameras)
       box.expandByPoint(new THREE.Vector3(c.position.x, c.position.y, c.position.z));
+    // A scanned location counts: the miniature centers on the whole room.
+    const scan = this.sceneData.scan;
+    if (scan && this.location.hasScan) {
+      box.expandByPoint(new THREE.Vector3(scan.boundsMin.x, scan.boundsMin.y, scan.boundsMin.z));
+      box.expandByPoint(new THREE.Vector3(scan.boundsMax.x, scan.boundsMax.y, scan.boundsMax.z));
+    }
     if (box.isEmpty()) return null;
     box.expandByScalar(0.5);
     return box;
@@ -735,6 +910,11 @@ class App {
     this.wrist.setLabel('pace', `${this.sceneData.walkSpeed.toFixed(1)} m/s`);
     this.wrist.setToggle('undo', this.history.canUndo);
     this.wrist.setToggle('redo', this.history.canRedo);
+    this.wrist.setLabel('scan', this.pendingScan ? 'Scanning…' : 'Scan Room');
+    this.wrist.setToggle('scan', this.pendingScan !== null);
+    const loc = this.location.mode;
+    this.wrist.setLabel('location', `Loc: ${loc.charAt(0).toUpperCase()}${loc.slice(1)}`);
+    this.wrist.setToggle('location', this.location.hasScan && loc !== 'hidden');
     const sel = this.selectedActorId
       ? (this.actors.get(this.selectedActorId)?.data.name ?? '—')
       : '—';
@@ -782,6 +962,8 @@ class App {
     // Deferred anchor creation (queued from input events, needs a live frame).
     for (const obj of this.pendingReanchorActors.splice(0)) this.actors.reanchor(obj, frame);
     for (const obj of this.pendingReanchorCams.splice(0)) this.cams.reanchor(obj, frame);
+
+    this.updatePendingScan(frame, time);
 
     this.session.updateHitTest(frame, pointer);
 
@@ -845,7 +1027,15 @@ class App {
     this.driftMarker.update(time);
 
     if (this.views.mode === 'camera') {
-      this.cams.renderMonitor(this.renderer, this.scene3, this.hiddenForVirtualCamera());
+      // The virtual camera always sees the scanned set, even when the wearer
+      // has it hidden (on location the real room fills that role for eyes,
+      // but the monitor can only show virtual content).
+      this.location.beginCameraPass();
+      try {
+        this.cams.renderMonitor(this.renderer, this.scene3, this.hiddenForVirtualCamera());
+      } finally {
+        this.location.endCameraPass();
+      }
     }
 
     // FPS + wrist readouts (throttled).

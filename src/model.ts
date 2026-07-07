@@ -157,6 +157,23 @@ export interface CameraSetupData {
   formatId: string;
 }
 
+/**
+ * Compact description of a captured location scan. The heavy geometry blob
+ * lives outside the scene JSON (IndexedDB, keyed by `id` — see scanStore.ts);
+ * this summary is what localStorage autosave carries.
+ */
+export interface ScanSummary {
+  /** Key of the geometry blob in the scan store. */
+  id: string;
+  /** Epoch ms at capture. */
+  capturedAt: number;
+  vertices: number;
+  triangles: number;
+  /** Axis-aligned bounds in scene space (meters). */
+  boundsMin: Vec3;
+  boundsMax: Vec3;
+}
+
 export interface SceneData {
   version: 1;
   id: string;
@@ -167,6 +184,8 @@ export interface SceneData {
   cameras: CameraSetupData[];
   /** Playback pace for blocking moves (m/s); drives segment timing. */
   walkSpeed: number;
+  /** Captured location scan, if any. Absent/null = no scan. */
+  scan?: ScanSummary | null;
 }
 
 // --- factories --------------------------------------------------------------
@@ -200,6 +219,7 @@ export function createScene(name: string): SceneData {
     actors: [],
     cameras: [],
     walkSpeed: WALK_SPEED_MS,
+    scan: null,
   };
 }
 
@@ -353,6 +373,20 @@ function isCameraData(v: unknown): boolean {
   );
 }
 
+function isScanSummary(v: unknown): v is ScanSummary {
+  const s = v as ScanSummary;
+  return (
+    !!s &&
+    typeof s === 'object' &&
+    typeof s.id === 'string' &&
+    isFiniteNum(s.capturedAt) &&
+    isFiniteNum(s.vertices) &&
+    isFiniteNum(s.triangles) &&
+    isVec3(s.boundsMin) &&
+    isVec3(s.boundsMax)
+  );
+}
+
 /**
  * Deep shape check used when importing scene JSON from disk — validates every
  * actor and camera so a malformed file can't crash the renderer on load.
@@ -370,13 +404,15 @@ export function isSceneData(v: unknown): v is SceneData {
     Array.isArray(s.actors) &&
     s.actors.every(isActorData) &&
     Array.isArray(s.cameras) &&
-    s.cameras.every(isCameraData)
+    s.cameras.every(isCameraData) &&
+    (s.scan == null || isScanSummary(s.scan))
   );
 }
 
 /** Fills defaults for fields absent from older scene JSON. Mutates + returns. */
 export function normalizeScene(s: SceneData): SceneData {
   if (!isFiniteNum(s.walkSpeed) || s.walkSpeed <= 0) s.walkSpeed = WALK_SPEED_MS;
+  if (s.scan === undefined) s.scan = null;
   for (const c of s.cameras) {
     if (!isFiniteNum(c.lensFocalLength) || c.lensFocalLength <= 0) c.lensFocalLength = 35;
     if (!isFiniteNum(c.tStop) || c.tStop <= 0) c.tStop = DEFAULT_TSTOP;

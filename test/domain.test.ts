@@ -43,6 +43,17 @@ import {
   nearestActorDistance,
   planBounds,
 } from '../src/plan.ts';
+import {
+  base64ToBytes,
+  bytesToBase64,
+  decodeScan,
+  encodeScan,
+  isLocationScan,
+  summarizeScan,
+  transformPositions,
+  type LocationScan,
+} from '../src/scan.ts';
+import { ScanStore } from '../src/scanStore.ts';
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -570,4 +581,188 @@ test('History: no-op record on unchanged scene, and bounded depth', () => {
   assert.equal(steps, 3); // capped at the limit, never unbounded
 });
 
-console.log(`\n${passed} tests passed`);
+// --- location scans -----------------------------------------------------------
+
+function makeScan(): LocationScan {
+  return {
+    version: 1,
+    id: 'scan-1',
+    capturedAt: 1_720_000_000_000,
+    meshes: [
+      {
+        label: 'global mesh',
+        positions: new Float32Array([0, 0, 0, 1, 0, 0, 1, 2, 0, 0, 2, -3]),
+        indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
+      },
+      {
+        label: 'table',
+        positions: new Float32Array([-1, 0.7, -1, -0.5, 0.7, -1, -1, 0.7, -0.5]),
+        indices: new Uint32Array([0, 1, 2]),
+      },
+    ],
+  };
+}
+
+/** Corrupt-and-reencode helper for decoder rejection tests. */
+function mutated(b64: string, fn: (bytes: Uint8Array) => Uint8Array): string {
+  return bytesToBase64(fn(base64ToBytes(b64)!));
+}
+
+test('base64: round-trips all remainder lengths and matches Node', () => {
+  for (const len of [0, 1, 2, 3, 4, 5, 31]) {
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = (i * 37 + 5) % 256;
+    const b64 = bytesToBase64(bytes);
+    assert.equal(b64, Buffer.from(bytes).toString('base64'));
+    assert.deepEqual(base64ToBytes(b64), bytes);
+  }
+});
+
+test('base64: rejects bad charset and bad length', () => {
+  assert.equal(base64ToBytes('####'), null);
+  assert.equal(base64ToBytes('QUJ'), null); // not a multiple of 4
+  assert.equal(base64ToBytes('émoji=='), null);
+});
+
+test('transformPositions: translation and 90° yaw (column-major)', () => {
+  const p = new Float32Array([1, 2, 3]);
+  transformPositions(p, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 20, 30, 1]);
+  assert.deepEqual([...p], [11, 22, 33]);
+  const q = new Float32Array([1, 0, 0]);
+  // +90° about Y: (1,0,0) → (0,0,-1), matching THREE's applyAxisAngle.
+  transformPositions(q, [0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1]);
+  approx(q[0], 0);
+  approx(q[1], 0);
+  approx(q[2], -1);
+});
+
+test('summarizeScan: counts and bounds across meshes', () => {
+  const s = summarizeScan(makeScan());
+  assert.equal(s.id, 'scan-1');
+  assert.equal(s.vertices, 7);
+  assert.equal(s.triangles, 3);
+  assert.deepEqual(s.boundsMin, { x: -1, y: 0, z: -3 });
+  assert.deepEqual(s.boundsMax, { x: 1, y: 2, z: 0 });
+});
+
+test('summarizeScan: empty scan yields zeroed bounds, not infinities', () => {
+  const s = summarizeScan({ version: 1, id: 'e', capturedAt: 1, meshes: [] });
+  assert.deepEqual(s.boundsMin, { x: 0, y: 0, z: 0 });
+  assert.deepEqual(s.boundsMax, { x: 0, y: 0, z: 0 });
+});
+
+test('scan codec: encode/decode round-trips geometry with a fresh id', () => {
+  const src = makeScan();
+  const out = decodeScan(encodeScan(src));
+  assert.ok(out);
+  assert.notEqual(out.id, src.id); // imports must never collide with stored blobs
+  assert.equal(out.capturedAt, src.capturedAt);
+  assert.equal(out.meshes.length, 2);
+  for (let i = 0; i < 2; i++) {
+    assert.equal(out.meshes[i].label, src.meshes[i].label);
+    assert.deepEqual([...out.meshes[i].positions], [...src.meshes[i].positions]);
+    assert.deepEqual([...out.meshes[i].indices], [...src.meshes[i].indices]);
+  }
+  assert.ok(isLocationScan(out));
+});
+
+test('scan codec: u32 index path preserved above 65535 vertices', () => {
+  const n = 66_000; // > 0xffff forces the wide index path
+  const positions = new Float32Array(n * 3);
+  for (let i = 0; i < positions.length; i++) positions[i] = (i % 977) * 0.01;
+  const scan: LocationScan = {
+    version: 1,
+    id: 'wide',
+    capturedAt: 2,
+    meshes: [{ label: 'global mesh', positions, indices: new Uint32Array([0, 65_999, 65_536]) }],
+  };
+  const out = decodeScan(encodeScan(scan))!;
+  assert.deepEqual([...out.meshes[0].indices], [0, 65_999, 65_536]);
+  assert.equal(out.meshes[0].positions.length, n * 3);
+});
+
+test('scan codec: rejects corrupt input instead of crashing', () => {
+  const good = encodeScan(makeScan());
+  assert.equal(decodeScan('not base64!!'), null);
+  // wrong version
+  assert.equal(decodeScan(mutated(good, (b) => ((b[0] = 9), b))), null);
+  // truncated buffer
+  assert.equal(decodeScan(mutated(good, (b) => b.subarray(0, b.length - 7))), null);
+  // trailing garbage
+  assert.equal(
+    decodeScan(
+      mutated(good, (b) => {
+        const g = new Uint8Array(b.length + 4);
+        g.set(b);
+        return g;
+      }),
+    ),
+    null,
+  );
+  // out-of-range index (encoder doesn't validate; decoder must)
+  const bad = makeScan();
+  bad.meshes[1].indices = new Uint32Array([0, 1, 9]);
+  assert.equal(decodeScan(encodeScan(bad)), null);
+  // non-finite position
+  const nan = makeScan();
+  nan.meshes[0].positions[4] = NaN;
+  assert.equal(decodeScan(encodeScan(nan)), null);
+});
+
+test('SceneData: scan summary is validated and normalized', () => {
+  const s = createScene('scan-scene');
+  assert.equal(s.scan, null); // new scenes carry an explicit null
+  s.scan = summarizeScan(makeScan());
+  const json = JSON.parse(JSON.stringify(s));
+  assert.equal(isSceneData(json), true);
+
+  const broken = JSON.parse(JSON.stringify(s));
+  broken.scan.boundsMax = 'nope';
+  assert.equal(isSceneData(broken), false);
+
+  const legacy = JSON.parse(JSON.stringify(s)) as SceneData;
+  delete (legacy as unknown as Record<string, unknown>).scan; // pre-scan export
+  assert.equal(isSceneData(legacy), true);
+  normalizeScene(legacy);
+  assert.equal(legacy.scan, null);
+});
+
+// ScanStore's IndexedDB-free contract: Node has no indexedDB, so this
+// exercises exactly the degraded path a storage-broken browser takes
+// (memory fallback + onError warning). Real IDB is covered by
+// test/scan-store.html in a headed browser and TESTING.md Phase 6.
+async function scanStoreFallback(): Promise<void> {
+  const store = new ScanStore();
+  let warned = '';
+  store.onError = (m) => (warned = m);
+  const scan = makeScan();
+
+  const stored = await store.putScan(scan);
+  assert.equal(stored, false); // memory fallback reports non-durable
+  assert.ok(warned.includes('memory'), 'warns that the scan is memory-only');
+  assert.equal(await store.getScan('scan-1'), scan);
+  assert.deepEqual(await store.listScanIds(), ['scan-1']);
+
+  // Prune keeps referenced ids, removes orphans.
+  const other = { ...makeScan(), id: 'scan-2' };
+  await store.putScan(other);
+  const removed = await store.pruneOrphans(new Set(['scan-1']));
+  assert.equal(removed, 1);
+  assert.equal(await store.getScan('scan-2'), null);
+  assert.equal((await store.getScan('scan-1'))?.id, 'scan-1');
+
+  await store.deleteScan('scan-1');
+  assert.equal(await store.getScan('scan-1'), null);
+}
+
+void scanStoreFallback().then(
+  () => {
+    passed++;
+    console.log('  ✓ ScanStore: memory fallback contract (put/get/list/prune/delete + warning)');
+    console.log(`\n${passed} tests passed`);
+  },
+  (e) => {
+    console.error('  ✗ ScanStore: memory fallback contract');
+    throw e;
+  },
+);

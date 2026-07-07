@@ -157,6 +157,7 @@ body {
   font-size: 13px;
 }
 #landing .cam-edit .field input[type='number'] { width: 68px; }
+#landing .cam-edit .scan-info { color: #9aa3b2; font-size: 13px; flex: 1; }
 
 #landing .help { margin-top: 24px; color: #9aa3b2; }
 #landing .help pre {

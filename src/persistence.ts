@@ -5,6 +5,11 @@
 
 import { createScene, isSceneData, normalizeScene, uid, type SceneData } from './model.ts';
 import { downloadFloorplan, downloadShotList } from './exporters.ts';
+import { decodeScan, encodeScan, summarizeScan } from './scan.ts';
+import { ScanStore } from './scanStore.ts';
+
+/** Exported scene files optionally embed the scan geometry as base64. */
+type SceneFile = SceneData & { scanData?: string };
 
 const INDEX_KEY = 'setview.sceneIndex';
 const CURRENT_KEY = 'setview.currentScene';
@@ -16,12 +21,34 @@ export interface SceneIndexEntry {
   updatedAt: number;
   actors: number;
   cameras: number;
+  hasScan?: boolean;
 }
 
 export class Persistence {
+  /** Scan geometry blobs (IndexedDB) — scene JSON carries only the summary. */
+  readonly scans = new ScanStore();
+
   private saveTimer: number | null = null;
   /** Notified when a save fails (e.g. storage full) so the UI can warn. */
   onError: (msg: string) => void = () => {};
+
+  constructor() {
+    this.scans.onError = (m) => this.onError(m);
+  }
+
+  /**
+   * Deletes scan blobs no scene references. Run once at app start: replaced
+   * or abandoned scans are deliberately kept during a session (undo can bring
+   * them back) and swept on the next launch.
+   */
+  async pruneOrphanScans(): Promise<void> {
+    const referenced = new Set<string>();
+    for (const e of this.listScenes()) {
+      const s = this.loadScene(e.id);
+      if (s?.scan) referenced.add(s.scan.id);
+    }
+    await this.scans.pruneOrphans(referenced);
+  }
 
   listScenes(): SceneIndexEntry[] {
     try {
@@ -96,6 +123,7 @@ export class Persistence {
         updatedAt: scene.updatedAt,
         actors: scene.actors.length,
         cameras: scene.cameras.length,
+        hasScan: !!scene.scan,
       });
       localStorage.setItem(INDEX_KEY, JSON.stringify(index));
       return true;
@@ -120,12 +148,14 @@ export class Persistence {
   }
 
   deleteScene(id: string): void {
+    const scene = this.loadScene(id);
+    if (scene?.scan) void this.scans.deleteScan(scene.scan.id);
     localStorage.removeItem(SCENE_PREFIX + id);
     localStorage.setItem(INDEX_KEY, JSON.stringify(this.listScenes().filter((e) => e.id !== id)));
     if (this.currentId() === id) localStorage.removeItem(CURRENT_KEY);
   }
 
-  duplicateScene(id: string): SceneData | null {
+  async duplicateScene(id: string): Promise<SceneData | null> {
     const src = this.loadScene(id);
     if (!src) return null;
     const copy: SceneData = JSON.parse(JSON.stringify(src));
@@ -135,14 +165,31 @@ export class Persistence {
     // New ids so duplicated scenes never share object identity.
     for (const a of copy.actors) a.id = uid();
     for (const c of copy.cameras) c.id = uid();
+    if (copy.scan) {
+      // Copy the geometry blob under a fresh id so deleting either scene
+      // never strands the other's scan.
+      const scan = await this.scans.getScan(copy.scan.id);
+      if (scan) {
+        const dup = { ...scan, id: uid() };
+        await this.scans.putScan(dup);
+        copy.scan = { ...copy.scan, id: dup.id };
+      } else {
+        copy.scan = null; // blob missing — don't carry a dangling reference
+      }
+    }
     this.saveNow(copy);
     return copy;
   }
 
-  exportScene(id: string): void {
+  async exportScene(id: string): Promise<void> {
     const scene = this.loadScene(id);
     if (!scene) return;
-    const blob = new Blob([JSON.stringify(scene, null, 2)], { type: 'application/json' });
+    const file: SceneFile = { ...scene };
+    if (scene.scan) {
+      const scan = await this.scans.getScan(scene.scan.id);
+      if (scan) file.scanData = encodeScan(scan);
+    }
+    const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -165,12 +212,24 @@ export class Persistence {
 
   async importScene(file: File): Promise<SceneData | null> {
     try {
-      const data = JSON.parse(await file.text());
+      const data = JSON.parse(await file.text()) as SceneFile;
       if (!isSceneData(data)) return null;
       normalizeScene(data);
       // Fresh id so an import never clobbers an existing scene.
       data.id = uid();
       data.name = `${data.name} (imported)`;
+      // Rehydrate embedded scan geometry into the store (fresh blob id from
+      // decodeScan). A summary with no decodable blob is dropped rather than
+      // imported dangling.
+      const embedded = typeof data.scanData === 'string' ? decodeScan(data.scanData) : null;
+      delete data.scanData; // never let megabytes of base64 hit localStorage
+      if (embedded) {
+        await this.scans.putScan(embedded);
+        data.scan = summarizeScan(embedded);
+      } else {
+        if (data.scan) this.onError('imported scene had an unreadable scan — geometry dropped');
+        data.scan = null;
+      }
       this.saveNow(data);
       return data;
     } catch {
