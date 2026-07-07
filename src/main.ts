@@ -396,8 +396,11 @@ class App {
     this.persistence.setCurrent(data.id);
     this.selectedActorId = null;
     this.hover = null;
-    this.draggedActor = null;
-    this.draggedCamera = null;
+    // Reparent (not just null) any in-progress drag before setScene disposes
+    // the old objects — a grip-dragged camera root lives under the controller,
+    // and disposing it there would orphan a phantom gizmo on the controller.
+    // Mirrors restoreScene; handles a load that follows a session ended mid-grip.
+    this.cancelActiveManipulation();
     this.actors.setScene(data);
     this.keyframes.setScene(data);
     this.cams.setScene(data);
@@ -652,6 +655,10 @@ class App {
   private onSessionEnd(): void {
     this.renderer.setAnimationLoop(null);
     this.keyframes.stop();
+    // A session can end mid-grip (headset removed / OS-ended) with no
+    // squeezeend, leaving a dragged camera root parented to the controller.
+    // Reparent it now so it isn't orphaned across the next load/session.
+    this.cancelActiveManipulation();
     this.pendingScan = null;
     this.noteEditor.close();
     this.persistence.saveNow(this.sceneData);
