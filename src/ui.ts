@@ -839,15 +839,23 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
-export const CONTROLS_CHEATSHEET = `RIGHT controller (pointer)
+export const CONTROLS_CHEATSHEET = `MOVING AROUND THE SET
+  Walk ............ just walk — you're in passthrough, the set is registered
+  LEFT stick ...... glide through the set (forward/back + strafe), full view
+  RIGHT stick ← → . snap-turn the set 30° (full view, when not framing)
+  RIGHT stick click teleport to the aimed floor point (full view)
+  Wrist Re-align .. undo all glide/turn/teleport — back to true registration
+
+RIGHT controller (pointer)
   Trigger ......... place actor/camera · select · click wrist menu
   Grip (hold) ..... grab actor/camera to move · grab miniature
-  Stick ← → ....... rotate held actor · focal length (Cam View / frame lines)
+  Stick ← → ....... rotate held actor · focal (Cam View / frame lines) · snap-turn
   Stick click ..... teleport to reticle (full-scale view)
   A ............... commit camera (frame lines on) · capture PNG (Cam View)
   B ............... store keyframe for selected actor (max 5)
 
 LEFT controller
+  Stick ........... glide through the set (full-scale view)
   X ............... toggle placement mode (actor / camera)
   Y ............... cycle view: full-scale → miniature → camera
   Wrist menu ...... point at the panel above your left wrist and pull trigger

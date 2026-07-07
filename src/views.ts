@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
+import { rotateOffsetAboutPivot } from './locomotion.ts';
 
 export type ViewMode = 'full' | 'mini' | 'camera';
 
@@ -16,8 +17,10 @@ export class ViewManager {
   mode: ViewMode = 'full';
   onModeChange: (mode: ViewMode) => void = () => {};
 
-  /** Non-zero while teleported away from true AR registration. */
+  /** Non-zero while teleported/glided away from true AR registration. */
   readonly teleportOffset = new THREE.Vector3();
+  /** Content yaw (radians) accumulated by snap-turn; 0 at true registration. */
+  private viewYaw = 0;
 
   /** Diorama table visuals (platform disc + rim); child of scene root. */
   readonly platform: THREE.Group;
@@ -102,7 +105,7 @@ export class ViewManager {
   /** Restores full-scale transform (also camera view — life-size content). */
   private applyFullTransform(): void {
     this.contentRoot.scale.setScalar(1);
-    this.contentRoot.rotation.set(0, 0, 0);
+    this.contentRoot.rotation.set(0, this.viewYaw, 0);
     this.contentRoot.position.copy(this.teleportOffset);
   }
 
@@ -163,16 +166,42 @@ export class ViewManager {
     });
   }
 
-  /** Clears the teleport offset — content snaps back to true AR alignment. */
+  /**
+   * Smooth glide (thumbstick): translate content by −(dx,dz) in world XZ so the
+   * user advances through the set. Same mechanism as teleport, applied
+   * continuously — no fade (it's meant to be seen). Full view only.
+   */
+  glide(dx: number, dz: number): void {
+    if (this.mode !== 'full') return;
+    this.teleportOffset.x -= dx;
+    this.teleportOffset.z -= dz;
+    this.applyFullTransform();
+  }
+
+  /**
+   * Snap-turn: yaw the whole set about the user's position by `angle` radians,
+   * keeping the point under their feet fixed. Full view only.
+   */
+  snapTurn(angle: number, pivotWorld: THREE.Vector3): void {
+    if (this.mode !== 'full') return;
+    const r = rotateOffsetAboutPivot(this.teleportOffset, pivotWorld, angle);
+    this.teleportOffset.x = r.x;
+    this.teleportOffset.z = r.z;
+    this.viewYaw += angle;
+    this.applyFullTransform();
+  }
+
+  /** Clears all teleport/glide/turn — content snaps back to true AR alignment. */
   realign(): void {
     this.startFade(() => {
       this.teleportOffset.set(0, 0, 0);
+      this.viewYaw = 0;
       if (this.mode !== 'mini') this.applyFullTransform();
     });
   }
 
   get isShifted(): boolean {
-    return this.teleportOffset.lengthSq() > 1e-6;
+    return this.teleportOffset.lengthSq() > 1e-6 || Math.abs(this.viewYaw) > 1e-4;
   }
 
   private startFade(action: () => void): void {

@@ -54,6 +54,7 @@ import {
   type LocationScan,
 } from '../src/scan.ts';
 import { ScanStore } from '../src/scanStore.ts';
+import { locomotionAmount, rotateOffsetAboutPivot } from '../src/locomotion.ts';
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -725,6 +726,53 @@ test('SceneData: scan summary is validated and normalized', () => {
   assert.equal(isSceneData(legacy), true);
   normalizeScene(legacy);
   assert.equal(legacy.scan, null);
+});
+
+// --- locomotion ---------------------------------------------------------------
+
+test('locomotionAmount: deadzone suppresses stick noise', () => {
+  const a = locomotionAmount(0.1, -0.1, 2, 0.5);
+  assert.deepEqual(a, { forward: 0, right: 0 });
+});
+
+test('locomotionAmount: forward = -stickY, right = +stickX, scaled by speed·dt', () => {
+  // Push straight up (stickY = -1): move forward speed·dt = 2·0.5 = 1 m.
+  const f = locomotionAmount(0, -1, 2, 0.5);
+  approx(f.forward, 1);
+  approx(f.right, 0);
+  // Push right (stickX = +1): strafe right 1 m.
+  const r = locomotionAmount(1, 0, 2, 0.5);
+  approx(r.right, 1);
+  approx(r.forward, 0);
+});
+
+test('locomotionAmount: diagonals are clamped to unit speed (no faster corners)', () => {
+  const d = locomotionAmount(1, -1, 2, 0.5); // full diagonal
+  const mag = Math.hypot(d.forward, d.right);
+  approx(mag, 1); // same total speed as a cardinal push, not √2
+});
+
+test('rotateOffsetAboutPivot: rotating about the offset itself is a no-op', () => {
+  const p = { x: 3, z: -2 };
+  const r = rotateOffsetAboutPivot(p, p, Math.PI / 3);
+  approx(r.x, 3);
+  approx(r.z, -2);
+});
+
+test('rotateOffsetAboutPivot: 90° about origin maps +Y-rotation convention', () => {
+  // Rotation about +Y by +90° on (x,z): x' = z, z' = -x.
+  const r = rotateOffsetAboutPivot({ x: 1, z: 0 }, { x: 0, z: 0 }, Math.PI / 2);
+  approx(r.x, 0);
+  approx(r.z, -1);
+});
+
+test('rotateOffsetAboutPivot: full turn returns to start; pivot is fixed', () => {
+  const start = { x: 2, z: 5 };
+  const pivot = { x: -1, z: 1 };
+  let cur = start;
+  for (let i = 0; i < 12; i++) cur = rotateOffsetAboutPivot(cur, pivot, Math.PI / 6); // 12×30° = 360°
+  approx(cur.x, start.x, 1e-6);
+  approx(cur.z, start.z, 1e-6);
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this

@@ -15,6 +15,7 @@ import {
   type SceneData,
 } from './model.ts';
 import { History } from './history.ts';
+import { locomotionAmount } from './locomotion.ts';
 import { summarizeScan } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
 import { LocationRenderer } from './location.ts';
@@ -36,6 +37,16 @@ const WRIST_ROT_X = -1.05; // radians, tilt toward the face
 const _pt = new THREE.Vector3();
 // Reused for the world → scene-space re-basing at scan capture.
 const _worldToScene = new THREE.Matrix4();
+// Reused each frame for locomotion basis vectors (no per-frame allocation).
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+
+/** Smooth-glide speed (m/s) for thumbstick locomotion through the set. */
+const LOCOMOTION_SPEED = 1.8;
+/** Radial stick deadzone for glide (shared by the hot-path gate and the math). */
+const LOCOMOTION_DEADZONE = 0.15;
+/** Snap-turn increment (radians) per thumbstick push. */
+const SNAP_TURN_RAD = Math.PI / 6; // 30°
 
 /** Give the platform this long to surface tracked meshes before giving up. */
 const SCAN_TIMEOUT_MS = 30_000;
@@ -1004,7 +1015,8 @@ class App {
     } else if (this.views.mode === 'mini') {
       this.views.miniRotate(axes.x, dt);
     } else {
-      // Thumbstick steps focal length in Camera View / frame-lines mode.
+      // Pointer (right) stick: steps focal length in Camera View / frame-lines
+      // mode, otherwise snap-turns the set in Full view.
       const step = this.input.stickStepX(pointer);
       if (step !== 0) {
         if (this.views.mode === 'camera') {
@@ -1012,6 +1024,34 @@ class App {
           this.refreshWristState();
         } else if (this.cams.eyesMode) {
           this.cams.stepEyesFocal(step);
+        } else if (this.views.mode === 'full' && pointer === 'right') {
+          // Stick right → turn view right (content yaws the other way). Guarded
+          // to the right stick so a left-only controller keeps the left stick
+          // purely for glide instead of turning and strafing at once.
+          this.views.snapTurn(-step * SNAP_TURN_RAD, this.lastViewerPos);
+        }
+      }
+    }
+
+    // Smooth locomotion: LEFT stick glides through the set at full scale. Same
+    // content-shift mechanism as teleport, so anchored content stays consistent.
+    // Suppressed while manipulating so it never fights a drag/grab. The radial
+    // deadzone gate keeps the hot path allocation-free when the stick is centered
+    // (the common case) — locomotionAmount only runs on real input.
+    if (this.views.mode === 'full' && !this.draggedActor && !this.draggedCamera && !this.miniGrabbing) {
+      const ls = this.input.axes('left');
+      if (ls.x * ls.x + ls.y * ls.y > LOCOMOTION_DEADZONE * LOCOMOTION_DEADZONE) {
+        const mv = locomotionAmount(ls.x, ls.y, LOCOMOTION_SPEED, dt, LOCOMOTION_DEADZONE);
+        if (mv.forward !== 0 || mv.right !== 0) {
+          _fwd.set(0, 0, -1).applyQuaternion(this.lastViewerQuat);
+          _fwd.y = 0;
+          if (_fwd.lengthSq() > 1e-6) _fwd.normalize();
+          _right.set(1, 0, 0).applyQuaternion(this.lastViewerQuat);
+          _right.y = 0;
+          if (_right.lengthSq() > 1e-6) _right.normalize();
+          const dx = _right.x * mv.right + _fwd.x * mv.forward;
+          const dz = _right.z * mv.right + _fwd.z * mv.forward;
+          this.views.glide(dx, dz);
         }
       }
     }

@@ -10,7 +10,7 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 Checked on the dev machine — no headset needed:
 
-- [x] `npm test` — **54** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete + 27-camera hang guard**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **undo/redo history** (record/undo/redo, fresh-object isolation, redo-clear, bounded depth), **duplicate actor/camera** (fresh id/name, deep copy, offset), **move pace** normalization, **floorplan projection**, **shot-list text**, timeline + move stats, **location scans** (base64 vs Node reference, column-major vertex transforms, bounds/counts summary, binary codec round-trip incl. >65k-vertex index path, corrupt-input rejection, scan-summary scene validation).
+- [x] `npm test` — **60** domain tests pass: lens FOV, **depth of field / hyperfocal**, **angle of view** (H/V/diagonal), **sensor formats** (S35/FF/S16 + the anamorphic-2×-≡-half-focal identity), field width at distance, `stepFocal` snapping, **camera-name uniqueness after delete + 27-camera hang guard**, **deep import validation** (malformed actor/camera rejected), `normalizeScene` defaults, **undo/redo history** (record/undo/redo, fresh-object isolation, redo-clear, bounded depth), **duplicate actor/camera** (fresh id/name, deep copy, offset), **move pace** normalization, **floorplan projection**, **shot-list text**, timeline + move stats, **locomotion** (glide deadzone/clamp, pivot-rotation identities), **location scans** (base64 vs Node reference, column-major vertex transforms, bounds/counts summary, binary codec round-trip incl. >65k-vertex index path, corrupt-input rejection, scan-summary scene validation).
 - [x] `npx tsc --noEmit` clean · `npm run build` bundles.
 - [x] Landing page boots in headless Chrome (canvas created, correct `immersive-ar unavailable` diagnostics on desktop, scene list + per-camera editor render, no error fallback).
 - [x] Floorplan PNG rasterizes (`toDataURL`) and shot-list Markdown builds in a real browser via the dev server — no runtime errors, anamorphic format surfaced.
@@ -56,14 +56,20 @@ The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop
 - [ ] Place a second camera (Place: Cam mode or another A-commit); trigger-click gizmos to switch the active camera; monitor follows.
 - [ ] Grip-drag a camera gizmo — monitor viewpoint moves with it after release.
 
-## Phase 3 — Three views + teleport
+## Phase 3 — Three views, locomotion + teleport
 
 - [ ] **Y** cycles Full → Mini → Camera → Full. Any view reachable in ≤ 2 clicks (or 1 wrist tap).
 - [ ] Miniature: whole blocked scene appears as a ≤ ~0.5 m diorama on a platform at waist height. Actors, camera gizmos, sightline cones, footprints all present and to scale.
 - [ ] Live mirror check: have a second person... no wait, single user: enter Mini during playback (Phase 4) — the tiny actors move exactly as the full-scale ones did.
 - [ ] Grip-grab moves the diorama; thumbstick rotates it; you can view it top-down like a table model.
-- [ ] Full-scale: aim at a far floor point, click thumbstick → quick 150 ms fade, and the scene has shifted so that point is at your feet (walk-free repositioning). No smooth slide, no nausea.
-- [ ] Wrist **Re-align** snaps content back to true room registration (verify an anchored actor returns exactly to its real spot).
+- [ ] **Walk (IRL):** in Full view with an actor placed, physically walk around — the actor stays planted on the real floor (this is the same anchor test as Phase 1, and the on-location locomotion).
+- [ ] **Glide (left stick):** push the left stick — you glide through the set in the direction you're **facing** (forward/back + strafe), ~1.8 m/s, no drift when centered. Turn your head and glide again: direction follows your gaze, not a fixed axis. Actors/cameras move together as one rigid set (nothing tears apart).
+- [ ] **Snap-turn (right stick ← →):** in Full view with frame lines OFF, flick the right stick — the set yaws 30° per flick about your position (the spot under your feet stays put). Push-and-hold gives one turn, re-armed on release (not a spin).
+- [ ] Glide out into a scanned/blocked area, then **Re-align** — content snaps back to true room registration and an anchored actor returns exactly to its real spot (verifies glide + turn both fold into the same offset the re-align clears).
+- [ ] Frame lines ON: right stick steps focal length instead of snap-turning (no conflict); left stick still glides.
+- [ ] Full-scale teleport: aim at a far floor point, click thumbstick → quick 150 ms fade, scene shifts so that point is at your feet. No smooth slide, no nausea.
+- [ ] Wrist **Re-align** snaps content back to true room registration after any mix of walk / glide / turn / teleport.
+- [ ] **Comfort:** a few minutes of glide + snap-turn shouldn't induce sickness at the default speed. If smooth strafe feels too much, `LOCOMOTION_SPEED` in `main.ts` is the knob; snap-turn (vs smooth-turn) is already the comfort default.
 
 ## Phase 4 — Keyframes & playback
 

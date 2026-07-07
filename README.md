@@ -74,13 +74,17 @@ The **wrist menu** floats above your **left** controller — point at it with th
 | **Trigger** on a camera gizmo | Make it the active camera |
 | **Grip** on a camera gizmo | Grab & re-position it (full 6-DOF) |
 
-### Phase 3 — views & teleport
+### Phase 3 — views, moving through the set, teleport
 | Input | Action |
 |---|---|
 | **Y** | Cycle view: Full-scale → Miniature → Camera View |
-| **Grip** (miniature view) | Grab the diorama to move it; stick ← → rotates it |
+| **Walk (IRL)** | You're in passthrough — the set is registered to the real floor, so you move through it by physically walking. This is the primary locomotion on location. |
+| **Left stick** | **Glide** through the set (forward/back + strafe, head-relative, ~1.8 m/s) — for covering a scanned location bigger than your physical room, or moving without walking |
+| **Right stick ← →** | **Snap-turn** the set 30° (full view, when not framing/dragging) — reorient without physically turning |
 | **Right stick click** | Teleport: shifts the virtual scene so the aimed floor point comes to you (150 ms fade) |
-| Wrist **Re-align** | Undo all teleports — snap content back to true AR registration |
+| Wrist **Re-align** | Undo all glide / snap-turn / teleport — snap content back to true AR registration |
+
+**Two ways to move, one model.** On location you just walk (passthrough AR keeps the virtual set glued to the real floor). When the set is bigger than your room — or you're reviewing a scanned location back at the office — the **left stick glides** you through it and the **right stick snap-turns**. Under the hood, all of these (walk aside) shift the same content transform, so anchored actors and cameras stay consistent; **Re-align** always returns you to true real-world registration.
 
 ### Phase 4 — keyframes & playback
 | Input | Action |
@@ -138,7 +142,7 @@ The landing page is a full prep surface you can use at a laptop before ever putt
 - **Lens math is real and format-aware.** Selectable capture formats — **Super 35** (24.89 mm gate), **Full-Frame/VV** (36 mm), **Super 16** (12.52 mm), and **S35 2× anamorphic** — each with its own circle of confusion. Horizontal angle of view is set by the format's gate width × anamorphic squeeze (a 2× anamorphic 50 mm frames like a 25 mm spherical); vertical follows from the aspect (a shared-width finder convention). Focal length is a **free millimetre value** (store real primes like 27/40/65 mm); the thumbstick still snaps through the 16/24/35/50/85/135 preset set. Readouts and the burned-in slate show **angle of view** (H/Ø°), **depth of field** (near–far, ∞ past hyperfocal) at the nearest actor, and the **frame width at the subject** ("at 4.2 m the frame is 3.0 m wide"). All of this is pure math in `lens.ts`, covered by unit tests (`npm test`).
 - **Anchors are position-only.** Orientation comes from the data model. Yaw drift on a standing figure is negligible; position drift is what kills the illusion, and that's what anchors correct.
 - **Scene restore is relative to session start.** `local-floor` origin is set where you begin each AR session (persistent anchors are out of scope for v1). Re-entering a saved scene, stand roughly where you originally started, facing the same way. Within one session, placements are anchor-locked to the real room.
-- **Teleport de-registers AR on purpose.** In passthrough you physically exist in the room, so "teleport" shifts the *virtual content* to you (e.g. to stand at a far camera position without walking). Objects placed while shifted are not anchored. **Re-align** restores true registration and re-anchoring.
+- **Teleport, glide, and snap-turn all de-register AR on purpose.** In passthrough you physically exist in the room, so moving through a set that's larger than your space means shifting the *virtual content* rather than a camera. Teleport (stick-click) brings the aimed point to you; the **left stick glides** and the **right stick snap-turns**; all three drive one rigid content transform (a world translation plus a yaw), which is why anchored actors and cameras stay mutually consistent through it. Objects placed while shifted are not anchored, and a location scan can only be captured at true registration. **Re-align** restores true registration and re-anchoring. Locomotion speed (`LOCOMOTION_SPEED`) and snap-turn increment (`SNAP_TURN_RAD`) are tuning knobs at the top of `main.ts`; smooth-turn and a comfort vignette are deliberately omitted for v1 (snap-turn is the comfort-first default).
 - **Notes need dom-overlay.** Quest and Android XR browsers support it; if a session lacks it, the note button explains instead of failing.
 - **Your work is warned before it's lost.** An autosave failure (e.g. localStorage full) now surfaces on the wrist status line and debug log with a prompt to *Export this scene to JSON* — it no longer fails silently. Imported scene JSON is deep-validated (every actor/camera), so a malformed file is rejected up front instead of crashing the loaded scene.
 - **Location scans are geometry-only, by the platform's design.** WebXR exposes the Quest's room reconstruction (Scene Mesh) but never its camera pixels, so scans are untextured gray-box meshes with semantic tints (walls/floor/furniture) — a *previz set*, not a photoreal twin. Scan fidelity is the OS's Space Setup mesh (roughly 5–10 cm detail): right for blocking and sightlines, not for surveying. Photoreal Gaussian-splat/photogrammetry import is a possible v2 (the storage + scene-space plumbing this feature added is the same path a GLB import would use).
@@ -156,6 +160,7 @@ src/
   timeline.ts     Keyframe timing/interpolation + move stats — PURE
   history.ts      Undo/redo snapshot stack over SceneData — PURE
   plan.ts         Floorplan projection + shot-list text — PURE (feeds exporters)
+  locomotion.ts   Thumbstick glide + snap-turn math — PURE (feeds views.ts)
   scan.ts         Location-scan data + binary/base64 codec + transforms — PURE
   session.ts      WebXR session, feature detection, hit-test, anchors, room capture, reset logging
   scanner.ts      Reads the Scene Mesh (mesh-detection) off a live XRFrame into scene space
@@ -170,7 +175,7 @@ src/
   exporters.ts    Floorplan PNG + Markdown shot-list rendering/download (consumes plan.ts)
   persistence.ts  localStorage autosave, scene list, JSON export/import (scan-embedding), rename/update
   main.ts         Wiring + the per-frame loop + input routing
-test/domain.test.ts  Node-runnable tests for the pure domain modules (54 tests)
+test/domain.test.ts  Node-runnable tests for the pure domain modules (60 tests)
 ```
 
 ## Port-to-Unity notes
