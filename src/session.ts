@@ -88,6 +88,12 @@ export class SessionManager {
     };
     const session = await navigator.xr!.requestSession('immersive-ar', init);
     this.session = session;
+    // Fresh session: clear a stuck anchor-failure latch from a prior session.
+    // features.anchors is set optimistically below; without this reset, one
+    // transient createAnchor failure would disable anchoring for the lifetime
+    // of this SessionManager (it's reused across sessions), silently killing
+    // drift resistance on every later session until a page reload.
+    this.anchorsBroken = false;
 
     const enabled: string[] = (session as unknown as { enabledFeatures?: string[] }).enabledFeatures ?? [];
     const has = (f: string) => enabled.includes(f);

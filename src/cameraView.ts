@@ -198,11 +198,17 @@ export class CameraSystem {
     this.objects.delete(id);
     this.scene.cameras = this.scene.cameras.filter((c) => c.id !== id);
     if (this.activeId === id) {
-      this.activeId = this.scene.cameras.length
+      // Promote the next camera via setActive (not a bare activeId assignment)
+      // so its frustum is highlighted and the render target + monitor image are
+      // resized to its aspect — otherwise the monitor renders the new camera
+      // into the removed camera's RT aspect (stretched frame) with a dim gizmo.
+      const next = this.scene.cameras.length
         ? this.scene.cameras[this.scene.cameras.length - 1].id
         : null;
+      this.setActive(next);
+    } else {
+      this.refreshMonitorInfo();
     }
-    this.refreshMonitorInfo();
     this.onChange();
   }
 
