@@ -25,6 +25,7 @@ import {
   type SceneData,
 } from './model.ts';
 import { depthOfFieldFor, dFovDeg, frameSizeAtDistance, hFovDeg, vFovDeg } from './lens.ts';
+import { DofPass } from './dof.ts';
 import type { SessionManager } from './session.ts';
 import { disposeTree, makeLabel, type Label } from './ui.ts';
 
@@ -66,6 +67,8 @@ export class CameraSystem {
   /** Format/stop applied to newly committed cameras (edit per-camera later). */
   currentFormat: string = DEFAULT_FORMAT_ID;
   currentTStop: number = DEFAULT_TSTOP;
+  /** Simulated depth-of-field blur on the monitor + captures (off by default). */
+  dofEnabled = false;
   onChange: () => void = () => {};
 
   private scene: SceneData;
@@ -74,6 +77,9 @@ export class CameraSystem {
   private objects = new Map<string, CamObject>();
   private rtCamera: THREE.PerspectiveCamera;
   private rt: THREE.WebGLRenderTarget | null = null;
+  /** Blurred output of the DOF pass; feeds the monitor when dofEnabled. */
+  private rtDof: THREE.WebGLRenderTarget | null = null;
+  private dofPass: DofPass | null = null;
   private monitorImage: THREE.Mesh;
   private monitorImageMat: THREE.MeshBasicMaterial;
   private monitorInfo: Label;
@@ -274,6 +280,10 @@ export class CameraSystem {
     return this.currentAspect;
   }
 
+  setDofEnabled(on: boolean): void {
+    this.dofEnabled = on;
+  }
+
   setEyesMode(on: boolean): void {
     this.eyesMode = on;
     this.frameLines.visible = on;
@@ -358,11 +368,40 @@ export class CameraSystem {
     if (!this.rt) return;
     this.poseRtCamera(obj);
     this.renderPass(renderer, scene3, this.rt, hidden);
-    if (this.monitorImageMat.map !== this.rt.texture) {
-      this.monitorImageMat.map = this.rt.texture;
+    const outTex =
+      this.dofEnabled && this.rtDof && this.runDof(renderer, obj, this.rt, this.rtDof)
+        ? this.rtDof.texture
+        : this.rt.texture;
+    if (this.monitorImageMat.map !== outTex) {
+      this.monitorImageMat.map = outTex;
       this.monitorImageMat.color.set(0xffffff);
       this.monitorImageMat.needsUpdate = true;
     }
+  }
+
+  /**
+   * Runs the depth-of-field pass for `obj` from `src` (color+depth) into `out`.
+   * Returns false (leaving `out` untouched) when there's no subject to focus on.
+   */
+  private runDof(
+    renderer: THREE.WebGLRenderer,
+    obj: CamObject,
+    src: THREE.WebGLRenderTarget,
+    out: THREE.WebGLRenderTarget,
+  ): boolean {
+    const focus = this.nearestActorDistance(obj.data);
+    if (focus === null || !src.depthTexture) return false;
+    if (!this.dofPass) this.dofPass = new DofPass();
+    this.dofPass.render(renderer, src.texture, src.depthTexture, out, {
+      focusDistM: focus,
+      focalMm: obj.data.lensFocalLength,
+      fNumber: obj.data.tStop,
+      gateWidthMm: sensorFormat(obj.data.formatId).gateWidthMm,
+      near: this.rtCamera.near,
+      far: this.rtCamera.far,
+      maxCoCPx: out.width * 0.03, // cap blur at ~3% of frame width
+    });
+    return true;
   }
 
   /**
@@ -382,13 +421,19 @@ export class CameraSystem {
     const h = Math.round(w / aspect);
     const rt = new THREE.WebGLRenderTarget(w, h);
     rt.texture.colorSpace = THREE.SRGBColorSpace;
+    if (this.dofEnabled) rt.depthTexture = new THREE.DepthTexture(w, h);
+    // Second target only when DOF is on, so the PNG matches the monitor.
+    const rtOut = this.dofEnabled ? new THREE.WebGLRenderTarget(w, h) : null;
+    if (rtOut) rtOut.texture.colorSpace = THREE.SRGBColorSpace;
     const pixels = new Uint8Array(w * h * 4);
     try {
       this.poseRtCamera(obj);
       this.renderPass(renderer, scene3, rt, hidden);
-      renderer.readRenderTargetPixels(rt, 0, 0, w, h, pixels);
+      const readFrom = rtOut && this.runDof(renderer, obj, rt, rtOut) ? rtOut : rt;
+      renderer.readRenderTargetPixels(readFrom, 0, 0, w, h, pixels);
     } finally {
-      rt.dispose(); // never leak the RT, even if the render throws
+      rt.dispose(); // never leak the RTs, even if the render throws
+      rtOut?.dispose();
     }
 
     const canvas = document.createElement('canvas');
@@ -519,8 +564,14 @@ export class CameraSystem {
     const h = Math.round(w / aspect);
     if (this.rt && this.rt.width === w && this.rt.height === h) return;
     this.rt?.dispose();
+    this.rtDof?.dispose();
     this.rt = new THREE.WebGLRenderTarget(w, h);
     this.rt.texture.colorSpace = THREE.SRGBColorSpace;
+    // Depth texture so the DOF pass can read per-pixel distance.
+    this.rt.depthTexture = new THREE.DepthTexture(w, h);
+    // Blurred-output target for the DOF pass (color only, same size/space).
+    this.rtDof = new THREE.WebGLRenderTarget(w, h);
+    this.rtDof.texture.colorSpace = THREE.SRGBColorSpace;
     this.monitorImageMat.map = null; // reattached on next renderMonitor
     this.monitorImageMat.color.set(0x111318);
     // Resize the image plane to the new aspect (letterbox inside housing).

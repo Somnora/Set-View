@@ -1,0 +1,61 @@
+<!doctype html>
+<!-- Headless-verifiable smoke test for the DOF shader: builds a WebGL2 context,
+     renders a scene to a depth+color target, runs the DofPass, and reads back a
+     pixel. Catches GLSL compile errors without a headset. Run:
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --enable-logging=stderr --v=0 \
+         --virtual-time-budget=8000 --dump-dom \
+         https://localhost:5173/test/dof-smoke.html | grep -o "DOF-SMOKE [A-Z]*"
+
+     PASS = shader compiled and ran; FAIL = compile/link/runtime error. -->
+<html>
+  <head><meta charset="utf-8" /><title>dof shader smoke</title></head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { DofPass } from '../src/dof.ts';
+
+      const out = document.getElementById('out');
+      try {
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(64, 64);
+
+        // Scene RT with a depth texture (as cameraView attaches).
+        const rt = new THREE.WebGLRenderTarget(64, 64);
+        rt.depthTexture = new THREE.DepthTexture(64, 64);
+        const scene = new THREE.Scene();
+        const cam = new THREE.PerspectiveCamera(50, 1, 0.05, 100);
+        cam.position.z = 3;
+        scene.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: 0x88aaff })));
+        renderer.setRenderTarget(rt);
+        renderer.render(scene, cam);
+        renderer.setRenderTarget(null);
+
+        const outRt = new THREE.WebGLRenderTarget(64, 64);
+        const dof = new DofPass();
+        dof.render(renderer, rt.texture, rt.depthTexture, outRt, {
+          focusDistM: 3,
+          focalMm: 50,
+          fNumber: 2.8,
+          gateWidthMm: 24.89,
+          near: 0.05,
+          far: 100,
+          maxCoCPx: 8,
+        });
+
+        // Force the pass to execute and check for a GL error.
+        const px = new Uint8Array(4);
+        renderer.readRenderTargetPixels(outRt, 32, 32, 1, 1, px);
+        const gl = renderer.getContext();
+        const err = gl.getError();
+        const programs = renderer.info.programs || [];
+        const broken = programs.some((p) => p.diagnostics && !p.diagnostics.runnable);
+        out.textContent = err === 0 && !broken ? 'DOF-SMOKE PASS' : `DOF-SMOKE FAIL: glError=${err} broken=${broken}`;
+      } catch (e) {
+        out.textContent = `DOF-SMOKE FAIL: ${e.message}`;
+      }
+    </script>
+  </body>
+</html>

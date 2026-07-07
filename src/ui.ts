@@ -12,6 +12,7 @@ import {
   type CameraSetupData,
   type SceneData,
 } from './model.ts';
+import { STANCES, type StanceId } from './pose.ts';
 
 // --- shared helpers ---------------------------------------------------------
 
@@ -474,6 +475,10 @@ export function buildWristPanel(): UIPanel {
       { id: 'dup', label: '⧉ Dup' },
     ],
     [
+      { id: 'stance', label: 'Stance ▸', flex: 1.6 },
+      { id: 'dof', label: 'DOF' },
+    ],
+    [
       { id: 'addnote', label: '+ Note' },
       { id: 'notes', label: 'Notes' },
     ],
@@ -516,6 +521,7 @@ export interface LandingCallbacks {
   getScene: (id: string) => SceneData | null;
   onUpdateCamera: (sceneId: string, cameraId: string, patch: Partial<CameraSetupData>) => void;
   onSetPace: (sceneId: string, walkSpeed: number) => void;
+  onSetStance: (sceneId: string, actorId: string, stance: StanceId) => void;
 }
 
 export class Landing {
@@ -731,6 +737,11 @@ export class Landing {
         scanRow.appendChild(info);
       }
       panel.appendChild(scanRow);
+
+      // Cast: per-actor stance (poses are placed in AR; stance is editable here).
+      if (scene.actors.length) {
+        for (const actor of scene.actors) panel.appendChild(this.buildActorEditor(sceneId, actor));
+      }
     }
     if (!scene || scene.cameras.length === 0) {
       const p = document.createElement('p');
@@ -741,6 +752,34 @@ export class Landing {
     }
     for (const cam of scene.cameras) panel.appendChild(this.buildCameraEditor(sceneId, cam));
     return panel;
+  }
+
+  /** A per-actor row: name swatch + a stance dropdown. */
+  private buildActorEditor(sceneId: string, actor: { id: string; name: string; color: string; stance?: StanceId }): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'cam-edit';
+    const name = document.createElement('b');
+    name.textContent = actor.name;
+    name.style.color = actor.color;
+    row.appendChild(name);
+
+    const l = document.createElement('label');
+    l.className = 'field';
+    const span = document.createElement('span');
+    span.textContent = 'Stance';
+    const sel = document.createElement('select');
+    for (const p of STANCES) {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.name;
+      if (p.id === (actor.stance ?? 'standing')) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.onchange = () => this.cb.onSetStance(sceneId, actor.id, sel.value as StanceId);
+    l.appendChild(span);
+    l.appendChild(sel);
+    row.appendChild(l);
+    return row;
   }
 
   private buildCameraEditor(sceneId: string, cam: CameraSetupData): HTMLElement {
@@ -862,14 +901,16 @@ LEFT controller
   Undo / Redo ..... step back / forward through placement & keyframe edits
   Dup ............. clone the pointed-at (or selected) actor / camera
   Pace − / + ...... slow down / speed up blocking playback (per scene)
+  Stance ▸ ........ cycle the selected actor's pose (stand/lean/sit/lie)
+  DOF ............. toggle simulated depth of field on the camera monitor
   Scan Room ....... capture the room's Scene Mesh into this scene
   Loc: … .......... location display: Hidden → Ghost → Solid
 
 Hands (no controllers): pinch = trigger (place/select). Menu needs controllers.
 
 Desktop prep (no headset)
-  Rename scenes · edit each camera's lens / format / aspect / T-stop / height
-  Export a top-down floorplan PNG or a Markdown shot list (per scene)
+  Rename scenes · set each actor's stance · edit each camera's lens / format /
+  aspect / T-stop / height · export a floorplan PNG or Markdown shot list
   Keys: Enter = Enter AR · N = New Scene`;
 
 // --- note editor (dom-overlay) --------------------------------------------------

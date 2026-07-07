@@ -15,6 +15,7 @@ import {
   type SceneData,
 } from './model.ts';
 import { History } from './history.ts';
+import { cycleStance, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
 import { summarizeScan } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
@@ -201,6 +202,7 @@ class App {
         id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
       onUpdateCamera: (sceneId, cameraId, patch) => this.updateCamera(sceneId, cameraId, patch),
       onSetPace: (sceneId, walkSpeed) => this.setScenePace(sceneId, walkSpeed),
+      onSetStance: (sceneId, actorId, stance) => this.setActorStance(sceneId, actorId, stance),
     });
 
     this.persistence.onError = (m) => {
@@ -593,6 +595,14 @@ class App {
       case 'pace-fast':
         this.adjustPace(+0.2);
         break;
+      case 'stance':
+        this.cycleSelectedStance();
+        break;
+      case 'dof':
+        this.cams.setDofEnabled(!this.cams.dofEnabled);
+        this.debug.log(`depth of field ${this.cams.dofEnabled ? 'ON' : 'off'}`);
+        this.refreshWristState();
+        break;
       case 'scan':
         this.toggleScan();
         break;
@@ -862,6 +872,41 @@ class App {
     this.markDirty();
   }
 
+  /** Wrist "Stance": cycles the selected actor's rest pose. */
+  private cycleSelectedStance(): void {
+    const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
+    if (!obj) {
+      this.debug.log('Stance: select an actor first (point + trigger)');
+      return;
+    }
+    const next = cycleStance(obj.data.stance, 1);
+    this.actors.setStance(obj, next);
+    this.actors.flashLabel(obj, poseFor(next).short);
+    this.refreshWristState();
+    this.markDirty();
+  }
+
+  /** Applies a stance from the landing-page editor (in- or out-of-session). */
+  private setActorStance(sceneId: string, actorId: string, stance: StanceId): void {
+    if (sceneId === this.sceneData.id) {
+      const obj = this.actors.get(actorId);
+      if (obj) this.actors.setStance(obj, stance);
+      else {
+        const a = this.sceneData.actors.find((x) => x.id === actorId);
+        if (a) a.stance = stance;
+      }
+      this.persistence.saveNow(this.sceneData);
+      this.refreshWristState();
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      const a = scene?.actors.find((x) => x.id === actorId);
+      if (!scene || !a) return;
+      a.stance = stance;
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
+  }
+
   private openNoteEditor(): void {
     const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
     if (!obj) {
@@ -943,9 +988,10 @@ class App {
     const loc = this.location.mode;
     this.wrist.setLabel('location', `Loc: ${loc.charAt(0).toUpperCase()}${loc.slice(1)}`);
     this.wrist.setToggle('location', this.location.hasScan && loc !== 'hidden');
-    const sel = this.selectedActorId
-      ? (this.actors.get(this.selectedActorId)?.data.name ?? '—')
-      : '—';
+    this.wrist.setToggle('dof', this.cams.dofEnabled);
+    const selObj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
+    this.wrist.setLabel('stance', selObj ? `Stance ▸ ${poseFor(selObj.data.stance).short}` : 'Stance ▸');
+    const sel = selObj?.data.name ?? '—';
     const cam = this.cams.active;
     this.wrist.setStatus(`${sel}${cam ? ` · ${cam.data.name} ${Math.round(cam.data.lensFocalLength)}mm` : ''}`);
   }

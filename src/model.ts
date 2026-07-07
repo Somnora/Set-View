@@ -9,6 +9,8 @@
 //  - rotationY is a heading in radians around +Y; 0 faces +Z.
 // ---------------------------------------------------------------------------
 
+import { DEFAULT_STANCE, isStanceId, type StanceId } from './pose.ts';
+
 export interface Vec3 {
   x: number;
   y: number;
@@ -49,6 +51,8 @@ export interface ActorData {
   rotationY: number;
   keyframes: TransformKeyframe[];
   notes: ActorNote[];
+  /** Body pose held at rest (see pose.ts). Absent = 'standing'. */
+  stance?: StanceId;
 }
 
 export const MAX_KEYFRAMES = 5;
@@ -247,6 +251,7 @@ export function createActor(scene: SceneData, position: Vec3, rotationY: number)
     rotationY,
     keyframes: [],
     notes: [],
+    stance: DEFAULT_STANCE,
   };
   scene.actors.push(actor);
   return actor;
@@ -413,6 +418,9 @@ export function isSceneData(v: unknown): v is SceneData {
 export function normalizeScene(s: SceneData): SceneData {
   if (!isFiniteNum(s.walkSpeed) || s.walkSpeed <= 0) s.walkSpeed = WALK_SPEED_MS;
   if (s.scan === undefined) s.scan = null;
+  for (const a of s.actors) {
+    if (!isStanceId(a.stance)) a.stance = DEFAULT_STANCE;
+  }
   for (const c of s.cameras) {
     if (!isFiniteNum(c.lensFocalLength) || c.lensFocalLength <= 0) c.lensFocalLength = 35;
     if (!isFiniteNum(c.tStop) || c.tStop <= 0) c.tStop = DEFAULT_TSTOP;

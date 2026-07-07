@@ -25,6 +25,7 @@ import {
 } from '../src/model.ts';
 import { History } from '../src/history.ts';
 import {
+  cocDiameterMm,
   depthOfField,
   depthOfFieldFor,
   dFovDeg,
@@ -34,6 +35,7 @@ import {
   hyperfocalM,
   vFovDeg,
 } from '../src/lens.ts';
+import { cycleStance, isStanceId, poseFor, STANCES } from '../src/pose.ts';
 import { buildTimeline, lerpAngle, moveStats, sampleTimeline } from '../src/timeline.ts';
 import {
   buildShotList,
@@ -726,6 +728,135 @@ test('SceneData: scan summary is validated and normalized', () => {
   assert.equal(isSceneData(legacy), true);
   normalizeScene(legacy);
   assert.equal(legacy.scan, null);
+});
+
+// --- stance / pose ------------------------------------------------------------
+
+test('STANCES: all 10 requested poses present, unique ids, finite targets', () => {
+  const ids = STANCES.map((p) => p.id);
+  const expected = [
+    'standing',
+    'lean-left',
+    'lean-right',
+    'seated-chair',
+    'seated-lounge',
+    'seated-cross',
+    'lying-up',
+    'lying-down',
+    'lying-left',
+    'lying-right',
+  ];
+  assert.equal(STANCES.length, expected.length);
+  const idSet = new Set<string>(ids);
+  for (const id of expected) assert.ok(idSet.has(id), `missing stance ${id}`);
+  assert.equal(idSet.size, ids.length, 'stance ids must be unique');
+  for (const p of STANCES) {
+    for (const v of [p.bodyRot.x, p.bodyRot.y, p.bodyRot.z, p.bodyLift, p.hip, p.knee, p.shoulder, p.legSplay]) {
+      assert.ok(Number.isFinite(v), `${p.id} has a non-finite target`);
+    }
+    assert.ok(typeof p.name === 'string' && p.name.length > 0);
+    assert.ok(typeof p.short === 'string' && p.short.length > 0);
+  }
+});
+
+test('standing is the neutral pose (all targets zero)', () => {
+  const s = poseFor('standing');
+  for (const v of [s.bodyRot.x, s.bodyRot.y, s.bodyRot.z, s.bodyLift, s.hip, s.knee, s.shoulder, s.legSplay]) {
+    assert.equal(v, 0);
+  }
+});
+
+test('seated/lying poses actually differ from standing', () => {
+  assert.ok(poseFor('seated-chair').bodyLift < 0, 'seated lowers the hips');
+  assert.ok(Math.abs(poseFor('seated-chair').hip) > 0.5, 'seated bends the hips');
+  assert.ok(Math.abs(poseFor('lying-up').bodyRot.x) > 1, 'lying swings the body flat');
+  assert.notEqual(poseFor('lying-up').bodyRot.z, poseFor('lying-left').bodyRot.z); // side roll differs
+  assert.equal(poseFor('lean-left').bodyRot.z, -poseFor('lean-right').bodyRot.z); // mirror leans
+});
+
+test('poseFor falls back to standing for unknown ids', () => {
+  assert.equal(poseFor(undefined).id, 'standing');
+  assert.equal(poseFor('nonsense').id, 'standing');
+});
+
+test('cycleStance wraps forward and back over all poses', () => {
+  const n = STANCES.length;
+  let id: string = 'standing';
+  const seen = new Set<string>();
+  for (let i = 0; i < n; i++) {
+    seen.add(id);
+    id = cycleStance(id, 1);
+  }
+  assert.equal(seen.size, n, 'forward cycle visits every stance');
+  assert.equal(id, 'standing', 'a full forward cycle returns to the start');
+  assert.equal(cycleStance('standing', -1), STANCES[n - 1].id); // backward wraps
+  assert.equal(cycleStance('nonsense', 1), STANCES[1 % n].id); // unknown treated as index 0
+});
+
+test('isStanceId accepts known ids, rejects junk', () => {
+  assert.ok(isStanceId('seated-cross'));
+  assert.ok(!isStanceId('sitting'));
+  assert.ok(!isStanceId(42));
+  assert.ok(!isStanceId(undefined));
+});
+
+test('createActor defaults to standing; normalizeScene repairs a bad stance', () => {
+  const scene = createScene('s');
+  const a = createActor(scene, { x: 0, y: 0, z: 0 }, 0);
+  assert.equal(a.stance, 'standing');
+  (a as unknown as Record<string, unknown>).stance = 'floating';
+  normalizeScene(scene);
+  assert.equal(a.stance, 'standing');
+  // A valid non-default stance survives normalization.
+  a.stance = 'lying-right';
+  normalizeScene(scene);
+  assert.equal(a.stance, 'lying-right');
+});
+
+test('isSceneData accepts a valid stance and a legacy actor with no stance', () => {
+  const scene = createScene('s');
+  const a = createActor(scene, { x: 0, y: 0, z: 0 }, 0);
+  a.stance = 'seated-lounge';
+  const json = JSON.parse(JSON.stringify(scene));
+  assert.equal(isSceneData(json), true);
+  delete json.actors[0].stance; // pre-stance export
+  assert.equal(isSceneData(json), true);
+  normalizeScene(json);
+  assert.equal(json.actors[0].stance, 'standing');
+});
+
+test('duplicateActor copies the stance', () => {
+  const scene = createScene('s');
+  const a = createActor(scene, { x: 0, y: 0, z: 0 }, 0);
+  a.stance = 'seated-cross';
+  const dup = duplicateActor(scene, a.id)!;
+  assert.equal(dup.stance, 'seated-cross');
+});
+
+// --- depth-of-field circle of confusion ---------------------------------------
+
+test('cocDiameterMm: zero at the focus plane, grows with distance from it', () => {
+  // Focus at 3m: a subject exactly at 3m is sharp.
+  assert.equal(cocDiameterMm(50, 2.8, 3, 3), 0);
+  const near = cocDiameterMm(50, 2.8, 3, 2);
+  const far = cocDiameterMm(50, 2.8, 3, 5);
+  assert.ok(near > 0 && far > 0);
+  // Farther from focus (2m off vs 1m off) blurs more.
+  assert.ok(cocDiameterMm(50, 2.8, 3, 6) > cocDiameterMm(50, 2.8, 3, 4));
+});
+
+test('cocDiameterMm: wider aperture (lower T-stop) blurs more; longer lens blurs more', () => {
+  assert.ok(cocDiameterMm(50, 1.4, 3, 6) > cocDiameterMm(50, 5.6, 3, 6)); // f/1.4 vs f/5.6
+  assert.ok(cocDiameterMm(85, 2.8, 3, 6) > cocDiameterMm(35, 2.8, 3, 6)); // 85mm vs 35mm
+});
+
+test('cocDiameterMm: degenerate inputs return 0, never NaN', () => {
+  assert.equal(cocDiameterMm(50, 2.8, 3, 0), 0); // subject at 0
+  assert.equal(cocDiameterMm(50, 0, 3, 6), 0); // no aperture
+  assert.equal(cocDiameterMm(50, 2.8, 0.01, 6), 0); // focus closer than focal length
+  for (const v of [cocDiameterMm(50, 2.8, 3, 6), cocDiameterMm(1000, 2.8, 3, 6)]) {
+    assert.ok(Number.isFinite(v));
+  }
 });
 
 // --- locomotion ---------------------------------------------------------------

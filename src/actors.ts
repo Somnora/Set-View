@@ -11,6 +11,7 @@
 import * as THREE from 'three';
 import type { ActorData, SceneData, Vec3 } from './model.ts';
 import { createActor } from './model.ts';
+import { poseFor, type StanceId } from './pose.ts';
 import type { SessionManager } from './session.ts';
 import { disposeSprite, disposeTree, makeLabel, type Label } from './ui.ts';
 
@@ -24,8 +25,12 @@ export interface ActorObject {
   ring: THREE.Mesh;
   hoverRing: THREE.Mesh;
   noteGroup: THREE.Group;
+  /** Hip pivots (thigh + knee child). */
   legL: THREE.Group;
   legR: THREE.Group;
+  /** Knee pivots (children of the hips). */
+  kneeL: THREE.Group;
+  kneeR: THREE.Group;
   armL: THREE.Group;
   armR: THREE.Group;
   body: THREE.Group;
@@ -98,11 +103,38 @@ export class ActorManager {
     obj.root.rotation.y = rotationY;
   }
 
-  /** Restores rest pose (used when playback stops). */
+  /** Restores rest transform + the authored stance (used when playback stops). */
   restoreRest(obj: ActorObject): void {
     obj.root.position.set(obj.data.position.x, obj.data.position.y, obj.data.position.z);
     obj.root.rotation.y = obj.data.rotationY;
-    this.setWalk(obj, false, 0, 0);
+    this.applyStance(obj);
+  }
+
+  /**
+   * Poses the rig into the actor's rest stance (see pose.ts): whole-body tilt/
+   * recline/lie via the body group Euler + lift, plus hip/knee/shoulder joint
+   * rotations. This is the "not walking" pose; the walk cycle overrides the
+   * limbs (and resets the body upright) during a moving playback segment.
+   */
+  applyStance(obj: ActorObject): void {
+    const p = poseFor(obj.data.stance);
+    obj.walkPhase = 0;
+    obj.body.rotation.set(p.bodyRot.x, p.bodyRot.y, p.bodyRot.z);
+    obj.body.position.y = p.bodyLift;
+    obj.legL.rotation.set(0, 0, p.legSplay);
+    obj.legR.rotation.set(0, 0, -p.legSplay);
+    obj.legL.rotation.x = p.hip;
+    obj.legR.rotation.x = p.hip;
+    obj.kneeL.rotation.x = p.knee;
+    obj.kneeR.rotation.x = p.knee;
+    obj.armL.rotation.set(p.shoulder, 0, 0);
+    obj.armR.rotation.set(p.shoulder, 0, 0);
+  }
+
+  /** Sets an actor's rest stance and re-poses it (when not being played back). */
+  setStance(obj: ActorObject, stance: StanceId): void {
+    obj.data.stance = stance;
+    if (!obj.overridden) this.applyStance(obj);
   }
 
   /**
@@ -191,23 +223,27 @@ export class ActorManager {
     }
   }
 
-  /** Procedural walk: leg/arm swing + slight bob while moving. */
+  /**
+   * Procedural walk while moving; the authored stance while at rest. A walking
+   * actor always stands upright (the walk overrides any lean/seat/lie), and
+   * straight-leg — the knees only bend for static poses.
+   */
   setWalk(obj: ActorObject, moving: boolean, speed: number, dt: number): void {
     if (moving) {
       obj.walkPhase += dt * speed * 6.5; // step frequency scales with speed
       const s = Math.sin(obj.walkPhase);
+      obj.body.rotation.set(0, 0, 0); // upright while walking
+      obj.legL.rotation.set(0, 0, 0);
+      obj.legR.rotation.set(0, 0, 0);
       obj.legL.rotation.x = s * 0.45;
       obj.legR.rotation.x = -s * 0.45;
-      obj.armL.rotation.x = -s * 0.3;
-      obj.armR.rotation.x = s * 0.3;
+      obj.kneeL.rotation.x = 0;
+      obj.kneeR.rotation.x = 0;
+      obj.armL.rotation.set(-s * 0.3, 0, 0);
+      obj.armR.rotation.set(s * 0.3, 0, 0);
       obj.body.position.y = Math.abs(Math.cos(obj.walkPhase)) * 0.025;
     } else {
-      obj.walkPhase = 0;
-      obj.legL.rotation.x = 0;
-      obj.legR.rotation.x = 0;
-      obj.armL.rotation.x = 0;
-      obj.armR.rotation.x = 0;
-      obj.body.position.y = 0;
+      this.applyStance(obj);
     }
   }
 
@@ -238,17 +274,28 @@ export class ActorManager {
     root.userData.actorId = data.id;
     const body = new THREE.Group(); // bobs vertically while walking
 
-    // Legs pivot at the hip (y = 0.84) so they can swing.
+    // Legs: hip pivot (y=0.84) -> thigh -> knee pivot (y=0.50) -> shin. The
+    // knee lets seated/cross-legged/lying poses bend the shin; the walk cycle
+    // only rotates the hip, so straight-leg walking is unchanged. Returns the
+    // hip pivot with its knee pivot attached (out-param captures the knee).
+    const knees: THREE.Group[] = [];
     const mkLeg = (x: number) => {
-      const pivot = new THREE.Group();
-      pivot.position.set(x, 0.84, 0);
-      const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.68, 3, 8), matDark);
-      leg.position.y = -0.42;
-      pivot.add(leg);
-      return pivot;
+      const hip = new THREE.Group();
+      hip.position.set(x, 0.84, 0);
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.3, 3, 8), matDark);
+      thigh.position.y = -0.17;
+      const knee = new THREE.Group();
+      knee.position.y = -0.34; // knee ~y=0.50 in body space
+      const shin = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.3, 3, 8), matDark);
+      shin.position.y = -0.17;
+      knee.add(shin);
+      hip.add(thigh, knee);
+      knees.push(knee);
+      return hip;
     };
     const legL = mkLeg(-0.09);
     const legR = mkLeg(0.09);
+    const [kneeL, kneeR] = knees;
 
     const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.155, 0.42, 3, 10), mat);
     torso.position.y = 1.16;
@@ -305,6 +352,8 @@ export class ActorManager {
       noteGroup,
       legL,
       legR,
+      kneeL,
+      kneeR,
       armL,
       armR,
       body,
@@ -314,6 +363,7 @@ export class ActorManager {
       labelFlashUntil: 0,
     };
     this.objects.set(data.id, obj);
+    this.applyStance(obj); // pose the rest position from data.stance
     this.refreshNotes(obj);
     return obj;
   }

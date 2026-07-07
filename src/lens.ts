@@ -116,3 +116,18 @@ export function depthOfFieldFor(
 ): DepthOfField {
   return depthOfField(cam.lensFocalLength, cam.tStop, subjectM, sensorFormat(cam.formatId).cocMm);
 }
+
+/**
+ * Blur-disk diameter, in millimetres on the sensor, for a point at `subjectM`
+ * when focus is at `focusM` — the physical basis for the simulated depth-of-
+ * field blur on the virtual monitor. Thin-lens circle of confusion:
+ *   c = F²·|d − s| / (N·d·(s − F))
+ * with F the focal length in metres. Returns 0 at the focus plane and for
+ * degenerate inputs. The DOF shader in cameraView.ts recomputes this same
+ * formula per pixel; this pure version is the tested source of truth.
+ */
+export function cocDiameterMm(focalMm: number, fNumber: number, focusM: number, subjectM: number): number {
+  const F = focalMm / 1000; // focal length in metres
+  if (!(subjectM > 0) || !(focusM > F) || !(fNumber > 0)) return 0;
+  return ((F * F * Math.abs(subjectM - focusM)) / (fNumber * subjectM * (focusM - F))) * 1000;
+}
