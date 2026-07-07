@@ -54,7 +54,7 @@ import {
   type LocationScan,
 } from '../src/scan.ts';
 import { ScanStore } from '../src/scanStore.ts';
-import { locomotionAmount, rotateOffsetAboutPivot } from '../src/locomotion.ts';
+import { locomotionAmount, rotateOffsetAboutPivot, snapTurnAngle } from '../src/locomotion.ts';
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -764,6 +764,28 @@ test('rotateOffsetAboutPivot: 90° about origin maps +Y-rotation convention', ()
   const r = rotateOffsetAboutPivot({ x: 1, z: 0 }, { x: 0, z: 0 }, Math.PI / 2);
   approx(r.x, 0);
   approx(r.z, -1);
+});
+
+test('snapTurn sign: a RIGHT push turns the view right (right-side actor comes to front)', () => {
+  // Full view, at true registration: viewYaw = 0, offset = 0. An actor is to
+  // the user's right at world/content (5, 0). The user (at origin) pushes the
+  // right stick RIGHT (step +1) to turn toward it. After the turn the actor
+  // must appear IN FRONT (content forward is -Z, so world z < 0, x ~ 0).
+  const step = 1; // stickStepX for a rightward push
+  const angle = snapTurnAngle(step, Math.PI / 2); // 90° for a clean check
+  // snapTurn accumulates viewYaw += angle; displayed world = R(viewYaw)·p (offset 0).
+  // R(θ) about +Y: x' = x·cosθ + z·sinθ, z' = -x·sinθ + z·cosθ.
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  const p = { x: 5, z: 0 };
+  const world = { x: p.x * c + p.z * s, z: -p.x * s + p.z * c };
+  approx(world.x, 0, 1e-9); // no longer off to the side
+  assert.ok(world.z < 0, `right-side actor should swing to front (z<0), got z=${world.z}`);
+});
+
+test('snapTurnAngle: left push is the exact opposite of right', () => {
+  assert.equal(snapTurnAngle(1, Math.PI / 6), -snapTurnAngle(-1, Math.PI / 6));
+  assert.equal(snapTurnAngle(0, Math.PI / 6), 0);
 });
 
 test('rotateOffsetAboutPivot: full turn returns to start; pivot is fixed', () => {

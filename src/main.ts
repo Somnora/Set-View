@@ -15,7 +15,7 @@ import {
   type SceneData,
 } from './model.ts';
 import { History } from './history.ts';
-import { locomotionAmount } from './locomotion.ts';
+import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
 import { summarizeScan } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
 import { LocationRenderer } from './location.ts';
@@ -1025,10 +1025,10 @@ class App {
         } else if (this.cams.eyesMode) {
           this.cams.stepEyesFocal(step);
         } else if (this.views.mode === 'full' && pointer === 'right') {
-          // Stick right → turn view right (content yaws the other way). Guarded
-          // to the right stick so a left-only controller keeps the left stick
-          // purely for glide instead of turning and strafing at once.
-          this.views.snapTurn(-step * SNAP_TURN_RAD, this.lastViewerPos);
+          // Stick right → turn the view right (sign lives in snapTurnAngle, which
+          // is unit-tested). Guarded to the right stick so a left-only controller
+          // keeps the left stick purely for glide, not turning + strafing at once.
+          this.views.snapTurn(snapTurnAngle(step, SNAP_TURN_RAD), this.lastViewerPos);
         }
       }
     }

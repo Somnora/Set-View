@@ -44,6 +44,18 @@ export function locomotionAmount(
   return { forward: -ay * step, right: ax * step };
 }
 
+/**
+ * viewYaw delta for one snap-turn step. `step` is +1 for a stick push to the
+ * RIGHT and -1 for LEFT (see input.stickStepX). Convention: a right push turns
+ * the VIEW right, which means yawing the content by a POSITIVE angle about the
+ * user — e.g. an actor on your right swings to front (verified in the pivot
+ * test). So the angle is simply step·increment; the sign lives here, tested,
+ * rather than as a bare literal at the call site.
+ */
+export function snapTurnAngle(step: -1 | 0 | 1, incrementRad: number): number {
+  return step * incrementRad;
+}
+
 export interface XZ {
   x: number;
   z: number;
