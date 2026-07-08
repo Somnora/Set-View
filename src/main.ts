@@ -25,6 +25,8 @@ import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
 import { KeyframeSystem } from './keyframes.ts';
 import { CameraSystem, type CamObject } from './cameraView.ts';
+import { MonitorRecorder } from './recorder.ts';
+import { recordingClock } from './recording.ts';
 import { ViewManager } from './views.ts';
 import { Persistence } from './persistence.ts';
 import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, type UIPanel } from './ui.ts';
@@ -74,6 +76,7 @@ class App {
   private keyframes: KeyframeSystem;
   private cams: CameraSystem;
   private views: ViewManager;
+  private recorder = new MonitorRecorder();
   private location = new LocationRenderer();
   private wrist: UIPanel;
   private wristMount = new THREE.Group();
@@ -208,6 +211,13 @@ class App {
     this.persistence.onError = (m) => {
       this.debug.log(m);
       this.wrist.setStatus(m);
+    };
+
+    // Fires whichever way a take ends (wrist toggle, camera deleted, session
+    // end, MAX_RECORD_S cap, encoder error) — the file is already downloading.
+    this.recorder.onStopped = (saved) => {
+      this.debug.log(saved ? `saved ${saved}` : 'recording discarded (nothing captured)');
+      this.refreshWristState();
     };
 
     this.wireSubsystems();
@@ -403,6 +413,8 @@ class App {
     // and disposing it there would orphan a phantom gizmo on the controller.
     // Mirrors restoreScene; handles a load that follows a session ended mid-grip.
     this.cancelActiveManipulation();
+    // A take belongs to the scene it was rolling on — finish and save it.
+    this.stopRecording(true);
     this.actors.setScene(data);
     this.keyframes.setScene(data);
     this.cams.setScene(data);
@@ -630,6 +642,9 @@ class App {
       case 'capture':
         this.capturePhoto();
         break;
+      case 'record':
+        this.toggleRecording();
+        break;
       case 'exit':
         void this.session.session?.end();
         break;
@@ -664,6 +679,8 @@ class App {
 
   private onSessionEnd(): void {
     this.renderer.setAnimationLoop(null);
+    // End an in-flight take and save it — the download lands on the 2D page.
+    this.stopRecording(true);
     this.keyframes.stop();
     // A session can end mid-grip (headset removed / OS-ended) with no
     // squeezeend, leaving a dragged camera root parented to the controller.
@@ -940,6 +957,34 @@ class App {
     this.debug.log(name ? `saved ${name}` : 'capture: no active camera');
   }
 
+  /**
+   * Starts/stops a video take of the active virtual camera. The take records
+   * the monitor feed (virtual content only, DOF included when enabled) in any
+   * view mode — walk the set or play blocking while the camera rolls — and
+   * saves on device via the browser's download path, like photo capture.
+   */
+  private toggleRecording(): void {
+    if (this.recorder.recording) {
+      this.stopRecording(true);
+      return;
+    }
+    const base = this.cams.recordingBaseName(this.sceneData.name);
+    const size = this.cams.feedSize();
+    if (!base || !size) {
+      this.debug.log('record: no active camera — place one first');
+      return;
+    }
+    const name = this.recorder.start(this.renderer, size.w, size.h, base, performance.now());
+    this.debug.log(name ? `recording ${name}` : 'record: video capture not supported in this browser');
+    this.refreshWristState();
+  }
+
+  private stopRecording(save: boolean): void {
+    if (!this.recorder.recording) return;
+    this.recorder.stop(save);
+    this.refreshWristState();
+  }
+
   private setPlaceMode(mode: PlaceMode): void {
     this.placeMode = mode;
     this.refreshWristState();
@@ -993,6 +1038,8 @@ class App {
     this.wrist.setLabel('location', `Loc: ${loc.charAt(0).toUpperCase()}${loc.slice(1)}`);
     this.wrist.setToggle('location', this.location.hasScan && loc !== 'hidden');
     this.wrist.setToggle('dof', this.cams.dofEnabled);
+    this.wrist.setToggle('record', this.recorder.recording);
+    if (!this.recorder.recording) this.wrist.setLabel('record', '⏺ Rec');
     const selObj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
     this.wrist.setLabel('stance', selObj ? `Stance ▸ ${poseFor(selObj.data.stance).short}` : 'Stance ▸');
     const sel = selObj?.data.name ?? '—';
@@ -1133,15 +1180,28 @@ class App {
     this.actors.updateLabels(time);
     this.driftMarker.update(time);
 
-    if (this.views.mode === 'camera') {
+    const recording = this.recorder.recording;
+    if (this.views.mode === 'camera' || recording) {
       // The virtual camera always sees the scanned set, even when the wearer
       // has it hidden (on location the real room fills that role for eyes,
-      // but the monitor can only show virtual content).
+      // but the monitor can only show virtual content). While a take is
+      // rolling the pass runs in ANY view mode — the camera keeps filming
+      // while the wearer walks the set. Still the same single RTT pass.
       this.location.beginCameraPass();
+      let feedTex: THREE.Texture | null = null;
       try {
-        this.cams.renderMonitor(this.renderer, this.scene3, this.hiddenForVirtualCamera());
+        feedTex = this.cams.renderMonitor(this.renderer, this.scene3, this.hiddenForVirtualCamera());
       } finally {
         this.location.endCameraPass();
+      }
+      if (recording) {
+        const size = this.cams.feedSize();
+        if (feedTex && size) {
+          this.recorder.captureFrame(this.renderer, feedTex, size.w, size.h, time);
+        } else {
+          // Active camera deleted mid-take — finish and save what we have.
+          this.stopRecording(true);
+        }
       }
     }
 
@@ -1157,6 +1217,8 @@ class App {
       this.wrist.setDebug([`fps ${this.debug.fps.toFixed(0)} · ${this.views.mode}`, ...this.debug.tail(2)]);
       if (this.keyframes.active) this.wrist.setSlider('scrub', this.keyframes.normalizedT);
       this.wrist.setLabel('play', this.keyframes.playing ? '⏸ Pause' : '▶ Play');
+      if (this.recorder.recording)
+        this.wrist.setLabel('record', `⏺ ${recordingClock(this.recorder.elapsedS(time))}`);
     }
 
     this.renderer.render(this.scene3, this.camera);

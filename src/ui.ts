@@ -488,7 +488,8 @@ export function buildWristPanel(): UIPanel {
       { id: 'resetview', label: 'Re-align' },
     ],
     [
-      { id: 'capture', label: '📷 Capture', flex: 1.4 },
+      { id: 'capture', label: '📷 Capture', flex: 1.2 },
+      { id: 'record', label: '⏺ Rec' },
       { id: 'exit', label: 'Exit AR' },
     ],
   ]);

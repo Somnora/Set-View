@@ -11,6 +11,7 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - **Simulated depth of field** on the virtual monitor + PNG captures (toggle, off by default).
 - Three views (full / miniature / camera) + teleport, smooth-glide, and snap-turn locomotion.
 - Notes, PNG capture with a burned-in slate, floorplan PNG + Markdown shot-list export.
+- **Video takes (added 2026-07-08)** — record the virtual camera's monitor feed (any view mode, DOF included) to an mp4/webm saved on device; play blocking while the camera rolls.
 - Location scan (Quest Scene Mesh) with hidden/ghost/solid walkthrough; scans travel in exported JSON.
 - localStorage autosave + JSON export/import; undo/redo; duplicate.
 
@@ -20,6 +21,8 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - **Sensor-format switch from the wrist** — today format/T-stop are set on the desktop prep page; add an in-AR cycle so S16/S35/FF is changeable through the lens.
 - **Richer poses** — an elbow joint (arms rest on thighs when seated), a few gesture poses (pointing, reaching), and left/right-hand-on-hip variants.
 - **DOF tuning** — expose focus pull (rack focus between actors) and a bokeh-quality setting; validate the blur budget on-headset and pick the default tap count.
+- **Mic audio on video takes** — mix a `getUserMedia` audio track into the MediaRecorder stream so a skit take carries scratch dialogue (needs the headset mic-permission flow; today's takes are silent).
+- **AI shot analysis** — captured PNGs/video takes plus the scene JSON (cameras, stances, blocking) are exactly what a multimodal model needs for coverage/continuity suggestions; an export-to-model flow (e.g. Gemini) is an integration, not a rewrite.
 
 ## The realistic-rendering path (Unreal handoff)
 
@@ -39,4 +42,4 @@ The goal: keep SetView as the fast, in-location blocking tool, and hand a shot t
 
 - Photoreal rendering inside SetView (that's the Unreal path — WebXR + the 72 fps Quest budget can't do it, and shouldn't try).
 - Capturing passthrough/real-world pixels (the platform never exposes them).
-- Multi-user / networked sessions, audio.
+- Multi-user / networked sessions, spatial/scene audio (mic audio on video takes is the one exception, tracked above).

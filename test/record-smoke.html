@@ -1,0 +1,88 @@
+<!doctype html>
+<!-- Headless-verifiable smoke test for the video recorder: builds a WebGL2
+     context, renders a fake monitor feed to an RT, runs MonitorRecorder
+     start → captureFrame ×30 → stop, and asserts MediaRecorder produced a
+     non-empty take and the canvas backbuffer was restored. Catches
+     captureStream/MediaRecorder/blit failures without a headset. Run:
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --enable-logging=stderr --v=0 \
+         --virtual-time-budget=20000 --dump-dom \
+         https://localhost:5173/test/record-smoke.html | grep -o "RECORD-SMOKE [A-Z]*"
+
+     PASS = a take was encoded and finalized; FAIL prints the reason; a dump
+     still saying "running…" means the encoder never fired onstop (hang).
+     Virtual-time notes: timers are fast-forwarded but the encoder runs in
+     real time, so (a) each frame is followed by a real GPU readback to give
+     the encoder wall time, (b) the wait for onstop is a plain await — a
+     virtual-timer watchdog would fire before the real event — and (c) an
+     empty take gets one retry (an encoder-timing race, not a code path). -->
+<html>
+  <head><meta charset="utf-8" /><title>video recorder smoke</title></head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { MonitorRecorder } from '../src/recorder.ts';
+
+      const out = document.getElementById('out');
+      const fail = (m) => (out.textContent = `RECORD-SMOKE FAIL: ${m}`);
+      const renderer = new THREE.WebGLRenderer({ antialias: false });
+      renderer.setSize(200, 100);
+      document.body.appendChild(renderer.domElement);
+      const prevW = renderer.domElement.width;
+      const prevH = renderer.domElement.height;
+
+      // Fake monitor feed: a colored box rendered into an RT.
+      const rt = new THREE.WebGLRenderTarget(128, 54); // ~2.39:1
+      rt.texture.colorSpace = THREE.SRGBColorSpace;
+      const scene = new THREE.Scene();
+      const cam = new THREE.PerspectiveCamera(50, 128 / 54, 0.05, 100);
+      cam.position.z = 3;
+      scene.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: 0xff8844 })));
+
+      const runTake = async () => {
+        const rec = new MonitorRecorder();
+        const done = new Promise((resolve) => (rec.onStopped = resolve));
+        const t0 = performance.now();
+        const name = rec.start(renderer, rt.width, rt.height, 'record-smoke', t0);
+        if (!name) throw new Error('start() returned null (captureStream/MediaRecorder unavailable)');
+        if (renderer.domElement.width !== rt.width) throw new Error('canvas not resized to feed');
+        const px = new Uint8Array(4);
+        // 30 frames at synthetic 40 ms spacing (> the fps throttle). The sync
+        // readback after each blit burns real wall time so the encoder thread
+        // actually receives frames while virtual time races ahead.
+        for (let i = 0; i < 30; i++) {
+          renderer.setRenderTarget(rt);
+          renderer.render(scene, cam);
+          renderer.setRenderTarget(null);
+          rec.captureFrame(renderer, rt.texture, rt.width, rt.height, t0 + 1 + i * 40);
+          renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+          await new Promise((r) => setTimeout(r, 15));
+        }
+        const err = renderer.getContext().getError();
+        if (err !== 0) throw new Error(`glError=${err} after blits`);
+        rec.stop(true);
+        const saved = await done; // real event — no virtual-timer race here
+        if (renderer.domElement.width !== prevW || renderer.domElement.height !== prevH)
+          throw new Error('canvas backbuffer not restored after stop');
+        return saved; // filename, or null when the take finalized empty
+      };
+
+      (async () => {
+        try {
+          let saved = await runTake();
+          if (!saved) saved = await runTake(); // encoder-timing flake guard
+          out.textContent = saved
+            ? `RECORD-SMOKE PASS (${saved})`
+            : 'RECORD-SMOKE FAIL: take finalized empty twice (no chunks from MediaRecorder)';
+        } catch (e) {
+          fail(e.message);
+        }
+        // Give the virtual clock a pending timer to consume, so
+        // --virtual-time-budget completes and --dump-dom fires post-verdict.
+        setTimeout(() => {}, 60_000);
+      })();
+    </script>
+  </body>
+</html>

@@ -57,6 +57,16 @@ import {
 } from '../src/scan.ts';
 import { ScanStore } from '../src/scanStore.ts';
 import { locomotionAmount, rotateOffsetAboutPivot, snapTurnAngle } from '../src/locomotion.ts';
+import {
+  containScale,
+  fileExtensionFor,
+  MAX_RECORD_S,
+  pickMimeType,
+  RECORD_FPS,
+  RECORD_MIME_CANDIDATES,
+  RECORD_VIDEO_BPS,
+  recordingClock,
+} from '../src/recording.ts';
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -926,6 +936,65 @@ test('rotateOffsetAboutPivot: full turn returns to start; pivot is fixed', () =>
   for (let i = 0; i < 12; i++) cur = rotateOffsetAboutPivot(cur, pivot, Math.PI / 6); // 12×30° = 360°
   approx(cur.x, start.x, 1e-6);
   approx(cur.z, start.z, 1e-6);
+});
+
+// --- video recording (pure policy/math; MediaRecorder itself is browser-only) --
+
+test('pickMimeType: first supported candidate wins, in preference order', () => {
+  const picked = pickMimeType(RECORD_MIME_CANDIDATES, (t) => t.startsWith('video/webm'));
+  assert.equal(picked, 'video/webm;codecs=vp9'); // mp4s unsupported → best webm
+  const mp4 = pickMimeType(RECORD_MIME_CANDIDATES, () => true);
+  assert.ok(mp4?.startsWith('video/mp4'), 'mp4 preferred when everything is supported');
+});
+
+test('pickMimeType: nothing supported → null (recording unavailable, not a crash)', () => {
+  assert.equal(pickMimeType(RECORD_MIME_CANDIDATES, () => false), null);
+});
+
+test('fileExtensionFor matches container for every shipped candidate', () => {
+  for (const c of RECORD_MIME_CANDIDATES) {
+    const ext = fileExtensionFor(c);
+    assert.ok(ext === 'mp4' || ext === 'webm');
+    assert.equal(ext === 'mp4', c.startsWith('video/mp4'), `wrong extension for ${c}`);
+  }
+});
+
+test('containScale: matching aspect fills the frame exactly (the common case)', () => {
+  assert.deepEqual(containScale(1024, 430, 1024, 430), { x: 1, y: 1 });
+  assert.deepEqual(containScale(2048, 860, 1024, 430), { x: 1, y: 1 }); // same aspect, any size
+});
+
+test('containScale: wider source letterboxes, taller source pillarboxes', () => {
+  // 2.39:1 feed into a 16:9 canvas → full width, reduced height.
+  const lb = containScale(2390, 1000, 1600, 900);
+  approx(lb.x, 1);
+  approx(lb.y, (1600 / 900) / (2390 / 1000));
+  assert.ok(lb.y < 1);
+  // 4:3 feed into a 2.39:1 canvas → full height, reduced width.
+  const pb = containScale(4, 3, 2390, 1000);
+  approx(pb.y, 1);
+  assert.ok(pb.x < 1);
+});
+
+test('containScale: degenerate inputs fall back to full cover, never a zero rect', () => {
+  assert.deepEqual(containScale(0, 430, 1024, 430), { x: 1, y: 1 });
+  assert.deepEqual(containScale(1024, 430, 1024, 0), { x: 1, y: 1 });
+  assert.deepEqual(containScale(NaN, 430, 1024, 430), { x: 1, y: 1 });
+});
+
+test('recordingClock: M:SS with zero-padded seconds, clamped at 0', () => {
+  assert.equal(recordingClock(0), '0:00');
+  assert.equal(recordingClock(7.9), '0:07');
+  assert.equal(recordingClock(75), '1:15');
+  assert.equal(recordingClock(600), '10:00');
+  assert.equal(recordingClock(-3), '0:00');
+});
+
+test('recording policy constants are sane (fps/bitrate/cap all positive, bounded memory)', () => {
+  assert.ok(RECORD_FPS > 0 && RECORD_FPS <= 72);
+  assert.ok(RECORD_VIDEO_BPS > 0);
+  // The cap bounds worst-case in-memory take size to something a Quest tab survives.
+  assert.ok((RECORD_VIDEO_BPS / 8) * MAX_RECORD_S < 512 * 1024 * 1024);
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this

@@ -358,14 +358,21 @@ export class CameraSystem {
   }
 
   /**
-   * Renders the active camera's view into the monitor texture. `hidden` is
-   * every UI/overlay object that must not appear in the frame.
+   * Renders the active camera's view into the monitor texture and returns it
+   * (null when there is no active camera). `hidden` is every UI/overlay
+   * object that must not appear in the frame. Called while Camera View is
+   * open OR a video take is rolling — with the monitor hidden the map update
+   * is just a texture-reference swap.
    */
-  renderMonitor(renderer: THREE.WebGLRenderer, scene3: THREE.Scene, hidden: THREE.Object3D[]): void {
+  renderMonitor(
+    renderer: THREE.WebGLRenderer,
+    scene3: THREE.Scene,
+    hidden: THREE.Object3D[],
+  ): THREE.Texture | null {
     const obj = this.active;
-    if (!obj || !this.monitor.visible) return;
+    if (!obj) return null;
     if (!this.rt) this.refreshRT();
-    if (!this.rt) return;
+    if (!this.rt) return null;
     this.poseRtCamera(obj);
     this.renderPass(renderer, scene3, this.rt, hidden);
     const outTex =
@@ -377,6 +384,24 @@ export class CameraSystem {
       this.monitorImageMat.color.set(0xffffff);
       this.monitorImageMat.needsUpdate = true;
     }
+    return outTex;
+  }
+
+  /**
+   * Ensures the feed RT exists for the active camera and returns its pixel
+   * size — the video recorder records at exactly these dimensions.
+   */
+  feedSize(): { w: number; h: number } | null {
+    if (!this.active) return null;
+    if (!this.rt) this.refreshRT();
+    return this.rt ? { w: this.rt.width, h: this.rt.height } : null;
+  }
+
+  /** Filename base (no extension) for a video take, mirroring capture(). */
+  recordingBaseName(sceneName: string): string | null {
+    const obj = this.active;
+    if (!obj) return null;
+    return `${slug(sceneName)}-${slug(obj.data.name)}-${obj.data.lensFocalLength}mm-${timestamp(new Date())}`;
   }
 
   /**
