@@ -354,6 +354,76 @@ test('lerpAngle takes the shortest arc across ±π', () => {
   approx(lerpAngle(0, Math.PI / 2, 0.5), Math.PI / 4);
 });
 
+// --- per-keyframe stance ---------------------------------------------------------
+
+test('addKeyframe stamps a stance when given, leaves legacy marks bare', () => {
+  const s = createScene('kf-stance');
+  const a = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+  addKeyframe(a, { x: 0, y: 0, z: 0 }, 0, 'seated-chair');
+  addKeyframe(a, { x: 1, y: 0, z: 0 }, 0);
+  assert.equal(a.keyframes[0].stance, 'seated-chair');
+  assert.equal(a.keyframes[1].stance, undefined);
+});
+
+test('sample: walk to the chair and sit (stance held at marks, none while walking)', () => {
+  // Mark 1: start standing. Mark 2: arrive at the chair (standing). Mark 3:
+  // same spot, seated — the turn/settle beat where the actor sits.
+  const kfs = [
+    { position: { x: 0, y: 0, z: 0 }, rotationY: 0, stance: 'standing' as const },
+    { position: { x: 0, y: 0, z: 2.8 }, rotationY: 0, stance: 'standing' as const },
+    { position: { x: 0, y: 0, z: 2.8 }, rotationY: 1.0, stance: 'seated-chair' as const },
+  ];
+  const tl = buildTimeline(kfs);
+  assert.equal(sampleTimeline(kfs, tl, 0)!.stance, 'standing'); // holding mark 1
+  const walking = sampleTimeline(kfs, tl, 1.0)!;
+  assert.equal(walking.moving, true);
+  assert.equal(walking.stance, undefined); // upright while walking
+  const settling = sampleTimeline(kfs, tl, tl.times[1] + 0.2)!; // mid settle beat
+  assert.equal(settling.moving, false);
+  assert.equal(settling.stance, 'seated-chair'); // sits on arrival at the chair
+  assert.equal(sampleTimeline(kfs, tl, 99)!.stance, 'seated-chair'); // stays seated
+});
+
+test('sample: marks without a stance leave it undefined (caller falls back to rest stance)', () => {
+  const kfs = [
+    { position: { x: 0, y: 0, z: 0 }, rotationY: 0 },
+    { position: { x: 0, y: 0, z: 2 }, rotationY: 0 },
+  ];
+  const tl = buildTimeline(kfs);
+  assert.equal(sampleTimeline(kfs, tl, 0)!.stance, undefined);
+  assert.equal(sampleTimeline(kfs, tl, 99)!.stance, undefined);
+});
+
+test('normalizeScene drops an invalid mark stance but keeps valid ones', () => {
+  const s = createScene('kf-stance-repair');
+  const a = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+  addKeyframe(a, { x: 0, y: 0, z: 0 }, 0, 'lying-left');
+  addKeyframe(a, { x: 1, y: 0, z: 0 }, 0);
+  (a.keyframes[1] as { stance?: string }).stance = 'levitating'; // corrupt import
+  normalizeScene(s);
+  assert.equal(a.keyframes[0].stance, 'lying-left');
+  assert.equal(a.keyframes[1].stance, undefined); // repaired to legacy fallback
+});
+
+test('duplicateActor deep-copies mark stances', () => {
+  const s = createScene('kf-stance-dup');
+  const a = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+  addKeyframe(a, { x: 0, y: 0, z: 0 }, 0, 'seated-lounge');
+  const copy = duplicateActor(s, a.id)!;
+  assert.equal(copy.keyframes[0].stance, 'seated-lounge');
+  copy.keyframes[0].stance = 'standing';
+  assert.equal(a.keyframes[0].stance, 'seated-lounge'); // originals untouched
+});
+
+test('scene JSON round-trips mark stances through the import validator', () => {
+  const s = createScene('kf-stance-json');
+  const a = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+  addKeyframe(a, { x: 0, y: 0, z: 0 }, 0, 'lying-up');
+  const back = JSON.parse(JSON.stringify(s));
+  assert.equal(isSceneData(back), true);
+  assert.equal(normalizeScene(back).actors[0].keyframes[0].stance, 'lying-up');
+});
+
 // --- floorplan / shot-list exports ---------------------------------------------
 
 function exportScene(): SceneData {

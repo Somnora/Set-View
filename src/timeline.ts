@@ -5,6 +5,7 @@
 // ---------------------------------------------------------------------------
 
 import { WALK_SPEED_MS, type TransformKeyframe, type Vec3 } from './model.ts';
+import type { StanceId } from './pose.ts';
 
 export interface Timeline {
   /** Absolute time (seconds) at which each keyframe is reached. times[0] = 0. */
@@ -66,6 +67,13 @@ export interface TimelineSample {
   moving: boolean;
   /** Instantaneous speed in m/s (0 when holding a mark). */
   speed: number;
+  /**
+   * Stance held at the governing mark while NOT moving: the first mark before
+   * the move starts, the destination mark during a turn-in-place beat, the
+   * last mark from arrival on. Undefined while walking, and for marks with no
+   * stamped stance (the caller falls back to the actor's rest stance).
+   */
+  stance?: StanceId;
 }
 
 /**
@@ -80,11 +88,11 @@ export function sampleTimeline(
   if (kfs.length === 0) return null;
   if (kfs.length === 1 || t <= 0) {
     const k = kfs[0];
-    return { position: { ...k.position }, rotationY: k.rotationY, moving: false, speed: 0 };
+    return { position: { ...k.position }, rotationY: k.rotationY, moving: false, speed: 0, stance: k.stance };
   }
   if (t >= tl.duration) {
     const k = kfs[kfs.length - 1];
-    return { position: { ...k.position }, rotationY: k.rotationY, moving: false, speed: 0 };
+    return { position: { ...k.position }, rotationY: k.rotationY, moving: false, speed: 0, stance: k.stance };
   }
   let i = 0;
   while (i < tl.times.length - 2 && t >= tl.times[i + 1]) i++;
@@ -112,5 +120,7 @@ export function sampleTimeline(
   } else {
     rotationY = lerpAngle(a.rotationY, b.rotationY, u);
   }
-  return { position, rotationY, moving, speed };
+  // A turn-in-place beat settles into the destination mark's stance ("walk to
+  // the chair, then sit" = a same-spot mark with a seated stance).
+  return { position, rotationY, moving, speed, stance: moving ? undefined : b.stance };
 }

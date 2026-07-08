@@ -111,13 +111,14 @@ export class ActorManager {
   }
 
   /**
-   * Poses the rig into the actor's rest stance (see pose.ts): whole-body tilt/
-   * recline/lie via the body group Euler + lift, plus hip/knee/shoulder joint
-   * rotations. This is the "not walking" pose; the walk cycle overrides the
-   * limbs (and resets the body upright) during a moving playback segment.
+   * Poses the rig into a stance (see pose.ts): whole-body tilt/recline/lie
+   * via the body group Euler + lift, plus hip/knee/shoulder joint rotations.
+   * Defaults to the actor's rest stance; playback passes the held mark's
+   * stance as `override`. This is the "not walking" pose; the walk cycle
+   * overrides the limbs (and resets the body upright) while moving.
    */
-  applyStance(obj: ActorObject): void {
-    const p = poseFor(obj.data.stance);
+  applyStance(obj: ActorObject, override?: StanceId): void {
+    const p = poseFor(override ?? obj.data.stance);
     obj.walkPhase = 0;
     obj.body.rotation.set(p.bodyRot.x, p.bodyRot.y, p.bodyRot.z);
     obj.body.position.y = p.bodyLift;
@@ -224,11 +225,12 @@ export class ActorManager {
   }
 
   /**
-   * Procedural walk while moving; the authored stance while at rest. A walking
-   * actor always stands upright (the walk overrides any lean/seat/lie), and
-   * straight-leg — the knees only bend for static poses.
+   * Procedural walk while moving; a stance while at rest (`holdStance` from
+   * the held keyframe, else the actor's rest stance). A walking actor always
+   * stands upright (the walk overrides any lean/seat/lie), and straight-leg —
+   * the knees only bend for static poses.
    */
-  setWalk(obj: ActorObject, moving: boolean, speed: number, dt: number): void {
+  setWalk(obj: ActorObject, moving: boolean, speed: number, dt: number, holdStance?: StanceId): void {
     if (moving) {
       obj.walkPhase += dt * speed * 6.5; // step frequency scales with speed
       const s = Math.sin(obj.walkPhase);
@@ -243,7 +245,7 @@ export class ActorManager {
       obj.armR.rotation.set(s * 0.3, 0, 0);
       obj.body.position.y = Math.abs(Math.cos(obj.walkPhase)) * 0.025;
     } else {
-      this.applyStance(obj);
+      this.applyStance(obj, holdStance);
     }
   }
 

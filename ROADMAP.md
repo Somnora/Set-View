@@ -7,6 +7,7 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - Actors on the real floor, anchored against drift; grab/move/rotate.
 - Blocking keyframes + simultaneous playback with a procedural walk, adjustable pace.
 - **Actor stance** — 10 gray-box poses (stand, lean L/R, seated chair/lounge/cross-legged, lying flat up/down, lying on side L/R).
+- **Per-keyframe stance (added 2026-07-08)** — each mark records the stance at capture; playback holds it at the mark and walks upright between ("walk to the chair and sit").
 - Cameras with real, format-aware optics (Super 16 / Super 35 / Full-Frame / S35 anamorphic), free focal length, T-stop, aspect; angle-of-view / DOF / frame-width readouts.
 - **Simulated depth of field** on the virtual monitor + PNG captures (toggle, off by default).
 - Three views (full / miniature / camera) + teleport, smooth-glide, and snap-turn locomotion.
@@ -16,8 +17,6 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - localStorage autosave + JSON export/import; undo/redo; duplicate.
 
 ## Near term (headset-free-buildable)
-
-- **Per-keyframe stance** — let an actor walk to a chair and sit (stance on each mark, not just per actor). The data model and rig already support arbitrary poses; this is a keyframe-schema + playback-hold change.
 - **Sensor-format switch from the wrist** — today format/T-stop are set on the desktop prep page; add an in-AR cycle so S16/S35/FF is changeable through the lens.
 - **Richer poses** — an elbow joint (arms rest on thighs when seated), a few gesture poses (pointing, reaching), and left/right-hand-on-hip variants.
 - **DOF tuning** — expose focus pull (rack focus between actors) and a bokeh-quality setting; validate the blur budget on-headset and pick the default tap count.

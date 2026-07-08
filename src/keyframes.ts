@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import type { ActorData, SceneData } from './model.ts';
 import { addKeyframe, MAX_KEYFRAMES } from './model.ts';
 import { buildTimeline, lerpAngle, sampleTimeline, type Timeline } from './timeline.ts';
+import { poseFor } from './pose.ts';
 import type { ActorManager, ActorObject } from './actors.ts';
 import { disposeTree, makeLabel } from './ui.ts';
 
@@ -46,9 +47,13 @@ export class KeyframeSystem {
     this.recomputeDuration();
   }
 
-  /** Stores the actor's current transform as its next keyframe. */
+  /**
+   * Stores the actor's current transform AND stance as its next keyframe —
+   * set the pose first, then capture, and the mark holds it on playback
+   * ("walk to the chair and sit" = a second same-spot mark captured seated).
+   */
   capture(obj: ActorObject): 'ok' | 'full' {
-    if (!addKeyframe(obj.data, obj.data.position, obj.data.rotationY)) return 'full';
+    if (!addKeyframe(obj.data, obj.data.position, obj.data.rotationY, obj.data.stance)) return 'full';
     this.rebuildForActor(obj.data);
     this.recomputeDuration();
     this.onChange();
@@ -161,7 +166,7 @@ export class KeyframeSystem {
       this.smoothedRotY.set(obj.data.id, rotY);
       obj.root.position.set(s.position.x, s.position.y, s.position.z);
       obj.root.rotation.y = rotY;
-      this.actors.setWalk(obj, s.moving && this.playing, Math.max(s.speed, 0.6), dt);
+      this.actors.setWalk(obj, s.moving && this.playing, Math.max(s.speed, 0.6), dt, s.stance);
     }
   }
 
@@ -211,7 +216,9 @@ export class KeyframeSystem {
         new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 }),
       );
       tick.position.z = 0.16;
-      const num = makeLabel(String(i + 1), 0.055, { fontPx: 40, bg: 'rgba(12,14,18,0.75)' });
+      // Non-standing marks show their pose on the footprint ("3 · Seated").
+      const tag = kf.stance && kf.stance !== 'standing' ? ` · ${poseFor(kf.stance).short}` : '';
+      const num = makeLabel(String(i + 1) + tag, 0.055, { fontPx: 40, bg: 'rgba(12,14,18,0.75)' });
       num.sprite.position.y = 0.09;
       marker.add(disc, rim, tick, num.sprite);
       g.add(marker);

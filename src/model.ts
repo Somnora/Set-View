@@ -30,6 +30,12 @@ export interface TransformKeyframe {
   position: Vec3;
   /** Facing at this mark, radians around +Y. */
   rotationY: number;
+  /**
+   * Pose held AT this mark (stamped from the actor's stance at capture).
+   * Absent (legacy marks) = fall back to the actor's rest stance. The actor
+   * always walks upright between marks regardless.
+   */
+  stance?: StanceId;
 }
 
 export type NoteKind = 'dialogue' | 'action';
@@ -319,9 +325,16 @@ export function addNote(actor: ActorData, kind: NoteKind, text: string): ActorNo
 }
 
 /** Returns false (and does nothing) when the actor is at MAX_KEYFRAMES. */
-export function addKeyframe(actor: ActorData, position: Vec3, rotationY: number): boolean {
+export function addKeyframe(
+  actor: ActorData,
+  position: Vec3,
+  rotationY: number,
+  stance?: StanceId,
+): boolean {
   if (actor.keyframes.length >= MAX_KEYFRAMES) return false;
-  actor.keyframes.push({ position: { ...position }, rotationY });
+  const kf: TransformKeyframe = { position: { ...position }, rotationY };
+  if (stance !== undefined) kf.stance = stance;
+  actor.keyframes.push(kf);
   return true;
 }
 
@@ -420,6 +433,11 @@ export function normalizeScene(s: SceneData): SceneData {
   if (s.scan === undefined) s.scan = null;
   for (const a of s.actors) {
     if (!isStanceId(a.stance)) a.stance = DEFAULT_STANCE;
+    for (const k of a.keyframes) {
+      // Invalid mark stance falls back to "absent" (= the actor's rest
+      // stance at playback), not DEFAULT — deleting preserves legacy meaning.
+      if (k.stance !== undefined && !isStanceId(k.stance)) delete k.stance;
+    }
   }
   for (const c of s.cameras) {
     if (!isFiniteNum(c.lensFocalLength) || c.lensFocalLength <= 0) c.lensFocalLength = 35;
