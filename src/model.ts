@@ -134,6 +134,28 @@ export const SENSOR_FORMATS: readonly SensorFormat[] = [
 export const DEFAULT_FORMAT_ID = 'super35';
 export const DEFAULT_TSTOP = 2.8;
 
+/** Whole-stop presets the wrist T-stop button cycles through. */
+export const TSTOP_PRESETS = [1.4, 2, 2.8, 4, 5.6, 8] as const;
+
+/**
+ * Snaps to the nearest preset stop, then advances one (wrapping). A free
+ * value typed on the prep page (e.g. T2.2) cycles from its nearest neighbour.
+ */
+export function cycleTStop(t: number): number {
+  const p = TSTOP_PRESETS;
+  let i = 0;
+  for (let k = 1; k < p.length; k++) {
+    if (Math.abs(p[k] - t) < Math.abs(p[i] - t)) i = k;
+  }
+  return p[(i + 1) % p.length];
+}
+
+/** The next sensor format in table order, wrapping (unknown id → first). */
+export function nextFormatId(id: string): string {
+  const i = SENSOR_FORMATS.findIndex((f) => f.id === id);
+  return SENSOR_FORMATS[(i + 1) % SENSOR_FORMATS.length].id;
+}
+
 export function sensorFormat(id: string): SensorFormat {
   return SENSOR_FORMATS.find((f) => f.id === id) ?? SENSOR_FORMATS[0];
 }

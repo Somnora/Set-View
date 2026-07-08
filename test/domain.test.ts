@@ -10,13 +10,16 @@ import {
   createActor,
   createCameraSetup,
   createScene,
+  cycleTStop,
   DEFAULT_FORMAT_ID,
   DEFAULT_TSTOP,
   duplicateActor,
   duplicateCameraSetup,
   isSceneData,
   MAX_KEYFRAMES,
+  nextFormatId,
   normalizeScene,
+  SENSOR_FORMATS,
   sensorFormat,
   stepFocal,
   vecDistance,
@@ -207,6 +210,29 @@ test('camera names stay unique after deleting a middle camera', () => {
   assert.equal(d.name, 'CAM B');
   const names = s.cameras.map((x) => x.name);
   assert.equal(new Set(names).size, names.length, `duplicate camera name: ${names}`);
+});
+
+test('cycleTStop: whole-stop wheel wraps; free values snap to nearest then step', () => {
+  assert.equal(cycleTStop(2.8), 4);
+  assert.equal(cycleTStop(8), 1.4); // wraps
+  assert.equal(cycleTStop(2.2), 2.8); // T2.2 snaps to 2, steps to 2.8
+  // Six presses from any preset returns home.
+  let t = 5.6;
+  for (let i = 0; i < 6; i++) t = cycleTStop(t);
+  assert.equal(t, 5.6);
+});
+
+test('nextFormatId: cycles the sensor table in order and wraps; unknown → first', () => {
+  const ids = SENSOR_FORMATS.map((f) => f.id);
+  let cur = ids[0];
+  const seen = [cur];
+  for (let i = 1; i < ids.length; i++) {
+    cur = nextFormatId(cur);
+    seen.push(cur);
+  }
+  assert.deepEqual(seen, ids); // visits every format once, in table order
+  assert.equal(nextFormatId(cur), ids[0]); // wraps
+  assert.equal(nextFormatId('betamax'), ids[0]); // unknown falls back safely
 });
 
 test(`keyframes cap at ${MAX_KEYFRAMES}`, () => {

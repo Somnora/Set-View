@@ -14,8 +14,10 @@ import * as THREE from 'three';
 import {
   aspectValue,
   createCameraSetup,
+  cycleTStop,
   DEFAULT_FORMAT_ID,
   DEFAULT_TSTOP,
+  nextFormatId,
   sensorFormat,
   stepFocal,
   vecDistance,
@@ -23,6 +25,7 @@ import {
   type CameraSetupData,
   type FocalLength,
   type SceneData,
+  type SensorFormat,
 } from './model.ts';
 import { depthOfFieldFor, dFovDeg, frameSizeAtDistance, hFovDeg, vFovDeg } from './lens.ts';
 import { DofPass } from './dof.ts';
@@ -278,6 +281,39 @@ export class CameraSystem {
     this.rebuildFrameLines();
     this.onChange();
     return this.currentAspect;
+  }
+
+  /**
+   * Cycles the sensor format (S35 → FF → S16 → ANA2×) on the active camera —
+   * and on `currentFormat` for frame lines + newly committed cameras. The
+   * frustum, monitor readout, and frame lines all re-derive from the new gate.
+   */
+  cycleFormat(): SensorFormat {
+    const next = nextFormatId(this.active?.data.formatId ?? this.currentFormat);
+    this.currentFormat = next;
+    const obj = this.active;
+    if (obj) {
+      obj.data.formatId = next;
+      this.rebuildFrustum(obj);
+      obj.label.setText(`${obj.data.name} · ${Math.round(obj.data.lensFocalLength)}mm`);
+      this.refreshMonitorInfo();
+    }
+    this.rebuildFrameLines();
+    this.onChange();
+    return sensorFormat(next);
+  }
+
+  /** Cycles the T-stop through whole-stop presets (see model.cycleTStop). */
+  cycleActiveTStop(): number {
+    const next = cycleTStop(this.active?.data.tStop ?? this.currentTStop);
+    this.currentTStop = next;
+    const obj = this.active;
+    if (obj) {
+      obj.data.tStop = next;
+      this.refreshMonitorInfo(); // DOF range readout changes with the stop
+    }
+    this.onChange();
+    return next;
   }
 
   setDofEnabled(on: boolean): void {

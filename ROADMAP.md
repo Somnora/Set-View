@@ -8,7 +8,7 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - Blocking keyframes + simultaneous playback with a procedural walk, adjustable pace.
 - **Actor stance** — 10 gray-box poses (stand, lean L/R, seated chair/lounge/cross-legged, lying flat up/down, lying on side L/R).
 - **Per-keyframe stance (added 2026-07-08)** — each mark records the stance at capture; playback holds it at the mark and walks upright between ("walk to the chair and sit").
-- Cameras with real, format-aware optics (Super 16 / Super 35 / Full-Frame / S35 anamorphic), free focal length, T-stop, aspect; angle-of-view / DOF / frame-width readouts.
+- Cameras with real, format-aware optics (Super 16 / Super 35 / Full-Frame / S35 anamorphic), free focal length, T-stop, aspect; angle-of-view / DOF / frame-width readouts. Format + T-stop cycle from the wrist in-AR (added 2026-07-08) as well as the prep page.
 - **Simulated depth of field** on the virtual monitor + PNG captures (toggle, off by default).
 - Three views (full / miniature / camera) + teleport, smooth-glide, and snap-turn locomotion.
 - Notes, PNG capture with a burned-in slate, floorplan PNG + Markdown shot-list export.
@@ -17,7 +17,6 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - localStorage autosave + JSON export/import; undo/redo; duplicate.
 
 ## Near term (headset-free-buildable)
-- **Sensor-format switch from the wrist** — today format/T-stop are set on the desktop prep page; add an in-AR cycle so S16/S35/FF is changeable through the lens.
 - **Richer poses** — an elbow joint (arms rest on thighs when seated), a few gesture poses (pointing, reaching), and left/right-hand-on-hip variants.
 - **DOF tuning** — expose focus pull (rack focus between actors) and a bokeh-quality setting; validate the blur budget on-headset and pick the default tap count.
 - **Mic audio on video takes** — mix a `getUserMedia` audio track into the MediaRecorder stream so a skit take carries scratch dialogue (needs the headset mic-permission flow; today's takes are silent).

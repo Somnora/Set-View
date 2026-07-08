@@ -455,8 +455,10 @@ export function buildWristPanel(): UIPanel {
       { id: 'location', label: 'Loc: Hidden' },
     ],
     [
-      { id: 'framelines', label: 'Frame Lines', flex: 1.4 },
+      { id: 'framelines', label: 'Frame Lines', flex: 1.3 },
       { id: 'aspect', label: '2.39:1' },
+      { id: 'format', label: 'S35' },
+      { id: 'tstop', label: 'T2.8' },
     ],
     [
       { id: 'play', label: '▶ Play' },

@@ -11,6 +11,7 @@ import {
   duplicateActor,
   duplicateCameraSetup,
   normalizeScene,
+  sensorFormat,
   type CameraSetupData,
   type SceneData,
 } from './model.ts';
@@ -610,6 +611,18 @@ class App {
       case 'stance':
         this.cycleSelectedStance();
         break;
+      case 'format': {
+        const fmt = this.cams.cycleFormat();
+        this.debug.log(`format: ${fmt.name}`);
+        this.refreshWristState();
+        break;
+      }
+      case 'tstop': {
+        const t = this.cams.cycleActiveTStop();
+        this.debug.log(`T-stop: T${t}`);
+        this.refreshWristState();
+        break;
+      }
       case 'dof':
         this.cams.setDofEnabled(!this.cams.dofEnabled);
         this.debug.log(`depth of field ${this.cams.dofEnabled ? 'ON' : 'off'}`);
@@ -1029,6 +1042,11 @@ class App {
     this.wrist.setToggle('drift', this.driftMarker.group.visible);
     this.wrist.setLabel('play', this.keyframes.playing ? '⏸ Pause' : '▶ Play');
     this.wrist.setLabel('aspect', this.cams.currentAspect);
+    // Format/T-stop buttons read the ACTIVE camera (what cycling would edit),
+    // falling back to the defaults applied to newly committed cameras.
+    const activeCam = this.cams.active;
+    this.wrist.setLabel('format', sensorFormat(activeCam?.data.formatId ?? this.cams.currentFormat).short);
+    this.wrist.setLabel('tstop', `T${activeCam?.data.tStop ?? this.cams.currentTStop}`);
     this.wrist.setLabel('pace', `${this.sceneData.walkSpeed.toFixed(1)} m/s`);
     this.wrist.setToggle('undo', this.history.canUndo);
     this.wrist.setToggle('redo', this.history.canRedo);

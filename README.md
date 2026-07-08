@@ -70,6 +70,8 @@ The **wrist menu** floats above your **left** controller — point at it with th
 | **A** (Frame Lines on) | Commit your head pose as a new camera setup (CAM A, B, …) |
 | Place: Cam + **trigger** | Alternative: drop a camera gizmo at your head pose |
 | Wrist **Aspect** | Cycle 2.39:1 → 16:9 → 4:3 |
+| Wrist **Format** (e.g. `S35`) | Cycle the sensor format S35 → FF → S16 → ANA2× on the active camera (and for frame lines / new cameras) — the frustum, monitor FOV, and DOF readouts re-derive from the new gate |
+| Wrist **T-stop** (e.g. `T2.8`) | Cycle whole stops T1.4 → 2 → 2.8 → 4 → 5.6 → 8 on the active camera — watch the DOF range tighten as you open up |
 | **Y** / wrist **Cam View** | Virtual monitor shows the active camera's frame (see limitation below) |
 | **Trigger** on a camera gizmo | Make it the active camera |
 | **Grip** on a camera gizmo | Grab & re-position it (full 6-DOF) |
@@ -191,7 +193,7 @@ src/
   exporters.ts    Floorplan PNG + Markdown shot-list rendering/download (consumes plan.ts)
   persistence.ts  localStorage autosave, scene list, JSON export/import (scan-embedding), rename/update
   main.ts         Wiring + the per-frame loop + input routing
-test/domain.test.ts  Node-runnable tests for the pure domain modules (88 tests)
+test/domain.test.ts  Node-runnable tests for the pure domain modules (90 tests)
 ```
 
 ## Port-to-Unity notes
