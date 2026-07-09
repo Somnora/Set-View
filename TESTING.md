@@ -19,6 +19,8 @@ Checked on the dev machine — no headset needed:
 
 The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop/height editing; floorplan & shot-list export; Enter/N keys) is fully usable and verifiable at a laptop before the headset is available.
 
+**Desktop 3D preview (pre-QA):** the landing page **Preview** button opens a non-XR orbit view of any scene — posed actors, blocking playback, per-camera lens views. Use it to pre-verify the *content* half of this checklist at a laptop (stance silhouettes, walk-to-chair-and-sit, footprint pose tags, camera framing/format width) so the headset hour spends itself on the AR-only half (anchors/drift, passthrough, fps, controllers, scan, video takes). `test/preview-smoke.html` renders it headless (`PREVIEW-SMOKE PASS`); `?gallery` renders all 10 stances in a row — screenshot it to review pose aesthetics without a headset.
+
 ---
 
 ## Phase 0 — Boot & passthrough

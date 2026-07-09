@@ -217,3 +217,38 @@ body {
 }
 #overlay .note-dialog .save { background: #2e5bd7; color: #fff; }
 #overlay .note-dialog .cancel { background: #232936; color: #d7dce4; }
+
+/* Desktop scene preview toolbar */
+.preview-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: rgba(13, 16, 22, 0.92);
+  border: 1px solid #2a3140;
+  border-radius: 12px;
+  z-index: 10;
+}
+.preview-bar button {
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: none;
+  background: #232936;
+  color: #d7dce4;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.preview-bar button:hover { background: #2e3646; }
+.preview-bar input[type='range'] { width: 220px; accent-color: #2e5bd7; }
+.preview-bar span {
+  color: #9aa4b5;
+  font: 13px ui-monospace, monospace;
+  min-width: 92px;
+  text-align: center;
+}

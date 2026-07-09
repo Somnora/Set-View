@@ -1,0 +1,119 @@
+<!doctype html>
+<!-- Headless-verifiable smoke for the desktop preview: builds a scene with
+     stances + a walk-to-chair-and-sit path + a camera, opens DesktopPreview,
+     scrubs to the end (actor seated at the chair), and renders. Run:
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --window-size=1280,800 \
+         --virtual-time-budget=9000 \
+         --screenshot=preview-smoke.png https://localhost:5173/test/preview-smoke.html
+
+     Inspect the PNG: grid + three posed gray-box actors (one seated at the
+     end of a dotted path, one lying, one standing) + a camera gizmo + the
+     preview toolbar. The <pre> also reports PREVIEW-SMOKE PASS/FAIL. -->
+<html>
+  <head><meta charset="utf-8" /><title>desktop preview smoke</title>
+  <link rel="stylesheet" href="../src/style.css" /></head>
+  <body>
+    <pre id="out" style="position:fixed;top:8px;left:8px;z-index:20;color:#9f6">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { addKeyframe, createActor, createCameraSetup, createScene } from '../src/model.ts';
+      import { SessionManager } from '../src/session.ts';
+      import { ActorManager } from '../src/actors.ts';
+      import { KeyframeSystem } from '../src/keyframes.ts';
+      import { DesktopPreview } from '../src/preview.ts';
+
+      const out = document.getElementById('out');
+      try {
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(innerWidth, innerHeight);
+        renderer.domElement.style.position = 'fixed';
+        renderer.domElement.style.inset = '0';
+        document.body.appendChild(renderer.domElement);
+
+        const scene3 = new THREE.Scene();
+        scene3.add(new THREE.HemisphereLight(0xffffff, 0x3a4152, 1.6));
+        const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+        sun.position.set(1.5, 3, 1);
+        scene3.add(sun);
+        const contentRoot = new THREE.Group();
+        scene3.add(contentRoot);
+
+        const params = new URLSearchParams(location.search);
+        const scene = createScene('preview smoke');
+        if (params.has('gallery')) {
+          // All 10 stances in a row, facing +Z (toward the default camera side)
+          // — a one-screenshot pose review, no headset needed.
+          const { STANCES } = await import('../src/pose.ts');
+          STANCES.forEach((p, i) => {
+            const a = createActor(scene, { x: (i - (STANCES.length - 1) / 2) * 1.7, y: 0, z: 0 }, 0);
+            a.stance = p.id;
+            a.name = p.short;
+          });
+        } else {
+          // A seated diner, a lying figure, and a walker who sits.
+          const seated = createActor(scene, { x: -1.2, y: 0, z: 0 }, 0.4);
+          seated.stance = 'seated-chair';
+          const lying = createActor(scene, { x: 3.2, y: 0, z: -0.6 }, -0.8);
+          lying.stance = 'lying-left';
+          const walker = createActor(scene, { x: 0, y: 0, z: 1.6 }, 0);
+          addKeyframe(walker, { x: 0, y: 0, z: 1.6 }, 0, 'standing');
+          addKeyframe(walker, { x: 0.9, y: 0, z: -1.2 }, 0, 'standing');
+          addKeyframe(walker, { x: 0.9, y: 0, z: -1.2 }, 1.2, 'seated-chair');
+          createCameraSetup(scene, { x: -2.4, y: 1.5, z: 2.4 }, { x: 0, y: 0.38, z: 0, w: 0.925 }, 35, '2.39:1');
+        }
+
+        const session = new SessionManager(renderer, () => {});
+        const actors = new ActorManager(session, scene);
+        contentRoot.add(actors.group);
+        actors.setScene(scene);
+        const keyframes = new KeyframeSystem(scene, actors);
+        contentRoot.add(keyframes.vizGroup);
+        keyframes.setScene(scene);
+
+        const preview = new DesktopPreview(renderer, scene3, contentRoot, keyframes, []);
+        // ?focus=x,z zooms the orbit onto one spot (stance close-ups).
+        const focus = params.get('focus');
+        let bounds = new THREE.Box3(new THREE.Vector3(-2, 0, -2), new THREE.Vector3(2, 1.8, 2.2));
+        if (params.has('gallery')) {
+          bounds = new THREE.Box3(new THREE.Vector3(-8.5, 0, -1), new THREE.Vector3(8.5, 1.9, 1));
+        } else if (focus) {
+          const [fx, fz] = focus.split(',').map(Number);
+          bounds = new THREE.Box3(new THREE.Vector3(fx - 0.8, 0, fz - 0.8), new THREE.Vector3(fx + 0.8, 1.6, fz + 0.8));
+        }
+        preview.open(scene, bounds);
+        if (params.has('gallery')) {
+          // Head-on elevation instead of the orbit three-quarter view.
+          preview['camera'].position.set(0, 1.1, 7);
+          preview['controls'].target.set(0, 0.75, 0);
+          preview['controls'].update();
+        }
+        // End of the move: the walker should be SEATED at the chair mark.
+        keyframes.scrubTo(1);
+
+        // Give the loop a few frames, then report.
+        let frames = 0;
+        const check = () => {
+          frames++;
+          if (frames < 10) return requestAnimationFrame(check);
+          const gl = renderer.getContext();
+          const err = gl.getError();
+          const ok =
+            err === 0 &&
+            preview.active &&
+            document.querySelector('.preview-bar') !== null &&
+            (params.has('gallery') || keyframes.duration > 0); // gallery has no moves
+          out.textContent = ok
+            ? 'PREVIEW-SMOKE PASS'
+            : `PREVIEW-SMOKE FAIL: glError=${err} active=${preview.active} dur=${keyframes.duration}`;
+          out.style.color = ok ? '#9f6' : '#f66';
+        };
+        requestAnimationFrame(check);
+      } catch (e) {
+        out.textContent = `PREVIEW-SMOKE FAIL: ${e.message}`;
+        out.style.color = '#f66';
+      }
+    </script>
+  </body>
+</html>

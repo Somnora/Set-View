@@ -140,6 +140,7 @@ The landing page is a full prep surface you can use at a laptop before ever putt
 
 | Action | How |
 |---|---|
+| **Preview a scene in 3D** | *Preview* on the scene row — a desktop orbit view of the whole scene: posed actors, keyframe footprints/paths, camera gizmos. **▶ Play** runs the blocking (walk-to-the-chair-and-sit included); the **View** button looks through each camera with its true focal/format/aspect (letterboxed); drag to orbit, scroll to dolly, Space play/pause, Esc closes. What it can't show is the AR part — passthrough, anchors, drift — that's TESTING.md on the headset. |
 | **Rename a scene** | *Rename* on the scene row — the name is the slate and the export filename, so label it `INT-KITCHEN-Sc14` |
 | **Edit any camera** | Expand **Shots & exports** → per-camera **lens (mm)**, **format**, **aspect**, **T-stop**, and **height** (with tripod-height presets: low hat / low / waist / eye / high). Edits persist immediately. |
 | **Set move pace** | The scene's **Move pace (m/s)** field in the same panel — drives blocking playback timing and the shot-list durations |
@@ -188,6 +189,7 @@ src/
   actors.ts       Humanoid meshes, floor-locking, labels, notes cards, walk cycle
   keyframes.ts    Keyframe capture, footprints/paths, playback driving actors
   cameraView.ts   Camera gizmos, virtual monitor (RTT), frame lines, PNG capture
+  preview.ts      Desktop (non-XR) orbit preview: playback + per-camera lens views
   views.ts        Full-scale / miniature / camera view, teleport, fades
   ui.ts           Wrist panel, labels, debug log, drift marker, landing page + camera editor, note editor
   exporters.ts    Floorplan PNG + Markdown shot-list rendering/download (consumes plan.ts)

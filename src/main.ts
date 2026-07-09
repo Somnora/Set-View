@@ -26,6 +26,7 @@ import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
 import { KeyframeSystem } from './keyframes.ts';
 import { CameraSystem, type CamObject } from './cameraView.ts';
+import { DesktopPreview } from './preview.ts';
 import { MonitorRecorder } from './recorder.ts';
 import { recordingClock } from './recording.ts';
 import { ViewManager } from './views.ts';
@@ -77,6 +78,7 @@ class App {
   private keyframes: KeyframeSystem;
   private cams: CameraSystem;
   private views: ViewManager;
+  private preview: DesktopPreview;
   private recorder = new MonitorRecorder();
   private location = new LocationRenderer();
   private wrist: UIPanel;
@@ -159,6 +161,21 @@ class App {
     this.driftMarker = new DriftMarker(this.debug);
     this.scene3.add(this.driftMarker.group);
 
+    // Desktop (non-XR) preview of the current scene: actors/stances/paths and
+    // camera gizmos stay visible; AR-session chrome is hidden.
+    this.preview = new DesktopPreview(this.renderer, this.scene3, this.contentRoot, this.keyframes, [
+      this.session.reticle,
+      this.cams.monitor,
+      this.cams.frameLines,
+      this.views.platform,
+      this.views.fadeSphere,
+      this.driftMarker.group,
+    ]);
+    this.preview.onClose = () => {
+      this.landing.show(true);
+      this.refreshLanding();
+    };
+
     const overlayRoot = document.getElementById('overlay')!;
     this.noteEditor = new NoteEditor(overlayRoot);
 
@@ -202,6 +219,7 @@ class App {
       onExportFloorplan: (id) => this.persistence.exportFloorplan(id),
       onExportShotList: (id) => this.persistence.exportShotList(id),
       onRemoveScan: (id) => this.removeScan(id),
+      onPreview: (id) => this.openPreview(id),
       getScene: (id) =>
         id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
       onUpdateCamera: (sceneId, cameraId, patch) => this.updateCamera(sceneId, cameraId, patch),
@@ -223,6 +241,9 @@ class App {
 
     this.wireSubsystems();
     this.loadScene(this.sceneData);
+    // ?preview auto-opens the desktop viewer on the current scene (also the
+    // hook for the headless render smoke — see test notes in TESTING.md).
+    if (new URLSearchParams(location.search).has('preview')) this.openPreview(this.sceneData.id);
     // Sweep scan blobs no scene references (left behind by re-scans/undo —
     // deliberately deferred to launch so in-session undo can restore them).
     void this.persistence.pruneOrphanScans();
@@ -666,8 +687,20 @@ class App {
 
   // --- session ---------------------------------------------------------------------
 
+  /** Opens the desktop orbit preview for a scene (loading it if needed). */
+  private openPreview(id: string): void {
+    if (id !== this.sceneData.id) {
+      const data = this.persistence.loadScene(id);
+      if (!data) return;
+      this.loadScene(data);
+    }
+    this.landing.show(false);
+    this.preview.open(this.sceneData, this.sceneBounds());
+  }
+
   private async startAR(): Promise<void> {
     try {
+      this.preview.close(); // the XR session owns the animation loop
       const overlayRoot = document.getElementById('overlay')!;
       overlayRoot.hidden = false;
       await this.session.start(overlayRoot, () => this.onSessionEnd());

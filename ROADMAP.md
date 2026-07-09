@@ -15,6 +15,7 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - **Video takes (added 2026-07-08)** — record the virtual camera's monitor feed (any view mode, DOF included) to an mp4/webm saved on device; play blocking while the camera rolls.
 - Location scan (Quest Scene Mesh) with hidden/ghost/solid walkthrough; scans travel in exported JSON.
 - localStorage autosave + JSON export/import; undo/redo; duplicate.
+- **Desktop 3D preview (added 2026-07-09)** — orbit view of any scene on the landing page: posed actors, blocking playback, per-camera lens views; pre-verifies the content half of QA without a headset. CI (GitHub Actions) enforces the test/build gate on every push.
 
 ## Near term (headset-free-buildable)
 - **Richer poses** — an elbow joint (arms rest on thighs when seated), a few gesture poses (pointing, reaching), and left/right-hand-on-hip variants.

@@ -520,6 +520,8 @@ export interface LandingCallbacks {
   onExportFloorplan: (id: string) => void;
   onExportShotList: (id: string) => void;
   onRemoveScan: (id: string) => void;
+  /** Opens the desktop 3D preview (orbit + playback) for a scene. */
+  onPreview: (id: string) => void;
   /** Full scene for the inline camera editor, or null. */
   getScene: (id: string) => SceneData | null;
   onUpdateCamera: (sceneId: string, cameraId: string, patch: Partial<CameraSetupData>) => void;
@@ -632,6 +634,7 @@ export class Landing {
       info.onclick = () => this.cb.onSelect(s.id);
       head.appendChild(info);
       for (const [label, fn] of [
+        ['Preview', this.cb.onPreview],
         ['Rename', (id: string) => this.promptRename(id, s.name)],
         ['Dup', this.cb.onDuplicate],
         ['Export', this.cb.onExport],
