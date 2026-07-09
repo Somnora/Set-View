@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import {
   addKeyframe,
   addNote,
+  applyMarkOp,
   createActor,
   createCameraSetup,
   createScene,
@@ -380,6 +381,67 @@ test('lerpAngle takes the shortest arc across ±π', () => {
   approx(lerpAngle(0, Math.PI / 2, 0.5), Math.PI / 4);
 });
 
+// --- desktop blocking editor (applyMarkOp) ---------------------------------------
+
+function markScene(): { s: SceneData; a: ReturnType<typeof createActor> } {
+  const s = createScene('marks');
+  const a = createActor(s, { x: 1, y: 0, z: 2 }, 0.5);
+  return { s, a };
+}
+
+test('applyMarkOp add: first mark lands at the rest pose, stamped with the actor stance', () => {
+  const { a } = markScene();
+  a.stance = 'seated-chair';
+  assert.equal(applyMarkOp(a, { kind: 'add' }), true);
+  assert.deepEqual(a.keyframes[0].position, { x: 1, y: 0, z: 2 });
+  assert.equal(a.keyframes[0].rotationY, 0.5);
+  assert.equal(a.keyframes[0].stance, 'seated-chair');
+});
+
+test('applyMarkOp add: later marks step past the last; cap at MAX_KEYFRAMES', () => {
+  const { a } = markScene();
+  for (let i = 0; i < MAX_KEYFRAMES; i++) assert.equal(applyMarkOp(a, { kind: 'add' }), true);
+  approx(a.keyframes[1].position.x, a.keyframes[0].position.x + 0.6);
+  assert.equal(applyMarkOp(a, { kind: 'add' }), false); // full
+  assert.equal(a.keyframes.length, MAX_KEYFRAMES);
+});
+
+test('applyMarkOp update: patches x/z/facing/stance; null stance clears to rest', () => {
+  const { a } = markScene();
+  applyMarkOp(a, { kind: 'add' });
+  assert.equal(applyMarkOp(a, { kind: 'update', index: 0, position: { x: -3, z: 4 }, rotationY: 1.2, stance: 'lying-up' }), true);
+  assert.deepEqual(a.keyframes[0].position, { x: -3, y: 0, z: 4 });
+  approx(a.keyframes[0].rotationY, 1.2);
+  assert.equal(a.keyframes[0].stance, 'lying-up');
+  assert.equal(applyMarkOp(a, { kind: 'update', index: 0, stance: null }), true);
+  assert.equal(a.keyframes[0].stance, undefined);
+});
+
+test('applyMarkOp update: invalid input rejected atomically (no half-applied op)', () => {
+  const { a } = markScene();
+  applyMarkOp(a, { kind: 'add' });
+  const before = JSON.stringify(a.keyframes[0]);
+  assert.equal(applyMarkOp(a, { kind: 'update', index: 0, position: { x: 9, z: NaN } }), false);
+  assert.equal(applyMarkOp(a, { kind: 'update', index: 0, rotationY: Infinity }), false);
+  assert.equal(applyMarkOp(a, { kind: 'update', index: 5, rotationY: 1 }), false); // OOB
+  assert.equal(JSON.stringify(a.keyframes[0]), before); // untouched, incl. the valid x
+});
+
+test('applyMarkOp move/remove: swap neighbours, reject ends, splice out', () => {
+  const { a } = markScene();
+  applyMarkOp(a, { kind: 'add' });
+  applyMarkOp(a, { kind: 'add' });
+  applyMarkOp(a, { kind: 'add' });
+  const [k0, k1, k2] = [...a.keyframes];
+  assert.equal(applyMarkOp(a, { kind: 'move', index: 0, dir: -1 }), false); // top end
+  assert.equal(applyMarkOp(a, { kind: 'move', index: 2, dir: 1 }), false); // bottom end
+  assert.equal(applyMarkOp(a, { kind: 'move', index: 1, dir: 1 }), true);
+  assert.deepEqual(a.keyframes, [k0, k2, k1]);
+  assert.equal(applyMarkOp(a, { kind: 'remove', index: 0 }), true);
+  assert.deepEqual(a.keyframes, [k2, k1]);
+  assert.equal(applyMarkOp(a, { kind: 'remove', index: 7 }), false);
+});
+
 // --- per-keyframe stance ---------------------------------------------------------
 
 test('addKeyframe stamps a stance when given, leaves legacy marks bare', () => {
@@ -525,6 +587,20 @@ test('buildShotList: static mark, notes, and ∞ DOF past hyperfocal', () => {
   assert.ok(md.includes('“Hello there”'), 'dialogue note quoted');
   assert.ok(md.includes('∞'), 'infinite DOF far limit');
   assert.ok(!/NaN/.test(md), 'no NaN anywhere in the export');
+});
+
+test('buildShotList: stances surface on the header and on non-standing marks only', () => {
+  const s = createScene('S');
+  const a = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+  a.stance = 'seated-lounge';
+  addKeyframe(a, { x: 0, y: 0, z: 0 }, 0, 'standing');
+  addKeyframe(a, { x: 2, y: 0, z: 0 }, 0, 'seated-chair');
+  const md = buildShotList(s);
+  assert.ok(md.includes('Seated (lounging)'), 'rest stance on the actor header');
+  assert.ok(md.includes('Seated (chair)'), 'non-standing mark stance listed');
+  // The standing mark line carries no stance suffix (standing is the default read).
+  const mark1 = md.split('\n').find((l) => l.trim().startsWith('1.'))!;
+  assert.ok(!/Standing/.test(mark1), `standing mark stays untagged: ${mark1}`);
 });
 
 test('cameraHalfFovRad is half the horizontal FOV for the camera format', () => {

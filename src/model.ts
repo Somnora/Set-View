@@ -360,6 +360,73 @@ export function addKeyframe(
   return true;
 }
 
+/**
+ * One desktop blocking-editor operation on an actor's mark list. Kept as a
+ * discriminated union so the whole editor funnels through one pure, tested
+ * function (applyMarkOp) instead of scattering list surgery through the UI.
+ */
+export type MarkOp =
+  | {
+      kind: 'update';
+      index: number;
+      position?: Partial<Pick<Vec3, 'x' | 'z'>>;
+      rotationY?: number;
+      /** A StanceId sets the mark's pose; null clears it (→ rest stance). */
+      stance?: StanceId | null;
+    }
+  | { kind: 'remove'; index: number }
+  | { kind: 'move'; index: number; dir: 1 | -1 }
+  | { kind: 'add' };
+
+/**
+ * Applies a mark operation. Returns false (mutating nothing) when the op is
+ * invalid: index out of range, add at MAX_KEYFRAMES, move past an end, or a
+ * non-finite number. 'add' mirrors AR capture: the new mark lands a step past
+ * the last mark (or at the actor's rest position) stamped with the actor's
+ * current stance.
+ */
+export function applyMarkOp(actor: ActorData, op: MarkOp): boolean {
+  const kfs = actor.keyframes;
+  switch (op.kind) {
+    case 'add': {
+      if (kfs.length >= MAX_KEYFRAMES) return false;
+      const last = kfs[kfs.length - 1];
+      const base = last ?? { position: actor.position, rotationY: actor.rotationY };
+      return addKeyframe(
+        actor,
+        { x: base.position.x + (last ? 0.6 : 0), y: base.position.y, z: base.position.z },
+        base.rotationY,
+        actor.stance,
+      );
+    }
+    case 'remove':
+      if (!(op.index >= 0 && op.index < kfs.length)) return false;
+      kfs.splice(op.index, 1);
+      return true;
+    case 'move': {
+      const j = op.index + op.dir;
+      if (!(op.index >= 0 && op.index < kfs.length) || j < 0 || j >= kfs.length) return false;
+      [kfs[op.index], kfs[j]] = [kfs[j], kfs[op.index]];
+      return true;
+    }
+    case 'update': {
+      const k = kfs[op.index];
+      if (!k) return false;
+      // Validate everything BEFORE mutating so a bad op can't half-apply.
+      if (op.position?.x !== undefined && !isFiniteNum(op.position.x)) return false;
+      if (op.position?.z !== undefined && !isFiniteNum(op.position.z)) return false;
+      if (op.rotationY !== undefined && !isFiniteNum(op.rotationY)) return false;
+      if (op.stance !== undefined && op.stance !== null && !isStanceId(op.stance)) return false;
+      if (op.position?.x !== undefined) k.position.x = op.position.x;
+      if (op.position?.z !== undefined) k.position.z = op.position.z;
+      if (op.rotationY !== undefined) k.rotationY = op.rotationY;
+      if (op.stance === null) delete k.stance;
+      else if (op.stance !== undefined) k.stance = op.stance;
+      return true;
+    }
+  }
+}
+
 /** Euclidean distance between two scene-space points (meters). Pure. */
 export function vecDistance(a: Vec3, b: Vec3): number {
   const dx = b.x - a.x;

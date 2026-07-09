@@ -1,0 +1,99 @@
+<!doctype html>
+<!-- Headless smoke for the desktop blocking editor: seeds a scene into
+     localStorage, boots the real app (main.ts), opens the prep panel, and
+     drives the mark editor through the actual DOM — add, edit position,
+     set stance, reorder, delete — asserting the persisted scene after each
+     step. Run:
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --virtual-time-budget=9000 --dump-dom \
+         https://localhost:5173/test/marks-editor-smoke.html | grep -o "MARKS-SMOKE [A-Z]*"
+-->
+<html>
+  <head><meta charset="utf-8" /><title>blocking editor smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6">running…</pre>
+    <script type="module">
+      import { addKeyframe, createActor, createScene } from '../src/model.ts';
+
+      const out = document.getElementById('out');
+      const fail = (m) => { out.textContent = `MARKS-SMOKE FAIL: ${m}`; out.style.color = '#f66'; };
+      try {
+        // Seed BEFORE the app module loads (persistence reads at construction).
+        localStorage.clear();
+        const scene = createScene('marks smoke');
+        const actor = createActor(scene, { x: 0, y: 0, z: 0 }, 0);
+        addKeyframe(actor, { x: 0, y: 0, z: 0 }, 0, 'standing');
+        localStorage.setItem('setview.scene.' + scene.id, JSON.stringify(scene));
+        localStorage.setItem('setview.currentScene', scene.id);
+        localStorage.setItem(
+          'setview.sceneIndex',
+          JSON.stringify([
+            { id: scene.id, name: scene.name, updatedAt: Date.now(), actors: 1, cameras: 0 },
+          ]),
+        );
+
+        await import('../src/main.ts');
+        await new Promise((r) => setTimeout(r, 300));
+
+        const readBack = () => JSON.parse(localStorage.getItem('setview.scene.' + scene.id));
+        const $ = (sel) => document.querySelector(sel);
+        const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+        // Open the prep panel and find the marks editor.
+        const det = $('#landing details.prep');
+        if (!det) throw new Error('no prep panel rendered');
+        det.open = true;
+        if (!$('#landing .marks')) throw new Error('marks editor missing from actor row');
+
+        // 1. Add a mark (button lives in the .mark-foot row).
+        const addBtn = $$('#landing .mark-foot button').find((b) => b.textContent === '+ Mark');
+        if (!addBtn) throw new Error('+ Mark button missing');
+        addBtn.click();
+        await new Promise((r) => setTimeout(r, 50));
+        let a = readBack().actors[0];
+        if (a.keyframes.length !== 2) throw new Error(`add: expected 2 marks, got ${a.keyframes.length}`);
+        if (Math.abs(a.keyframes[1].position.x - 0.6) > 1e-6) throw new Error('add: not a step past the last mark');
+
+        // 2. Edit mark 2's Z (second number input on its row: X, Z, Facing).
+        const rowInputs = $$('#landing .mark-row')[1].querySelectorAll('input');
+        rowInputs[1].value = '3.5';
+        rowInputs[1].dispatchEvent(new Event('change'));
+        await new Promise((r) => setTimeout(r, 50));
+        a = readBack().actors[0];
+        if (Math.abs(a.keyframes[1].position.z - 3.5) > 1e-6) throw new Error('update z did not persist');
+
+        // 3. Set mark 2's stance to seated via its dropdown.
+        const sel = $$('#landing .mark-row')[1].querySelector('select');
+        sel.value = 'seated-chair';
+        sel.dispatchEvent(new Event('change'));
+        await new Promise((r) => setTimeout(r, 50));
+        a = readBack().actors[0];
+        if (a.keyframes[1].stance !== 'seated-chair') throw new Error('stance did not persist');
+        if (!det.open && !$('#landing details.prep[open]')) throw new Error('prep panel collapsed on edit');
+
+        // 4. Reorder: move mark 2 up.
+        const up = $$('#landing .mark-row')[1].querySelectorAll('button')[0];
+        if (up.textContent !== '↑') throw new Error('unexpected button layout');
+        up.click();
+        await new Promise((r) => setTimeout(r, 50));
+        a = readBack().actors[0];
+        if (a.keyframes[0].stance !== 'seated-chair') throw new Error('reorder did not swap marks');
+
+        // 5. Delete the first mark.
+        const del = Array.from($$('#landing .mark-row')[0].querySelectorAll('button')).find((b) => b.textContent === '✕');
+        del.click();
+        await new Promise((r) => setTimeout(r, 50));
+        a = readBack().actors[0];
+        if (a.keyframes.length !== 1 || a.keyframes[0].stance === 'seated-chair')
+          throw new Error('delete removed the wrong mark');
+
+        out.textContent = 'MARKS-SMOKE PASS';
+      } catch (e) {
+        fail(e.message);
+      }
+    </script>
+  </body>
+</html>

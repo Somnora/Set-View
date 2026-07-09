@@ -66,6 +66,17 @@ export class KeyframeSystem {
     this.recomputeDuration();
   }
 
+  /**
+   * Re-syncs one actor after its marks were edited externally (the desktop
+   * blocking editor). Stops playback first so a held pose can't be stranded
+   * on marks that no longer exist (same reasoning as clear()).
+   */
+  refreshActor(data: ActorData): void {
+    if (this.active) this.stop();
+    this.rebuildForActor(data);
+    this.recomputeDuration();
+  }
+
   clear(actorId: string): void {
     const data = this.scene.actors.find((a) => a.id === actorId);
     if (!data) return;

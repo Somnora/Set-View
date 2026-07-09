@@ -16,6 +16,7 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - Location scan (Quest Scene Mesh) with hidden/ghost/solid walkthrough; scans travel in exported JSON.
 - localStorage autosave + JSON export/import; undo/redo; duplicate.
 - **Desktop 3D preview (added 2026-07-09)** — orbit view of any scene on the landing page: posed actors, blocking playback, per-camera lens views; pre-verifies the content half of QA without a headset. CI (GitHub Actions) enforces the test/build gate on every push.
+- **Desktop blocking editor (added 2026-07-09)** — the prep panel authors blocking, not just lenses: per-actor mark list (position, facing, per-mark stance, reorder, delete, add) with stance tags on the floorplan/shot-list exports. Author a scene at a laptop, Preview it, walk on set with the blocking built.
 
 ## Near term (headset-free-buildable)
 - **Richer poses** — an elbow joint (arms rest on thighs when seated), a few gesture poses (pointing, reaching), and left/right-hand-on-hip variants.

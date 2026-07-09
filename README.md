@@ -144,8 +144,9 @@ The landing page is a full prep surface you can use at a laptop before ever putt
 | **Rename a scene** | *Rename* on the scene row — the name is the slate and the export filename, so label it `INT-KITCHEN-Sc14` |
 | **Edit any camera** | Expand **Shots & exports** → per-camera **lens (mm)**, **format**, **aspect**, **T-stop**, and **height** (with tripod-height presets: low hat / low / waist / eye / high). Edits persist immediately. |
 | **Set move pace** | The scene's **Move pace (m/s)** field in the same panel — drives blocking playback timing and the shot-list durations |
-| **Export a floorplan** | **⬇ Floorplan PNG** — a printable top-down blocking diagram: actor dots + facing, numbered dashed keyframe paths, camera icons with FOV wedges, 1 m grid + scale bar |
-| **Export a shot list** | **⬇ Shot List** — a Markdown table (lens/format/aspect/stop/AoV/height/subject/DOF per camera) plus a per-actor blocking summary (marks, travel distance, move duration) and notes |
+| **Author blocking** | Each actor row carries the full **mark list**: X/Z position, facing (degrees), a per-mark stance dropdown ("(rest stance)" = the actor's own pose), reorder (↑↓), delete (✕), and **+ Mark** (appends a step past the last mark, up to 5). Block the whole scene at a laptop, press **Preview** to watch it play, then walk on location with the blocking already built. |
+| **Export a floorplan** | **⬇ Floorplan PNG** — a printable top-down blocking diagram: actor dots + facing, numbered dashed keyframe paths (non-standing marks tagged with their pose, e.g. `Sit`), camera icons with FOV wedges, 1 m grid + scale bar |
+| **Export a shot list** | **⬇ Shot List** — a Markdown table (lens/format/aspect/stop/AoV/height/subject/DOF per camera) plus a per-actor blocking summary (marks, travel distance, move duration, stances on non-standing marks) and notes |
 | **Keyboard** | **Enter** = Enter AR (when supported) · **N** = New Scene |
 
 ## Pragmatic choices & known limitations
@@ -195,7 +196,7 @@ src/
   exporters.ts    Floorplan PNG + Markdown shot-list rendering/download (consumes plan.ts)
   persistence.ts  localStorage autosave, scene list, JSON export/import (scan-embedding), rename/update
   main.ts         Wiring + the per-frame loop + input routing
-test/domain.test.ts  Node-runnable tests for the pure domain modules (90 tests)
+test/domain.test.ts  Node-runnable tests for the pure domain modules (96 tests)
 ```
 
 ## Port-to-Unity notes

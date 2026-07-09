@@ -7,9 +7,12 @@ import * as THREE from 'three';
 import type { SupportReport } from './session.ts';
 import {
   ASPECT_NAMES,
+  MAX_KEYFRAMES,
   SENSOR_FORMATS,
   TRIPOD_HEIGHTS,
+  type ActorData,
   type CameraSetupData,
+  type MarkOp,
   type SceneData,
 } from './model.ts';
 import { STANCES, type StanceId } from './pose.ts';
@@ -527,6 +530,8 @@ export interface LandingCallbacks {
   onUpdateCamera: (sceneId: string, cameraId: string, patch: Partial<CameraSetupData>) => void;
   onSetPace: (sceneId: string, walkSpeed: number) => void;
   onSetStance: (sceneId: string, actorId: string, stance: StanceId) => void;
+  /** Desktop blocking editor: one mark-list operation (see model.MarkOp). */
+  onEditMarks: (sceneId: string, actorId: string, op: MarkOp) => void;
 }
 
 export class Landing {
@@ -609,6 +614,13 @@ export class Landing {
   }
 
   refreshScenes(scenes: SceneSummary[], currentId: string | null): void {
+    // Edits re-render the whole list; keep expanded prep panels expanded so
+    // the blocking editor doesn't collapse after every field change.
+    const openIds = new Set(
+      Array.from(this.listEl.querySelectorAll('details.prep[open]')).map(
+        (d) => (d as HTMLElement).dataset.sceneId ?? '',
+      ),
+    );
     this.listEl.innerHTML = '';
     const h2 = document.createElement('h2');
     h2.textContent = 'Scenes';
@@ -651,6 +663,8 @@ export class Landing {
       // Expandable prep panel: exports + inline camera editor.
       const det = document.createElement('details');
       det.className = 'prep';
+      det.dataset.sceneId = s.id;
+      if (openIds.has(s.id)) det.open = true;
       const sum = document.createElement('summary');
       sum.textContent = 'Shots & exports';
       det.appendChild(sum);
@@ -760,10 +774,14 @@ export class Landing {
     return panel;
   }
 
-  /** A per-actor row: name swatch + a stance dropdown. */
-  private buildActorEditor(sceneId: string, actor: { id: string; name: string; color: string; stance?: StanceId }): HTMLElement {
+  /**
+   * A per-actor blocking editor: rest-stance dropdown + the full mark list
+   * (position / facing / per-mark stance / reorder / delete / add) — author a
+   * scene's blocking at a laptop, then check it with Preview.
+   */
+  private buildActorEditor(sceneId: string, actor: ActorData): HTMLElement {
     const row = document.createElement('div');
-    row.className = 'cam-edit';
+    row.className = 'cam-edit actor-edit';
     const name = document.createElement('b');
     name.textContent = actor.name;
     name.style.color = actor.color;
@@ -785,7 +803,105 @@ export class Landing {
     l.appendChild(span);
     l.appendChild(sel);
     row.appendChild(l);
+
+    row.appendChild(this.buildMarksEditor(sceneId, actor));
     return row;
+  }
+
+  /** The mark list under an actor row. Every op funnels through onEditMarks. */
+  private buildMarksEditor(sceneId: string, actor: ActorData): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'marks';
+    const op = (o: MarkOp) => this.cb.onEditMarks(sceneId, actor.id, o);
+
+    const numCell = (value: string, title: string, apply: (n: number) => void): HTMLInputElement => {
+      const i = document.createElement('input');
+      i.type = 'number';
+      i.step = '0.1';
+      i.value = value;
+      i.title = title;
+      i.onchange = () => {
+        const n = Number(i.value);
+        if (i.value.trim() === '' || !Number.isFinite(n)) {
+          i.value = value; // restore rather than apply garbage
+          return;
+        }
+        apply(n);
+      };
+      return i;
+    };
+
+    actor.keyframes.forEach((kf, i) => {
+      const line = document.createElement('div');
+      line.className = 'mark-row';
+      const idx = document.createElement('span');
+      idx.className = 'mark-idx';
+      idx.textContent = String(i + 1);
+      line.appendChild(idx);
+
+      line.appendChild(
+        numCell(kf.position.x.toFixed(1), 'X (m, + = right)', (n) => op({ kind: 'update', index: i, position: { x: n } })),
+      );
+      line.appendChild(
+        numCell(kf.position.z.toFixed(1), 'Z (m, 0° faces +Z)', (n) => op({ kind: 'update', index: i, position: { z: n } })),
+      );
+      line.appendChild(
+        numCell(((kf.rotationY * 180) / Math.PI).toFixed(0), 'Facing (degrees)', (n) =>
+          op({ kind: 'update', index: i, rotationY: (n * Math.PI) / 180 }),
+        ),
+      );
+
+      const stanceSel = document.createElement('select');
+      stanceSel.title = 'Pose held at this mark';
+      const rest = document.createElement('option');
+      rest.value = '';
+      rest.textContent = '(rest stance)';
+      if (kf.stance === undefined) rest.selected = true;
+      stanceSel.appendChild(rest);
+      for (const p of STANCES) {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name;
+        if (p.id === kf.stance) opt.selected = true;
+        stanceSel.appendChild(opt);
+      }
+      stanceSel.onchange = () =>
+        op({ kind: 'update', index: i, stance: stanceSel.value === '' ? null : (stanceSel.value as StanceId) });
+      line.appendChild(stanceSel);
+
+      const btn = (label: string, title: string, disabled: boolean, fn: () => void) => {
+        const b = document.createElement('button');
+        b.className = 'small mark-btn';
+        b.textContent = label;
+        b.title = title;
+        b.disabled = disabled;
+        b.onclick = fn;
+        line.appendChild(b);
+      };
+      btn('↑', 'Move mark earlier', i === 0, () => op({ kind: 'move', index: i, dir: -1 }));
+      btn('↓', 'Move mark later', i === actor.keyframes.length - 1, () => op({ kind: 'move', index: i, dir: 1 }));
+      btn('✕', 'Delete mark', false, () => op({ kind: 'remove', index: i }));
+      wrap.appendChild(line);
+    });
+
+    const foot = document.createElement('div');
+    foot.className = 'mark-row mark-foot';
+    const add = document.createElement('button');
+    add.className = 'small';
+    add.textContent = '+ Mark';
+    add.title = 'Append a mark (a step past the last, in the actor’s current stance)';
+    add.disabled = actor.keyframes.length >= MAX_KEYFRAMES;
+    add.onclick = () => this.cb.onEditMarks(sceneId, actor.id, { kind: 'add' });
+    foot.appendChild(add);
+    const hint = document.createElement('span');
+    hint.className = 'mark-hint';
+    hint.textContent =
+      actor.keyframes.length === 0
+        ? 'no marks — the actor holds its placed spot'
+        : `${actor.keyframes.length}/${MAX_KEYFRAMES} marks · check with Preview`;
+    foot.appendChild(hint);
+    wrap.appendChild(foot);
+    return wrap;
   }
 
   private buildCameraEditor(sceneId: string, cam: CameraSetupData): HTMLElement {

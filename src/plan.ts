@@ -17,6 +17,7 @@ import {
   type SceneData,
 } from './model.ts';
 import { depthOfFieldFor, hFovDeg, hFovRad } from './lens.ts';
+import { poseFor } from './pose.ts';
 import { moveStats } from './timeline.ts';
 
 export interface PlanBounds {
@@ -144,15 +145,21 @@ export function buildShotList(scene: SceneData, header = ''): string {
   } else {
     for (const a of scene.actors) {
       const ms = moveStats(a.keyframes, scene.walkSpeed);
+      // Rest stance on the header; per-mark stances on the marks. Standing is
+      // the default read of a blocking diagram, so only exceptions are named.
+      const rest = a.stance && a.stance !== 'standing' ? ` · ${poseFor(a.stance).name}` : '';
       if (a.keyframes.length <= 1) {
-        lines.push(`- **${a.name}** — static (${a.keyframes.length} mark)`);
+        lines.push(`- **${a.name}** — static (${a.keyframes.length} mark)${rest}`);
       } else {
         lines.push(
-          `- **${a.name}** — ${ms.marks} marks · ${ms.distanceM.toFixed(1)}m · ${ms.durationS.toFixed(1)}s @ ${ms.avgSpeed.toFixed(1)} m/s`,
+          `- **${a.name}** — ${ms.marks} marks · ${ms.distanceM.toFixed(1)}m · ${ms.durationS.toFixed(1)}s @ ${ms.avgSpeed.toFixed(1)} m/s${rest}`,
         );
       }
       a.keyframes.forEach((k, i) => {
-        lines.push(`  ${i + 1}. (${k.position.x.toFixed(2)}, ${k.position.z.toFixed(2)}) facing ${((k.rotationY * 180) / Math.PI).toFixed(0)}°`);
+        const pose = k.stance && k.stance !== 'standing' ? ` · ${poseFor(k.stance).name}` : '';
+        lines.push(
+          `  ${i + 1}. (${k.position.x.toFixed(2)}, ${k.position.z.toFixed(2)}) facing ${((k.rotationY * 180) / Math.PI).toFixed(0)}°${pose}`,
+        );
       });
       for (const n of a.notes) {
         lines.push(`  - _${n.kind}_: ${n.kind === 'dialogue' ? `“${n.text}”` : n.text}`);

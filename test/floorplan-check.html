@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- Visual check for the floorplan export (canvas drawing isn't Node-testable):
+     renders renderFloorplanCanvas for a scene with a walk → sit → lie blocking
+     path and a camera. Screenshot headless and confirm: numbered marks 1-3 with
+     "Sit"/"Lie ↑" tags under the non-standing ones, dashed path, camera wedge:
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --window-size=940,940 \
+         --virtual-time-budget=6000 --screenshot=floorplan.png \
+         https://localhost:5173/test/floorplan-check.html -->
+<html>
+  <head><meta charset="utf-8" /><title>floorplan stance check</title></head>
+  <body style="margin:0;background:#000">
+    <script type="module">
+      import { addKeyframe, createActor, createCameraSetup, createScene } from '../src/model.ts';
+      import { renderFloorplanCanvas } from '../src/exporters.ts';
+      const s = createScene('stance floorplan');
+      const a = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+      addKeyframe(a, { x: 0, y: 0, z: 0 }, 0, 'standing');
+      addKeyframe(a, { x: 2.5, y: 0, z: 1.5 }, 1.0, 'seated-chair');
+      addKeyframe(a, { x: 2.5, y: 0, z: 3.5 }, 0, 'lying-up');
+      createCameraSetup(s, { x: -2, y: 1.5, z: -2 }, { x: 0, y: 0.38, z: 0, w: 0.925 }, 35, '2.39:1');
+      const canvas = renderFloorplanCanvas(s, 900);
+      canvas.style.width = '900px';
+      document.body.appendChild(canvas);
+    </script>
+  </body>
+</html>

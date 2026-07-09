@@ -7,12 +7,14 @@ import './style.css';
 import * as THREE from 'three';
 import {
   addNote,
+  applyMarkOp,
   createScene,
   duplicateActor,
   duplicateCameraSetup,
   normalizeScene,
   sensorFormat,
   type CameraSetupData,
+  type MarkOp,
   type SceneData,
 } from './model.ts';
 import { History } from './history.ts';
@@ -225,6 +227,7 @@ class App {
       onUpdateCamera: (sceneId, cameraId, patch) => this.updateCamera(sceneId, cameraId, patch),
       onSetPace: (sceneId, walkSpeed) => this.setScenePace(sceneId, walkSpeed),
       onSetStance: (sceneId, actorId, stance) => this.setActorStance(sceneId, actorId, stance),
+      onEditMarks: (sceneId, actorId, op) => this.editActorMarks(sceneId, actorId, op),
     });
 
     this.persistence.onError = (m) => {
@@ -969,6 +972,23 @@ class App {
       const a = scene?.actors.find((x) => x.id === actorId);
       if (!scene || !a) return;
       a.stance = stance;
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
+  }
+
+  /** Applies a blocking-editor mark op from the landing page (mirrors setActorStance). */
+  private editActorMarks(sceneId: string, actorId: string, op: MarkOp): void {
+    if (sceneId === this.sceneData.id) {
+      const a = this.sceneData.actors.find((x) => x.id === actorId);
+      if (!a || !applyMarkOp(a, op)) return;
+      this.keyframes.refreshActor(a);
+      this.persistence.saveNow(this.sceneData);
+      this.refreshWristState();
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      const a = scene?.actors.find((x) => x.id === actorId);
+      if (!scene || !a || !applyMarkOp(a, op)) return;
       this.persistence.updateScene(scene);
     }
     this.refreshLanding();

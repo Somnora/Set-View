@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 import { sensorFormat, type SceneData } from './model.ts';
+import { poseFor } from './pose.ts';
 import {
   buildShotList,
   cameraHalfFovRad,
@@ -91,6 +92,13 @@ export function renderFloorplanCanvas(scene: SceneData, sizePx = 1400): HTMLCanv
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(String(i + 1), p.x, p.y);
+      // Non-standing marks carry their pose ("Sit", "Lie ↑") under the number
+      // — what an AD reads off the printed diagram on the day.
+      if (k.stance && k.stance !== 'standing') {
+        ctx.fillStyle = col;
+        ctx.font = '600 13px ui-monospace, monospace';
+        ctx.fillText(poseFor(k.stance).short, p.x, p.y + 22);
+      }
     });
   }
 
