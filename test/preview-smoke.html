@@ -46,8 +46,10 @@
           // All 10 stances in a row, facing +Z (toward the default camera side)
           // — a one-screenshot pose review, no headset needed.
           const { STANCES } = await import('../src/pose.ts');
+          // 2.4 m apart: a lying body is ~1.7 m long, so tighter spacing
+          // overlaps the four lying poses.
           STANCES.forEach((p, i) => {
-            const a = createActor(scene, { x: (i - (STANCES.length - 1) / 2) * 1.7, y: 0, z: 0 }, 0);
+            const a = createActor(scene, { x: (i - (STANCES.length - 1) / 2) * 2.4, y: 0, z: 0 }, 0);
             a.stance = p.id;
             a.name = p.short;
           });
@@ -77,7 +79,7 @@
         const focus = params.get('focus');
         let bounds = new THREE.Box3(new THREE.Vector3(-2, 0, -2), new THREE.Vector3(2, 1.8, 2.2));
         if (params.has('gallery')) {
-          bounds = new THREE.Box3(new THREE.Vector3(-8.5, 0, -1), new THREE.Vector3(8.5, 1.9, 1));
+          bounds = new THREE.Box3(new THREE.Vector3(-11.5, 0, -1), new THREE.Vector3(11.5, 1.9, 1));
         } else if (focus) {
           const [fx, fz] = focus.split(',').map(Number);
           bounds = new THREE.Box3(new THREE.Vector3(fx - 0.8, 0, fz - 0.8), new THREE.Vector3(fx + 0.8, 1.6, fz + 0.8));
@@ -85,7 +87,7 @@
         preview.open(scene, bounds);
         if (params.has('gallery')) {
           // Head-on elevation instead of the orbit three-quarter view.
-          preview['camera'].position.set(0, 1.1, 7);
+          preview['camera'].position.set(0, 1.1, 9.5);
           preview['controls'].target.set(0, 0.75, 0);
           preview['controls'].update();
         }
