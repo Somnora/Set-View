@@ -11,7 +11,8 @@ export type GuideAnchor = 'trigger' | 'grip' | 'stick' | 'stick-click' | 'upper'
 
 export interface GuideContext {
   mode: GuideMode;
-  placeMode: 'actor' | 'camera';
+  /** Placement arming ('none' = pinch/trigger only selects, never places). */
+  placeMode: 'none' | 'actor' | 'camera';
   /** Frame Lines (eyes-as-camera) active. */
   eyesMode: boolean;
   /** Block = plan the shot; dress = adjust the physical space. */
@@ -67,7 +68,12 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
       items.push({
         hand: 'left',
         anchor: 'lower',
-        label: ctx.placeMode === 'actor' ? 'X: switch to placing cameras' : 'X: switch to placing actors',
+        label:
+          ctx.placeMode === 'none'
+            ? 'X: arm actor placing'
+            : ctx.placeMode === 'actor'
+              ? 'X: switch to camera placing'
+              : 'X: placing off',
       });
     }
     items.push({ hand: 'left', anchor: 'stick', label: 'Glide through the set' });
@@ -82,7 +88,12 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
     items.push({
       hand: 'right',
       anchor: 'trigger',
-      label: ctx.placeMode === 'actor' ? 'Place actor on the ring, or select' : 'Place camera on the ring, or select',
+      label:
+        ctx.placeMode === 'none'
+          ? 'Select what you point at'
+          : ctx.placeMode === 'actor'
+            ? 'Place actor on the ring'
+            : 'Place camera at your head',
     });
     items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab an actor or camera' });
     items.push({ hand: 'right', anchor: 'upper', label: 'B: mark a move for the actor' });

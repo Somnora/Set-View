@@ -34,7 +34,14 @@ import { recordingClock } from './recording.ts';
 import { ViewManager } from './views.ts';
 import { GUIDE_AUTO_SHOW_S, type GuideContext } from './guide.ts';
 import { GuideView } from './guideView.ts';
-import { gazeEngaged, type InteractionMode, wheelMenu, type WheelPath } from './wheel.ts';
+import {
+  gazeEngaged,
+  type InteractionMode,
+  nextPlaceMode,
+  type PlaceArm,
+  wheelMenu,
+  type WheelPath,
+} from './wheel.ts';
 import { WheelPanel } from './wheelView.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
@@ -67,7 +74,6 @@ const SCAN_TIMEOUT_MS = 30_000;
 /** If nothing is tracked after this long, ask the OS to run room capture. */
 const SCAN_ROOM_CAPTURE_AFTER_MS = 2_000;
 
-type PlaceMode = 'actor' | 'camera';
 /** What the pointer ray is over ('furniture' id = scan mesh index as string). */
 type Hover = { kind: 'actor' | 'camera' | 'furniture'; id: string } | null;
 
@@ -109,7 +115,8 @@ class App {
   private wheelShown = false;
   /** Right fingertip is over the wheel disc (suppresses pinch fall-through). */
   private tipOnWheel = false;
-  private placeMode: PlaceMode = 'actor';
+  /** Placement is an ARMED tool, off by default — a bare pinch never places. */
+  private placeMode: PlaceArm = 'none';
   private selectedActorId: string | null = null;
   private hover: Hover = null;
   private draggedActor: ActorObject | null = null;
@@ -619,7 +626,7 @@ class App {
       onSqueezeUp: (hand) => this.onSqueezeUp(hand),
       onButtonDown: (hand, button) => {
         if (this.noteEditor.isOpen) return;
-        if (button === 'x') this.setPlaceMode(this.placeMode === 'actor' ? 'camera' : 'actor');
+        if (button === 'x') this.setPlaceMode(nextPlaceMode(this.placeMode));
         else if (button === 'y') this.cycleView();
         else if (button === 'b' && this.interactionMode === 'block') this.captureKeyframe();
         else if (button === 'a') this.onButtonA();
@@ -651,7 +658,7 @@ class App {
         this.setInteractionMode(this.interactionMode === 'block' ? 'dress' : 'block');
         break;
       case 'wheel-place':
-        this.setPlaceMode(this.placeMode === 'actor' ? 'camera' : 'actor');
+        this.setPlaceMode(nextPlaceMode(this.placeMode));
         break;
       case 'wheel-view':
         this.cycleView();
@@ -701,10 +708,10 @@ class App {
   private onWristPress(id: string): void {
     switch (id) {
       case 'mode-actor':
-        this.setPlaceMode('actor');
+        this.setPlaceMode(this.placeMode === 'actor' ? 'none' : 'actor');
         break;
       case 'mode-camera':
-        this.setPlaceMode('camera');
+        this.setPlaceMode(this.placeMode === 'camera' ? 'none' : 'camera');
         break;
       case 'view-full':
         this.setView('full');
@@ -864,6 +871,7 @@ class App {
       // Every session opens planning the shot; Dress is an explicit switch.
       this.interactionMode = 'block';
       this.panelPinned = false;
+      this.placeMode = 'none'; // placing is armed per use, never carried over
       // Fresh reference space, fresh floor evidence.
       this.floorEst = newFloorEstimate();
       this.views.setFloorOffset(0);
@@ -907,10 +915,16 @@ class App {
 
   private onTriggerDown(hand: Hand): void {
     if (this.noteEditor.isOpen || hand !== this.input.pointerHand()) return;
-    // A fingertip on the wheel already pressed by touch; swallow the pinch so
-    // it can't fall through and place an actor behind the palm.
-    if (this.tipOnWheel) return;
-    if (this.wheel.handleTriggerDown()) return;
+    // Wheel up = you're looking at your palm, so every pinch/trigger is MENU
+    // intent: press the hovered sector (fingertip or ray hover) or the pinned
+    // panel, and otherwise swallow it. Nothing here may ever reach the world —
+    // on hands a palm tap doubles as a pinch, and third-QA showed each tap
+    // spawning an actor behind the wheel.
+    if (this.wheelShown || this.tipOnWheel) {
+      if (this.wheel.handleTriggerDown()) return;
+      this.wrist.handleTriggerDown();
+      return;
+    }
     if (this.wrist.handleTriggerDown()) return;
 
     if (this.hover?.kind === 'actor') {
@@ -923,6 +937,9 @@ class App {
       return;
     }
     if (this.views.mode !== 'full' || this.interactionMode !== 'block') return;
+    // Placement is an armed tool (wheel Place sector / X button), never the
+    // default meaning of a pinch — see PlaceArm in wheel.ts.
+    if (this.placeMode === 'none') return;
 
     if (this.placeMode === 'actor') {
       if (!this.session.lastHit) return;
@@ -943,6 +960,10 @@ class App {
       this.debug.log(`placed ${obj.data.name} at head (${Math.round(obj.data.lensFocalLength)}mm)`);
       this.markDirty();
     }
+    // Hands place ONE per arm: stray pinches are constant on hand tracking,
+    // so the tool disarms after each placement (the wheel is a glance away).
+    // A controller trigger pull is deliberate — it stays armed for the next.
+    if (this.input.isHand(hand)) this.setPlaceMode('none');
   }
 
   private onSqueezeDown(hand: Hand): void {
@@ -1260,8 +1281,16 @@ class App {
     this.refreshWristState();
   }
 
-  private setPlaceMode(mode: PlaceMode): void {
+  private setPlaceMode(mode: PlaceArm): void {
+    if (mode === this.placeMode) return;
     this.placeMode = mode;
+    this.debug.log(
+      mode === 'none'
+        ? 'placing off'
+        : mode === 'actor'
+          ? 'ARMED: pinch/trigger on the floor ring places an actor'
+          : 'ARMED: pinch/trigger places a camera at your head',
+    );
     this.guide.refresh(this.guideCtx());
     this.refreshWristState();
   }
@@ -1418,12 +1447,13 @@ class App {
     }
 
     // Pointer ray → wrist panel first, then world targets. Hands drive the
-    // wheel by DIRECT fingertip taps (right index tip on the palm disc);
-    // controllers by ray + trigger.
+    // wheel by DIRECT fingertip taps (right index tip on the palm disc), with
+    // the ray as a fallback hover so a pinch can press the pointed-at sector
+    // even when the occluded tip loses tracking; controllers by ray + trigger.
     const rc = this.input.raycaster(pointer, this.raycaster);
     const tip = this.input.fingertip('right', _tip);
-    const onWheel = tip !== null ? this.wheel.touchAt(tip) : this.wheel.update(rc);
-    this.tipOnWheel = tip !== null && onWheel;
+    this.tipOnWheel = tip !== null && this.wheel.touchAt(tip);
+    const onWheel = this.tipOnWheel || this.wheel.update(rc);
     const onPanel = this.wrist.update(rc, this.input.triggerHeld(pointer)) || onWheel;
     this.updateHover(onPanel ? null : rc);
 
@@ -1468,7 +1498,10 @@ class App {
       this.refreshWristState();
     }
     this.wheel.group.visible = this.wheelShown;
-    if (this.wheelShown) this.wheel.group.lookAt(this.lastViewerPos); // face the eyes from the palm
+    // Face the eyes from the palm — but FREEZE while a fingertip is on the
+    // disc: re-billboarding under the finger shifts the disc's local depth
+    // axis mid-tap and breaks the push-down edge detection.
+    if (this.wheelShown && !this.tipOnWheel) this.wheel.group.lookAt(this.lastViewerPos);
     this.wrist.group.visible = this.wheelShown && this.panelPinned;
 
     // Controls-guide chips ride the same grip spaces; expire the auto-show.

@@ -50,10 +50,12 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 
 **The palm tool wheel:** look at your left palm and a ring of tools appears in it — look away and it melts out of the frame. **Hands: tap a sector with your right index fingertip**, like tapping your palm. **Controllers: point and pull the trigger.** Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit) and the hub becomes **◂ Back**. The wheel is mode-aware, with the hub at root switching between the two jobs on a set:
 
-- **Block** (default) — plan the shot: Place actor/cam, Marks ▸ (mark here, play/pause, pace), Lens ▸ (focal, T-stop, format, aspect, frame lines, DOF), View, Camera ▸ (photo, rec, exit), Edit ▸ (undo, redo, duplicate, delete, stance, notes).
+- **Block** (default) — plan the shot: Place (an **armed tool**: Off → Actor → Cam — see below), Marks ▸ (mark here, play/pause, pace), Lens ▸ (focal, T-stop, format, aspect, frame lines, DOF), View, Camera ▸ (photo, rec, exit), Edit ▸ (undo, redo, duplicate, delete, stance, notes).
 - **Dress** — adjust the physical space: Scan Room, room display (Hidden/Ghost/Solid), plus View / Camera ▸ / Edit ▸. In Dress mode the grip grabs **scanned furniture** and can't disturb your blocking; in Block mode it grabs **actors and cameras** and can't nudge the set.
 
 **More** pins the legacy detail panel (scrub slider, exports readouts) under the wheel. Hand-tracking users have full parity: "Mark here" in Marks ▸ replaces the controller B button.
+
+**Placing is armed, never default.** A bare trigger pull or hand pinch only ever *selects* what you point at — it cannot create anything. To place: tap **Place** on the wheel (or press **X**) until it reads **Actor** or **Cam**, then pinch/trigger on the floor ring. With hand tracking each arm places exactly **one** (stray pinches are common on hands); controllers stay armed until you cycle back to **Off**. While the wheel is visible, every pinch is treated as a menu press and never reaches the world.
 
 **In-headset controls guide:** on entering AR, chips appear tethered to each controller for 12 seconds, labeling what every button does in the current mode (they update live when you switch view, place mode, or Dress/Block). Press the panel **?** button to pin them back on anytime. The tables below are the desktop reference of the same content.
 
@@ -61,13 +63,13 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 | Input | Action |
 |---|---|
 | Point at floor | White reticle sits on the detected surface |
-| **Right trigger** on reticle | Place an actor (feet planted, faces you) |
+| Wheel **Place: Actor** (or **X**), then **right trigger / pinch** on reticle | Place an actor (feet planted, faces you). Hands: one per arm; controllers: stays armed |
 | **Right trigger** on an actor | Select it (yellow ring) |
 | **Right grip (hold)** on an actor | Grab & drag — stays floor-locked while dragging |
 | **Right stick ← →** while holding | Rotate the actor's facing |
 | Wrist **Delete** | Delete the pointed-at (or selected) actor/camera |
 | Wrist **Drift** | Toggle drift-test grid at the session origin + debug readout |
-| **X** | Toggle placement mode: Actor ↔ Camera |
+| **X** | Cycle the Place tool: Off → Actor → Camera → Off |
 
 The **wrist menu** (tool wheel + detail panel) appears above your **left** controller when you look at it — point with the right controller and pull the trigger.
 

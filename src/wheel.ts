@@ -12,6 +12,19 @@
 
 export type InteractionMode = 'block' | 'dress';
 
+/**
+ * Placement arming. 'none' is the DEFAULT: a bare trigger/pinch must never
+ * create content — on hand tracking every stray thumb-index touch reads as a
+ * pinch, and third-QA showed each palm tap spawning an actor. Placing is an
+ * armed tool: pick it (wheel Place sector / X button), then the pinch places.
+ */
+export type PlaceArm = 'none' | 'actor' | 'camera';
+
+/** The Place tool cycle (wheel sector and the X button step through it). */
+export function nextPlaceMode(mode: PlaceArm): PlaceArm {
+  return mode === 'none' ? 'actor' : mode === 'actor' ? 'camera' : 'none';
+}
+
 /** Menu levels: the root ring, or one of the sub-wheels. */
 export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit';
 
@@ -31,7 +44,7 @@ export interface WheelMenu {
 
 export interface WheelContext {
   mode: InteractionMode;
-  placeMode: 'actor' | 'camera';
+  placeMode: PlaceArm;
   viewMode: 'full' | 'mini' | 'camera';
   playing: boolean;
   recording: boolean;
@@ -66,7 +79,11 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
     return {
       hub,
       sectors: [
-        { id: 'wheel-place', label: ctx.placeMode === 'actor' ? 'Place:\nActor' : 'Place:\nCam' },
+        {
+          id: 'wheel-place',
+          label:
+            ctx.placeMode === 'none' ? 'Place:\nOff' : ctx.placeMode === 'actor' ? 'Place:\nActor' : 'Place:\nCam',
+        },
         { id: 'sub-marks', label: 'Marks ▸', submenu: 'marks' },
         { id: 'sub-lens', label: 'Lens ▸', submenu: 'lens' },
         { id: 'wheel-view', label: `View:\n${viewLabel}` },
@@ -163,10 +180,17 @@ export function sectorAngle(i: number, n: number): number {
  * (+z toward the viewer, disc of `radius` around the origin). A press fires
  * on the DOWN edge: the tip must first hover in front of the plane, then
  * push to (or through) it. Pulling back past the hover band re-arms.
+ *
+ * Tuned for occluded tracking (the tapping finger hides behind the palm, so
+ * joint positions jitter): the press plane sits proud of the disc, the re-arm
+ * lift is short, and arming works anywhere NEAR the disc — a natural tap
+ * often approaches from the side of the ring, not head-on through it.
  */
-export const TOUCH_PRESS_Z = 0.01;
-export const TOUCH_ARM_Z = 0.035;
-export const TOUCH_MAX_BEHIND_Z = -0.06;
+export const TOUCH_PRESS_Z = 0.012;
+export const TOUCH_ARM_Z = 0.025;
+export const TOUCH_MAX_BEHIND_Z = -0.08;
+/** Tips beyond this multiple of the disc radius don't touch the state. */
+export const TOUCH_NEAR_FACTOR = 2;
 
 export interface TouchState {
   armed: boolean;
@@ -191,19 +215,21 @@ export function touchWheel(
   radius: number,
 ): TouchSample | null {
   const r = Math.sqrt(x * x + y * y);
-  if (r > radius || z < TOUCH_MAX_BEHIND_Z || z > 0.25) {
-    // Off the disc entirely: keep the armed state (a tap can start slightly
-    // off-plane), but nothing to report.
+  if (r > radius * TOUCH_NEAR_FACTOR || z < TOUCH_MAX_BEHIND_Z || z > 0.25) {
+    // Far from the disc in any direction: keep the armed state, nothing to
+    // report (a tap can start slightly off-plane).
     return null;
   }
+  // Arm anywhere near the disc, including just off its rim — occluded finger
+  // tracking skips frames, and side approaches never pass through the front.
+  if (z >= TOUCH_ARM_Z) state.armed = true;
+  if (r > radius) return null; // near (state updated) but not on the disc
   const u = x / (radius * 2) + 0.5;
   const v = 0.5 - y / (radius * 2);
   let pressed = false;
   if (state.armed && z <= TOUCH_PRESS_Z) {
     pressed = true;
     state.armed = false;
-  } else if (!state.armed && z >= TOUCH_ARM_Z) {
-    state.armed = true;
   }
   return { u, v, pressed };
 }
@@ -216,10 +242,17 @@ export function touchWheel(
  * engage needs a deliberate look; disengage only when clearly looking away,
  * so the wheel doesn't flicker at the boundary.
  */
-export const GAZE_SHOW_DOT = 0.86;
-export const GAZE_HIDE_DOT = 0.72;
+export const GAZE_SHOW_DOT = 0.82;
+export const GAZE_HIDE_DOT = 0.7;
 /** Beyond arm's reach it's not a "look at your hand" — never summon. */
 export const GAZE_MAX_DISTANCE_M = 1.2;
+/**
+ * A hand hanging at your side while you look DOWN (aiming at the floor to
+ * place or teleport) sits in the gaze cone too — but far below the eyes.
+ * Only a raised palm summons: while the wheel is up every pinch is menu
+ * intent (main.ts swallows it), so a false summon would eat real actions.
+ */
+export const GAZE_MAX_DROP_M = 0.55;
 
 export interface GazeInput {
   /** Normalized head forward. */
@@ -234,6 +267,7 @@ export interface GazeInput {
 export function gazeEngaged({ fwd, toWrist, shown }: GazeInput): boolean {
   const dist = Math.sqrt(toWrist.x ** 2 + toWrist.y ** 2 + toWrist.z ** 2);
   if (dist > GAZE_MAX_DISTANCE_M || dist < 1e-6) return false;
+  if (toWrist.y < -GAZE_MAX_DROP_M) return false; // hand at the side, not raised
   const dot = (fwd.x * toWrist.x + fwd.y * toWrist.y + fwd.z * toWrist.z) / dist;
   return dot >= (shown ? GAZE_HIDE_DOT : GAZE_SHOW_DOT);
 }

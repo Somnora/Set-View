@@ -48,6 +48,7 @@ import {
   gazeEngaged,
   HUB_R,
   MAX_SECTORS,
+  nextPlaceMode,
   RING_R,
   touchWheel,
   wheelHit,
@@ -1244,7 +1245,7 @@ test('recording policy constants are sane (fps/bitrate/cap all positive, bounded
 
 const GUIDE_MODES = ['full', 'mini', 'camera'] as const;
 const GUIDE_CTXS = GUIDE_MODES.flatMap((mode) =>
-  (['actor', 'camera'] as const).flatMap((placeMode) =>
+  (['none', 'actor', 'camera'] as const).flatMap((placeMode) =>
     [false, true].flatMap((eyesMode) =>
       (['block', 'dress'] as const).map((interaction) => ({ mode, placeMode, eyesMode, interaction })),
     ),
@@ -1290,6 +1291,16 @@ test('guide: full-view trigger chip tracks place mode; eyes mode adds the A chip
   );
   assert.ok(actorTrig?.label.includes('actor') && !actorTrig.label.includes('camera'));
   assert.ok(camTrig?.label.includes('camera'));
+  // Disarmed (the default): the trigger chip must promise selection only —
+  // never placement, which is the third-QA actor-spam bug.
+  const noneTrig = guideItems({ mode: 'full', placeMode: 'none', eyesMode: false, interaction: 'block' }).find(
+    (i) => i.anchor === 'trigger',
+  );
+  assert.ok(noneTrig && /select/i.test(noneTrig.label) && !/place/i.test(noneTrig.label));
+  const noneX = guideItems({ mode: 'full', placeMode: 'none', eyesMode: false, interaction: 'block' }).find(
+    (i) => i.hand === 'left' && i.anchor === 'lower',
+  );
+  assert.ok(noneX && /arm/i.test(noneX.label), 'X chip teaches arming');
   const eyesA = (eyes: boolean) =>
     guideItems({ mode: 'full', placeMode: 'actor', eyesMode: eyes, interaction: 'block' }).some(
       (i) => i.hand === 'right' && i.anchor === 'lower',
@@ -1440,6 +1451,18 @@ test('wheel: sub-wheels carry live values and hands get a Mark button', () => {
   assert.ok(cap.sectors.some((s) => s.id === 'exit'), 'hands must be able to exit AR');
 });
 
+test('wheel: placement arming cycles Off, Actor, Cam and the Place sector shows it', () => {
+  assert.equal(nextPlaceMode('none'), 'actor');
+  assert.equal(nextPlaceMode('actor'), 'camera');
+  assert.equal(nextPlaceMode('camera'), 'none');
+  const label = (placeMode: 'none' | 'actor' | 'camera') =>
+    wheelMenu({ ...WHEEL_BASE, mode: 'block', placeMode }, 'root').sectors.find((s) => s.id === 'wheel-place')
+      ?.label ?? '';
+  assert.ok(label('none').includes('Off'), 'disarmed state is visible on the wheel');
+  assert.ok(label('actor').includes('Actor'));
+  assert.ok(label('camera').includes('Cam'));
+});
+
 test('wheel: fingertip touch fires on the push-down edge only, re-arms on pull-back', () => {
   const st = { armed: false };
   const R = 0.08;
@@ -1454,6 +1477,13 @@ test('wheel: fingertip touch fires on the push-down edge only, re-arms on pull-b
   assert.equal(touchWheel(st, 0, 0.05, 0.0, R)?.pressed, true);
   // Off the disc: nothing to report (and no accidental press).
   assert.equal(touchWheel(st, 0.2, 0.2, 0.005, R), null);
+  // Side approach (the natural tap): hovering just OFF the rim still arms, so
+  // sliding onto a sector at press depth fires — occluded tracking rarely
+  // delivers a clean head-on approach through the front band.
+  const side = { armed: false };
+  assert.equal(touchWheel(side, R * 1.5, 0, 0.06, R), null, 'near the rim: reported as off-disc');
+  assert.equal(side.armed, true, 'but the hover still arms the tap');
+  assert.equal(touchWheel(side, 0, 0.05, 0.005, R)?.pressed, true);
   // Starting BEHIND the plane (hand through the wheel) never fires unarmed.
   const st2 = { armed: false };
   assert.equal(touchWheel(st2, 0, 0, -0.02, R)?.pressed, false);
@@ -1495,6 +1525,16 @@ test('wheel: gaze summon has hysteresis and an arm-length cap', () => {
   // Beyond arm's reach never engages, even dead-center.
   assert.equal(gazeEngaged({ fwd, toWrist: at(1, 2.0), shown: true }), false);
   assert.ok(GAZE_SHOW_DOT > GAZE_HIDE_DOT, 'show threshold must be tighter than hide');
+  // A hand hanging at the side while looking DOWN at the floor sits in the
+  // gaze cone but far below the eyes — it must never summon (a shown wheel
+  // swallows every pinch, which would eat real placements/teleports).
+  const down = { x: 0, y: -Math.SQRT1_2, z: -Math.SQRT1_2 }; // looking 45° down
+  const wristLow = { x: 0, y: -0.7, z: -0.7 }; // dot = 1.0, drop 0.7 m
+  assert.equal(gazeEngaged({ fwd: down, toWrist: wristLow, shown: false }), false);
+  assert.equal(gazeEngaged({ fwd: down, toWrist: wristLow, shown: true }), false);
+  // A RAISED palm at the same dot engages fine.
+  const ahead = { x: 0, y: 0, z: -1 };
+  assert.equal(gazeEngaged({ fwd: ahead, toWrist: { x: 0, y: -0.2, z: -0.45 }, shown: false }), true);
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this
