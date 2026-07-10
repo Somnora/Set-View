@@ -130,6 +130,10 @@ class App {
     this.renderer.xr.setFoveation(1);
     this.renderer.domElement.style.position = 'fixed';
     this.renderer.domElement.style.inset = '0';
+    // The canvas paints above the landing page (positioned, later in DOM), so
+    // it must not hit-test or every button underneath is unclickable. Only the
+    // desktop preview needs pointer events (OrbitControls); it toggles this.
+    this.renderer.domElement.style.pointerEvents = 'none';
     document.body.appendChild(this.renderer.domElement);
 
     // Cheap lighting: hemisphere + one directional, no shadows (perf budget).

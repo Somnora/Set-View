@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- Click-reachability check: boots the real app, then asks elementFromPoint
+     what sits on top of the Enter AR button and the + New Scene button.
+     PASS = both resolve to the buttons themselves (nothing covers them).
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --window-size=1000,800 \
+         --virtual-time-budget=8000 --dump-dom \
+         https://localhost:5175/test/hit-check.html -->
+<html>
+  <head><meta charset="utf-8" /><title>hit check</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6">running…</pre>
+    <script type="module">
+      const out = document.getElementById('out');
+      try {
+        await import('../src/main.ts');
+        await new Promise((r) => setTimeout(r, 400));
+        const report = [];
+        for (const sel of ['button.enter', '#landing .bar button']) {
+          const btn = document.querySelector(sel);
+          if (!btn) { report.push(`${sel}: MISSING`); continue; }
+          const r = btn.getBoundingClientRect();
+          const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          report.push(`${sel}: top=${top ? top.tagName : 'null'} covered=${top !== btn}`);
+        }
+        const blocked = report.some((l) => l.includes('covered=true') || l.includes('MISSING'));
+        out.textContent = `HIT-CHECK ${blocked ? 'FAIL' : 'PASS'} | ${report.join(' | ')}`;
+      } catch (e) {
+        out.textContent = `HIT-CHECK ERROR ${e.message}`;
+      }
+    </script>
+  </body>
+</html>

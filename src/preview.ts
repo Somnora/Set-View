@@ -99,6 +99,9 @@ export class DesktopPreview {
       radius = Math.max(3, bounds.getSize(new THREE.Vector3()).length() * 0.75);
     }
     this.camera.position.set(center.x + radius * 0.7, center.y + radius * 0.55, center.z + radius * 0.7);
+    // The canvas is pointer-events:none so the landing page stays clickable;
+    // orbit input needs it back on for the preview's lifetime only.
+    this.renderer.domElement.style.pointerEvents = 'auto';
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.copy(center);
     this.controls.maxPolarAngle = Math.PI * 0.495; // don't orbit under the floor
@@ -118,6 +121,7 @@ export class DesktopPreview {
 
     this.controls?.dispose();
     this.controls = null;
+    this.renderer.domElement.style.pointerEvents = 'none';
     if (this.grid) {
       this.scene3.remove(this.grid);
       this.grid.geometry.dispose();

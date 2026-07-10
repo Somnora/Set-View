@@ -6,6 +6,16 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 ---
 
+## QA findings — first on-headset session (2026-07-09, James, Quest 3)
+
+- [x] **Every landing-page button dead to hands AND controllers** — the full-screen WebGL canvas covered the page and swallowed all pointer input (synthetic-click smokes never caught it). Fixed: canvas is `pointer-events: none` except while the desktop preview owns it; guarded by `test/hit-check.html`.
+- [ ] **Controls are unclear in AR** — no onboarding; the controls cheat-sheet lives on the 2D landing page where you can't see it in-headset.
+- [ ] **"A giant camera on top of my face" after switching view** — entering a view mode put a camera model at/next to the user's head with no obvious way to move it. Needs repro (which view + how the camera got there) then fix: don't spawn/leave gizmos inside the user's head, and make grab-to-move discoverable.
+- [ ] **Couldn't figure out how to scan a room** — wrist-panel Scan Room button wasn't discoverable (wrist menu itself may not be obvious).
+- [ ] **Wants to "build a room from scratch"** — no such feature yet (scan-only); candidate: primitive wall/flat blocking volumes. Roadmap item, not a bug.
+
+---
+
 ## Verified headset-free (this build, before QA)
 
 Checked on the dev machine — no headset needed:
@@ -20,6 +30,7 @@ Checked on the dev machine — no headset needed:
 The **desktop prep** surface (scene rename; per-camera lens/format/aspect/T-stop/height editing; floorplan & shot-list export; Enter/N keys) is fully usable and verifiable at a laptop before the headset is available.
 
 - [x] **Blocking editor drives the real DOM headless** — `test/marks-editor-smoke.html` seeds a scene, boots the actual app, and clicks/types through the prep panel: add mark, edit Z, set a mark stance, reorder, delete — asserting the persisted scene after every step and that the panel stays expanded: `MARKS-SMOKE PASS`. `test/floorplan-check.html` renders the floorplan export for a walk→sit→lie path (screenshot: pose tags under non-standing marks).
+- [x] **Landing buttons are hit-testable** — `test/hit-check.html` boots the app and asserts via `elementFromPoint` that nothing (the full-screen WebGL canvas in particular) covers **Enter AR** or the scene-bar buttons: `HIT-CHECK PASS`. Guards the canvas `pointer-events: none` contract — synthetic `.click()` smokes bypass hit-testing, so only this catches a covering layer (found live on the Quest 2026-07-09: every landing button dead).
 
 **Desktop 3D preview (pre-QA):** the landing page **Preview** button opens a non-XR orbit view of any scene — posed actors, blocking playback, per-camera lens views. Use it to pre-verify the *content* half of this checklist at a laptop (stance silhouettes, walk-to-chair-and-sit, footprint pose tags, camera framing/format width) so the headset hour spends itself on the AR-only half (anchors/drift, passthrough, fps, controllers, scan, video takes). `test/preview-smoke.html` renders it headless (`PREVIEW-SMOKE PASS`); `?gallery` renders all 10 stances in a row — screenshot it to review pose aesthetics without a headset.
 
