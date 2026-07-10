@@ -21,6 +21,12 @@ export class ViewManager {
   readonly teleportOffset = new THREE.Vector3();
   /** Content yaw (radians) accumulated by snap-turn; 0 at true registration. */
   private viewYaw = 0;
+  /**
+   * Vertical re-base applied when the platform's floor origin is wrong (see
+   * floor.ts). A registration CORRECTION, not a shift: it survives realign()
+   * and is excluded from isShifted.
+   */
+  private floorOffsetY = 0;
 
   /** Diorama table visuals (platform disc + rim); child of scene root. */
   readonly platform: THREE.Group;
@@ -102,11 +108,17 @@ export class ViewManager {
     this.onModeChange(mode);
   }
 
+  /** Re-bases the scene floor onto the real floor. Full/camera views only. */
+  setFloorOffset(y: number): void {
+    this.floorOffsetY = y;
+    if (this.mode !== 'mini') this.applyFullTransform();
+  }
+
   /** Restores full-scale transform (also camera view — life-size content). */
   private applyFullTransform(): void {
     this.contentRoot.scale.setScalar(1);
     this.contentRoot.rotation.set(0, this.viewYaw, 0);
-    this.contentRoot.position.copy(this.teleportOffset);
+    this.contentRoot.position.set(this.teleportOffset.x, this.floorOffsetY, this.teleportOffset.z);
   }
 
   private applyMiniTransform(): void {

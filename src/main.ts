@@ -36,6 +36,7 @@ import { GUIDE_AUTO_SHOW_S, type GuideContext } from './guide.ts';
 import { GuideView } from './guideView.ts';
 import { gazeEngaged, type InteractionMode } from './wheel.ts';
 import { WheelPanel } from './wheelView.ts';
+import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
 import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, type UIPanel } from './ui.ts';
 
@@ -111,6 +112,12 @@ class App {
   private draggedMonitor = false;
   /** Scanned furniture mesh being grip-carried (Stage 1 movable furniture). */
   private draggedFurniture: THREE.Object3D | null = null;
+  /** Per-session floor-height sanity check (see floor.ts). */
+  private floorEst = newFloorEstimate();
+
+  private observeFloor(hitY: number, timeMs: number): void {
+    observeFloorHit(this.floorEst, hitY, timeMs);
+  }
   private miniGrabbing = false;
   /** Controls guide: auto-shows at session start; wrist "?" pins it. */
   private guide = new GuideView();
@@ -842,6 +849,9 @@ class App {
       // Every session opens planning the shot; Dress is an explicit switch.
       this.interactionMode = 'block';
       this.panelPinned = false;
+      // Fresh reference space, fresh floor evidence.
+      this.floorEst = newFloorEstimate();
+      this.views.setFloorOffset(0);
       // Teach the controls up front: chips tethered to the controllers for the
       // first few seconds; the wrist "?" button brings them back anytime.
       this.guideSticky = false;
@@ -1363,6 +1373,20 @@ class App {
 
     this.session.updateHitTest(frame, pointer);
 
+    // Floor sanity: the lowest real hit over the first seconds IS the floor.
+    // If it sits below y=0 the platform's floor origin is too high (bad
+    // boundary height / local fallback) and the whole scene would float at
+    // head height (first-QA failure, on video) — re-base once, loudly.
+    if (!this.floorEst.committed) {
+      if (this.session.lastHit) this.observeFloor(this.session.lastHit.point.y, time);
+      const fix = floorCorrection(this.floorEst, this.lastViewerPos.y, time);
+      if (fix !== null) {
+        this.floorEst.committed = true;
+        this.views.setFloorOffset(fix);
+        this.debug.log(`⚠ floor origin was ${(-fix).toFixed(2)} m too high — scene re-based to the real floor`);
+      }
+    }
+
     // Pointer ray → wrist panel first, then world targets.
     const rc = this.input.raycaster(pointer, this.raycaster);
     const onWheel = this.wheel.update(rc);
@@ -1378,15 +1402,17 @@ class App {
       this.placeMode === 'actor';
     this.session.updateReticle(placingAllowed || (this.views.mode === 'full' && !onPanel && !this.hover));
 
-    // Wrist cluster (tool wheel + pinned detail panel) follows the left grip;
-    // hidden for tracked hands (no grip pose — it would freeze at the origin).
+    // Wrist cluster (tool wheel + pinned detail panel) follows the left grip.
     // Summoned by GAZE: it appears when you look at your hand and melts away
     // when you look back at the set, so the tools are always one glance away
     // without ever cluttering the frame. Hysteresis in gazeEngaged stops
-    // boundary flicker.
+    // boundary flicker. Tracked HANDS get it too (Quest hands expose a grip
+    // pose; pinch = trigger) — first QA showed hands-only users were locked
+    // out of every menu. If a grip pose ever IS missing, the mount sits at
+    // the world origin, which the gaze gate's 1.2 m cap never engages.
     const leftGrip = this.input.gripSpace('left');
     if (leftGrip && this.wristMount.parent !== leftGrip) leftGrip.add(this.wristMount);
-    const wristUsable = this.input.connected('left') && !this.input.isHand('left');
+    const wristUsable = this.input.connected('left');
     if (wristUsable) {
       this.wristMount.getWorldPosition(_pt);
       _fwd.set(0, 0, -1).applyQuaternion(this.lastViewerQuat);
@@ -1503,6 +1529,9 @@ class App {
       // rolling the pass runs in ANY view mode — the camera keeps filming
       // while the wearer walks the set. Still the same single RTT pass.
       this.location.beginCameraPass();
+      // Clear last frame's near-head ghosting so the take films the full
+      // cast; the wearer-view ghost pass below re-applies it after.
+      for (const obj of this.actors.all()) obj.root.visible = true;
       let feedTex: THREE.Texture | null = null;
       try {
         feedTex = this.cams.renderMonitor(this.renderer, this.scene3, this.hiddenForVirtualCamera());
@@ -1517,6 +1546,26 @@ class App {
           // Active camera deleted mid-take — finish and save what we have.
           this.stopRecording(true);
         }
+      }
+    }
+
+    // Ghost any actor the user's head is inside — walking through your own
+    // blocking is normal; a torso across the eyes is not (first-QA video:
+    // "giant actor on my face"). Scale-aware like the camera-gizmo ghosting;
+    // never a mid-drag actor (deliberately in hand). Runs AFTER the virtual
+    // camera pass so the monitor and takes keep filming the full cast.
+    {
+      const scale = this.contentRoot.getWorldScale(_pt).x || 1;
+      const threshold = 0.45 * scale;
+      for (const obj of this.actors.all()) {
+        if (obj === this.draggedActor) continue;
+        const d = obj.root.getWorldPosition(_fwd).distanceTo(this.lastViewerPos);
+        // Distance is to the feet origin; a standing body's torso spans well
+        // above it, so also test a chest point (~1.3 m up, scaled).
+        const chest = _right.copy(_fwd);
+        chest.y += 1.3 * scale;
+        const near = Math.min(d, chest.distanceTo(this.lastViewerPos));
+        obj.root.visible = near > threshold;
       }
     }
 

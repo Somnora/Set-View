@@ -52,6 +52,7 @@ import {
   wheelHit,
   wheelSectors,
 } from '../src/wheel.ts';
+import { floorCorrection, newFloorEstimate, observeFloorHit } from '../src/floor.ts';
 import {
   buildShotList,
   cameraHalfFovRad,
@@ -1313,6 +1314,52 @@ test('guide: dress mode swaps the grip chip to furniture and drops placing chips
   const block = guideItems({ mode: 'full', placeMode: 'actor', eyesMode: false, interaction: 'block' });
   const blockGrip = block.find((i) => i.hand === 'right' && i.anchor === 'grip');
   assert.ok(blockGrip && !/furniture/i.test(blockGrip.label), 'block grip chip is actors/cameras only');
+});
+
+// --- floor-height correction -----------------------------------------------------
+
+test('floor: the first-QA failure (floor 1.3m too high) is detected and corrected', () => {
+  const e = newFloorEstimate();
+  // 12 hits over 3 seconds, lowest on the real floor at world y = -1.3.
+  for (let i = 0; i < 12; i++) observeFloorHit(e, -1.3 + (i % 4) * 0.2, 1000 + i * 300);
+  assert.equal(floorCorrection(e, 0.3, 5000), -1.3); // head near origin ('local' fallback)
+});
+
+test('floor: never corrects a plausible floor, desk-only hits, or too-early evidence', () => {
+  // Hits at/above 0 (correct floor; reticle on desks and props): no correction.
+  const desk = newFloorEstimate();
+  for (let i = 0; i < 20; i++) observeFloorHit(desk, 0.02 + (i % 3) * 0.4, 1000 + i * 300);
+  assert.equal(floorCorrection(desk, 1.6, 60_000), null);
+
+  // Real failure signature but too few hits / too little time: hold off.
+  const early = newFloorEstimate();
+  for (let i = 0; i < 4; i++) observeFloorHit(early, -1.2, 1000 + i * 100);
+  assert.equal(floorCorrection(early, 0.3, 60_000), null, 'needs more hits');
+  const rushed = newFloorEstimate();
+  for (let i = 0; i < 12; i++) observeFloorHit(rushed, -1.2, 1000 + i * 10);
+  assert.equal(floorCorrection(rushed, 0.3, 1200), null, 'needs more elapsed time');
+
+  // Correction implying an impossible eye height (tracking glitch): rejected.
+  const glitch = newFloorEstimate();
+  for (let i = 0; i < 12; i++) observeFloorHit(glitch, -5, 1000 + i * 300);
+  assert.equal(floorCorrection(glitch, 0.3, 5000), null);
+  // NaN hits are ignored entirely.
+  const nan = newFloorEstimate();
+  for (let i = 0; i < 12; i++) observeFloorHit(nan, NaN, 1000 + i * 300);
+  assert.equal(nan.hits, 0);
+});
+
+test('floor: boundary floor slightly high (0.5m) corrects; sub-threshold (0.1m) does not', () => {
+  const off = newFloorEstimate();
+  for (let i = 0; i < 12; i++) observeFloorHit(off, -0.5, 1000 + i * 300);
+  assert.equal(floorCorrection(off, 1.1, 5000), -0.5);
+  const fine = newFloorEstimate();
+  for (let i = 0; i < 12; i++) observeFloorHit(fine, -0.1, 1000 + i * 300);
+  assert.equal(floorCorrection(fine, 1.5, 5000), null);
+  // Committed estimates stop observing and never re-fire.
+  off.committed = true;
+  observeFloorHit(off, -2, 10_000);
+  assert.equal(floorCorrection(off, 1.1, 20_000), null);
 });
 
 // --- hand tool wheel -------------------------------------------------------------

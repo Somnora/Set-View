@@ -6,6 +6,13 @@ Run through these on the Quest 3 (and repeat on Android XR if available) after a
 
 ---
 
+## QA findings — second on-headset session (2026-07-10, James, Quest 3, on video)
+
+- [x] **Whole scene floated at head height ("giant legs from the ceiling")** — the headset's floor origin sat ~1–1.5 m above the real floor (bad boundary floor height or local-space fallback), so everything authored at scene y=0 rendered at head level while the hit-test reticle sat correctly on the REAL floor. Fixed (pending re-QA): `floor.ts` watches the lowest real hit over the first seconds of a session; when it sits >0.15 m below y=0 (with enough hits, enough time, and a plausible resulting eye height), the scene re-bases onto the real floor once, with a debug-log warning. One-directional by design — hits on desks/props can't trigger a false fix. Unit-tested against this exact failure.
+- [x] **Hands-only users were locked out of every menu** — wrist panel (and the new wheel) were hidden for tracked hands, so with controllers down there was no mode switch, no scan, no exit: just floating geometry. Fixed: the gaze-summoned wheel + panel now work with hands (Quest hands expose a grip pose; pinch = trigger). If a grip pose is ever missing, the gaze gate's arm-length cap keeps the dead mount from appearing.
+- [x] **Giant actor body across the face** — actors now ghost when your head is inside them (feet or chest within 0.45 m, scale-aware), same as camera gizmos; re-appear when you step back. The virtual-camera pass and video takes still film the full cast (ghosting applies only to the wearer's view, after the RTT pass).
+- [ ] **Leftover confusion-era actors** — the scene autosaved the Actor 2/3/4 placed during the broken session (some stored below scene floor). Delete them on the landing page or start a New Scene before the next run.
+
 ## QA findings — first on-headset session (2026-07-09, James, Quest 3)
 
 - [x] **Every landing-page button dead to hands AND controllers** — the full-screen WebGL canvas covered the page and swallowed all pointer input (synthetic-click smokes never caught it). Fixed: canvas is `pointer-events: none` except while the desktop preview owns it; guarded by `test/hit-check.html`.
