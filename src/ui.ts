@@ -601,6 +601,15 @@ export class Landing {
     });
   }
 
+  /** Shows an AR-start failure on the landing page (the wrist debug log is
+      unreachable when the session never starts). */
+  showStartError(message: string): void {
+    const p = document.createElement('p');
+    p.className = 'bad';
+    p.textContent = `Enter AR failed: ${message}`;
+    this.diagEl.appendChild(p);
+  }
+
   setDiagnostics(report: SupportReport): void {
     this.enterBtn.disabled = !report.immersiveAR;
     if (report.immersiveAR) {

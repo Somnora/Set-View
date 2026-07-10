@@ -723,6 +723,9 @@ class App {
     } catch (e) {
       this.debug.log(`failed to start AR: ${(e as Error).message}`);
       document.getElementById('overlay')!.hidden = true;
+      // The wrist debug board never appears if the session can't start, so
+      // put the reason where the user is actually looking.
+      this.landing.showStartError((e as Error).message || String(e));
     }
   }
 
