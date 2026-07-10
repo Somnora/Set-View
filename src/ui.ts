@@ -111,8 +111,11 @@ export function makeLabel(text: string, worldHeight: number, style: LabelStyle =
     ctx.textAlign = 'left';
     lines.forEach((l, i) => ctx.fillText(l, padX, padY + lineH * (i + 0.5)));
     texture.needsUpdate = true;
+    // Preserve the canvas aspect exactly: height = one worldHeight per line,
+    // width follows from the pixel aspect (dividing by lines squishes
+    // multiline text horizontally).
     const h = worldHeight * lines.length;
-    sprite.scale.set((h * canvas.width) / canvas.height / lines.length, h, 1);
+    sprite.scale.set((h * canvas.width) / canvas.height, h, 1);
   };
   draw(text, style);
   return { sprite, setText: draw };
@@ -495,6 +498,7 @@ export function buildWristPanel(): UIPanel {
     [
       { id: 'capture', label: '📷 Capture', flex: 1.2 },
       { id: 'record', label: '⏺ Rec' },
+      { id: 'help', label: '?' },
       { id: 'exit', label: 'Exit AR' },
     ],
   ]);

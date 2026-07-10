@@ -1,0 +1,58 @@
+<!doctype html>
+<!-- Guide-chip visual smoke: renders GuideView's controller chip fans for the
+     full-view context at roughly hand positions, so layout/wrapping/leader
+     lines can be checked headless. PASS = both groups populated and rendered.
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --window-size=1000,700 \
+         --virtual-time-budget=8000 --screenshot=guide.png \
+         https://localhost:5173/test/guide-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>guide chips smoke</title></head>
+  <body style="margin:0;background:#000">
+    <pre id="out" style="position:fixed;top:6px;left:8px;z-index:9;color:#9f6;font:14px monospace">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { GuideView } from '../src/guideView.ts';
+      import { guideItems } from '../src/guide.ts';
+
+      const out = document.getElementById('out');
+      try {
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(1000, 700);
+        document.body.appendChild(renderer.domElement);
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x14181f);
+        const camera = new THREE.PerspectiveCamera(55, 1000 / 700, 0.01, 10);
+        camera.position.set(0, 1.45, 0.32);
+        camera.lookAt(0, 1.05, -0.25);
+
+        const guide = new GuideView();
+        guide.left.position.set(-0.22, 1.05, -0.25);
+        guide.right.position.set(0.22, 1.05, -0.25);
+        scene.add(guide.left, guide.right);
+        const ctx = { mode: 'full', placeMode: 'actor', eyesMode: false };
+        guide.show(ctx);
+        // Stand-in controller bodies AFTER show() — rebuild clears the groups.
+        for (const group of [guide.left, guide.right]) {
+          group.add(
+            new THREE.Mesh(
+              new THREE.SphereGeometry(0.025, 12, 8),
+              new THREE.MeshBasicMaterial({ color: 0x39415a }),
+            ),
+          );
+        }
+        renderer.render(scene, camera);
+
+        const n = guideItems(ctx).length;
+        const drawn = guide.left.children.length + guide.right.children.length;
+        // Each item contributes a line + a sprite; plus the 2 stand-in bodies.
+        if (drawn !== n * 2 + 2) throw new Error(`expected ${n * 2 + 2} children, got ${drawn}`);
+        out.textContent = `GUIDE-SMOKE PASS (${n} chips)`;
+      } catch (e) {
+        out.textContent = `GUIDE-SMOKE FAIL: ${e.message}`;
+        out.style.color = '#f66';
+      }
+    </script>
+  </body>
+</html>

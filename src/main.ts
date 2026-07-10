@@ -32,6 +32,8 @@ import { DesktopPreview } from './preview.ts';
 import { MonitorRecorder } from './recorder.ts';
 import { recordingClock } from './recording.ts';
 import { ViewManager } from './views.ts';
+import { GUIDE_AUTO_SHOW_S, type GuideContext } from './guide.ts';
+import { GuideView } from './guideView.ts';
 import { Persistence } from './persistence.ts';
 import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, type UIPanel } from './ui.ts';
 
@@ -95,7 +97,12 @@ class App {
   private hover: { kind: 'actor' | 'camera'; id: string } | null = null;
   private draggedActor: ActorObject | null = null;
   private draggedCamera: CamObject | null = null;
+  private draggedMonitor = false;
   private miniGrabbing = false;
+  /** Controls guide: auto-shows at session start; wrist "?" pins it. */
+  private guide = new GuideView();
+  private guideAutoUntil = 0;
+  private guideSticky = false;
   private notesVisible = true;
   private pendingReanchorActors: ActorObject[] = [];
   private pendingReanchorCams: CamObject[] = [];
@@ -176,6 +183,8 @@ class App {
       this.views.platform,
       this.views.fadeSphere,
       this.driftMarker.group,
+      this.guide.left,
+      this.guide.right,
     ]);
     this.preview.onClose = () => {
       this.landing.show(true);
@@ -471,6 +480,10 @@ class App {
     if (this.draggedCamera) this.cams.gizmoGroup.attach(this.draggedCamera.root);
     this.draggedActor = null;
     this.draggedCamera = null;
+    if (this.draggedMonitor) {
+      this.draggedMonitor = false;
+      this.scene3.attach(this.cams.monitor);
+    }
     if (this.miniGrabbing) {
       this.views.miniGrabEnd();
       this.miniGrabbing = false;
@@ -544,7 +557,9 @@ class App {
     this.cams.onChange = () => this.markDirty();
     this.views.onModeChange = (mode) => {
       this.cams.monitor.visible = mode === 'camera';
-      if (mode === 'camera') this.cams.monitor.position.set(0, 0, 0); // snap ahead
+      // (0,0,0) is the "park me where the user looks" sentinel (cams.update).
+      if (mode === 'camera') this.cams.monitor.position.set(0, 0, 0);
+      this.guide.refresh(this.guideCtx());
       this.debug.log(`view: ${mode}`);
       this.refreshWristState();
     };
@@ -588,6 +603,7 @@ class App {
         break;
       case 'framelines':
         this.cams.setEyesMode(!this.cams.eyesMode);
+        this.guide.refresh(this.guideCtx());
         this.refreshWristState();
         break;
       case 'aspect': {
@@ -686,6 +702,13 @@ class App {
       case 'record':
         this.toggleRecording();
         break;
+      case 'help':
+        this.guideSticky = !this.guideSticky;
+        this.guideAutoUntil = 0;
+        if (this.guideSticky) this.guide.show(this.guideCtx());
+        else this.guide.hide();
+        this.wrist.setToggle('help', this.guideSticky);
+        break;
       case 'exit':
         void this.session.session?.end();
         break;
@@ -723,6 +746,11 @@ class App {
         this.pendingReanchorCams.push(obj);
       }
       this.lastTime = 0;
+      // Teach the controls up front: chips tethered to the controllers for the
+      // first few seconds; the wrist "?" button brings them back anytime.
+      this.guideSticky = false;
+      this.guideAutoUntil = performance.now() + GUIDE_AUTO_SHOW_S * 1000;
+      this.guide.show(this.guideCtx());
       this.renderer.setAnimationLoop((t, frame) => this.loop(t, frame));
     } catch (e) {
       this.debug.log(`failed to start AR: ${(e as Error).message}`);
@@ -735,6 +763,9 @@ class App {
 
   private onSessionEnd(): void {
     this.renderer.setAnimationLoop(null);
+    this.guide.hide();
+    this.guideSticky = false;
+    this.guideAutoUntil = 0;
     // End an in-flight take and save it — the download lands on the 2D page.
     this.stopRecording(true);
     this.keyframes.stop();
@@ -813,6 +844,14 @@ class App {
         this.draggedCamera = obj;
         ray.attach(obj.root); // free 6-DOF carry; re-parented on release
       }
+    } else if (this.views.mode === 'camera' && this.cams.monitor.visible) {
+      // Grab the parked director's monitor to re-park it wherever you like.
+      const rc = this.input.raycaster(hand, this.raycaster);
+      const ray = this.input.raySpace(hand);
+      if (rc && ray && rc.intersectObject(this.cams.monitor, true).length > 0) {
+        this.draggedMonitor = true;
+        ray.attach(this.cams.monitor);
+      }
     }
   }
 
@@ -839,6 +878,10 @@ class App {
       this.cams.gizmoGroup.attach(obj.root);
       this.cams.syncFromRoot(obj);
       if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
+    }
+    if (this.draggedMonitor) {
+      this.draggedMonitor = false;
+      this.scene3.attach(this.cams.monitor); // keeps its carried world pose
     }
   }
 
@@ -1060,6 +1103,7 @@ class App {
 
   private setPlaceMode(mode: PlaceMode): void {
     this.placeMode = mode;
+    this.guide.refresh(this.guideCtx());
     this.refreshWristState();
   }
 
@@ -1069,6 +1113,10 @@ class App {
 
   private cycleView(): void {
     this.views.cycle(this.lastViewerPos, this.lastViewerQuat, this.sceneBounds());
+  }
+
+  private guideCtx(): GuideContext {
+    return { mode: this.views.mode, placeMode: this.placeMode, eyesMode: this.cams.eyesMode };
   }
 
   private sceneBounds(): THREE.Box3 | null {
@@ -1184,6 +1232,12 @@ class App {
     const leftGrip = this.input.gripSpace('left');
     if (leftGrip && this.wristMount.parent !== leftGrip) leftGrip.add(this.wristMount);
     this.wrist.group.visible = this.input.connected('left') && !this.input.isHand('left');
+
+    // Controls-guide chips ride the same grip spaces; expire the auto-show.
+    if (leftGrip && this.guide.left.parent !== leftGrip) leftGrip.add(this.guide.left);
+    const rightGrip = this.input.gripSpace('right');
+    if (rightGrip && this.guide.right.parent !== rightGrip) rightGrip.add(this.guide.right);
+    if (this.guide.visible && !this.guideSticky && time > this.guideAutoUntil) this.guide.hide();
 
     // Active drags.
     const axes = this.input.axes(pointer);

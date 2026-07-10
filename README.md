@@ -48,6 +48,8 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 
 ## Controls cheat-sheet
 
+**In-headset controls guide:** on entering AR, chips appear tethered to each controller for 12 seconds, labeling what every button does in the current mode (they update live when you switch view or place mode). Press the wrist **?** button to pin them back on anytime. The tables below are the desktop reference of the same content.
+
 ### Phase 0–1 — placing & moving actors
 | Input | Action |
 |---|---|
@@ -72,7 +74,7 @@ The **wrist menu** floats above your **left** controller — point at it with th
 | Wrist **Aspect** | Cycle 2.39:1 → 16:9 → 4:3 |
 | Wrist **Format** (e.g. `S35`) | Cycle the sensor format S35 → FF → S16 → ANA2× on the active camera (and for frame lines / new cameras) — the frustum, monitor FOV, and DOF readouts re-derive from the new gate |
 | Wrist **T-stop** (e.g. `T2.8`) | Cycle whole stops T1.4 → 2 → 2.8 → 4 → 5.6 → 8 on the active camera — watch the DOF range tighten as you open up |
-| **Y** / wrist **Cam View** | Virtual monitor shows the active camera's frame (see limitation below) |
+| **Y** / wrist **Cam View** | Virtual monitor shows the active camera's frame (see limitation below). It parks where you're looking when the view opens — grip-grab it to carry it anywhere, like a real on-set monitor |
 | **Trigger** on a camera gizmo | Make it the active camera |
 | **Grip** on a camera gizmo | Grab & re-position it (full 6-DOF) |
 

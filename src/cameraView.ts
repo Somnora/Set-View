@@ -39,6 +39,8 @@ function m(v: number): string {
 
 /** Reused each frame by updateFromAnchors to avoid per-camera allocations. */
 const _scratchAnchor = new THREE.Vector3();
+const _ws = new THREE.Vector3();
+const _wp = new THREE.Vector3();
 
 const FRAME_LINE_DIST = 1.4; // meters from the eye
 const MONITOR_IMG_W = 0.6; // meters
@@ -372,15 +374,40 @@ export class CameraSystem {
 
   // --- per-frame updates ---------------------------------------------------------
 
-  /** Lazy-follow monitor placement + flash restore. Call every frame. */
-  update(dt: number, time: number, headPos: THREE.Vector3, headQuat: THREE.Quaternion): void {
+  /** Monitor parking, near-head gizmo ghosting, flash restore. Every frame. */
+  update(_dt: number, time: number, headPos: THREE.Vector3, headQuat: THREE.Quaternion): void {
     if (this.monitor.visible) {
-      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(headQuat);
-      const desired = headPos.clone().addScaledVector(forward, 0.7);
-      desired.y -= 0.06;
-      const k = 1 - Math.exp(-dt * 5);
-      this.monitor.position.lerp(desired, this.monitor.position.lengthSq() === 0 ? 1 : k);
-      this.monitor.lookAt(headPos);
+      // Park once where the user is looking when the view opens (position is
+      // zeroed on entry as the "place me" sentinel), then STAY PUT like a
+      // real director's monitor — a screen that chases the head reads as
+      // "stuck to my face" and can't be escaped or repositioned. Grip-grab
+      // moves it (main.ts); it only billboards toward the user while parked.
+      if (this.monitor.position.lengthSq() === 0) {
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(headQuat);
+        forward.y = 0;
+        if (forward.lengthSq() > 1e-6) forward.normalize();
+        this.monitor.position.copy(headPos).addScaledVector(forward, 0.9);
+        this.monitor.position.y = headPos.y - 0.15;
+      }
+      if (this.monitor.parent && !(this.monitor.parent instanceof THREE.Scene)) {
+        // Mid-grab: carried by the controller; skip the billboard.
+      } else {
+        this.monitor.lookAt(headPos);
+      }
+    }
+    // Ghost any camera gizmo the user's head is inside (eyes-mode commits
+    // place the camera AT the head — without this it covers their face and
+    // they have to guess why). World-space check so mini view (scaled-down
+    // content) is unaffected; the RTT pass save/restores visibility per
+    // object, so this composes with pass hiding.
+    const scale = this.contentRoot.getWorldScale(_ws).x || 1;
+    const threshold = 0.45 * scale;
+    for (const o of this.objects.values()) {
+      // A grip-carried camera is parented to the ray space and legitimately
+      // passes near the head — never ghost it mid-drag.
+      if (o.root.parent !== this.gizmoGroup) continue;
+      const d = o.root.getWorldPosition(_wp).distanceTo(headPos);
+      o.root.visible = d > threshold;
     }
     if (this.frameLabelFlashUntil && time > this.frameLabelFlashUntil) {
       this.frameLabelFlashUntil = 0;

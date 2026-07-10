@@ -41,6 +41,7 @@ import {
 } from '../src/lens.ts';
 import { cycleStance, isStanceId, poseFor, STANCES } from '../src/pose.ts';
 import { buildTimeline, lerpAngle, moveStats, sampleTimeline } from '../src/timeline.ts';
+import { ANCHOR_OFFSETS, guideItems, NEXT_VIEW } from '../src/guide.ts';
 import {
   buildShotList,
   cameraHalfFovRad,
@@ -1167,6 +1168,70 @@ test('recording policy constants are sane (fps/bitrate/cap all positive, bounded
   assert.ok(RECORD_VIDEO_BPS > 0);
   // The cap bounds worst-case in-memory take size to something a Quest tab survives.
   assert.ok((RECORD_VIDEO_BPS / 8) * MAX_RECORD_S < 512 * 1024 * 1024);
+});
+
+// --- in-AR controls guide -------------------------------------------------------
+
+const GUIDE_MODES = ['full', 'mini', 'camera'] as const;
+const GUIDE_CTXS = GUIDE_MODES.flatMap((mode) =>
+  (['actor', 'camera'] as const).flatMap((placeMode) =>
+    [false, true].map((eyesMode) => ({ mode, placeMode, eyesMode })),
+  ),
+);
+
+test('guide: every state yields chips, unique per hand+anchor, wrist chip always present', () => {
+  for (const ctx of GUIDE_CTXS) {
+    const items = guideItems(ctx);
+    assert.ok(items.length >= 4, `${ctx.mode}: too few chips`);
+    const keys = items.map((i) => `${i.hand}|${i.anchor}`);
+    assert.equal(new Set(keys).size, keys.length, `${ctx.mode}: duplicate hand+anchor`);
+    assert.ok(
+      items.some((i) => i.hand === 'left' && i.anchor === 'wrist'),
+      `${ctx.mode}: wrist-menu chip missing (scan-room discoverability)`,
+    );
+    for (const i of items) {
+      assert.ok(i.label.length > 0 && i.label.length <= 44, `label length: "${i.label}"`);
+      assert.ok(!/[—–]/.test(i.label), `no em/en dashes in product copy: "${i.label}"`);
+      assert.ok(i.anchor in ANCHOR_OFFSETS, `anchor "${i.anchor}" has no offset`);
+    }
+  }
+});
+
+test('guide: NEXT_VIEW matches ViewManager cycle order and the Y chip names it', () => {
+  assert.equal(NEXT_VIEW.full, 'mini');
+  assert.equal(NEXT_VIEW.mini, 'camera');
+  assert.equal(NEXT_VIEW.camera, 'full');
+  const titles = { full: 'Full', mini: 'Mini', camera: 'Cam View' } as const;
+  for (const ctx of GUIDE_CTXS) {
+    const y = guideItems(ctx).find((i) => i.hand === 'left' && i.anchor === 'upper');
+    assert.ok(y, `${ctx.mode}: Y chip missing`);
+    assert.ok(y.label.includes(titles[NEXT_VIEW[ctx.mode]]), `${ctx.mode}: Y chip names wrong next view`);
+  }
+});
+
+test('guide: full-view trigger chip tracks place mode; eyes mode adds the A chip', () => {
+  const actorTrig = guideItems({ mode: 'full', placeMode: 'actor', eyesMode: false }).find(
+    (i) => i.anchor === 'trigger',
+  );
+  const camTrig = guideItems({ mode: 'full', placeMode: 'camera', eyesMode: false }).find(
+    (i) => i.anchor === 'trigger',
+  );
+  assert.ok(actorTrig?.label.includes('actor') && !actorTrig.label.includes('camera'));
+  assert.ok(camTrig?.label.includes('camera'));
+  const eyesA = (eyes: boolean) =>
+    guideItems({ mode: 'full', placeMode: 'actor', eyesMode: eyes }).some(
+      (i) => i.hand === 'right' && i.anchor === 'lower',
+    );
+  assert.equal(eyesA(false), false, 'A does nothing in plain full view — no chip');
+  assert.equal(eyesA(true), true, 'eyes mode: A commits the camera — chip required');
+});
+
+test('guide: camera view teaches photo, focal, and monitor grab', () => {
+  const items = guideItems({ mode: 'camera', placeMode: 'actor', eyesMode: false });
+  const labels = items.map((i) => i.label.toLowerCase()).join(' | ');
+  assert.ok(labels.includes('photo'), 'photo chip');
+  assert.ok(labels.includes('focal'), 'focal chip');
+  assert.ok(labels.includes('monitor'), 'monitor-grab chip');
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this
