@@ -1,22 +1,32 @@
 // ---------------------------------------------------------------------------
-// Hand tool wheel — PURE, renderer-free (the tested surface).
+// Palm tool wheel — PURE, renderer-free (the tested surface).
 //
-// The wheel is the app's top-level menu: look at your left hand and a ring of
-// the tools for the CURRENT working mode fans around it. Two modes split the
-// two jobs on a set:
-//   block — plan the shot: place/move actors and cameras, marks, lenses.
+// The wheel is the app's top-level menu: look at your left palm and a ring of
+// tools appears in it. Tap a sector with a fingertip (or point + trigger with
+// a controller) to press. Some sectors open a SUB-WHEEL in place — the hub
+// turns into Back. Two modes split the two jobs on a set:
+//   block — plan the shot: actors, cameras, marks, lenses.
 //   dress — adjust the physical space: scan the room, move scanned furniture.
-// The hub shows the mode; the ring holds at most 8 sectors ordered roughly
-// start-to-finish through a session. "More" opens the detailed wrist panel.
-// wheelView.ts renders this; main.ts routes presses and gaze-gating.
+// wheelView.ts renders this; main.ts owns the current path and routes presses.
 // ---------------------------------------------------------------------------
 
 export type InteractionMode = 'block' | 'dress';
+
+/** Menu levels: the root ring, or one of the sub-wheels. */
+export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit';
 
 export interface WheelSector {
   id: string;
   /** Short label drawn in the sector (line-broken on \n). */
   label: string;
+  /** Opens a sub-wheel instead of performing an action. */
+  submenu?: WheelPath;
+}
+
+export interface WheelMenu {
+  /** Hub button: mode toggle at root, Back inside a sub-wheel. */
+  hub: { id: string; label: string; sub: string };
+  sectors: WheelSector[];
 }
 
 export interface WheelContext {
@@ -25,47 +35,97 @@ export interface WheelContext {
   viewMode: 'full' | 'mini' | 'camera';
   playing: boolean;
   recording: boolean;
-  /** A location scan exists in the scene (enables Loc cycling). */
+  /** A location scan exists in the scene (enables Room cycling). */
   hasScan: boolean;
   locationMode: 'hidden' | 'ghost' | 'solid';
+  /** Active-camera lens state, for value labels in the Lens sub-wheel. */
+  lensFocal: number;
+  tStop: number;
+  formatShort: string;
+  aspect: string;
+  eyesMode: boolean;
+  dofOn: boolean;
+  /** Playback pace (m/s) for the Marks sub-wheel readout. */
+  pace: number;
 }
 
 export const MAX_SECTORS = 8;
 
-/** Sectors for the current state, clockwise from the top. Max 8. */
-export function wheelSectors(ctx: WheelContext): WheelSector[] {
-  const viewLabel = { full: 'Full', mini: 'Mini', camera: 'Cam' }[ctx.viewMode];
-  const common: WheelSector[] = [
-    { id: 'wheel-mode', label: ctx.mode === 'block' ? 'Dress\nthe set' : 'Block\nthe shot' },
-  ];
-  const tail: WheelSector[] = [
-    { id: 'wheel-view', label: `View:\n${viewLabel}` },
-    { id: 'wheel-photo', label: 'Photo' },
-    { id: 'wheel-rec', label: ctx.recording ? 'Stop\nRec' : 'Rec' },
-    { id: 'wheel-more', label: 'More' },
-  ];
-  if (ctx.mode === 'block') {
-    return [
-      ...common,
-      { id: 'wheel-place', label: ctx.placeMode === 'actor' ? 'Place:\nActor' : 'Place:\nCam' },
-      { id: 'wheel-play', label: ctx.playing ? 'Pause' : 'Play' },
-      { id: 'wheel-undo', label: 'Undo' },
-      ...tail,
-    ];
+/** The wheel for a given state + menu level. Sector 0 sits at 12 o'clock. */
+export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
+  if (path !== 'root') {
+    return { hub: { id: 'wheel-back', label: '◂ Back', sub: 'to tools' }, sectors: SUBMENUS[path](ctx) };
   }
-  return [
-    ...common,
-    { id: 'wheel-scan', label: 'Scan\nRoom' },
-    {
-      id: 'wheel-loc',
-      label: ctx.hasScan
-        ? `Room:\n${ctx.locationMode[0].toUpperCase()}${ctx.locationMode.slice(1)}`
-        : 'Room:\n(scan first)',
-    },
-    { id: 'wheel-undo', label: 'Undo' },
-    ...tail,
-  ];
+  const viewLabel = { full: 'Full', mini: 'Mini', camera: 'Cam' }[ctx.viewMode];
+  const hub = {
+    id: 'wheel-mode',
+    label: ctx.mode.toUpperCase(),
+    sub: ctx.mode === 'block' ? 'tap: dress set' : 'tap: block shot',
+  };
+  if (ctx.mode === 'block') {
+    return {
+      hub,
+      sectors: [
+        { id: 'wheel-place', label: ctx.placeMode === 'actor' ? 'Place:\nActor' : 'Place:\nCam' },
+        { id: 'sub-marks', label: 'Marks ▸', submenu: 'marks' },
+        { id: 'sub-lens', label: 'Lens ▸', submenu: 'lens' },
+        { id: 'wheel-view', label: `View:\n${viewLabel}` },
+        { id: 'sub-capture', label: 'Camera ▸', submenu: 'capture' },
+        { id: 'sub-edit', label: 'Edit ▸', submenu: 'edit' },
+        { id: 'wheel-more', label: 'More' },
+      ],
+    };
+  }
+  return {
+    hub,
+    sectors: [
+      { id: 'scan', label: 'Scan\nRoom' },
+      {
+        id: 'location',
+        label: ctx.hasScan
+          ? `Room:\n${ctx.locationMode[0].toUpperCase()}${ctx.locationMode.slice(1)}`
+          : 'Room:\n(scan first)',
+      },
+      { id: 'wheel-view', label: `View:\n${viewLabel}` },
+      { id: 'sub-capture', label: 'Camera ▸', submenu: 'capture' },
+      { id: 'sub-edit', label: 'Edit ▸', submenu: 'edit' },
+      { id: 'wheel-more', label: 'More' },
+    ],
+  };
 }
+
+const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelSector[]> = {
+  lens: (ctx) => [
+    { id: 'focal-down', label: 'Focal −' },
+    { id: 'focal-up', label: 'Focal +' },
+    { id: 'tstop', label: `T-stop\nT${ctx.tStop}` },
+    { id: 'format', label: `Format\n${ctx.formatShort}` },
+    { id: 'aspect', label: `Aspect\n${ctx.aspect}` },
+    { id: 'framelines', label: ctx.eyesMode ? 'Frame\nLines ✓' : 'Frame\nLines' },
+    { id: 'dof', label: ctx.dofOn ? 'DOF ✓' : 'DOF' },
+  ],
+  marks: (ctx) => [
+    { id: 'mark', label: 'Mark\nhere' },
+    { id: 'play', label: ctx.playing ? 'Pause' : 'Play' },
+    { id: 'stop', label: 'Stop' },
+    { id: 'clearkf', label: 'Clear\nmarks' },
+    { id: 'pace-slow', label: 'Pace −' },
+    { id: 'pace-fast', label: `Pace +\n${ctx.pace.toFixed(1)} m/s` },
+  ],
+  capture: (ctx) => [
+    { id: 'capture', label: 'Photo' },
+    { id: 'record', label: ctx.recording ? 'Stop\nRec ⏺' : 'Rec' },
+    { id: 'exit', label: 'Exit AR' },
+  ],
+  edit: () => [
+    { id: 'undo', label: 'Undo' },
+    { id: 'redo', label: 'Redo' },
+    { id: 'dup', label: 'Duplicate' },
+    { id: 'delete', label: 'Delete' },
+    { id: 'stance', label: 'Stance ▸' },
+    { id: 'notes', label: 'Notes' },
+  ],
+};
 
 // --- ring geometry -----------------------------------------------------------
 
@@ -94,6 +154,58 @@ export function wheelHit(u: number, v: number, sectorCount: number): number | 'h
 /** Center angle (radians from 12 o'clock, clockwise) of sector i of n. */
 export function sectorAngle(i: number, n: number): number {
   return (i * Math.PI * 2) / n;
+}
+
+// --- fingertip touch ------------------------------------------------------------
+
+/**
+ * Fingertip press detection against the wheel plane, in WHEEL-LOCAL meters
+ * (+z toward the viewer, disc of `radius` around the origin). A press fires
+ * on the DOWN edge: the tip must first hover in front of the plane, then
+ * push to (or through) it. Pulling back past the hover band re-arms.
+ */
+export const TOUCH_PRESS_Z = 0.01;
+export const TOUCH_ARM_Z = 0.035;
+export const TOUCH_MAX_BEHIND_Z = -0.06;
+
+export interface TouchState {
+  armed: boolean;
+}
+
+export interface TouchSample {
+  /** uv on the wheel (0..1, canvas orientation) or null when off the disc. */
+  u: number;
+  v: number;
+  pressed: boolean;
+}
+
+/**
+ * Feed one fingertip position (wheel-local). Returns the uv + whether a press
+ * fired this frame; mutates `state` for the edge detection.
+ */
+export function touchWheel(
+  state: TouchState,
+  x: number,
+  y: number,
+  z: number,
+  radius: number,
+): TouchSample | null {
+  const r = Math.sqrt(x * x + y * y);
+  if (r > radius || z < TOUCH_MAX_BEHIND_Z || z > 0.25) {
+    // Off the disc entirely: keep the armed state (a tap can start slightly
+    // off-plane), but nothing to report.
+    return null;
+  }
+  const u = x / (radius * 2) + 0.5;
+  const v = 0.5 - y / (radius * 2);
+  let pressed = false;
+  if (state.armed && z <= TOUCH_PRESS_Z) {
+    pressed = true;
+    state.armed = false;
+  } else if (!state.armed && z >= TOUCH_ARM_Z) {
+    state.armed = true;
+  }
+  return { u, v, pressed };
 }
 
 // --- gaze summon ---------------------------------------------------------------

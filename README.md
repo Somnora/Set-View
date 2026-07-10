@@ -48,12 +48,12 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 
 ## Controls cheat-sheet
 
-**The hand tool wheel:** look at your left hand and a ring of tools appears around it — look away and it melts out of the frame. The wheel is mode-aware, with the hub switching between the two jobs on a set:
+**The palm tool wheel:** look at your left palm and a ring of tools appears in it — look away and it melts out of the frame. **Hands: tap a sector with your right index fingertip**, like tapping your palm. **Controllers: point and pull the trigger.** Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit) and the hub becomes **◂ Back**. The wheel is mode-aware, with the hub at root switching between the two jobs on a set:
 
-- **Block** (default) — plan the shot: place actor/camera, play/pause marks, undo, view, photo, record.
-- **Dress** — adjust the physical space: Scan Room, room display (Hidden/Ghost/Solid), undo, view, photo, record. In Dress mode the grip grabs **scanned furniture** and can't disturb your blocking; in Block mode it grabs **actors and cameras** and can't nudge the set.
+- **Block** (default) — plan the shot: Place actor/cam, Marks ▸ (mark here, play/pause, pace), Lens ▸ (focal, T-stop, format, aspect, frame lines, DOF), View, Camera ▸ (photo, rec, exit), Edit ▸ (undo, redo, duplicate, delete, stance, notes).
+- **Dress** — adjust the physical space: Scan Room, room display (Hidden/Ghost/Solid), plus View / Camera ▸ / Edit ▸. In Dress mode the grip grabs **scanned furniture** and can't disturb your blocking; in Block mode it grabs **actors and cameras** and can't nudge the set.
 
-Point at a sector and pull the trigger. **More** pins the full detail panel (lenses, T-stop, pace, stance, notes, exports) under the wheel.
+**More** pins the legacy detail panel (scrub slider, exports readouts) under the wheel. Hand-tracking users have full parity: "Mark here" in Marks ▸ replaces the controller B button.
 
 **In-headset controls guide:** on entering AR, chips appear tethered to each controller for 12 seconds, labeling what every button does in the current mode (they update live when you switch view, place mode, or Dress/Block). Press the panel **?** button to pin them back on anytime. The tables below are the desktop reference of the same content.
 

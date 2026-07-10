@@ -49,8 +49,9 @@ import {
   HUB_R,
   MAX_SECTORS,
   RING_R,
+  touchWheel,
   wheelHit,
-  wheelSectors,
+  wheelMenu,
 } from '../src/wheel.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from '../src/floor.ts';
 import {
@@ -1371,38 +1372,96 @@ const WHEEL_BASE = {
   recording: false,
   hasScan: true,
   locationMode: 'ghost',
+  lensFocal: 35,
+  tStop: 2.8,
+  formatShort: 'S35',
+  aspect: '2.39:1',
+  eyesMode: false,
+  dofOn: false,
+  pace: 1.4,
 } as const;
 
-test('wheel: both modes fit the ring, unique ids, mode toggle first, copy rules hold', () => {
+test('wheel: every menu level fits the ring, unique ids, copy rules hold', () => {
   for (const mode of ['block', 'dress'] as const) {
-    const sectors = wheelSectors({ ...WHEEL_BASE, mode });
-    assert.ok(sectors.length >= 6 && sectors.length <= MAX_SECTORS, `${mode}: ${sectors.length} sectors`);
-    assert.equal(new Set(sectors.map((s) => s.id)).size, sectors.length, `${mode}: duplicate ids`);
-    assert.equal(sectors[0].id, 'wheel-mode', `${mode}: mode toggle must lead the ring`);
-    assert.equal(sectors[sectors.length - 1].id, 'wheel-more', `${mode}: More closes the ring`);
-    for (const s of sectors) {
-      assert.ok(s.label.length > 0 && !/[—–]/.test(s.label), `copy: "${s.label}"`);
+    for (const path of ['root', 'lens', 'marks', 'capture', 'edit'] as const) {
+      const menu = wheelMenu({ ...WHEEL_BASE, mode }, path);
+      assert.ok(
+        menu.sectors.length >= 3 && menu.sectors.length <= MAX_SECTORS,
+        `${mode}/${path}: ${menu.sectors.length} sectors`,
+      );
+      const ids = menu.sectors.map((s) => s.id);
+      assert.equal(new Set(ids).size, ids.length, `${mode}/${path}: duplicate ids`);
+      for (const s of [...menu.sectors, { id: menu.hub.id, label: menu.hub.label }]) {
+        assert.ok(s.label.length > 0 && !/[—–]/.test(s.label), `copy: "${s.label}"`);
+      }
+      // Hub is the mode switch at root, Back everywhere else.
+      assert.equal(menu.hub.id, path === 'root' ? 'wheel-mode' : 'wheel-back', `${mode}/${path}: hub`);
     }
   }
 });
 
-test('wheel: sectors reflect state (mode swap, place/play/rec labels, scan gating)', () => {
-  const block = wheelSectors({ ...WHEEL_BASE, mode: 'block' });
-  assert.ok(block[0].label.includes('Dress'), 'block hub offers Dress');
-  assert.ok(block.some((s) => s.id === 'wheel-place' && s.label.includes('Actor')));
-  assert.ok(!block.some((s) => s.id === 'wheel-scan'), 'scan lives in dress mode');
-  const dress = wheelSectors({ ...WHEEL_BASE, mode: 'dress' });
-  assert.ok(dress[0].label.includes('Block'), 'dress hub offers Block');
-  assert.ok(dress.some((s) => s.id === 'wheel-scan'));
-  assert.ok(dress.some((s) => s.id === 'wheel-loc' && s.label.includes('Ghost')));
-  assert.ok(!dress.some((s) => s.id === 'wheel-place'), 'placing is a block tool');
+test('wheel: root rings reflect mode and state; every submenu opener resolves', () => {
+  const block = wheelMenu({ ...WHEEL_BASE, mode: 'block' }, 'root');
+  assert.ok(block.hub.sub.includes('dress'), 'block hub offers dress');
+  assert.ok(block.sectors.some((s) => s.id === 'wheel-place' && s.label.includes('Actor')));
+  assert.ok(!block.sectors.some((s) => s.id === 'scan'), 'scan lives in dress mode');
+  const dress = wheelMenu({ ...WHEEL_BASE, mode: 'dress' }, 'root');
+  assert.ok(dress.hub.sub.includes('block'), 'dress hub offers block');
+  assert.ok(dress.sectors.some((s) => s.id === 'scan'));
+  assert.ok(dress.sectors.some((s) => s.id === 'location' && s.label.includes('Ghost')));
+  assert.ok(!dress.sectors.some((s) => s.id === 'wheel-place'), 'placing is a block tool');
+  const noScan = wheelMenu({ ...WHEEL_BASE, mode: 'dress', hasScan: false }, 'root');
+  assert.ok(noScan.sectors.some((s) => s.id === 'location' && /scan first/.test(s.label)));
 
-  const playing = wheelSectors({ ...WHEEL_BASE, mode: 'block', playing: true });
-  assert.ok(playing.some((s) => s.id === 'wheel-play' && s.label === 'Pause'));
-  const rec = wheelSectors({ ...WHEEL_BASE, mode: 'block', recording: true });
-  assert.ok(rec.some((s) => s.id === 'wheel-rec' && /stop/i.test(s.label)));
-  const noScan = wheelSectors({ ...WHEEL_BASE, mode: 'dress', hasScan: false });
-  assert.ok(noScan.some((s) => s.id === 'wheel-loc' && /scan first/.test(s.label)));
+  // Every submenu a root sector points to must produce a ring.
+  for (const menu of [block, dress]) {
+    for (const s of menu.sectors) {
+      if (s.submenu) {
+        const sub = wheelMenu({ ...WHEEL_BASE, mode: 'block' }, s.submenu);
+        assert.ok(sub.sectors.length > 0, `submenu ${s.submenu} empty`);
+      }
+    }
+  }
+});
+
+test('wheel: sub-wheels carry live values and hands get a Mark button', () => {
+  const lens = wheelMenu({ ...WHEEL_BASE, mode: 'block', tStop: 4, formatShort: 'FF', dofOn: true }, 'lens');
+  const labels = lens.sectors.map((s) => s.label).join('|');
+  assert.ok(labels.includes('T4') && labels.includes('FF') && labels.includes('DOF ✓'));
+  assert.ok(lens.sectors.some((s) => s.id === 'focal-down') && lens.sectors.some((s) => s.id === 'focal-up'));
+
+  const marks = wheelMenu({ ...WHEEL_BASE, mode: 'block', playing: true, pace: 2.0 }, 'marks');
+  assert.ok(marks.sectors.some((s) => s.id === 'mark'), 'hands need a Mark button (no B on hand tracking)');
+  assert.ok(marks.sectors.some((s) => s.id === 'play' && s.label === 'Pause'));
+  assert.ok(marks.sectors.some((s) => /2\.0 m\/s/.test(s.label)));
+
+  const cap = wheelMenu({ ...WHEEL_BASE, mode: 'block', recording: true }, 'capture');
+  assert.ok(cap.sectors.some((s) => s.id === 'record' && /stop/i.test(s.label)));
+  assert.ok(cap.sectors.some((s) => s.id === 'exit'), 'hands must be able to exit AR');
+});
+
+test('wheel: fingertip touch fires on the push-down edge only, re-arms on pull-back', () => {
+  const st = { armed: false };
+  const R = 0.08;
+  // Approach from the front: hover (arms), push through (fires once).
+  assert.equal(touchWheel(st, 0, 0.05, 0.06, R)?.pressed, false); // hovering, arms
+  assert.equal(st.armed, true);
+  assert.equal(touchWheel(st, 0, 0.05, 0.005, R)?.pressed, true); // push → press
+  assert.equal(touchWheel(st, 0, 0.05, 0.002, R)?.pressed, false, 'held through: no repeat');
+  // Pull back past the arm band → re-armed → second tap fires.
+  touchWheel(st, 0, 0.05, 0.05, R);
+  assert.equal(st.armed, true);
+  assert.equal(touchWheel(st, 0, 0.05, 0.0, R)?.pressed, true);
+  // Off the disc: nothing to report (and no accidental press).
+  assert.equal(touchWheel(st, 0.2, 0.2, 0.005, R), null);
+  // Starting BEHIND the plane (hand through the wheel) never fires unarmed.
+  const st2 = { armed: false };
+  assert.equal(touchWheel(st2, 0, 0, -0.02, R)?.pressed, false);
+  // uv maps the disc to canvas orientation: center = (0.5, 0.5), up = v<0.5.
+  const c = touchWheel(st2, 0, 0, 0.1, R);
+  assert.ok(c && Math.abs(c.u - 0.5) < 1e-9 && Math.abs(c.v - 0.5) < 1e-9);
+  const up = touchWheel(st2, 0, 0.06, 0.1, R);
+  assert.ok(up && up.v < 0.5);
 });
 
 test('wheel: hit-testing — hub, sector centers, wrap at 12 o\'clock, outside null', () => {

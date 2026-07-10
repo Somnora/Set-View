@@ -34,7 +34,7 @@ import { recordingClock } from './recording.ts';
 import { ViewManager } from './views.ts';
 import { GUIDE_AUTO_SHOW_S, type GuideContext } from './guide.ts';
 import { GuideView } from './guideView.ts';
-import { gazeEngaged, type InteractionMode } from './wheel.ts';
+import { gazeEngaged, type InteractionMode, wheelMenu, type WheelPath } from './wheel.ts';
 import { WheelPanel } from './wheelView.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
@@ -53,6 +53,7 @@ const _worldToScene = new THREE.Matrix4();
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
+const _tip = new THREE.Vector3();
 
 /** Smooth-glide speed (m/s) for thumbstick locomotion through the set. */
 const LOCOMOTION_SPEED = 1.8;
@@ -101,9 +102,13 @@ class App {
   /** Dress = adjust the physical space; Block = plan the shot. */
   private interactionMode: InteractionMode = 'block';
   private wheel = new WheelPanel();
+  /** Current wheel menu level; resets to root whenever the wheel hides. */
+  private wheelPath: WheelPath = 'root';
   /** Wheel "More" pins the detailed wrist panel open under the wheel. */
   private panelPinned = false;
   private wheelShown = false;
+  /** Right fingertip is over the wheel disc (suppresses pinch fall-through). */
+  private tipOnWheel = false;
   private placeMode: PlaceMode = 'actor';
   private selectedActorId: string | null = null;
   private hover: Hover = null;
@@ -221,8 +226,10 @@ class App {
     // The tool wheel floats just above the wrist; the detailed panel hangs
     // below it, shown only while the wheel's "More" is pinned.
     this.wristMount.add(this.wheel.group);
-    this.wheel.group.position.set(WRIST_POS.x, WRIST_POS.y + 0.05, WRIST_POS.z - 0.13);
-    this.wheel.group.rotation.x = WRIST_ROT_X;
+    // In the PALM (just above the grip origin), not up the forearm — hands
+    // tap it directly, so it must sit where the fingers naturally reach. It
+    // billboards toward the eyes each frame while shown.
+    this.wheel.group.position.set(0, 0.05, -0.04);
     this.wheel.onPress = (id) => this.onWheelPress(id);
 
     this.landing = new Landing(document.getElementById('landing')!, {
@@ -626,38 +633,46 @@ class App {
     };
   }
 
-  /** Tool-wheel sector presses (top-level menu; wheel.ts defines the ring). */
+  /** Palm-wheel presses: menu navigation + actions (wheel.ts defines rings). */
   private onWheelPress(id: string): void {
     switch (id) {
+      // Navigation.
+      case 'sub-lens':
+      case 'sub-marks':
+      case 'sub-capture':
+      case 'sub-edit':
+        this.wheelPath = id.slice(4) as WheelPath;
+        break;
+      case 'wheel-back':
+        this.wheelPath = 'root';
+        break;
+      // Root actions.
       case 'wheel-mode':
         this.setInteractionMode(this.interactionMode === 'block' ? 'dress' : 'block');
         break;
       case 'wheel-place':
         this.setPlaceMode(this.placeMode === 'actor' ? 'camera' : 'actor');
         break;
-      case 'wheel-play':
-        this.onWristPress('play');
-        break;
-      case 'wheel-undo':
-        this.undo();
-        break;
       case 'wheel-view':
         this.cycleView();
         break;
-      case 'wheel-photo':
-        this.capturePhoto();
-        break;
-      case 'wheel-rec':
-        this.toggleRecording();
-        break;
-      case 'wheel-scan':
-        this.toggleScan();
-        break;
-      case 'wheel-loc':
-        this.onWristPress('location');
-        break;
       case 'wheel-more':
         this.panelPinned = !this.panelPinned;
+        break;
+      // Sub-wheel actions with no wrist-panel equivalent.
+      case 'focal-down':
+        this.cams.stepActiveFocal(-1);
+        break;
+      case 'focal-up':
+        this.cams.stepActiveFocal(1);
+        break;
+      case 'mark':
+        // The B button is unreachable on hand tracking — this is its home.
+        if (this.interactionMode === 'block') this.captureKeyframe();
+        break;
+      // Everything else is a wrist-panel action verbatim.
+      default:
+        this.onWristPress(id);
         break;
     }
     this.refreshWristState();
@@ -892,6 +907,9 @@ class App {
 
   private onTriggerDown(hand: Hand): void {
     if (this.noteEditor.isOpen || hand !== this.input.pointerHand()) return;
+    // A fingertip on the wheel already pressed by touch; swallow the pinch so
+    // it can't fall through and place an actor behind the palm.
+    if (this.tipOnWheel) return;
     if (this.wheel.handleTriggerDown()) return;
     if (this.wrist.handleTriggerDown()) return;
 
@@ -1286,15 +1304,28 @@ class App {
   }
 
   private refreshWristState(): void {
-    this.wheel.setContext({
-      mode: this.interactionMode,
-      placeMode: this.placeMode,
-      viewMode: this.views.mode,
-      playing: this.keyframes.playing,
-      recording: this.recorder.recording,
-      hasScan: this.location.hasScan,
-      locationMode: this.location.mode,
-    });
+    const activeCam = this.cams.active;
+    this.wheel.setMenu(
+      wheelMenu(
+        {
+          mode: this.interactionMode,
+          placeMode: this.placeMode,
+          viewMode: this.views.mode,
+          playing: this.keyframes.playing,
+          recording: this.recorder.recording,
+          hasScan: this.location.hasScan,
+          locationMode: this.location.mode,
+          lensFocal: activeCam?.data.lensFocalLength ?? 35,
+          tStop: activeCam?.data.tStop ?? this.cams.currentTStop,
+          formatShort: sensorFormat(activeCam?.data.formatId ?? this.cams.currentFormat).short,
+          aspect: activeCam?.data.aspect ?? this.cams.currentAspect,
+          eyesMode: this.cams.eyesMode,
+          dofOn: this.cams.dofEnabled,
+          pace: this.sceneData.walkSpeed,
+        },
+        this.wheelPath,
+      ),
+    );
     this.wrist.setToggle('mode-actor', this.placeMode === 'actor');
     this.wrist.setToggle('mode-camera', this.placeMode === 'camera');
     this.wrist.setToggle('view-full', this.views.mode === 'full');
@@ -1307,7 +1338,6 @@ class App {
     this.wrist.setLabel('aspect', this.cams.currentAspect);
     // Format/T-stop buttons read the ACTIVE camera (what cycling would edit),
     // falling back to the defaults applied to newly committed cameras.
-    const activeCam = this.cams.active;
     this.wrist.setLabel('format', sensorFormat(activeCam?.data.formatId ?? this.cams.currentFormat).short);
     this.wrist.setLabel('tstop', `T${activeCam?.data.tStop ?? this.cams.currentTStop}`);
     this.wrist.setLabel('pace', `${this.sceneData.walkSpeed.toFixed(1)} m/s`);
@@ -1387,9 +1417,13 @@ class App {
       }
     }
 
-    // Pointer ray → wrist panel first, then world targets.
+    // Pointer ray → wrist panel first, then world targets. Hands drive the
+    // wheel by DIRECT fingertip taps (right index tip on the palm disc);
+    // controllers by ray + trigger.
     const rc = this.input.raycaster(pointer, this.raycaster);
-    const onWheel = this.wheel.update(rc);
+    const tip = this.input.fingertip('right', _tip);
+    const onWheel = tip !== null ? this.wheel.touchAt(tip) : this.wheel.update(rc);
+    this.tipOnWheel = tip !== null && onWheel;
     const onPanel = this.wrist.update(rc, this.input.triggerHeld(pointer)) || onWheel;
     this.updateHover(onPanel ? null : rc);
 
@@ -1428,7 +1462,13 @@ class App {
     } else {
       this.wheelShown = false;
     }
+    if (!this.wheelShown && this.wheel.group.visible) {
+      // Fresh summon starts at the root ring.
+      this.wheelPath = 'root';
+      this.refreshWristState();
+    }
     this.wheel.group.visible = this.wheelShown;
+    if (this.wheelShown) this.wheel.group.lookAt(this.lastViewerPos); // face the eyes from the palm
     this.wrist.group.visible = this.wheelShown && this.panelPinned;
 
     // Controls-guide chips ride the same grip spaces; expire the auto-show.

@@ -60,6 +60,7 @@ export class InputManager {
   private renderer: THREE.WebGLRenderer;
   private controllers: THREE.Object3D[] = [];
   private grips: THREE.Object3D[] = [];
+  private handSpaces: THREE.Object3D[] = [];
   /** index -> handedness, filled from 'connected' events */
   private handedness: (Hand | null)[] = [null, null];
   private state: Record<Hand, HandState> = { left: freshHandState(), right: freshHandState() };
@@ -120,11 +121,32 @@ export class InputManager {
         }
       });
 
+      // Articulated hand joints (Quest hand tracking) — used for direct
+      // fingertip taps on the palm wheel. Inert when controllers are held.
+      const handSpace = renderer.xr.getHand(i);
+
       scene.add(controller);
       scene.add(grip);
+      scene.add(handSpace);
       this.controllers.push(controller);
       this.grips.push(grip);
+      this.handSpaces.push(handSpace);
     }
+  }
+
+  /**
+   * World position of a hand's index fingertip, or null (controller held /
+   * joint not tracked this frame). Writes into `out` and returns it.
+   */
+  fingertip(hand: Hand, out: THREE.Vector3): THREE.Vector3 | null {
+    if (!this.state[hand].isHand) return null;
+    const i = this.handedness.indexOf(hand);
+    if (i < 0) return null;
+    const joints = (this.handSpaces[i] as THREE.XRHandSpace).joints;
+    const tip = joints?.['index-finger-tip'];
+    if (!tip) return null;
+    tip.updateMatrixWorld();
+    return out.setFromMatrixPosition(tip.matrixWorld);
   }
 
   /** Poll gamepad buttons/axes with edge detection. Call once per frame. */

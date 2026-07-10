@@ -1,15 +1,19 @@
 // ---------------------------------------------------------------------------
-// Hand tool wheel renderer: a round canvas-texture panel above the left
-// wrist, drawing wheel.ts sectors as wedges with a mode hub. Same interaction
-// contract as UIPanel (ray hover + trigger press); main.ts summons it by
-// gaze (wheel.ts gazeEngaged) and routes presses.
+// Palm tool wheel renderer: a round canvas-texture disc in the left palm,
+// drawing the current wheel.ts menu (root ring or a sub-wheel, hub = mode /
+// Back). Two input paths share the same hover + press pipeline:
+//   controllers — point at it and pull the trigger (like the wrist panel);
+//   hands       — tap a sector with the RIGHT index fingertip (touchAt).
+// main.ts owns the menu path, summons the wheel by gaze, and routes presses.
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
-import { HUB_R, RING_R, sectorAngle, wheelHit, type WheelContext, wheelSectors } from './wheel.ts';
+import { sectorAngle, touchWheel, type TouchState, wheelHit, type WheelMenu } from './wheel.ts';
 
 const CANVAS_PX = 480;
-const WORLD_D = 0.16; // meters — wheel diameter at the wrist
+const WORLD_D = 0.16; // meters — wheel diameter in the palm
+
+const _local = new THREE.Vector3();
 
 export class WheelPanel {
   readonly group = new THREE.Group();
@@ -19,19 +23,11 @@ export class WheelPanel {
   private canvas: HTMLCanvasElement;
   private ctx2d: CanvasRenderingContext2D;
   private texture: THREE.CanvasTexture;
-  private sectors = wheelSectors({
-    mode: 'block',
-    placeMode: 'actor',
-    viewMode: 'full',
-    playing: false,
-    recording: false,
-    hasScan: false,
-    locationMode: 'hidden',
-  });
-  private hubLabel = 'BLOCK';
+  private menu: WheelMenu = { hub: { id: 'wheel-mode', label: 'BLOCK', sub: '' }, sectors: [] };
   private hover: number | 'hub' | null = null;
   private dirty = true;
   private raycastHits: THREE.Intersection[] = [];
+  private touchState: TouchState = { armed: false };
 
   constructor() {
     this.canvas = document.createElement('canvas');
@@ -54,22 +50,23 @@ export class WheelPanel {
     this.draw();
   }
 
-  /** Re-derives sectors + hub from app state; redraws only on change. */
-  setContext(ctx: WheelContext): void {
-    const next = wheelSectors(ctx);
-    const hub = ctx.mode.toUpperCase();
+  /** Swaps the displayed menu (root or sub-wheel); redraws only on change. */
+  setMenu(menu: WheelMenu): void {
+    const a = this.menu;
     if (
-      hub !== this.hubLabel ||
-      next.length !== this.sectors.length ||
-      next.some((s, i) => s.id !== this.sectors[i].id || s.label !== this.sectors[i].label)
+      a.hub.id !== menu.hub.id ||
+      a.hub.label !== menu.hub.label ||
+      a.hub.sub !== menu.hub.sub ||
+      a.sectors.length !== menu.sectors.length ||
+      menu.sectors.some((s, i) => s.id !== a.sectors[i].id || s.label !== a.sectors[i].label)
     ) {
-      this.sectors = next;
-      this.hubLabel = hub;
+      this.menu = menu;
+      this.hover = null;
       this.dirty = true;
     }
   }
 
-  /** Per-frame hover; returns true while the pointer engages the wheel. */
+  /** Per-frame ray hover (controllers); true while the pointer engages it. */
   update(ray: THREE.Raycaster | null): boolean {
     let newHover: number | 'hub' | null = null;
     let onWheel = false;
@@ -77,7 +74,7 @@ export class WheelPanel {
       this.raycastHits.length = 0;
       const hit = ray.intersectObject(this.mesh, false, this.raycastHits)[0];
       if (hit?.uv) {
-        newHover = wheelHit(hit.uv.x, 1 - hit.uv.y, this.sectors.length);
+        newHover = wheelHit(hit.uv.x, 1 - hit.uv.y, this.menu.sectors.length);
         onWheel = newHover !== null;
       }
     }
@@ -89,12 +86,41 @@ export class WheelPanel {
     return onWheel;
   }
 
-  /** Trigger-down routing; true when the wheel consumed the press. */
+  /**
+   * Fingertip interaction (hands): feed the RIGHT index tip world position;
+   * hovers the touched sector and fires onPress on the push-down edge.
+   * Returns true while the tip is over the disc (callers suppress pinch
+   * placement behind the wheel). Call INSTEAD of update() when a tip exists.
+   */
+  touchAt(tipWorld: THREE.Vector3 | null): boolean {
+    if (!this.group.visible || !tipWorld) return this.update(null);
+    this.mesh.updateMatrixWorld();
+    _local.copy(tipWorld);
+    this.mesh.worldToLocal(_local);
+    const sample = touchWheel(this.touchState, _local.x, _local.y, _local.z, WORLD_D / 2);
+    let newHover: number | 'hub' | null = null;
+    if (sample) {
+      newHover = wheelHit(sample.u, sample.v, this.menu.sectors.length);
+      if (sample.pressed && newHover !== null) this.pressAt(newHover);
+    }
+    if (newHover !== this.hover) {
+      this.hover = newHover;
+      this.dirty = true;
+    }
+    if (this.dirty) this.draw();
+    return sample !== null;
+  }
+
+  /** Trigger-down routing (controllers); true when the wheel consumed it. */
   handleTriggerDown(): boolean {
     if (this.hover === null || !this.group.visible) return false;
-    if (this.hover === 'hub') this.onPress('wheel-mode');
-    else this.onPress(this.sectors[this.hover].id);
+    this.pressAt(this.hover);
     return true;
+  }
+
+  private pressAt(target: number | 'hub'): void {
+    if (target === 'hub') this.onPress(this.menu.hub.id);
+    else if (this.menu.sectors[target]) this.onPress(this.menu.sectors[target].id);
   }
 
   private draw(): void {
@@ -102,15 +128,14 @@ export class WheelPanel {
     const ctx = this.ctx2d;
     const S = CANVAS_PX;
     const c = S / 2;
-    const ringR = (RING_R * S) / 2;
-    const hubR = (HUB_R * S) / 2;
+    const ringR = 0.98 * c;
+    const hubR = 0.3 * c;
     ctx.clearRect(0, 0, S, S);
 
-    const n = this.sectors.length;
+    const n = this.menu.sectors.length;
     const step = (Math.PI * 2) / Math.max(1, n);
-    this.sectors.forEach((sector, i) => {
-      // Canvas arcs measure from 3 o'clock CCW-negative; our sector centers
-      // are from 12 o'clock clockwise → canvas angle = center - π/2.
+    this.menu.sectors.forEach((sector, i) => {
+      // Canvas arcs measure from 3 o'clock; our centers from 12, clockwise.
       const a0 = sectorAngle(i, n) - Math.PI / 2 - step / 2;
       const hovered = this.hover === i;
       ctx.beginPath();
@@ -137,7 +162,7 @@ export class WheelPanel {
       });
     });
 
-    // Hub: current mode; pressing it (or sector 0) switches.
+    // Hub: mode at root (tap to switch), Back inside a sub-wheel.
     ctx.beginPath();
     ctx.arc(c, c, hubR, 0, Math.PI * 2);
     ctx.fillStyle = this.hover === 'hub' ? '#2e5bd7' : '#141821';
@@ -146,13 +171,13 @@ export class WheelPanel {
     ctx.lineWidth = 3;
     ctx.stroke();
     ctx.fillStyle = '#8ab4ff';
-    ctx.font = '700 26px system-ui, sans-serif';
+    ctx.font = '700 24px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(this.hubLabel, c, c - 8);
+    ctx.fillText(this.menu.hub.label, c, c - 9);
     ctx.fillStyle = '#9aa3b2';
-    ctx.font = '500 15px system-ui, sans-serif';
-    ctx.fillText('mode', c, c + 16);
+    ctx.font = '500 14px system-ui, sans-serif';
+    ctx.fillText(this.menu.hub.sub, c, c + 15);
 
     this.texture.needsUpdate = true;
   }

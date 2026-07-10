@@ -1,20 +1,21 @@
 <!doctype html>
-<!-- Hand tool-wheel smoke: renders the WheelPanel in both modes, then drives
-     a real raycast at a sector and at the hub, asserting hover + press
-     routing (the same code path a controller ray takes in AR).
+<!-- Palm tool-wheel smoke: renders the root ring and the Lens sub-wheel, then
+     drives BOTH input paths against the real WheelPanel — a controller
+     raycast (hover + trigger) and a simulated fingertip tap (hover in front,
+     push through the disc) — asserting press routing for each.
 
        chrome --headless=new --disable-gpu --ignore-certificate-errors \
          --enable-unsafe-swiftshader --window-size=1000,560 \
          --virtual-time-budget=8000 --screenshot=wheel.png --dump-dom \
          https://localhost:5173/test/wheel-smoke.html -->
 <html>
-  <head><meta charset="utf-8" /><title>tool wheel smoke</title></head>
+  <head><meta charset="utf-8" /><title>palm wheel smoke</title></head>
   <body style="margin:0;background:#000">
     <pre id="out" style="position:fixed;top:6px;left:8px;z-index:9;color:#9f6;font:14px monospace">running…</pre>
     <script type="module">
       import * as THREE from 'three';
       import { WheelPanel } from '../src/wheelView.ts';
-      import { wheelSectors } from '../src/wheel.ts';
+      import { wheelMenu } from '../src/wheel.ts';
 
       const out = document.getElementById('out');
       try {
@@ -26,44 +27,50 @@
         const camera = new THREE.PerspectiveCamera(50, 1000 / 560, 0.01, 10);
         camera.position.set(0, 0, 0.42);
 
-        const ctxBase = {
-          placeMode: 'actor',
-          viewMode: 'full',
-          playing: false,
-          recording: false,
-          hasScan: true,
-          locationMode: 'ghost',
+        const ctx = {
+          mode: 'block', placeMode: 'actor', viewMode: 'full', playing: false,
+          recording: false, hasScan: true, locationMode: 'ghost', lensFocal: 35,
+          tStop: 2.8, formatShort: 'S35', aspect: '2.39:1', eyesMode: false,
+          dofOn: false, pace: 1.4,
         };
-        const block = new WheelPanel();
-        block.setContext({ ...ctxBase, mode: 'block' });
-        block.group.position.x = -0.11;
-        const dress = new WheelPanel();
-        dress.setContext({ ...ctxBase, mode: 'dress' });
-        dress.group.position.x = 0.11;
-        scene.add(block.group, dress.group);
-        scene.updateMatrixWorld(true); // raycasts below run before any render
+        const root = new WheelPanel();
+        root.setMenu(wheelMenu(ctx, 'root'));
+        root.group.position.x = -0.11;
+        const lens = new WheelPanel();
+        lens.setMenu(wheelMenu(ctx, 'lens'));
+        lens.group.position.x = 0.11;
+        scene.add(root.group, lens.group);
+        scene.updateMatrixWorld(true); // interactions below run before any render
 
-        // Ray at the block wheel's 12 o'clock sector (sector 0 = mode toggle).
-        const rc = new THREE.Raycaster();
         const pressed = [];
-        block.onPress = (id) => pressed.push(id);
+        root.onPress = (id) => pressed.push(id);
+
+        // Controller path: ray at 12 o'clock (sector 0 = Place), then hub.
+        const rc = new THREE.Raycaster();
         const aim = (x, y) => {
           rc.set(new THREE.Vector3(x, y, 0.42), new THREE.Vector3(0, 0, -1));
-          block.update(rc);
+          root.update(rc);
         };
-        aim(-0.11, 0.05); // upper ring = sector 0
-        if (!block.handleTriggerDown()) throw new Error('sector press not consumed');
-        aim(-0.11, 0.0); // hub
-        if (!block.handleTriggerDown()) throw new Error('hub press not consumed');
-        if (pressed.join(',') !== 'wheel-mode,wheel-mode')
-          throw new Error(`press routing: ${pressed.join(',')}`);
-        aim(-0.3, 0.2); // far off the disc
-        if (block.handleTriggerDown()) throw new Error('miss consumed a press');
+        aim(-0.11, 0.05);
+        if (!root.handleTriggerDown()) throw new Error('ray sector press not consumed');
+        aim(-0.11, 0.0);
+        if (!root.handleTriggerDown()) throw new Error('ray hub press not consumed');
+        aim(-0.3, 0.2);
+        if (root.handleTriggerDown()) throw new Error('ray miss consumed a press');
 
-        const n = wheelSectors({ ...ctxBase, mode: 'block' }).length;
-        dress.update(null);
+        // Fingertip path: hover in front of sector 0, then push through.
+        const tip = new THREE.Vector3();
+        root.touchAt(tip.set(-0.11, 0.05, 0.05)); // hover: arms, no press
+        if (pressed.length !== 2) throw new Error('hover must not press');
+        root.touchAt(tip.set(-0.11, 0.05, 0.004)); // push: press fires
+        root.touchAt(tip.set(-0.11, 0.05, 0.002)); // held: no repeat
+        if (pressed.join(',') !== 'wheel-place,wheel-mode,wheel-place')
+          throw new Error(`press routing: ${pressed.join(',')}`);
+
+        const n = wheelMenu(ctx, 'root').sectors.length;
+        lens.update(null);
         renderer.render(scene, camera);
-        out.textContent = `WHEEL-SMOKE PASS (${n} sectors)`;
+        out.textContent = `WHEEL-SMOKE PASS (${n} root sectors, ray + touch)`;
       } catch (e) {
         out.textContent = `WHEEL-SMOKE FAIL: ${e.message}`;
         out.style.color = '#f66';
