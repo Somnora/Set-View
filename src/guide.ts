@@ -14,6 +14,8 @@ export interface GuideContext {
   placeMode: 'actor' | 'camera';
   /** Frame Lines (eyes-as-camera) active. */
   eyesMode: boolean;
+  /** Block = plan the shot; dress = adjust the physical space. */
+  interaction: 'block' | 'dress';
 }
 
 export interface GuideItem {
@@ -58,25 +60,31 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
   const nextTitle = VIEW_TITLE[NEXT_VIEW[ctx.mode]];
 
   // Left controller.
-  items.push({ hand: 'left', anchor: 'wrist', label: 'Menu here: Scan Room, Rec, views, notes' });
+  items.push({ hand: 'left', anchor: 'wrist', label: 'Look at this hand: tool wheel' });
   items.push({ hand: 'left', anchor: 'upper', label: `Y: next view (${nextTitle})` });
   if (ctx.mode === 'full') {
-    items.push({
-      hand: 'left',
-      anchor: 'lower',
-      label: ctx.placeMode === 'actor' ? 'X: switch to placing cameras' : 'X: switch to placing actors',
-    });
+    if (ctx.interaction === 'block') {
+      items.push({
+        hand: 'left',
+        anchor: 'lower',
+        label: ctx.placeMode === 'actor' ? 'X: switch to placing cameras' : 'X: switch to placing actors',
+      });
+    }
     items.push({ hand: 'left', anchor: 'stick', label: 'Glide through the set' });
   }
 
   // Right controller.
-  if (ctx.mode === 'full') {
+  if (ctx.mode === 'full' && ctx.interaction === 'dress') {
+    items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab furniture to move it' });
+    items.push({ hand: 'right', anchor: 'stick', label: 'Snap turn (or spin held furniture)' });
+    items.push({ hand: 'right', anchor: 'stick-click', label: 'Click: teleport to the ring' });
+  } else if (ctx.mode === 'full') {
     items.push({
       hand: 'right',
       anchor: 'trigger',
       label: ctx.placeMode === 'actor' ? 'Place actor on the ring, or select' : 'Place camera on the ring, or select',
     });
-    items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab actors, cameras, furniture' });
+    items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab an actor or camera' });
     items.push({ hand: 'right', anchor: 'upper', label: 'B: mark a move for the actor' });
     if (ctx.eyesMode) items.push({ hand: 'right', anchor: 'lower', label: 'A: commit camera at your eyes' });
     items.push({ hand: 'right', anchor: 'stick', label: 'Snap turn' });

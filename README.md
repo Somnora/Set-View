@@ -48,7 +48,14 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 
 ## Controls cheat-sheet
 
-**In-headset controls guide:** on entering AR, chips appear tethered to each controller for 12 seconds, labeling what every button does in the current mode (they update live when you switch view or place mode). Press the wrist **?** button to pin them back on anytime. The tables below are the desktop reference of the same content.
+**The hand tool wheel:** look at your left hand and a ring of tools appears around it — look away and it melts out of the frame. The wheel is mode-aware, with the hub switching between the two jobs on a set:
+
+- **Block** (default) — plan the shot: place actor/camera, play/pause marks, undo, view, photo, record.
+- **Dress** — adjust the physical space: Scan Room, room display (Hidden/Ghost/Solid), undo, view, photo, record. In Dress mode the grip grabs **scanned furniture** and can't disturb your blocking; in Block mode it grabs **actors and cameras** and can't nudge the set.
+
+Point at a sector and pull the trigger. **More** pins the full detail panel (lenses, T-stop, pace, stance, notes, exports) under the wheel.
+
+**In-headset controls guide:** on entering AR, chips appear tethered to each controller for 12 seconds, labeling what every button does in the current mode (they update live when you switch view, place mode, or Dress/Block). Press the panel **?** button to pin them back on anytime. The tables below are the desktop reference of the same content.
 
 ### Phase 0–1 — placing & moving actors
 | Input | Action |
@@ -62,7 +69,7 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 | Wrist **Drift** | Toggle drift-test grid at the session origin + debug readout |
 | **X** | Toggle placement mode: Actor ↔ Camera |
 
-The **wrist menu** floats above your **left** controller — point at it with the right controller and pull the trigger.
+The **wrist menu** (tool wheel + detail panel) appears above your **left** controller when you look at it — point with the right controller and pull the trigger.
 
 ### Phase 2 — cameras & lenses
 | Input | Action |

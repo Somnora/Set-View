@@ -34,6 +34,8 @@ import { recordingClock } from './recording.ts';
 import { ViewManager } from './views.ts';
 import { GUIDE_AUTO_SHOW_S, type GuideContext } from './guide.ts';
 import { GuideView } from './guideView.ts';
+import { gazeEngaged, type InteractionMode } from './wheel.ts';
+import { WheelPanel } from './wheelView.ts';
 import { Persistence } from './persistence.ts';
 import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, type UIPanel } from './ui.ts';
 
@@ -95,6 +97,12 @@ class App {
   private driftMarker: DriftMarker;
 
   // interaction state
+  /** Dress = adjust the physical space; Block = plan the shot. */
+  private interactionMode: InteractionMode = 'block';
+  private wheel = new WheelPanel();
+  /** Wheel "More" pins the detailed wrist panel open under the wheel. */
+  private panelPinned = false;
+  private wheelShown = false;
   private placeMode: PlaceMode = 'actor';
   private selectedActorId: string | null = null;
   private hover: Hover = null;
@@ -203,6 +211,12 @@ class App {
     this.wristMount.add(this.wrist.group);
     this.wrist.group.position.copy(WRIST_POS);
     this.wrist.group.rotation.x = WRIST_ROT_X;
+    // The tool wheel floats just above the wrist; the detailed panel hangs
+    // below it, shown only while the wheel's "More" is pinned.
+    this.wristMount.add(this.wheel.group);
+    this.wheel.group.position.set(WRIST_POS.x, WRIST_POS.y + 0.05, WRIST_POS.z - 0.13);
+    this.wheel.group.rotation.x = WRIST_ROT_X;
+    this.wheel.onPress = (id) => this.onWheelPress(id);
 
     this.landing = new Landing(document.getElementById('landing')!, {
       onEnter: () => void this.startAR(),
@@ -593,7 +607,7 @@ class App {
         if (this.noteEditor.isOpen) return;
         if (button === 'x') this.setPlaceMode(this.placeMode === 'actor' ? 'camera' : 'actor');
         else if (button === 'y') this.cycleView();
-        else if (button === 'b') this.captureKeyframe();
+        else if (button === 'b' && this.interactionMode === 'block') this.captureKeyframe();
         else if (button === 'a') this.onButtonA();
         else if (button === 'thumbclick' && hand === this.input.pointerHand()) this.tryTeleport();
       },
@@ -603,6 +617,63 @@ class App {
     this.wrist.onSlider = (id, v) => {
       if (id === 'scrub') this.keyframes.scrubTo(v);
     };
+  }
+
+  /** Tool-wheel sector presses (top-level menu; wheel.ts defines the ring). */
+  private onWheelPress(id: string): void {
+    switch (id) {
+      case 'wheel-mode':
+        this.setInteractionMode(this.interactionMode === 'block' ? 'dress' : 'block');
+        break;
+      case 'wheel-place':
+        this.setPlaceMode(this.placeMode === 'actor' ? 'camera' : 'actor');
+        break;
+      case 'wheel-play':
+        this.onWristPress('play');
+        break;
+      case 'wheel-undo':
+        this.undo();
+        break;
+      case 'wheel-view':
+        this.cycleView();
+        break;
+      case 'wheel-photo':
+        this.capturePhoto();
+        break;
+      case 'wheel-rec':
+        this.toggleRecording();
+        break;
+      case 'wheel-scan':
+        this.toggleScan();
+        break;
+      case 'wheel-loc':
+        this.onWristPress('location');
+        break;
+      case 'wheel-more':
+        this.panelPinned = !this.panelPinned;
+        break;
+    }
+    this.refreshWristState();
+  }
+
+  /**
+   * Dress = adjust the physical space (scan, move scanned furniture); Block =
+   * plan the shot (actors, cameras, marks, lenses). One mode is active at a
+   * time so pointing near a couch while blocking never grabs the couch, and
+   * dressing the set never disturbs the blocking.
+   */
+  private setInteractionMode(mode: InteractionMode): void {
+    if (mode === this.interactionMode) return;
+    this.cancelActiveManipulation();
+    this.interactionMode = mode;
+    this.contentVersion++; // grab targets swap between furniture and actors/cams
+    if (mode === 'dress' && this.location.hasScan && this.location.mode === 'hidden') {
+      // Give the dresser something to grab — ghost the scan in.
+      this.location.setMode('ghost');
+    }
+    this.guide.refresh(this.guideCtx());
+    this.debug.log(mode === 'dress' ? 'DRESS mode — move the set' : 'BLOCK mode — plan the shot');
+    this.refreshWristState();
   }
 
   private onWristPress(id: string): void {
@@ -768,6 +839,9 @@ class App {
         this.pendingReanchorCams.push(obj);
       }
       this.lastTime = 0;
+      // Every session opens planning the shot; Dress is an explicit switch.
+      this.interactionMode = 'block';
+      this.panelPinned = false;
       // Teach the controls up front: chips tethered to the controllers for the
       // first few seconds; the wrist "?" button brings them back anytime.
       this.guideSticky = false;
@@ -808,6 +882,7 @@ class App {
 
   private onTriggerDown(hand: Hand): void {
     if (this.noteEditor.isOpen || hand !== this.input.pointerHand()) return;
+    if (this.wheel.handleTriggerDown()) return;
     if (this.wrist.handleTriggerDown()) return;
 
     if (this.hover?.kind === 'actor') {
@@ -819,7 +894,7 @@ class App {
       this.refreshWristState();
       return;
     }
-    if (this.views.mode !== 'full') return;
+    if (this.views.mode !== 'full' || this.interactionMode !== 'block') return;
 
     if (this.placeMode === 'actor') {
       if (!this.session.lastHit) return;
@@ -1172,7 +1247,12 @@ class App {
   }
 
   private guideCtx(): GuideContext {
-    return { mode: this.views.mode, placeMode: this.placeMode, eyesMode: this.cams.eyesMode };
+    return {
+      mode: this.views.mode,
+      placeMode: this.placeMode,
+      eyesMode: this.cams.eyesMode,
+      interaction: this.interactionMode,
+    };
   }
 
   private sceneBounds(): THREE.Box3 | null {
@@ -1196,6 +1276,15 @@ class App {
   }
 
   private refreshWristState(): void {
+    this.wheel.setContext({
+      mode: this.interactionMode,
+      placeMode: this.placeMode,
+      viewMode: this.views.mode,
+      playing: this.keyframes.playing,
+      recording: this.recorder.recording,
+      hasScan: this.location.hasScan,
+      locationMode: this.location.mode,
+    });
     this.wrist.setToggle('mode-actor', this.placeMode === 'actor');
     this.wrist.setToggle('mode-camera', this.placeMode === 'camera');
     this.wrist.setToggle('view-full', this.views.mode === 'full');
@@ -1276,18 +1365,45 @@ class App {
 
     // Pointer ray → wrist panel first, then world targets.
     const rc = this.input.raycaster(pointer, this.raycaster);
-    const onPanel = this.wrist.update(rc, this.input.triggerHeld(pointer));
+    const onWheel = this.wheel.update(rc);
+    const onPanel = this.wrist.update(rc, this.input.triggerHeld(pointer)) || onWheel;
     this.updateHover(onPanel ? null : rc);
 
     const placingAllowed =
-      this.views.mode === 'full' && !onPanel && !this.hover && !this.draggedActor && this.placeMode === 'actor';
+      this.interactionMode === 'block' &&
+      this.views.mode === 'full' &&
+      !onPanel &&
+      !this.hover &&
+      !this.draggedActor &&
+      this.placeMode === 'actor';
     this.session.updateReticle(placingAllowed || (this.views.mode === 'full' && !onPanel && !this.hover));
 
-    // Wrist panel follows the left grip; hidden for tracked hands (no grip
-    // pose — the panel would freeze at the world origin).
+    // Wrist cluster (tool wheel + pinned detail panel) follows the left grip;
+    // hidden for tracked hands (no grip pose — it would freeze at the origin).
+    // Summoned by GAZE: it appears when you look at your hand and melts away
+    // when you look back at the set, so the tools are always one glance away
+    // without ever cluttering the frame. Hysteresis in gazeEngaged stops
+    // boundary flicker.
     const leftGrip = this.input.gripSpace('left');
     if (leftGrip && this.wristMount.parent !== leftGrip) leftGrip.add(this.wristMount);
-    this.wrist.group.visible = this.input.connected('left') && !this.input.isHand('left');
+    const wristUsable = this.input.connected('left') && !this.input.isHand('left');
+    if (wristUsable) {
+      this.wristMount.getWorldPosition(_pt);
+      _fwd.set(0, 0, -1).applyQuaternion(this.lastViewerQuat);
+      this.wheelShown = gazeEngaged({
+        fwd: _fwd,
+        toWrist: {
+          x: _pt.x - this.lastViewerPos.x,
+          y: _pt.y - this.lastViewerPos.y,
+          z: _pt.z - this.lastViewerPos.z,
+        },
+        shown: this.wheelShown,
+      });
+    } else {
+      this.wheelShown = false;
+    }
+    this.wheel.group.visible = this.wheelShown;
+    this.wrist.group.visible = this.wheelShown && this.panelPinned;
 
     // Controls-guide chips ride the same grip spaces; expire the auto-show.
     if (leftGrip && this.guide.left.parent !== leftGrip) leftGrip.add(this.guide.left);
@@ -1427,11 +1543,12 @@ class App {
     let next: Hover = null;
     if (rc && !this.draggedActor && !this.draggedCamera && !this.draggedFurniture && !this.miniGrabbing) {
       if (this.hoverTargetsVersion !== this.contentVersion) {
-        this.hoverTargets = [
-          ...this.actors.raycastTargets(),
-          ...this.cams.raycastTargets(),
-          ...this.location.furnitureTargets(),
-        ];
+        // The mode decides what the ray can touch: blocking never hovers the
+        // couch behind an actor; dressing never disturbs the blocking.
+        this.hoverTargets =
+          this.interactionMode === 'block'
+            ? [...this.actors.raycastTargets(), ...this.cams.raycastTargets()]
+            : [...this.location.furnitureTargets()];
         this.hoverTargetsVersion = this.contentVersion;
       }
       const hits = rc.intersectObjects(this.hoverTargets, true);

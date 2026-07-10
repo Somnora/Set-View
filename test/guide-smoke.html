@@ -31,7 +31,7 @@
         guide.left.position.set(-0.22, 1.05, -0.25);
         guide.right.position.set(0.22, 1.05, -0.25);
         scene.add(guide.left, guide.right);
-        const ctx = { mode: 'full', placeMode: 'actor', eyesMode: false };
+        const ctx = { mode: 'full', placeMode: 'actor', eyesMode: false, interaction: 'block' };
         guide.show(ctx);
         // Stand-in controller bodies AFTER show() — rebuild clears the groups.
         for (const group of [guide.left, guide.right]) {

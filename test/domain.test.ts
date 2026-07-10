@@ -43,6 +43,16 @@ import { cycleStance, isStanceId, poseFor, STANCES } from '../src/pose.ts';
 import { buildTimeline, lerpAngle, moveStats, sampleTimeline } from '../src/timeline.ts';
 import { ANCHOR_OFFSETS, guideItems, NEXT_VIEW } from '../src/guide.ts';
 import {
+  GAZE_HIDE_DOT,
+  GAZE_SHOW_DOT,
+  gazeEngaged,
+  HUB_R,
+  MAX_SECTORS,
+  RING_R,
+  wheelHit,
+  wheelSectors,
+} from '../src/wheel.ts';
+import {
   buildShotList,
   cameraHalfFovRad,
   cameraYaw,
@@ -1233,7 +1243,9 @@ test('recording policy constants are sane (fps/bitrate/cap all positive, bounded
 const GUIDE_MODES = ['full', 'mini', 'camera'] as const;
 const GUIDE_CTXS = GUIDE_MODES.flatMap((mode) =>
   (['actor', 'camera'] as const).flatMap((placeMode) =>
-    [false, true].map((eyesMode) => ({ mode, placeMode, eyesMode })),
+    [false, true].flatMap((eyesMode) =>
+      (['block', 'dress'] as const).map((interaction) => ({ mode, placeMode, eyesMode, interaction })),
+    ),
   ),
 );
 
@@ -1244,8 +1256,8 @@ test('guide: every state yields chips, unique per hand+anchor, wrist chip always
     const keys = items.map((i) => `${i.hand}|${i.anchor}`);
     assert.equal(new Set(keys).size, keys.length, `${ctx.mode}: duplicate hand+anchor`);
     assert.ok(
-      items.some((i) => i.hand === 'left' && i.anchor === 'wrist'),
-      `${ctx.mode}: wrist-menu chip missing (scan-room discoverability)`,
+      items.some((i) => i.hand === 'left' && i.anchor === 'wrist' && /tool wheel/i.test(i.label)),
+      `${ctx.mode}: tool-wheel chip missing (menu discoverability)`,
     );
     for (const i of items) {
       assert.ok(i.label.length > 0 && i.label.length <= 44, `label length: "${i.label}"`);
@@ -1268,16 +1280,16 @@ test('guide: NEXT_VIEW matches ViewManager cycle order and the Y chip names it',
 });
 
 test('guide: full-view trigger chip tracks place mode; eyes mode adds the A chip', () => {
-  const actorTrig = guideItems({ mode: 'full', placeMode: 'actor', eyesMode: false }).find(
+  const actorTrig = guideItems({ mode: 'full', placeMode: 'actor', eyesMode: false, interaction: 'block' }).find(
     (i) => i.anchor === 'trigger',
   );
-  const camTrig = guideItems({ mode: 'full', placeMode: 'camera', eyesMode: false }).find(
+  const camTrig = guideItems({ mode: 'full', placeMode: 'camera', eyesMode: false, interaction: 'block' }).find(
     (i) => i.anchor === 'trigger',
   );
   assert.ok(actorTrig?.label.includes('actor') && !actorTrig.label.includes('camera'));
   assert.ok(camTrig?.label.includes('camera'));
   const eyesA = (eyes: boolean) =>
-    guideItems({ mode: 'full', placeMode: 'actor', eyesMode: eyes }).some(
+    guideItems({ mode: 'full', placeMode: 'actor', eyesMode: eyes, interaction: 'block' }).some(
       (i) => i.hand === 'right' && i.anchor === 'lower',
     );
   assert.equal(eyesA(false), false, 'A does nothing in plain full view — no chip');
@@ -1285,11 +1297,98 @@ test('guide: full-view trigger chip tracks place mode; eyes mode adds the A chip
 });
 
 test('guide: camera view teaches photo, focal, and monitor grab', () => {
-  const items = guideItems({ mode: 'camera', placeMode: 'actor', eyesMode: false });
+  const items = guideItems({ mode: 'camera', placeMode: 'actor', eyesMode: false, interaction: 'block' });
   const labels = items.map((i) => i.label.toLowerCase()).join(' | ');
   assert.ok(labels.includes('photo'), 'photo chip');
   assert.ok(labels.includes('focal'), 'focal chip');
   assert.ok(labels.includes('monitor'), 'monitor-grab chip');
+});
+
+test('guide: dress mode swaps the grip chip to furniture and drops placing chips', () => {
+  const dress = guideItems({ mode: 'full', placeMode: 'actor', eyesMode: false, interaction: 'dress' });
+  const grip = dress.find((i) => i.hand === 'right' && i.anchor === 'grip');
+  assert.ok(grip && /furniture/i.test(grip.label), 'dress grip chip teaches furniture');
+  assert.ok(!dress.some((i) => i.anchor === 'trigger'), 'no placing chip while dressing');
+  assert.ok(!dress.some((i) => i.hand === 'left' && i.anchor === 'lower'), 'no X place-mode chip while dressing');
+  const block = guideItems({ mode: 'full', placeMode: 'actor', eyesMode: false, interaction: 'block' });
+  const blockGrip = block.find((i) => i.hand === 'right' && i.anchor === 'grip');
+  assert.ok(blockGrip && !/furniture/i.test(blockGrip.label), 'block grip chip is actors/cameras only');
+});
+
+// --- hand tool wheel -------------------------------------------------------------
+
+const WHEEL_BASE = {
+  placeMode: 'actor',
+  viewMode: 'full',
+  playing: false,
+  recording: false,
+  hasScan: true,
+  locationMode: 'ghost',
+} as const;
+
+test('wheel: both modes fit the ring, unique ids, mode toggle first, copy rules hold', () => {
+  for (const mode of ['block', 'dress'] as const) {
+    const sectors = wheelSectors({ ...WHEEL_BASE, mode });
+    assert.ok(sectors.length >= 6 && sectors.length <= MAX_SECTORS, `${mode}: ${sectors.length} sectors`);
+    assert.equal(new Set(sectors.map((s) => s.id)).size, sectors.length, `${mode}: duplicate ids`);
+    assert.equal(sectors[0].id, 'wheel-mode', `${mode}: mode toggle must lead the ring`);
+    assert.equal(sectors[sectors.length - 1].id, 'wheel-more', `${mode}: More closes the ring`);
+    for (const s of sectors) {
+      assert.ok(s.label.length > 0 && !/[—–]/.test(s.label), `copy: "${s.label}"`);
+    }
+  }
+});
+
+test('wheel: sectors reflect state (mode swap, place/play/rec labels, scan gating)', () => {
+  const block = wheelSectors({ ...WHEEL_BASE, mode: 'block' });
+  assert.ok(block[0].label.includes('Dress'), 'block hub offers Dress');
+  assert.ok(block.some((s) => s.id === 'wheel-place' && s.label.includes('Actor')));
+  assert.ok(!block.some((s) => s.id === 'wheel-scan'), 'scan lives in dress mode');
+  const dress = wheelSectors({ ...WHEEL_BASE, mode: 'dress' });
+  assert.ok(dress[0].label.includes('Block'), 'dress hub offers Block');
+  assert.ok(dress.some((s) => s.id === 'wheel-scan'));
+  assert.ok(dress.some((s) => s.id === 'wheel-loc' && s.label.includes('Ghost')));
+  assert.ok(!dress.some((s) => s.id === 'wheel-place'), 'placing is a block tool');
+
+  const playing = wheelSectors({ ...WHEEL_BASE, mode: 'block', playing: true });
+  assert.ok(playing.some((s) => s.id === 'wheel-play' && s.label === 'Pause'));
+  const rec = wheelSectors({ ...WHEEL_BASE, mode: 'block', recording: true });
+  assert.ok(rec.some((s) => s.id === 'wheel-rec' && /stop/i.test(s.label)));
+  const noScan = wheelSectors({ ...WHEEL_BASE, mode: 'dress', hasScan: false });
+  assert.ok(noScan.some((s) => s.id === 'wheel-loc' && /scan first/.test(s.label)));
+});
+
+test('wheel: hit-testing — hub, sector centers, wrap at 12 o\'clock, outside null', () => {
+  assert.equal(wheelHit(0.5, 0.5, 8), 'hub');
+  assert.equal(wheelHit(0.5, 0.5 - (HUB_R + RING_R) / 4, 8), 0); // straight up = sector 0
+  assert.equal(wheelHit(0.5 + (HUB_R + RING_R) / 4, 0.5, 8), 2); // 3 o'clock = sector 2 of 8
+  assert.equal(wheelHit(0.5, 0.5 + (HUB_R + RING_R) / 4, 8), 4); // 6 o'clock
+  assert.equal(wheelHit(0.5 - (HUB_R + RING_R) / 4, 0.5, 8), 6); // 9 o'clock
+  // Just left of 12 o'clock wraps back to sector 0, not sector 7.
+  const r = (HUB_R + RING_R) / 2 / 2;
+  const a = -0.1; // radians, slightly counter-clockwise of up
+  assert.equal(wheelHit(0.5 + Math.sin(a) * r, 0.5 - Math.cos(a) * r, 8), 0);
+  assert.equal(wheelHit(0.5, 0.02, 8) === null, false, 'ring edge still hits');
+  assert.equal(wheelHit(0.02, 0.02, 8), null, 'corner outside the disc');
+  assert.equal(wheelHit(0.5, 0.5, 0), 'hub');
+});
+
+test('wheel: gaze summon has hysteresis and an arm-length cap', () => {
+  const fwd = { x: 0, y: 0, z: -1 };
+  const at = (dot: number, dist: number) => ({
+    x: 0,
+    y: Math.sqrt(Math.max(0, 1 - dot * dot)) * dist,
+    z: -dot * dist,
+  });
+  // Looking straight at the hand engages; slightly off keeps it (hysteresis)…
+  assert.equal(gazeEngaged({ fwd, toWrist: at(0.9, 0.5), shown: false }), true);
+  assert.equal(gazeEngaged({ fwd, toWrist: at(0.8, 0.5), shown: false }), false);
+  assert.equal(gazeEngaged({ fwd, toWrist: at(0.8, 0.5), shown: true }), true);
+  // …until clearly looking away.
+  assert.equal(gazeEngaged({ fwd, toWrist: at(0.6, 0.5), shown: true }), false);
+  // Beyond arm's reach never engages, even dead-center.
+  assert.equal(gazeEngaged({ fwd, toWrist: at(1, 2.0), shown: true }), false);
+  assert.ok(GAZE_SHOW_DOT > GAZE_HIDE_DOT, 'show threshold must be tighter than hide');
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this

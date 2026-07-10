@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- Hand tool-wheel smoke: renders the WheelPanel in both modes, then drives
+     a real raycast at a sector and at the hub, asserting hover + press
+     routing (the same code path a controller ray takes in AR).
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --window-size=1000,560 \
+         --virtual-time-budget=8000 --screenshot=wheel.png --dump-dom \
+         https://localhost:5173/test/wheel-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>tool wheel smoke</title></head>
+  <body style="margin:0;background:#000">
+    <pre id="out" style="position:fixed;top:6px;left:8px;z-index:9;color:#9f6;font:14px monospace">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { WheelPanel } from '../src/wheelView.ts';
+      import { wheelSectors } from '../src/wheel.ts';
+
+      const out = document.getElementById('out');
+      try {
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(1000, 560);
+        document.body.appendChild(renderer.domElement);
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x14181f);
+        const camera = new THREE.PerspectiveCamera(50, 1000 / 560, 0.01, 10);
+        camera.position.set(0, 0, 0.42);
+
+        const ctxBase = {
+          placeMode: 'actor',
+          viewMode: 'full',
+          playing: false,
+          recording: false,
+          hasScan: true,
+          locationMode: 'ghost',
+        };
+        const block = new WheelPanel();
+        block.setContext({ ...ctxBase, mode: 'block' });
+        block.group.position.x = -0.11;
+        const dress = new WheelPanel();
+        dress.setContext({ ...ctxBase, mode: 'dress' });
+        dress.group.position.x = 0.11;
+        scene.add(block.group, dress.group);
+        scene.updateMatrixWorld(true); // raycasts below run before any render
+
+        // Ray at the block wheel's 12 o'clock sector (sector 0 = mode toggle).
+        const rc = new THREE.Raycaster();
+        const pressed = [];
+        block.onPress = (id) => pressed.push(id);
+        const aim = (x, y) => {
+          rc.set(new THREE.Vector3(x, y, 0.42), new THREE.Vector3(0, 0, -1));
+          block.update(rc);
+        };
+        aim(-0.11, 0.05); // upper ring = sector 0
+        if (!block.handleTriggerDown()) throw new Error('sector press not consumed');
+        aim(-0.11, 0.0); // hub
+        if (!block.handleTriggerDown()) throw new Error('hub press not consumed');
+        if (pressed.join(',') !== 'wheel-mode,wheel-mode')
+          throw new Error(`press routing: ${pressed.join(',')}`);
+        aim(-0.3, 0.2); // far off the disc
+        if (block.handleTriggerDown()) throw new Error('miss consumed a press');
+
+        const n = wheelSectors({ ...ctxBase, mode: 'block' }).length;
+        dress.update(null);
+        renderer.render(scene, camera);
+        out.textContent = `WHEEL-SMOKE PASS (${n} sectors)`;
+      } catch (e) {
+        out.textContent = `WHEEL-SMOKE FAIL: ${e.message}`;
+        out.style.color = '#f66';
+      }
+    </script>
+  </body>
+</html>
