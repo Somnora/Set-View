@@ -190,6 +190,36 @@ export interface CameraSetupData {
 }
 
 /**
+ * Where a labeled furniture mesh from the scan has been moved to, relative to
+ * its captured pose: an XZ offset plus a yaw about the mesh's own footprint
+ * center. The scan geometry blob itself is immutable — placements ride in the
+ * scene JSON so moving a couch never rewrites megabytes of mesh data.
+ */
+export interface FurniturePlacement {
+  /** Index into the scan's mesh list (codec order is stable). */
+  meshIndex: number;
+  /** Offset from the captured position, scene-space meters. */
+  dx: number;
+  dz: number;
+  /** Yaw about the footprint center, radians. */
+  rotY: number;
+}
+
+export function isFurniturePlacement(v: unknown): v is FurniturePlacement {
+  const p = v as FurniturePlacement;
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    isFiniteNum(p.meshIndex) &&
+    Number.isInteger(p.meshIndex) &&
+    p.meshIndex >= 0 &&
+    isFiniteNum(p.dx) &&
+    isFiniteNum(p.dz) &&
+    isFiniteNum(p.rotY)
+  );
+}
+
+/**
  * Compact description of a captured location scan. The heavy geometry blob
  * lives outside the scene JSON (IndexedDB, keyed by `id` — see scanStore.ts);
  * this summary is what localStorage autosave carries.
@@ -204,6 +234,8 @@ export interface ScanSummary {
   /** Axis-aligned bounds in scene space (meters). */
   boundsMin: Vec3;
   boundsMax: Vec3;
+  /** Moved furniture (labeled scan meshes). Absent = everything as captured. */
+  furniture?: FurniturePlacement[];
 }
 
 export interface SceneData {
@@ -490,7 +522,8 @@ function isScanSummary(v: unknown): v is ScanSummary {
     isFiniteNum(s.vertices) &&
     isFiniteNum(s.triangles) &&
     isVec3(s.boundsMin) &&
-    isVec3(s.boundsMax)
+    isVec3(s.boundsMax) &&
+    (s.furniture === undefined || (Array.isArray(s.furniture) && s.furniture.every(isFurniturePlacement)))
   );
 }
 
@@ -520,6 +553,12 @@ export function isSceneData(v: unknown): v is SceneData {
 export function normalizeScene(s: SceneData): SceneData {
   if (!isFiniteNum(s.walkSpeed) || s.walkSpeed <= 0) s.walkSpeed = WALK_SPEED_MS;
   if (s.scan === undefined) s.scan = null;
+  if (s.scan?.furniture !== undefined) {
+    // Drop malformed placements (a bad one would fling a couch to NaN);
+    // an empty list is equivalent to "as captured".
+    s.scan.furniture = s.scan.furniture.filter(isFurniturePlacement);
+    if (s.scan.furniture.length === 0) delete s.scan.furniture;
+  }
   for (const a of s.actors) {
     if (!isStanceId(a.stance)) a.stance = DEFAULT_STANCE;
     for (const k of a.keyframes) {

@@ -76,7 +76,7 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
       anchor: 'trigger',
       label: ctx.placeMode === 'actor' ? 'Place actor on the ring, or select' : 'Place camera on the ring, or select',
     });
-    items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab an actor or camera' });
+    items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab actors, cameras, furniture' });
     items.push({ hand: 'right', anchor: 'upper', label: 'B: mark a move for the actor' });
     if (ctx.eyesMode) items.push({ hand: 'right', anchor: 'lower', label: 'A: commit camera at your eyes' });
     items.push({ hand: 'right', anchor: 'stick', label: 'Snap turn' });

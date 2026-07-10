@@ -56,6 +56,9 @@ import {
   decodeScan,
   encodeScan,
   isLocationScan,
+  isMovableScanMesh,
+  meshFootprintCenter,
+  quatYaw,
   summarizeScan,
   transformPositions,
   type LocationScan,
@@ -911,6 +914,61 @@ test('SceneData: scan summary is validated and normalized', () => {
   assert.equal(isSceneData(legacy), true);
   normalizeScene(legacy);
   assert.equal(legacy.scan, null);
+});
+
+// --- movable scan furniture (Stage 1) -------------------------------------------
+
+test('furniture: global mesh is fixed, labeled meshes are movable', () => {
+  assert.equal(isMovableScanMesh('global mesh'), false);
+  assert.equal(isMovableScanMesh('Global Mesh'), false);
+  assert.equal(isMovableScanMesh('couch'), true);
+  assert.equal(isMovableScanMesh('table'), true);
+});
+
+test('furniture: meshFootprintCenter is the XZ bounds center, y always 0', () => {
+  const c = meshFootprintCenter(new Float32Array([-1, 0.7, -1, -0.5, 0.7, -1, -1, 0.7, -0.5]));
+  approx(c.x, -0.75);
+  approx(c.z, -0.75);
+  assert.equal(c.y, 0);
+  assert.deepEqual(meshFootprintCenter(new Float32Array([])), { x: 0, y: 0, z: 0 });
+});
+
+test('furniture: quatYaw matches the rotationY convention (0 = +Z)', () => {
+  approx(quatYaw(0, 0, 0, 1), 0); // identity
+  const half = Math.PI / 4; // quaternion for +90° yaw: (0, sin45, 0, cos45)
+  approx(quatYaw(0, Math.sin(half), 0, Math.cos(half)), Math.PI / 2);
+  // Mostly-yaw with a small tilt still lands on the yaw component.
+  approx(quatYaw(0.05, Math.sin(half), 0.05, Math.cos(half)), Math.PI / 2, 0.02);
+  assert.equal(quatYaw(Math.SQRT1_2, 0, 0, Math.SQRT1_2), 0); // forward → straight up: degenerate → 0
+});
+
+test('furniture: placements validate, survive JSON round-trip, bad ones drop', () => {
+  const s = createScene('furnished');
+  s.scan = summarizeScan(makeScan());
+  s.scan.furniture = [{ meshIndex: 1, dx: 0.5, dz: -0.25, rotY: Math.PI / 2 }];
+  const json = JSON.parse(JSON.stringify(s));
+  assert.equal(isSceneData(json), true);
+  assert.deepEqual(json.scan.furniture, s.scan.furniture);
+
+  const broken = JSON.parse(JSON.stringify(s));
+  broken.scan.furniture = [{ meshIndex: -1, dx: 0, dz: 0, rotY: 0 }];
+  assert.equal(isSceneData(broken), false); // import path rejects outright
+
+  // normalize path (localStorage autosave) drops bad entries, keeps good ones.
+  const mixed = JSON.parse(JSON.stringify(s)) as SceneData;
+  mixed.scan!.furniture = [
+    { meshIndex: 1, dx: 0.5, dz: -0.25, rotY: 0 },
+    { meshIndex: 0.5, dx: 0, dz: 0, rotY: 0 }, // fractional index
+    { meshIndex: 2, dx: NaN, dz: 0, rotY: 0 }, // NaN offset
+  ];
+  normalizeScene(mixed);
+  assert.deepEqual(mixed.scan!.furniture, [{ meshIndex: 1, dx: 0.5, dz: -0.25, rotY: 0 }]);
+
+  // All-bad list normalizes away entirely (absent = as captured).
+  const allBad = JSON.parse(JSON.stringify(s)) as SceneData;
+  allBad.scan!.furniture = [{ meshIndex: NaN, dx: 0, dz: 0, rotY: 0 }];
+  normalizeScene(allBad);
+  assert.equal(allBad.scan!.furniture, undefined);
 });
 
 // --- stance / pose ------------------------------------------------------------

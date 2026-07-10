@@ -63,6 +63,50 @@ export function transformPositions(positions: Float32Array, m: ArrayLike<number>
   }
 }
 
+// --- furniture placement (movable labeled meshes) ---------------------------
+
+/** The platform's whole-room mesh label; everything else is a movable piece. */
+export const GLOBAL_MESH_LABEL = 'global mesh';
+
+/** True for scan meshes the user can pick up and re-place (Stage 1). */
+export function isMovableScanMesh(label: string): boolean {
+  return label.toLowerCase() !== GLOBAL_MESH_LABEL;
+}
+
+/**
+ * XZ bounds center of a mesh's vertex positions — the pivot furniture yaws
+ * about (y stays 0: furniture slides on the floor plane).
+ */
+export function meshFootprintCenter(positions: Float32Array): Vec3 {
+  if (positions.length < 3) return { x: 0, y: 0, z: 0 };
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+  for (let i = 0; i + 2 < positions.length; i += 3) {
+    const x = positions[i];
+    const z = positions[i + 2];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+  return { x: (minX + maxX) / 2, y: 0, z: (minZ + maxZ) / 2 };
+}
+
+/**
+ * Yaw (radians about +Y, 0 = +Z — the app-wide heading convention) of a
+ * quaternion, by projecting its rotated forward onto the floor plane. Robust
+ * for furniture (mostly-yaw rotations); a degenerate vertical forward → 0.
+ */
+export function quatYaw(x: number, y: number, z: number, w: number): number {
+  // q * (0,0,1), then heading of the XZ projection.
+  const fx = 2 * (x * z + w * y);
+  const fz = 1 - 2 * (x * x + y * y);
+  if (fx * fx + fz * fz < 1e-12) return 0;
+  return Math.atan2(fx, fz);
+}
+
 /** Structural check for a scan object (e.g. read back from IndexedDB). */
 export function isLocationScan(v: unknown): v is LocationScan {
   const s = v as LocationScan;

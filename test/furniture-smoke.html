@@ -1,0 +1,92 @@
+<!doctype html>
+<!-- Movable scan furniture smoke: feeds a scan (global mesh + table) through
+     the real LocationRenderer and asserts re-centering, placement apply,
+     grab targets, and commitFurniture floor-settling — the renderer half of
+     the Stage 1 feature (the pure half lives in domain tests).
+
+       chrome --headless=new --disable-gpu --ignore-certificate-errors \
+         --enable-unsafe-swiftshader --virtual-time-budget=8000 --dump-dom \
+         https://localhost:5173/test/furniture-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>furniture smoke</title></head>
+  <body>
+    <pre id="out" style="color:#9f6">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { LocationRenderer } from '../src/location.ts';
+
+      const out = document.getElementById('out');
+      const eq = (a, b, m) => {
+        if (Math.abs(a - b) > 1e-5) throw new Error(`${m}: ${a} != ${b}`);
+      };
+      try {
+        const loc = new LocationRenderer();
+        const scan = {
+          version: 1,
+          id: 's1',
+          capturedAt: 1,
+          meshes: [
+            {
+              label: 'global mesh',
+              positions: new Float32Array([0, 0, 0, 4, 0, 0, 4, 2.5, 0]),
+              indices: new Uint32Array([0, 1, 2]),
+            },
+            {
+              // 1x1 table top centered on (2, ., 3), at 0.7m height
+              label: 'table',
+              positions: new Float32Array([1.5, 0.7, 2.5, 2.5, 0.7, 2.5, 2.5, 0.7, 3.5, 1.5, 0.7, 3.5]),
+              indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
+            },
+          ],
+        };
+        loc.setScan(scan);
+
+        // Hidden mode: nothing grabbable. Ghost: the table only.
+        if (loc.furnitureTargets().length !== 0) throw new Error('hidden scan offered grab targets');
+        loc.setMode('ghost');
+        const targets = loc.furnitureTargets();
+        if (targets.length !== 1) throw new Error(`expected 1 movable mesh, got ${targets.length}`);
+        const table = targets[0];
+        if (table.userData.scanMeshIndex !== 1) throw new Error('wrong meshIndex on table');
+
+        // Re-centered: object sits at the footprint center, geometry local.
+        eq(table.position.x, 2, 'center x');
+        eq(table.position.z, 3, 'center z');
+        const geoX = table.geometry.getAttribute('position').getX(0);
+        eq(geoX, -0.5, 'geometry recentered');
+        // The persisted scan buffer must be untouched (it may be shared).
+        eq(scan.meshes[1].positions[0], 1.5, 'source buffer untouched');
+
+        // A world-space vertex must land where it was captured.
+        table.updateMatrixWorld(true);
+        const v = new THREE.Vector3(-0.5, 0.7, -0.5).applyMatrix4(table.matrixWorld);
+        eq(v.x, 1.5, 'world vertex x');
+        eq(v.z, 2.5, 'world vertex z');
+
+        // Placement apply → move + yaw; clear → back to captured.
+        loc.applyPlacements([{ meshIndex: 1, dx: 1, dz: -2, rotY: Math.PI / 2 }]);
+        eq(table.position.x, 3, 'placed x');
+        eq(table.position.z, 1, 'placed z');
+        eq(table.rotation.y, Math.PI / 2, 'placed yaw');
+        loc.applyPlacements(undefined);
+        eq(table.position.x, 2, 'reset x');
+        eq(table.rotation.y, 0, 'reset yaw');
+
+        // commitFurniture settles a lifted/tilted release onto the floor.
+        table.position.set(2.5, 0.4, 3.5);
+        table.rotation.set(0.2, Math.PI / 4, -0.1);
+        const p = loc.commitFurniture(table);
+        eq(table.position.y, 0, 'settled to floor');
+        eq(table.rotation.x, 0, 'tilt removed');
+        eq(p.dx, 0.5, 'placement dx');
+        eq(p.dz, 0.5, 'placement dz');
+        if (Math.abs(p.rotY - Math.PI / 4) > 0.02) throw new Error(`yaw kept: ${p.rotY}`);
+
+        out.textContent = 'FURNITURE-SMOKE PASS';
+      } catch (e) {
+        out.textContent = `FURNITURE-SMOKE FAIL: ${e.message}`;
+        out.style.color = '#f66';
+      }
+    </script>
+  </body>
+</html>

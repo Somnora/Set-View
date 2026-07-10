@@ -49,6 +49,7 @@ const _worldToScene = new THREE.Matrix4();
 // Reused each frame for locomotion basis vectors (no per-frame allocation).
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
 
 /** Smooth-glide speed (m/s) for thumbstick locomotion through the set. */
 const LOCOMOTION_SPEED = 1.8;
@@ -63,6 +64,8 @@ const SCAN_TIMEOUT_MS = 30_000;
 const SCAN_ROOM_CAPTURE_AFTER_MS = 2_000;
 
 type PlaceMode = 'actor' | 'camera';
+/** What the pointer ray is over ('furniture' id = scan mesh index as string). */
+type Hover = { kind: 'actor' | 'camera' | 'furniture'; id: string } | null;
 
 class App {
   private renderer: THREE.WebGLRenderer;
@@ -94,10 +97,12 @@ class App {
   // interaction state
   private placeMode: PlaceMode = 'actor';
   private selectedActorId: string | null = null;
-  private hover: { kind: 'actor' | 'camera'; id: string } | null = null;
+  private hover: Hover = null;
   private draggedActor: ActorObject | null = null;
   private draggedCamera: CamObject | null = null;
   private draggedMonitor = false;
+  /** Scanned furniture mesh being grip-carried (Stage 1 movable furniture). */
+  private draggedFurniture: THREE.Object3D | null = null;
   private miniGrabbing = false;
   /** Controls guide: auto-shows at session start; wrist "?" pins it. */
   private guide = new GuideView();
@@ -330,7 +335,12 @@ class App {
       this.location.setScan(null);
       return;
     }
-    if (summary.id === this.displayedScanId) return;
+    if (summary.id === this.displayedScanId) {
+      // Same geometry, possibly different furniture placements (undo/redo,
+      // scene restore) — re-apply without reloading the blob.
+      this.location.applyPlacements(summary.furniture);
+      return;
+    }
     void this.persistence.scans.getScan(summary.id).then((scan) => {
       if (token !== this.locationSyncToken) return; // superseded
       if (!scan) {
@@ -341,6 +351,8 @@ class App {
       }
       this.displayedScanId = scan.id;
       this.location.setScan(scan);
+      this.location.applyPlacements(this.sceneData.scan?.furniture);
+      this.contentVersion++; // furniture raycast targets changed
       this.refreshWristState();
     });
   }
@@ -414,6 +426,7 @@ class App {
       this.locationSyncToken++; // kill any in-flight stale load
       this.location.setScan(scan);
       this.location.setMode('ghost'); // show alignment over passthrough for confirmation
+      this.contentVersion++; // fresh furniture raycast targets
       this.markDirty();
       this.refreshLanding();
       this.refreshWristState();
@@ -483,6 +496,14 @@ class App {
     if (this.draggedMonitor) {
       this.draggedMonitor = false;
       this.scene3.attach(this.cams.monitor);
+    }
+    if (this.draggedFurniture) {
+      // Settle visually but don't write data — the caller is about to reload
+      // or restore the scene, which re-applies the persisted placements.
+      const mesh = this.draggedFurniture;
+      this.draggedFurniture = null;
+      this.location.group.attach(mesh);
+      this.location.commitFurniture(mesh);
     }
     if (this.miniGrabbing) {
       this.views.miniGrabEnd();
@@ -681,6 +702,7 @@ class App {
           break;
         }
         const mode = this.location.cycleMode();
+        this.contentVersion++; // hidden scans aren't grabbable — targets change
         this.debug.log(`location: ${mode}`);
         this.refreshWristState();
         break;
@@ -844,6 +866,16 @@ class App {
         this.draggedCamera = obj;
         ray.attach(obj.root); // free 6-DOF carry; re-parented on release
       }
+    } else if (this.hover?.kind === 'furniture' && this.views.mode === 'full') {
+      // Carry a scanned furniture piece; release settles it on the floor.
+      const idx = Number(this.hover.id);
+      const mesh = this.location.furnitureTargets().find((m) => m.userData.scanMeshIndex === idx);
+      const ray = this.input.raySpace(hand);
+      if (mesh && ray) {
+        this.draggedFurniture = mesh;
+        ray.attach(mesh);
+        this.debug.log(`moving ${this.location.furnitureLabel(idx)}`);
+      }
     } else if (this.views.mode === 'camera' && this.cams.monitor.visible) {
       // Grab the parked director's monitor to re-park it wherever you like.
       const rc = this.input.raycaster(hand, this.raycaster);
@@ -882,6 +914,20 @@ class App {
     if (this.draggedMonitor) {
       this.draggedMonitor = false;
       this.scene3.attach(this.cams.monitor); // keeps its carried world pose
+    }
+    if (this.draggedFurniture) {
+      const mesh = this.draggedFurniture;
+      this.draggedFurniture = null;
+      this.location.group.attach(mesh); // back under contentRoot, world pose kept
+      const placement = this.location.commitFurniture(mesh);
+      if (placement && this.sceneData.scan) {
+        const list = (this.sceneData.scan.furniture ?? []).filter(
+          (p) => p.meshIndex !== placement.meshIndex,
+        );
+        list.push(placement);
+        this.sceneData.scan.furniture = list;
+        this.markDirty();
+      }
     }
   }
 
@@ -930,6 +976,12 @@ class App {
     // (phantom per-frame applyPose, and a leaked anchor queued on release).
     // Mirrors restoreScene. No-op when nothing is being manipulated.
     this.cancelActiveManipulation();
+    if (this.hover?.kind === 'furniture') {
+      // Guard: without this the fallthrough would delete the SELECTED actor
+      // while the user is pointing at a couch.
+      this.debug.log('scanned furniture can\'t be deleted — Remove scan (landing page) clears it all');
+      return;
+    }
     if (this.hover?.kind === 'camera') {
       this.debug.log(`deleted camera`);
       this.cams.remove(this.hover.id);
@@ -955,6 +1007,10 @@ class App {
 
   /** Clones the hovered/selected actor or camera a short step away. */
   private duplicateTarget(): void {
+    if (this.hover?.kind === 'furniture') {
+      this.debug.log('scanned furniture can\'t be duplicated (yet)');
+      return;
+    }
     if (this.hover?.kind === 'camera') {
       const data = duplicateCameraSetup(this.sceneData, this.hover.id);
       if (!data) return;
@@ -1254,6 +1310,11 @@ class App {
         const rotY = this.draggedActor.data.rotationY - axes.x * dt * 3.0;
         this.actors.applyPose(this.draggedActor, this.draggedActor.data.position, rotY);
       }
+    } else if (this.draggedFurniture) {
+      // Yaw the carried piece about the world up-axis (same stick gesture as
+      // rotating a dragged actor); world axis so the ray-space parent doesn't
+      // skew the spin.
+      if (Math.abs(axes.x) > 0.15) this.draggedFurniture.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
     } else if (this.miniGrabbing) {
       const grip = this.input.gripSpace(pointer);
       if (grip)
@@ -1284,7 +1345,13 @@ class App {
     // Suppressed while manipulating so it never fights a drag/grab. The radial
     // deadzone gate keeps the hot path allocation-free when the stick is centered
     // (the common case) — locomotionAmount only runs on real input.
-    if (this.views.mode === 'full' && !this.draggedActor && !this.draggedCamera && !this.miniGrabbing) {
+    if (
+      this.views.mode === 'full' &&
+      !this.draggedActor &&
+      !this.draggedCamera &&
+      !this.draggedFurniture &&
+      !this.miniGrabbing
+    ) {
       const ls = this.input.axes('left');
       if (ls.x * ls.x + ls.y * ls.y > LOCOMOTION_DEADZONE * LOCOMOTION_DEADZONE) {
         const mv = locomotionAmount(ls.x, ls.y, LOCOMOTION_SPEED, dt, LOCOMOTION_DEADZONE);
@@ -1357,10 +1424,14 @@ class App {
   }
 
   private updateHover(rc: THREE.Raycaster | null): void {
-    let next: { kind: 'actor' | 'camera'; id: string } | null = null;
-    if (rc && !this.draggedActor && !this.draggedCamera && !this.miniGrabbing) {
+    let next: Hover = null;
+    if (rc && !this.draggedActor && !this.draggedCamera && !this.draggedFurniture && !this.miniGrabbing) {
       if (this.hoverTargetsVersion !== this.contentVersion) {
-        this.hoverTargets = [...this.actors.raycastTargets(), ...this.cams.raycastTargets()];
+        this.hoverTargets = [
+          ...this.actors.raycastTargets(),
+          ...this.cams.raycastTargets(),
+          ...this.location.furnitureTargets(),
+        ];
         this.hoverTargetsVersion = this.contentVersion;
       }
       const hits = rc.intersectObjects(this.hoverTargets, true);
@@ -1368,6 +1439,10 @@ class App {
         const actorId = findActorId(hit.object);
         if (actorId) {
           next = { kind: 'actor', id: actorId };
+          break;
+        }
+        if (typeof hit.object.userData.scanMeshIndex === 'number') {
+          next = { kind: 'furniture', id: String(hit.object.userData.scanMeshIndex) };
           break;
         }
         let o: THREE.Object3D | null = hit.object;

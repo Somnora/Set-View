@@ -15,7 +15,8 @@
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
-import type { LocationScan } from './scan.ts';
+import type { FurniturePlacement } from './model.ts';
+import { isMovableScanMesh, meshFootprintCenter, quatYaw, type LocationScan } from './scan.ts';
 
 export type LocationMode = 'hidden' | 'ghost' | 'solid';
 
@@ -38,6 +39,15 @@ const LABEL_COLORS: Record<string, number> = {
 };
 const DEFAULT_COLOR = 0x8a8f98;
 
+interface FurnitureEntry {
+  mesh: THREE.Mesh;
+  /** Index into the scan's mesh list (the placement key). */
+  meshIndex: number;
+  label: string;
+  /** Captured footprint center — the mesh's rest position after re-centering. */
+  center: THREE.Vector3;
+}
+
 export class LocationRenderer {
   /** Parent under contentRoot. */
   readonly group = new THREE.Group();
@@ -46,6 +56,8 @@ export class LocationRenderer {
   /** One shared material per distinct color; retuned when the mode changes. */
   private materials = new Map<number, THREE.MeshLambertMaterial>();
   private cameraPassRestore: LocationMode | null = null;
+  /** Labeled (non-global) scan meshes, movable in Stage 1. */
+  private furniture: FurnitureEntry[] = [];
 
   constructor() {
     this.group.name = 'location-scan';
@@ -60,17 +72,80 @@ export class LocationRenderer {
   setScan(scan: LocationScan | null): void {
     this.clear();
     if (!scan) return;
-    for (const m of scan.meshes) {
+    scan.meshes.forEach((m, meshIndex) => {
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
+      const movable = isMovableScanMesh(m.label);
+      let center = new THREE.Vector3();
+      if (movable) {
+        // Re-center the geometry on its XZ footprint and put the offset in the
+        // object's position, so yawing the mesh pivots the couch about itself
+        // instead of orbiting the scene origin. The stored buffer is untouched
+        // (positions may be shared with the persisted scan) — copy first.
+        const c = meshFootprintCenter(m.positions);
+        center = new THREE.Vector3(c.x, 0, c.z);
+        const local = new Float32Array(m.positions);
+        for (let i = 0; i + 2 < local.length; i += 3) {
+          local[i] -= c.x;
+          local[i + 2] -= c.z;
+        }
+        geo.setAttribute('position', new THREE.BufferAttribute(local, 3));
+      } else {
+        geo.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
+      }
       // Indices fit u16 for typical room meshes; three picks the array type.
       geo.setIndex(new THREE.BufferAttribute(m.indices, 1));
       geo.computeVertexNormals(); // untextured Lambert needs normals to read as 3D
       const mesh = new THREE.Mesh(geo, this.material(labelColor(m.label)));
       mesh.name = `scan:${m.label}`;
+      if (movable) {
+        mesh.position.copy(center);
+        mesh.userData.scanMeshIndex = meshIndex;
+        this.furniture.push({ mesh, meshIndex, label: m.label, center });
+      }
       this.group.add(mesh);
-    }
+    });
     this.applyMode();
+  }
+
+  // --- movable furniture (Stage 1) -------------------------------------------
+
+  /** Sets every movable mesh from its placement (absent entry = as captured). */
+  applyPlacements(placements: FurniturePlacement[] | undefined): void {
+    for (const f of this.furniture) {
+      const p = placements?.find((x) => x.meshIndex === f.meshIndex);
+      f.mesh.position.set(f.center.x + (p?.dx ?? 0), 0, f.center.z + (p?.dz ?? 0));
+      f.mesh.rotation.set(0, p?.rotY ?? 0, 0);
+    }
+  }
+
+  /** Raycast targets for grab — only while the scan is actually visible. */
+  furnitureTargets(): THREE.Object3D[] {
+    if (this.mode === 'hidden' || this.furniture.length === 0) return [];
+    return this.furniture.map((f) => f.mesh);
+  }
+
+  furnitureLabel(meshIndex: number): string {
+    return this.furniture.find((f) => f.meshIndex === meshIndex)?.label ?? 'furniture';
+  }
+
+  /**
+   * Settles a just-released (or drag-cancelled) furniture mesh back onto the
+   * floor plane — position y to 0, rotation to pure yaw — and returns its
+   * placement for the scene JSON. The mesh must already be back under `group`.
+   */
+  commitFurniture(mesh: THREE.Object3D): FurniturePlacement | null {
+    const f = this.furniture.find((x) => x.mesh === mesh);
+    if (!f) return null;
+    const q = mesh.quaternion;
+    const rotY = quatYaw(q.x, q.y, q.z, q.w);
+    mesh.position.y = 0;
+    mesh.rotation.set(0, rotY, 0);
+    return {
+      meshIndex: f.meshIndex,
+      dx: mesh.position.x - f.center.x,
+      dz: mesh.position.z - f.center.z,
+      rotY,
+    };
   }
 
   setMode(mode: LocationMode): void {
@@ -130,6 +205,7 @@ export class LocationRenderer {
       this.group.remove(child);
       (child as THREE.Mesh).geometry?.dispose();
     }
+    this.furniture = [];
     // Materials are shared/reused across scans; keep them.
   }
 }
