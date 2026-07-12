@@ -28,19 +28,6 @@ export interface GuideItem {
 /** Seconds the guide stays up when it auto-shows at session start. */
 export const GUIDE_AUTO_SHOW_S = 12;
 
-/** Must match ViewManager's cycle order (full → mini → camera → full). */
-export const NEXT_VIEW: Record<GuideMode, GuideMode> = {
-  full: 'mini',
-  mini: 'camera',
-  camera: 'full',
-};
-
-const VIEW_TITLE: Record<GuideMode, string> = {
-  full: 'Full',
-  mini: 'Mini',
-  camera: 'Cam View',
-};
-
 /**
  * Line-start points for each anchor in grip-space meters, authored for the
  * RIGHT controller; the view mirrors x for the left hand.
@@ -58,11 +45,11 @@ export const ANCHOR_OFFSETS: Record<GuideAnchor, { x: number; y: number; z: numb
 /** The chips shown for a given app state. Order = fan slot order per hand. */
 export function guideItems(ctx: GuideContext): GuideItem[] {
   const items: GuideItem[] = [];
-  const nextTitle = VIEW_TITLE[NEXT_VIEW[ctx.mode]];
 
-  // Left controller.
-  items.push({ hand: 'left', anchor: 'wrist', label: 'Look at this hand: tool wheel' });
-  items.push({ hand: 'left', anchor: 'upper', label: `Y: next view (${nextTitle})` });
+  // Left controller. The tool wheel always rides this hand (raise it to see
+  // it); Y also pops the wheel in front of your face, hands-free.
+  items.push({ hand: 'left', anchor: 'wrist', label: 'Tool wheel is on this hand' });
+  items.push({ hand: 'left', anchor: 'upper', label: 'Y: pop the tool menu in front' });
   if (ctx.mode === 'full') {
     if (ctx.interaction === 'block') {
       items.push({

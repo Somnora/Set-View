@@ -35,7 +35,6 @@ import { ViewManager } from './views.ts';
 import { GUIDE_AUTO_SHOW_S, type GuideContext } from './guide.ts';
 import { GuideView } from './guideView.ts';
 import {
-  gazeEngaged,
   type InteractionMode,
   nextPlaceMode,
   type PlaceArm,
@@ -51,6 +50,16 @@ import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, type UIPan
 // Tune on-headset if the panel sits awkwardly (see TESTING.md).
 const WRIST_POS = new THREE.Vector3(0.0, 0.05, 0.16);
 const WRIST_ROT_X = -1.05; // radians, tilt toward the face
+
+// The tool wheel rides the LEFT hand and is shown whenever that hand is
+// tracked and this close to the head — no gaze, no summon gesture (repeated
+// QA showed gaze-summon left users with NO menu access at all). Beyond this
+// the grip is untracked/stuck at the world origin, so we hide the dead wheel.
+const WHEEL_MAX_REACH_M = 1.25;
+// Where the wheel parks when the menu BUTTON pops it in front of the face
+// (camera space: half a meter ahead, a touch low). A hard, hand-free path to
+// the menu for controller users.
+const WHEEL_FRONT_POS = new THREE.Vector3(0, -0.05, -0.5);
 
 // Reused each frame while dragging to avoid a Vector3 clone per frame.
 const _pt = new THREE.Vector3();
@@ -113,7 +122,12 @@ class App {
   /** Wheel "More" pins the detailed wrist panel open under the wheel. */
   private panelPinned = false;
   private wheelShown = false;
-  /** Right fingertip is over the wheel disc (suppresses pinch fall-through). */
+  /** Menu button popped the wheel to a head-anchored spot in front of you. */
+  private wheelInFront = false;
+  /** The pointer (ray or fingertip) is on the wheel this frame — so a pinch/
+   *  trigger is a MENU press and must never reach the world (place/select). */
+  private pointerOnWheel = false;
+  /** Right fingertip is over the wheel disc (freezes the billboard mid-tap). */
   private tipOnWheel = false;
   /** Placement is an ARMED tool, off by default — a bare pinch never places. */
   private placeMode: PlaceArm = 'none';
@@ -626,8 +640,11 @@ class App {
       onSqueezeUp: (hand) => this.onSqueezeUp(hand),
       onButtonDown: (hand, button) => {
         if (this.noteEditor.isOpen) return;
-        if (button === 'x') this.setPlaceMode(nextPlaceMode(this.placeMode));
-        else if (button === 'y') this.cycleView();
+        // Y (left) is the hard MENU button: pops the tool wheel to a spot in
+        // front of your face so the menu is one press away even if you never
+        // raise your hand. The wheel ALSO always rides the left hand (below).
+        if (button === 'y') this.toggleMenuInFront();
+        else if (button === 'x') this.setPlaceMode(nextPlaceMode(this.placeMode));
         else if (button === 'b' && this.interactionMode === 'block') this.captureKeyframe();
         else if (button === 'a') this.onButtonA();
         else if (button === 'thumbclick' && hand === this.input.pointerHand()) this.tryTeleport();
@@ -871,6 +888,7 @@ class App {
       // Every session opens planning the shot; Dress is an explicit switch.
       this.interactionMode = 'block';
       this.panelPinned = false;
+      this.wheelInFront = false; // wheel starts on the hand, Y parks it in front
       this.placeMode = 'none'; // placing is armed per use, never carried over
       // Fresh reference space, fresh floor evidence.
       this.floorEst = newFloorEstimate();
@@ -915,14 +933,15 @@ class App {
 
   private onTriggerDown(hand: Hand): void {
     if (this.noteEditor.isOpen || hand !== this.input.pointerHand()) return;
-    // Wheel up = you're looking at your palm, so every pinch/trigger is MENU
-    // intent: press the hovered sector (fingertip or ray hover) or the pinned
-    // panel, and otherwise swallow it. Nothing here may ever reach the world —
-    // on hands a palm tap doubles as a pinch, and third-QA showed each tap
-    // spawning an actor behind the wheel.
-    if (this.wheelShown || this.tipOnWheel) {
-      if (this.wheel.handleTriggerDown()) return;
-      this.wrist.handleTriggerDown();
+    // Pointer on the wheel (ray hovering a sector, or fingertip on the disc) =
+    // MENU intent: press the hovered sector and swallow the rest. Nothing here
+    // may reach the world — on hands a palm tap doubles as a pinch, and QA
+    // showed each such tap spawning an actor behind the wheel. Gated on
+    // actually POINTING at the wheel, not just its being visible (it always
+    // is now), so a pinch anywhere else still places/selects.
+    if (this.pointerOnWheel) {
+      // Fingertip taps already fired inside touchAt; the ray path presses here.
+      this.wheel.handleTriggerDown();
       return;
     }
     if (this.wrist.handleTriggerDown()) return;
@@ -1303,6 +1322,22 @@ class App {
     this.views.cycle(this.lastViewerPos, this.lastViewerQuat, this.sceneBounds());
   }
 
+  /**
+   * Hard menu button (Y): parks the tool wheel head-locked in front of you, or
+   * sends it back to riding the left hand. A hand-free, always-available path
+   * to the menu for controller users — pressed again it tucks away.
+   */
+  private toggleMenuInFront(): void {
+    this.wheelInFront = !this.wheelInFront;
+    this.wheelPath = 'root'; // a fresh summon always opens at the root ring
+    this.refreshWristState();
+    this.debug.log(
+      this.wheelInFront
+        ? 'menu: parked in front — point and pull the trigger (Y hides it)'
+        : 'menu: back on your left hand',
+    );
+  }
+
   private guideCtx(): GuideContext {
     return {
       mode: this.views.mode,
@@ -1395,6 +1430,7 @@ class App {
       this.session.reticle,
       ...this.input.hudObjects(),
       this.wrist.group,
+      this.wheel.group,
       this.cams.frameLines,
       this.cams.monitor,
       this.cams.gizmoGroup,
@@ -1454,6 +1490,10 @@ class App {
     const tip = this.input.fingertip('right', _tip);
     this.tipOnWheel = tip !== null && this.wheel.touchAt(tip);
     const onWheel = this.tipOnWheel || this.wheel.update(rc);
+    // A pinch/trigger is a MENU press only when the pointer is actually on the
+    // wheel — NOT merely because the wheel is visible (it almost always is
+    // now). This is what lets placement still work with the wheel on-screen.
+    this.pointerOnWheel = onWheel;
     const onPanel = this.wrist.update(rc, this.input.triggerHeld(pointer)) || onWheel;
     this.updateHover(onPanel ? null : rc);
 
@@ -1466,43 +1506,47 @@ class App {
       this.placeMode === 'actor';
     this.session.updateReticle(placingAllowed || (this.views.mode === 'full' && !onPanel && !this.hover));
 
-    // Wrist cluster (tool wheel + pinned detail panel) follows the left grip.
-    // Summoned by GAZE: it appears when you look at your hand and melts away
-    // when you look back at the set, so the tools are always one glance away
-    // without ever cluttering the frame. Hysteresis in gazeEngaged stops
-    // boundary flicker. Tracked HANDS get it too (Quest hands expose a grip
-    // pose; pinch = trigger) — first QA showed hands-only users were locked
-    // out of every menu. If a grip pose ever IS missing, the mount sits at
-    // the world origin, which the gaze gate's 1.2 m cap never engages.
+    // The tool wheel is the menu hub, and it is ALWAYS reachable — no gaze, no
+    // summon gesture (three QA sessions in a row, gaze-summon left users with
+    // NO way into the menu). It rides the LEFT hand: raise your hand and the
+    // wheel is right there; drop your hand and it falls out of frame on its
+    // own. The hard Y button ALSO parks it head-locked in front of your face
+    // (wheelInFront) so the menu is one press away even hand-free.
     const leftGrip = this.input.gripSpace('left');
     if (leftGrip && this.wristMount.parent !== leftGrip) leftGrip.add(this.wristMount);
-    const wristUsable = this.input.connected('left');
-    if (wristUsable) {
-      this.wristMount.getWorldPosition(_pt);
-      _fwd.set(0, 0, -1).applyQuaternion(this.lastViewerQuat);
-      this.wheelShown = gazeEngaged({
-        fwd: _fwd,
-        toWrist: {
-          x: _pt.x - this.lastViewerPos.x,
-          y: _pt.y - this.lastViewerPos.y,
-          z: _pt.z - this.lastViewerPos.z,
-        },
-        shown: this.wheelShown,
-      });
+    if (this.wheelInFront) {
+      // Head-locked, half a meter ahead. Parented to the camera so it stays
+      // planted in front of the face; identity rotation already faces you.
+      if (this.wheel.group.parent !== this.camera) this.camera.add(this.wheel.group);
+      this.wheel.group.position.copy(WHEEL_FRONT_POS);
+      this.wheel.group.quaternion.identity();
+      this.wheelShown = true;
     } else {
-      this.wheelShown = false;
+      // Riding the left hand (palm), billboarding to the eyes.
+      if (this.wheel.group.parent !== this.wristMount) {
+        this.wristMount.add(this.wheel.group);
+        this.wheel.group.position.set(0, 0.05, -0.04);
+      }
+      let reachable = false;
+      if (this.input.connected('left')) {
+        // Guard an untracked grip stuck at the world origin: a dead wheel far
+        // from the head must not float in space (past QA failure mode).
+        this.wheel.group.getWorldPosition(_pt);
+        reachable = _pt.distanceTo(this.lastViewerPos) < WHEEL_MAX_REACH_M;
+      }
+      this.wheelShown = reachable;
+      // Face the eyes from the palm — but FREEZE while a fingertip is on the
+      // disc: re-billboarding under the finger shifts the disc's local depth
+      // axis mid-tap and breaks the push-down edge detection.
+      if (this.wheelShown && !this.tipOnWheel) this.wheel.group.lookAt(this.lastViewerPos);
     }
     if (!this.wheelShown && this.wheel.group.visible) {
-      // Fresh summon starts at the root ring.
-      this.wheelPath = 'root';
+      this.wheelPath = 'root'; // reset to the root ring when it tucks away
       this.refreshWristState();
     }
     this.wheel.group.visible = this.wheelShown;
-    // Face the eyes from the palm — but FREEZE while a fingertip is on the
-    // disc: re-billboarding under the finger shifts the disc's local depth
-    // axis mid-tap and breaks the push-down edge detection.
-    if (this.wheelShown && !this.tipOnWheel) this.wheel.group.lookAt(this.lastViewerPos);
-    this.wrist.group.visible = this.wheelShown && this.panelPinned;
+    // The pinned detail panel hangs off the wrist, so only in hand mode.
+    this.wrist.group.visible = this.wheelShown && this.panelPinned && !this.wheelInFront;
 
     // Controls-guide chips ride the same grip spaces; expire the auto-show.
     if (leftGrip && this.guide.left.parent !== leftGrip) leftGrip.add(this.guide.left);

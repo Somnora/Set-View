@@ -234,40 +234,7 @@ export function touchWheel(
   return { u, v, pressed };
 }
 
-// --- gaze summon ---------------------------------------------------------------
-
-/**
- * Show/hide thresholds for summoning the wheel by looking at the hand, on the
- * dot product of head-forward with the direction to the wrist. Hysteresis:
- * engage needs a deliberate look; disengage only when clearly looking away,
- * so the wheel doesn't flicker at the boundary.
- */
-export const GAZE_SHOW_DOT = 0.82;
-export const GAZE_HIDE_DOT = 0.7;
-/** Beyond arm's reach it's not a "look at your hand" — never summon. */
-export const GAZE_MAX_DISTANCE_M = 1.2;
-/**
- * A hand hanging at your side while you look DOWN (aiming at the floor to
- * place or teleport) sits in the gaze cone too — but far below the eyes.
- * Only a raised palm summons: while the wheel is up every pinch is menu
- * intent (main.ts swallows it), so a false summon would eat real actions.
- */
-export const GAZE_MAX_DROP_M = 0.55;
-
-export interface GazeInput {
-  /** Normalized head forward. */
-  fwd: { x: number; y: number; z: number };
-  /** Wrist position minus head position (unnormalized). */
-  toWrist: { x: number; y: number; z: number };
-  /** Whether the wheel is currently shown (selects the hysteresis edge). */
-  shown: boolean;
-}
-
-/** Whether the wheel should be shown this frame. */
-export function gazeEngaged({ fwd, toWrist, shown }: GazeInput): boolean {
-  const dist = Math.sqrt(toWrist.x ** 2 + toWrist.y ** 2 + toWrist.z ** 2);
-  if (dist > GAZE_MAX_DISTANCE_M || dist < 1e-6) return false;
-  if (toWrist.y < -GAZE_MAX_DROP_M) return false; // hand at the side, not raised
-  const dot = (fwd.x * toWrist.x + fwd.y * toWrist.y + fwd.z * toWrist.z) / dist;
-  return dot >= (shown ? GAZE_HIDE_DOT : GAZE_SHOW_DOT);
-}
+// (The wheel used to be gaze-summoned — look at your palm to reveal it. Three
+// QA sessions showed that left users with no way into the menu at all, so it
+// is gone: the wheel now always rides the left hand and a hard Y button parks
+// it in front of the face. See main.ts loop + toggleMenuInFront.)

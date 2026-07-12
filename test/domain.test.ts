@@ -41,11 +41,8 @@ import {
 } from '../src/lens.ts';
 import { cycleStance, isStanceId, poseFor, STANCES } from '../src/pose.ts';
 import { buildTimeline, lerpAngle, moveStats, sampleTimeline } from '../src/timeline.ts';
-import { ANCHOR_OFFSETS, guideItems, NEXT_VIEW } from '../src/guide.ts';
+import { ANCHOR_OFFSETS, guideItems } from '../src/guide.ts';
 import {
-  GAZE_HIDE_DOT,
-  GAZE_SHOW_DOT,
-  gazeEngaged,
   HUB_R,
   MAX_SECTORS,
   nextPlaceMode,
@@ -1270,15 +1267,13 @@ test('guide: every state yields chips, unique per hand+anchor, wrist chip always
   }
 });
 
-test('guide: NEXT_VIEW matches ViewManager cycle order and the Y chip names it', () => {
-  assert.equal(NEXT_VIEW.full, 'mini');
-  assert.equal(NEXT_VIEW.mini, 'camera');
-  assert.equal(NEXT_VIEW.camera, 'full');
-  const titles = { full: 'Full', mini: 'Mini', camera: 'Cam View' } as const;
+test('guide: menu is always taught — wrist chip and the Y menu button, every state', () => {
   for (const ctx of GUIDE_CTXS) {
-    const y = guideItems(ctx).find((i) => i.hand === 'left' && i.anchor === 'upper');
-    assert.ok(y, `${ctx.mode}: Y chip missing`);
-    assert.ok(y.label.includes(titles[NEXT_VIEW[ctx.mode]]), `${ctx.mode}: Y chip names wrong next view`);
+    const items = guideItems(ctx);
+    const wrist = items.find((i) => i.hand === 'left' && i.anchor === 'wrist');
+    assert.ok(wrist && /tool wheel/i.test(wrist.label), `${ctx.mode}: no tool-wheel chip`);
+    const y = items.find((i) => i.hand === 'left' && i.anchor === 'upper');
+    assert.ok(y && /^Y:/.test(y.label) && /menu/i.test(y.label), `${ctx.mode}: Y menu chip missing`);
   }
 });
 
@@ -1507,34 +1502,6 @@ test('wheel: hit-testing — hub, sector centers, wrap at 12 o\'clock, outside n
   assert.equal(wheelHit(0.5, 0.02, 8) === null, false, 'ring edge still hits');
   assert.equal(wheelHit(0.02, 0.02, 8), null, 'corner outside the disc');
   assert.equal(wheelHit(0.5, 0.5, 0), 'hub');
-});
-
-test('wheel: gaze summon has hysteresis and an arm-length cap', () => {
-  const fwd = { x: 0, y: 0, z: -1 };
-  const at = (dot: number, dist: number) => ({
-    x: 0,
-    y: Math.sqrt(Math.max(0, 1 - dot * dot)) * dist,
-    z: -dot * dist,
-  });
-  // Looking straight at the hand engages; slightly off keeps it (hysteresis)…
-  assert.equal(gazeEngaged({ fwd, toWrist: at(0.9, 0.5), shown: false }), true);
-  assert.equal(gazeEngaged({ fwd, toWrist: at(0.8, 0.5), shown: false }), false);
-  assert.equal(gazeEngaged({ fwd, toWrist: at(0.8, 0.5), shown: true }), true);
-  // …until clearly looking away.
-  assert.equal(gazeEngaged({ fwd, toWrist: at(0.6, 0.5), shown: true }), false);
-  // Beyond arm's reach never engages, even dead-center.
-  assert.equal(gazeEngaged({ fwd, toWrist: at(1, 2.0), shown: true }), false);
-  assert.ok(GAZE_SHOW_DOT > GAZE_HIDE_DOT, 'show threshold must be tighter than hide');
-  // A hand hanging at the side while looking DOWN at the floor sits in the
-  // gaze cone but far below the eyes — it must never summon (a shown wheel
-  // swallows every pinch, which would eat real placements/teleports).
-  const down = { x: 0, y: -Math.SQRT1_2, z: -Math.SQRT1_2 }; // looking 45° down
-  const wristLow = { x: 0, y: -0.7, z: -0.7 }; // dot = 1.0, drop 0.7 m
-  assert.equal(gazeEngaged({ fwd: down, toWrist: wristLow, shown: false }), false);
-  assert.equal(gazeEngaged({ fwd: down, toWrist: wristLow, shown: true }), false);
-  // A RAISED palm at the same dot engages fine.
-  const ahead = { x: 0, y: 0, z: -1 };
-  assert.equal(gazeEngaged({ fwd: ahead, toWrist: { x: 0, y: -0.2, z: -0.45 }, shown: false }), true);
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this

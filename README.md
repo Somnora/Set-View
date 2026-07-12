@@ -48,7 +48,7 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 
 ## Controls cheat-sheet
 
-**The palm tool wheel:** look at your left palm and a ring of tools appears in it — look away and it melts out of the frame. **Hands: tap a sector with your right index fingertip**, like tapping your palm. **Controllers: point and pull the trigger.** Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit) and the hub becomes **◂ Back**. The wheel is mode-aware, with the hub at root switching between the two jobs on a set:
+**The tool wheel (your menu for everything):** a ring of tools that **always rides your left hand** — raise your hand and it's right there, drop your hand and it falls out of frame. There is no gaze or gesture to summon it, so you can never be locked out. **Controllers also have a hard menu button: press Y (left) to pop the wheel head-locked in front of your face** (press Y again to tuck it away). **To operate it: point your right hand/controller at a sector and pull the trigger (or pinch)** — that is the reliable path. Hands can also tap a sector directly with the right index fingertip. Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit) and the hub becomes **◂ Back**. The wheel is mode-aware, with the hub at root switching between the two jobs on a set:
 
 - **Block** (default) — plan the shot: Place (an **armed tool**: Off → Actor → Cam — see below), Marks ▸ (mark here, play/pause, pace), Lens ▸ (focal, T-stop, format, aspect, frame lines, DOF), View, Camera ▸ (photo, rec, exit), Edit ▸ (undo, redo, duplicate, delete, stance, notes).
 - **Dress** — adjust the physical space: Scan Room, room display (Hidden/Ghost/Solid), plus View / Camera ▸ / Edit ▸. In Dress mode the grip grabs **scanned furniture** and can't disturb your blocking; in Block mode it grabs **actors and cameras** and can't nudge the set.
@@ -71,7 +71,7 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 | Wrist **Drift** | Toggle drift-test grid at the session origin + debug readout |
 | **X** | Cycle the Place tool: Off → Actor → Camera → Off |
 
-The **wrist menu** (tool wheel + detail panel) appears above your **left** controller when you look at it — point with the right controller and pull the trigger.
+The **tool wheel** always rides your **left** hand/controller (raise it to use it) and **Y** pops it in front of your face — point with the right controller/hand and pull the trigger (or pinch) to press a sector.
 
 ### Phase 2 — cameras & lenses
 | Input | Action |
@@ -83,14 +83,14 @@ The **wrist menu** (tool wheel + detail panel) appears above your **left** contr
 | Wrist **Aspect** | Cycle 2.39:1 → 16:9 → 4:3 |
 | Wrist **Format** (e.g. `S35`) | Cycle the sensor format S35 → FF → S16 → ANA2× on the active camera (and for frame lines / new cameras) — the frustum, monitor FOV, and DOF readouts re-derive from the new gate |
 | Wrist **T-stop** (e.g. `T2.8`) | Cycle whole stops T1.4 → 2 → 2.8 → 4 → 5.6 → 8 on the active camera — watch the DOF range tighten as you open up |
-| **Y** / wrist **Cam View** | Virtual monitor shows the active camera's frame (see limitation below). It parks where you're looking when the view opens — grip-grab it to carry it anywhere, like a real on-set monitor |
+| Wheel **View** / wrist **Cam View** | Virtual monitor shows the active camera's frame (see limitation below). It parks where you're looking when the view opens — grip-grab it to carry it anywhere, like a real on-set monitor |
 | **Trigger** on a camera gizmo | Make it the active camera |
 | **Grip** on a camera gizmo | Grab & re-position it (full 6-DOF) |
 
 ### Phase 3 — views, moving through the set, teleport
 | Input | Action |
 |---|---|
-| **Y** | Cycle view: Full-scale → Miniature → Camera View |
+| Wheel **View** sector | Cycle view: Full-scale → Miniature → Camera View |
 | **Walk (IRL)** | You're in passthrough — the set is registered to the real floor, so you move through it by physically walking. This is the primary locomotion on location. |
 | **Left stick** | **Glide** through the set (forward/back + strafe, head-relative, ~1.8 m/s) — for covering a scanned location bigger than your physical room, or moving without walking |
 | **Right stick ← →** | **Snap-turn** the set 30° (full view, when not framing/dragging) — reorient without physically turning |
@@ -144,7 +144,7 @@ The **wrist menu** (tool wheel + detail panel) appears above your **left** contr
 | Wrist **⏺ Rec** | Start/stop a **video take** of the active camera's feed — the button shows the take clock while rolling. Works in **any view mode**: walk the set or **▶ Play** the blocking while the camera films. DOF applies when enabled; switching the active camera mid-take cuts to it. Saves on device (Downloads) as `scene-camera-focal-timestamp.mp4` (or `.webm`, whichever the browser encodes); takes auto-stop at 5 minutes. |
 | Landing page | Scene list: load / duplicate / delete / export JSON / import JSON. Autosaves to localStorage. |
 
-**Hands (no controllers):** pinch = trigger (place/select on the gaze/hand-ray reticle). The wrist menu and buttons need controllers — noted limitation.
+**Hands (no controllers):** full parity for the menu — the tool wheel always rides your left hand, and you drive it by pointing your right hand at a sector and pinching (or tapping it with your index fingertip). Pinch = trigger for placing/selecting on the hand-ray reticle. The only hand gap is the hard **Y** menu-in-front button, which needs a controller (hands don't need it — the wheel is always on your hand).
 
 ### Desktop prep (no headset)
 
