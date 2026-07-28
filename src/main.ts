@@ -18,7 +18,7 @@ import {
   type SceneData,
 } from './model.ts';
 import { History } from './history.ts';
-import { cycleStance, poseFor, type StanceId } from './pose.ts';
+import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
 import { summarizeScan } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
@@ -44,7 +44,7 @@ import {
 import { WheelPanel } from './wheelView.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
-import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, type UIPanel } from './ui.ts';
+import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, openAiAnalysisModal, type UIPanel } from './ui.ts';
 
 // Wrist-panel mount relative to the LEFT controller grip space.
 // Tune on-headset if the panel sits awkwardly (see TESTING.md).
@@ -287,6 +287,11 @@ class App {
       },
       onExportFloorplan: (id) => this.persistence.exportFloorplan(id),
       onExportShotList: (id) => this.persistence.exportShotList(id),
+      onAiShotAnalysis: (id) =>
+        openAiAnalysisModal(
+          id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
+          document.getElementById('overlay')!,
+        ),
       onRemoveScan: (id) => this.removeScan(id),
       onPreview: (id) => this.openPreview(id),
       getScene: (id) =>
@@ -294,6 +299,7 @@ class App {
       onUpdateCamera: (sceneId, cameraId, patch) => this.updateCamera(sceneId, cameraId, patch),
       onSetPace: (sceneId, walkSpeed) => this.setScenePace(sceneId, walkSpeed),
       onSetStance: (sceneId, actorId, stance) => this.setActorStance(sceneId, actorId, stance),
+      onSetScale: (sceneId, actorId, scale) => this.setActorScale(sceneId, actorId, scale),
       onEditMarks: (sceneId, actorId, op) => this.editActorMarks(sceneId, actorId, op),
     });
 
@@ -724,6 +730,9 @@ class App {
 
   private onWristPress(id: string): void {
     switch (id) {
+      case 'wheel-toggle':
+        this.toggleMenuInFront();
+        break;
       case 'mode-actor':
         this.setPlaceMode(this.placeMode === 'actor' ? 'none' : 'actor');
         break;
@@ -841,6 +850,9 @@ class App {
       case 'record':
         this.toggleRecording();
         break;
+      case 'aianalysis':
+        openAiAnalysisModal(this.sceneData, document.getElementById('overlay')!);
+        break;
       case 'help':
         this.guideSticky = !this.guideSticky;
         this.guideAutoUntil = 0;
@@ -848,8 +860,43 @@ class App {
         else this.guide.hide();
         this.wrist.setToggle('help', this.guideSticky);
         break;
+      case 'height-down':
+        this.adjustSelectedActorScale(-0.05);
+        break;
+      case 'height-up':
+        this.adjustSelectedActorScale(+0.05);
+        break;
+      case 'h-preset-150':
+        this.setSelectedActorScale(1.50 / 1.75);
+        break;
+      case 'h-preset-165':
+        this.setSelectedActorScale(1.65 / 1.75);
+        break;
+      case 'h-preset-175':
+        this.setSelectedActorScale(1.0);
+        break;
+      case 'h-preset-185':
+        this.setSelectedActorScale(1.85 / 1.75);
+        break;
+      case 'h-preset-200':
+        this.setSelectedActorScale(2.00 / 1.75);
+        break;
       case 'exit':
         void this.session.session?.end();
+        break;
+      case 'stance-cycle-next':
+        this.cycleSelectedStance(1);
+        break;
+      case 'stance-cycle-prev':
+        this.cycleSelectedStance(-1);
+        break;
+      default:
+        if (id.startsWith('stance-')) {
+          const sId = id.slice(7) as StanceId;
+          if (isStanceId(sId)) {
+            this.setSelectedStance(sId);
+          }
+        }
         break;
     }
   }
@@ -1192,17 +1239,75 @@ class App {
   }
 
   /** Wrist "Stance": cycles the selected actor's rest pose. */
-  private cycleSelectedStance(): void {
+  private cycleSelectedStance(dir: 1 | -1 = 1): void {
     const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
     if (!obj) {
       this.debug.log('Stance: select an actor first (point + trigger)');
       return;
     }
-    const next = cycleStance(obj.data.stance, 1);
+    const next = cycleStance(obj.data.stance, dir);
     this.actors.setStance(obj, next);
     this.actors.flashLabel(obj, poseFor(next).short);
     this.refreshWristState();
     this.markDirty();
+  }
+
+  private setSelectedStance(stance: StanceId): void {
+    const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
+    if (!obj) {
+      this.debug.log('Stance: select an actor first (point + trigger)');
+      return;
+    }
+    this.actors.setStance(obj, stance);
+    this.actors.flashLabel(obj, poseFor(stance).short);
+    this.refreshWristState();
+    this.markDirty();
+  }
+
+  private adjustSelectedActorScale(delta: number): void {
+    const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
+    if (!obj) {
+      this.debug.log('Height: select an actor first (point + trigger)');
+      return;
+    }
+    const current = obj.data.scale ?? 1.0;
+    const next = Math.min(3.0, Math.max(0.2, Math.round((current + delta) * 100) / 100));
+    this.setSelectedActorScale(next);
+  }
+
+  private setSelectedActorScale(scale: number): void {
+    const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
+    if (!obj) {
+      this.debug.log('Height: select an actor first (point + trigger)');
+      return;
+    }
+    const clamped = Math.min(3.0, Math.max(0.2, scale));
+    this.actors.setScale(obj, clamped);
+    const heightM = (1.75 * clamped).toFixed(2);
+    this.actors.flashLabel(obj, `${heightM}m`);
+    this.refreshWristState();
+    this.markDirty();
+  }
+
+  /** Applies actor scale from the landing-page editor (in- or out-of-session). */
+  private setActorScale(sceneId: string, actorId: string, scale: number): void {
+    if (sceneId === this.sceneData.id) {
+      const obj = this.actors.get(actorId);
+      if (obj) this.actors.setScale(obj, scale);
+      else {
+        const a = this.sceneData.actors.find((x) => x.id === actorId);
+        if (a) a.scale = Math.min(3.0, Math.max(0.2, scale));
+      }
+      this.persistence.saveNow(this.sceneData);
+      this.refreshWristState();
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      const a = scene?.actors.find((x) => x.id === actorId);
+      if (!scene || !a) return;
+      a.scale = Math.min(3.0, Math.max(0.2, scale));
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
   }
 
   /** Applies a stance from the landing-page editor (in- or out-of-session). */
@@ -1278,7 +1383,7 @@ class App {
    * view mode — walk the set or play blocking while the camera rolls — and
    * saves on device via the browser's download path, like photo capture.
    */
-  private toggleRecording(): void {
+  private async toggleRecording(): Promise<void> {
     if (this.recorder.recording) {
       this.stopRecording(true);
       return;
@@ -1289,7 +1394,7 @@ class App {
       this.debug.log('record: no active camera — place one first');
       return;
     }
-    const name = this.recorder.start(this.renderer, size.w, size.h, base, performance.now());
+    const name = await this.recorder.start(this.renderer, size.w, size.h, base, performance.now());
     this.debug.log(name ? `recording ${name}` : 'record: video capture not supported in this browser');
     this.refreshWristState();
   }
@@ -1390,6 +1495,7 @@ class App {
         this.wheelPath,
       ),
     );
+    this.wrist.setToggle('wheel-toggle', this.wheelInFront);
     this.wrist.setToggle('mode-actor', this.placeMode === 'actor');
     this.wrist.setToggle('mode-camera', this.placeMode === 'camera');
     this.wrist.setToggle('view-full', this.views.mode === 'full');
@@ -1503,8 +1609,11 @@ class App {
       !onPanel &&
       !this.hover &&
       !this.draggedActor &&
-      this.placeMode === 'actor';
-    this.session.updateReticle(placingAllowed || (this.views.mode === 'full' && !onPanel && !this.hover));
+      this.placeMode !== 'none';
+    this.session.updateReticle(
+      placingAllowed || (this.views.mode === 'full' && !onPanel && !this.hover),
+      this.placeMode,
+    );
 
     // The tool wheel is the menu hub, and it is ALWAYS reachable — no gaze, no
     // summon gesture (three QA sessions in a row, gaze-summon left users with
@@ -1545,8 +1654,8 @@ class App {
       this.refreshWristState();
     }
     this.wheel.group.visible = this.wheelShown;
-    // The pinned detail panel hangs off the wrist, so only in hand mode.
-    this.wrist.group.visible = this.wheelShown && this.panelPinned && !this.wheelInFront;
+    // The wrist panel is always accessible on the left wrist when hand is tracked.
+    this.wrist.group.visible = this.wheelShown;
 
     // Controls-guide chips ride the same grip spaces; expire the auto-show.
     if (leftGrip && this.guide.left.parent !== leftGrip) leftGrip.add(this.guide.left);
@@ -1672,15 +1781,16 @@ class App {
     // never a mid-drag actor (deliberately in hand). Runs AFTER the virtual
     // camera pass so the monitor and takes keep filming the full cast.
     {
-      const scale = this.contentRoot.getWorldScale(_pt).x || 1;
-      const threshold = 0.45 * scale;
+      const worldScale = this.contentRoot.getWorldScale(_pt).x || 1;
       for (const obj of this.actors.all()) {
         if (obj === this.draggedActor) continue;
+        const actorScale = obj.data.scale ?? 1.0;
+        const threshold = 0.45 * worldScale * actorScale;
         const d = obj.root.getWorldPosition(_fwd).distanceTo(this.lastViewerPos);
         // Distance is to the feet origin; a standing body's torso spans well
         // above it, so also test a chest point (~1.3 m up, scaled).
         const chest = _right.copy(_fwd);
-        chest.y += 1.3 * scale;
+        chest.y += 1.3 * worldScale * actorScale;
         const near = Math.min(d, chest.distanceTo(this.lastViewerPos));
         obj.root.visible = near > threshold;
       }

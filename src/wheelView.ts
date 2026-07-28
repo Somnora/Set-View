@@ -152,14 +152,21 @@ export class WheelPanel {
       const lr = (ringR + hubR) / 2 + 4;
       const lx = c + Math.sin(mid) * lr;
       const ly = c - Math.cos(mid) * lr;
-      ctx.fillStyle = hovered ? '#ffffff' : '#d7dce4';
-      ctx.font = '600 22px system-ui, sans-serif';
+      ctx.fillStyle = hovered ? '#ffffff' : '#f0f4f8';
+      ctx.font = '700 24px system-ui, sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+      ctx.shadowBlur = 6;
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = '#0a0d14';
       const lines = sector.label.split('\n');
       lines.forEach((l, li) => {
-        ctx.fillText(l, lx, ly + (li - (lines.length - 1) / 2) * 24);
+        const lineY = ly + (li - (lines.length - 1) / 2) * 26;
+        ctx.strokeText(l, lx, lineY);
+        ctx.fillText(l, lx, lineY);
       });
+      ctx.shadowBlur = 0;
     });
 
     // Hub: mode at root (tap to switch), Back inside a sub-wheel.
@@ -170,14 +177,21 @@ export class WheelPanel {
     ctx.strokeStyle = this.hover === 'hub' ? '#8ab4ff' : '#39415a';
     ctx.lineWidth = 3;
     ctx.stroke();
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+    ctx.shadowBlur = 6;
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = '#0a0d14';
     ctx.fillStyle = '#8ab4ff';
     ctx.font = '700 24px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
+    ctx.strokeText(this.menu.hub.label, c, c - 9);
     ctx.fillText(this.menu.hub.label, c, c - 9);
-    ctx.fillStyle = '#9aa3b2';
-    ctx.font = '500 14px system-ui, sans-serif';
+    ctx.fillStyle = '#b0b8c8';
+    ctx.font = '600 15px system-ui, sans-serif';
+    ctx.strokeText(this.menu.hub.sub, c, c + 15);
     ctx.fillText(this.menu.hub.sub, c, c + 15);
+    ctx.shadowBlur = 0;
 
     this.texture.needsUpdate = true;
   }

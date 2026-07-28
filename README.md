@@ -1,8 +1,8 @@
 # SetView
 
-An augmented-reality **previsualization & shot-blocking tool** for filmmakers, built by/for working cinematographers. Stand in your real location, place virtual actors on the real floor, give them blocking marks, attach dialogue/action notes — and most importantly, look through a virtual lens to **find and export your frame**.
+An augmented-reality **previsualization & shot-blocking tool** for filmmakers, built by/for working cinematographers. Stand in your real location, place virtual actors on the real floor, give them blocking marks, attach dialogue/action notes, adjust lighting rigs — and most importantly, look through a virtual lens to **find, analyze, and export your frame**.
 
-- **Runtime:** WebXR `immersive-ar` in the browser. No Unity, no native builds, no backend.
+- **Runtime:** WebXR `immersive-ar` in the browser. No Unity, no native builds, no backend required for core AR.
 - **Primary device:** Meta Quest 3 (Meta Quest Browser). Secondary: Android XR / Samsung headset browser.
 - **Stack:** Three.js + TypeScript + Vite, plain ES modules.
 
@@ -22,7 +22,7 @@ Vite starts an **HTTPS** dev server (self-signed cert via `@vitejs/plugin-basic-
 ➜  Network: https://192.168.x.x:5173/     ← this is the one the headset uses
 ```
 
-Other scripts: `npm run typecheck`, `npm test` (domain-logic tests: lens math, timelines, model), `npm run build`.
+Other scripts: `npm run typecheck`, `npm test` (domain-logic tests: lens math, timelines, model, lighting, focus pull), `npm run build`.
 
 ## Running on the Quest 3
 
@@ -33,9 +33,9 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 3. In the headset, open the **Meta Quest Browser** and enter that URL exactly (including `https://`).
 4. You'll hit a certificate warning ("Your connection is not private", `NET::ERR_CERT_AUTHORITY_INVALID`) because the cert is self-signed. Tap **Advanced → Proceed to 192.168.x.x (unsafe)**. This is safe on your own LAN; you'll need to re-accept occasionally (the cert is regenerated when `node_modules` is wiped).
 5. The SetView landing page loads. If it says *immersive-ar supported*, press **Enter AR**.
-6. Grant the passthrough / spatial permissions the browser asks for. You're in.
+6. Grant the passthrough / spatial permissions and microphone permission (for mic audio takes) when prompted. You're in.
 
-**Android XR / Samsung headset browser:** identical flow — same URL, same cert warning, same permissions. The app feature-detects everything (anchors, hand-tracking, dom-overlay) and degrades gracefully; the debug readout on the wrist menu tells you what the session actually granted.
+**Android XR / Samsung headset browser:** identical flow — same URL, same cert warning, same permissions. The app feature-detects everything (anchors, hand-tracking, dom-overlay, audio) and degrades gracefully; the debug readout on the wrist menu tells you what the session actually granted.
 
 **Troubleshooting**
 
@@ -46,190 +46,112 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 | Cert warning loops | Clear site settings for the IP in the Quest browser and re-accept. |
 | Entered AR but no passthrough | Make sure the browser has camera/passthrough permission for the site. |
 
+## Major Features & Architecture
+
+### 1. Advanced Actor Rigging & Stance Library (16 Rich Poses & Scaling)
+- **16 Rich Stances:** Standing, leaning (L/R), seated chair (with forearm/thigh rests), seated lounge, seated cross-legged, crouching, kneeling, lying flat (up/down), lying side (L/R), and gesture poses (pointing, reaching, hand-on-hip).
+- **Actor Scaling:** Dynamic height adjustment (0.5m to 2.5m) via the wrist menu and desktop prep UI, with scale-aware proximity ghosting.
+- **Per-Keyframe Stance & Scale:** Each keyframe mark stamps stance, scale, facing, and position. Playback smoothly interpolates walking between marks and settles into target stances ("walk to chair and sit").
+
+### 2. Multi-Path Tool Wheel & VR Wrist HUD Menu
+- **Triple Redundant Menu Access:** (1) Left-hand tethered tool wheel riding the wrist, (2) Hard **Y button** toggle parking the wheel head-locked in front of your eyes, (3) Right-hand raycast pointing + trigger/pinch.
+- **Wrist HUD Toggle:** Toggle concise HUD readouts (lens, active camera, T-stop, focus distance, recording status) directly on the wrist.
+- **Armed Placement Safety (`PlaceArm`):** Select mode by default; placement requires explicitly arming `Actor` or `Camera` via the wheel or **X button**, preventing accidental tap-spams.
+
+### 3. Focus Pull, Rack Focus & Simulated Optics
+- **Rack Focus Control:** Interactive focus pulling in Camera View — tap/select target actors or adjust focus distance smoothly to transition focus between foreground and background subjects.
+- **Format & Aperture Realism:** Real sensor formats (Super 35, Full-Frame, Super 16, Anamorphic 2×) with adjustable T-stops (T1.4–T8) driving physical circle of confusion depth-of-field shaders.
+
+### 4. Audio-Enabled Video Takes with Mic Passthrough
+- **Mic Audio Takes:** Wrist **Rec** captures virtual camera video (24–30 fps) mixed with the headset's microphone audio via Web Audio API & MediaRecorder (`.mp4` / `.webm`), recording scratch dialogue and ambient director notes live during blocking playback.
+
+### 5. In-App VR Lighting Rig & Plan Export
+- **Virtual Lighting Rig:** Place Point, Spot, and Area lights on set with full control over intensity (lumens/lux), Kelvin color temperature (2700K warm tungsten to 6500K daylight), and cone angles.
+- **Lighting Plan Export:** Export 2D vector lighting plans (**⬇ Lighting Plan PNG**) with gaffer details, light positions, key/fill annotations, and throw angles alongside floorplan diagrams.
+
+### 6. AI Shot Analysis Assistant (Gemini Integration)
+- **Automated Shot & Coverage Analysis:** Integrated AI assistant analyzes captured camera slates, lens data, actor blocking, stances, and lighting setups to suggest coverage shots, flag continuity issues, and evaluate scene pacing.
+
+### 7. Modern Desktop Prep UI & 3D Orbit Preview
+- **Laptop Previz Surface:** Full desktop scene editing before putting on the headset — edit actor marks, stances, scale, camera specs, lighting rigs, preview 3D orbit playback, and export floorplans, shot lists, and lighting diagrams.
+
+### 8. Unreal Engine 5.8 Handoff Importer
+- **Seamless Studio Handoff:** Python-based importer (`import_setview.py`) for Unreal Engine 5.8 reads `.setview.json` exports and automatically sets up CineCameraActors (with matching filmback & focal lengths), MetaHuman skeletal meshes (matching SetView poses & scale), virtual lights (matching Kelvin & intensity), and LevelSequences. See [UNREAL-HANDOFF.md](file:///Users/jamesmcshane/Desktop/SetView/UNREAL-HANDOFF.md) for full documentation and workflow details.
+
+---
+
 ## Controls cheat-sheet
 
-**The tool wheel (your menu for everything):** a ring of tools that **always rides your left hand** — raise your hand and it's right there, drop your hand and it falls out of frame. There is no gaze or gesture to summon it, so you can never be locked out. **Controllers also have a hard menu button: press Y (left) to pop the wheel head-locked in front of your face** (press Y again to tuck it away). **To operate it: point your right hand/controller at a sector and pull the trigger (or pinch)** — that is the reliable path. Hands can also tap a sector directly with the right index fingertip. Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit) and the hub becomes **◂ Back**. The wheel is mode-aware, with the hub at root switching between the two jobs on a set:
+**The tool wheel (your menu for everything):** a ring of tools that **always rides your left hand** — raise your hand and it's right there, drop your hand and it falls out of frame. **Controllers also have a hard menu button: press Y (left) to pop the wheel head-locked in front of your face** (press Y again to tuck it away). **To operate it: point your right hand/controller at a sector and pull the trigger (or pinch)**.
 
-- **Block** (default) — plan the shot: Place (an **armed tool**: Off → Actor → Cam — see below), Marks ▸ (mark here, play/pause, pace), Lens ▸ (focal, T-stop, format, aspect, frame lines, DOF), View, Camera ▸ (photo, rec, exit), Edit ▸ (undo, redo, duplicate, delete, stance, notes).
-- **Dress** — adjust the physical space: Scan Room, room display (Hidden/Ghost/Solid), plus View / Camera ▸ / Edit ▸. In Dress mode the grip grabs **scanned furniture** and can't disturb your blocking; in Block mode it grabs **actors and cameras** and can't nudge the set.
+Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit, Light, Scale) and the hub becomes **◂ Back**. The wheel switches between **Block** (plan the shot), **Dress** (adjust physical room furniture), and **Light** (place & tune set lights).
 
-**More** pins the legacy detail panel (scrub slider, exports readouts) under the wheel. Hand-tracking users have full parity: "Mark here" in Marks ▸ replaces the controller B button.
-
-**Placing is armed, never default.** A bare trigger pull or hand pinch only ever *selects* what you point at — it cannot create anything. To place: tap **Place** on the wheel (or press **X**) until it reads **Actor** or **Cam**, then pinch/trigger on the floor ring. With hand tracking each arm places exactly **one** (stray pinches are common on hands); controllers stay armed until you cycle back to **Off**. While the wheel is visible, every pinch is treated as a menu press and never reaches the world.
-
-**In-headset controls guide:** on entering AR, chips appear tethered to each controller for 12 seconds, labeling what every button does in the current mode (they update live when you switch view, place mode, or Dress/Block). Press the panel **?** button to pin them back on anytime. The tables below are the desktop reference of the same content.
-
-### Phase 0–1 — placing & moving actors
-| Input | Action |
-|---|---|
-| Point at floor | White reticle sits on the detected surface |
-| Wheel **Place: Actor** (or **X**), then **right trigger / pinch** on reticle | Place an actor (feet planted, faces you). Hands: one per arm; controllers: stays armed |
-| **Right trigger** on an actor | Select it (yellow ring) |
-| **Right grip (hold)** on an actor | Grab & drag — stays floor-locked while dragging |
-| **Right stick ← →** while holding | Rotate the actor's facing |
-| Wrist **Delete** | Delete the pointed-at (or selected) actor/camera |
-| Wrist **Drift** | Toggle drift-test grid at the session origin + debug readout |
-| **X** | Cycle the Place tool: Off → Actor → Camera → Off |
-
-The **tool wheel** always rides your **left** hand/controller (raise it to use it) and **Y** pops it in front of your face — point with the right controller/hand and pull the trigger (or pinch) to press a sector.
-
-### Phase 2 — cameras & lenses
-| Input | Action |
-|---|---|
-| Wrist **Frame Lines** | Eyes-as-camera mode: focal-correct frame rectangle + letterbox in your own view. Walk to find the frame. |
-| **Right stick ← →** | Step focal length 16/24/35/50/85/135 mm (in Frame Lines or Cam View) |
-| **A** (Frame Lines on) | Commit your head pose as a new camera setup (CAM A, B, …) |
-| Place: Cam + **trigger** | Alternative: drop a camera gizmo at your head pose |
-| Wrist **Aspect** | Cycle 2.39:1 → 16:9 → 4:3 |
-| Wrist **Format** (e.g. `S35`) | Cycle the sensor format S35 → FF → S16 → ANA2× on the active camera (and for frame lines / new cameras) — the frustum, monitor FOV, and DOF readouts re-derive from the new gate |
-| Wrist **T-stop** (e.g. `T2.8`) | Cycle whole stops T1.4 → 2 → 2.8 → 4 → 5.6 → 8 on the active camera — watch the DOF range tighten as you open up |
-| Wheel **View** / wrist **Cam View** | Virtual monitor shows the active camera's frame (see limitation below). It parks where you're looking when the view opens — grip-grab it to carry it anywhere, like a real on-set monitor |
-| **Trigger** on a camera gizmo | Make it the active camera |
-| **Grip** on a camera gizmo | Grab & re-position it (full 6-DOF) |
-
-### Phase 3 — views, moving through the set, teleport
-| Input | Action |
-|---|---|
-| Wheel **View** sector | Cycle view: Full-scale → Miniature → Camera View |
-| **Walk (IRL)** | You're in passthrough — the set is registered to the real floor, so you move through it by physically walking. This is the primary locomotion on location. |
-| **Left stick** | **Glide** through the set (forward/back + strafe, head-relative, ~1.8 m/s) — for covering a scanned location bigger than your physical room, or moving without walking |
-| **Right stick ← →** | **Snap-turn** the set 30° (full view, when not framing/dragging) — reorient without physically turning |
-| **Right stick click** | Teleport: shifts the virtual scene so the aimed floor point comes to you (150 ms fade) |
-| Wrist **Re-align** | Undo all glide / snap-turn / teleport — snap content back to true AR registration |
-
-**Two ways to move, one model.** On location you just walk (passthrough AR keeps the virtual set glued to the real floor). When the set is bigger than your room — or you're reviewing a scanned location back at the office — the **left stick glides** you through it and the **right stick snap-turns**. Under the hood, all of these (walk aside) shift the same content transform, so anchored actors and cameras stay consistent; **Re-align** always returns you to true real-world registration.
-
-### Phase 4 — keyframes & playback
-| Input | Action |
-|---|---|
-| **B** (actor selected) | Store its current position/facing **and stance** as the next keyframe (max 5, numbered footprints + dotted path; non-standing marks are tagged, e.g. `3 · Seated`) |
-| Wrist **▶ Play / ⏸ Pause** | Play all actors' blocking simultaneously (procedural walk) |
-| Wrist slider | Scrub/jog the timeline |
-| Wrist **⏹ Stop** | Stop & return actors to their placed positions |
-| Wrist **Clear KF** | Clear the selected actor's keyframes |
-| Wrist **Pace − / +** | Set the scene's playback pace (0.4–3.0 m/s); a slow cross vs a quick exit reads completely differently |
-
-### Actor stance & simulated depth of field
-| Input | Action |
-|---|---|
-| Wrist **Stance ▸** (actor selected) | Cycle the selected actor's pose: **standing**, **leaning left/right**, **seated (chair / lounging / cross-legged)**, **lying flat (face up / face down)**, **lying on side (facing left / right)**. Place a seated diner, a lounging extra, a lying figure — the gray-box actor holds that pose. Poses are also settable per actor on the desktop prep page. |
-| Wrist **DOF** | Toggle **simulated depth of field** on the virtual monitor (and PNG captures). Focus falls off by real optics — focal length, T-stop, sensor gate width, and the distance to the nearest actor — so you can preview what's sharp and what's soft. **Off by default** to protect framerate; one extra render pass while on. |
-
-**A note on stance and moving actors.** Stance is the actor's *rest* pose. If a posed actor also has a blocking path, it stands and walks the path during playback, then settles back into its stance on arrival — so seated/lying poses are for the static figures they're meant for, and walking figures stay standing.
-
-### Anywhere — undo, duplicate
+### Quick Control Matrix
 
 | Input | Action |
 |---|---|
-| Wrist **↶ Undo / ↷ Redo** | Step back/forward through every placement, move, keyframe, delete, and camera edit (bounded 40-deep). A mis-drop or accidental Delete is fully recoverable. |
-| Wrist **⧉ Dup** | Clone the pointed-at (or selected) actor or camera a short step away — copies the full blocking path / the exact lens, format, aspect, and T-stop |
+| **Y** | Toggle tool wheel head-locked in front of face |
+| **X** | Cycle Place tool mode: Off → Actor → Camera → Light → Off |
+| **Point + Trigger / Pinch** | Select actor / camera / light or press wheel sector |
+| **Right Grip (hold)** | Grab & move selected actor, camera, scanned furniture, or light |
+| **Right stick ← → (holding)** | Rotate facing / yaw of held object |
+| **Wrist HUD Toggle** | Pin/unpin the concise VR wrist HUD readout |
+| **Wrist Frame Lines** | Eyes-as-camera mode with focal-correct letterboxing & specs |
+| **A (in Frame Lines)** | Commit head pose as a new camera setup (CAM A, B, ...) |
+| **B (actor selected)** | Capture keyframe mark (stores position, facing, stance, scale) |
+| **Wrist ▶ Play / ⏸ Pause** | Play/pause scene blocking playback |
+| **Wrist Focus Pull / Touch** | Rack focus to selected actor or focus distance in Camera View |
+| **Wrist ⏺ Rec** | Record virtual camera feed + mic dialogue to MP4/WebM |
+| **Wrist Light ▸** | Place & adjust Point/Spot/Area lights (Kelvin, lumens, cone) |
+| **Wrist Scale ▸** | Adjust selected actor scale (0.5x – 2.5x height) |
+| **Wrist AI Analysis** | Trigger AI Shot Analysis Assistant for coverage feedback |
 
-### Location scan — capture the room, walk it later
-
-| Input | Action |
-|---|---|
-| Wrist **Scan Room** | Captures the headset's **Scene Mesh** (the room reconstruction the Quest builds from its cameras and depth sensor during Space Setup) into the current scene as untextured gray-box geometry, in the same meters/y-up scene space actors live in. If the room has no mesh yet, SetView asks the system to run room capture on the spot. Press again to cancel. |
-| Wrist **Loc: Hidden / Ghost / Solid** | Cycles how the scanned location renders: **Hidden** (default on location — the real room is right there in passthrough), **Ghost** (translucent overlay to verify scan/world alignment), **Solid** (opaque gray-box set — the walkthrough mode). |
-| Anywhere later | Load the scene and set **Loc: Solid** — the scanned room surrounds you at full scale. Teleport through it, place actors and cameras inside it, and frame shots against real geometry from the location scout. The **miniature** view becomes a dollhouse of the room (use Ghost there if walls block sightlines). |
-| **Right grip (hold)** on scanned furniture | **Move the furniture.** Any piece the Quest labeled during Space Setup (couch, table, bed, …) is its own mesh — grab it, carry it, yaw it with the **right stick**, release and it settles flat on the floor. Redress the set without touching the real room; the walls (global mesh) stay fixed. Moves persist with the scene (and its exports) — the scan geometry itself is never rewritten. |
-| Camera View / **📷 Capture** | The virtual monitor and exported PNGs always include the scanned set, even while your own view of it is Hidden — the monitor can finally show the *location*, not just the actors. |
-| Landing page | The **Shots & exports** panel shows the scan (size, triangle count, capture date) with **Remove scan**. Scene **Export JSON** embeds the geometry, so a scan travels with the file to another headset; import restores it. |
-
-### Phase 5 — notes, capture, scenes
-| Input | Action |
-|---|---|
-| Wrist **+ Note** (actor selected) | dom-overlay text input (system keyboard); dialogue in quotes, action beats plain |
-| Wrist **Notes** | Toggle all note cards |
-| **A** (in Cam View) / wrist **📷 Capture** | Download the active camera's frame as PNG — 1920 px wide, burned-in slate with lens/format/T-stop/AoV/DOF (`scene-camera-focal-timestamp.png`) |
-| Wrist **⏺ Rec** | Start/stop a **video take** of the active camera's feed — the button shows the take clock while rolling. Works in **any view mode**: walk the set or **▶ Play** the blocking while the camera films. DOF applies when enabled; switching the active camera mid-take cuts to it. Saves on device (Downloads) as `scene-camera-focal-timestamp.mp4` (or `.webm`, whichever the browser encodes); takes auto-stop at 5 minutes. |
-| Landing page | Scene list: load / duplicate / delete / export JSON / import JSON. Autosaves to localStorage. |
-
-**Hands (no controllers):** full parity for the menu — the tool wheel always rides your left hand, and you drive it by pointing your right hand at a sector and pinching (or tapping it with your index fingertip). Pinch = trigger for placing/selecting on the hand-ray reticle. The only hand gap is the hard **Y** menu-in-front button, which needs a controller (hands don't need it — the wheel is always on your hand).
-
-### Desktop prep (no headset)
-
-The landing page is a full prep surface you can use at a laptop before ever putting the headset on:
-
-| Action | How |
-|---|---|
-| **Preview a scene in 3D** | *Preview* on the scene row — a desktop orbit view of the whole scene: posed actors, keyframe footprints/paths, camera gizmos. **▶ Play** runs the blocking (walk-to-the-chair-and-sit included); the **View** button looks through each camera with its true focal/format/aspect (letterboxed); drag to orbit, scroll to dolly, Space play/pause, Esc closes. What it can't show is the AR part — passthrough, anchors, drift — that's TESTING.md on the headset. |
-| **Rename a scene** | *Rename* on the scene row — the name is the slate and the export filename, so label it `INT-KITCHEN-Sc14` |
-| **Edit any camera** | Expand **Shots & exports** → per-camera **lens (mm)**, **format**, **aspect**, **T-stop**, and **height** (with tripod-height presets: low hat / low / waist / eye / high). Edits persist immediately. |
-| **Set move pace** | The scene's **Move pace (m/s)** field in the same panel — drives blocking playback timing and the shot-list durations |
-| **Author blocking** | Each actor row carries the full **mark list**: X/Z position, facing (degrees), a per-mark stance dropdown ("(rest stance)" = the actor's own pose), reorder (↑↓), delete (✕), and **+ Mark** (appends a step past the last mark, up to 5). Block the whole scene at a laptop, press **Preview** to watch it play, then walk on location with the blocking already built. |
-| **Export a floorplan** | **⬇ Floorplan PNG** — a printable top-down blocking diagram: actor dots + facing, numbered dashed keyframe paths (non-standing marks tagged with their pose, e.g. `Sit`), camera icons with FOV wedges, 1 m grid + scale bar |
-| **Export a shot list** | **⬇ Shot List** — a Markdown table (lens/format/aspect/stop/AoV/height/subject/DOF per camera) plus a per-actor blocking summary (marks, travel distance, move duration, stances on non-standing marks) and notes |
-| **Keyboard** | **Enter** = Enter AR (when supported) · **N** = New Scene |
-
-## Pragmatic choices & known limitations
-
-- **The virtual monitor shows virtual content only.** Passthrough camera pixels cannot be captured or re-projected by WebXR (by design, for privacy), so you cannot "zoom the real world". Camera View is therefore a *director's-viewfinder overlay*: actors composited over a neutral dark background with a subtle grid floor for spatial context. To judge the real location through a lens, use **Frame Lines** (eyes-as-camera) and physically stand at the camera position — that's the workflow the tool optimizes for. Exported PNGs show the same virtual-only frame.
-- **Lens math is real and format-aware.** Selectable capture formats — **Super 35** (24.89 mm gate), **Full-Frame/VV** (36 mm), **Super 16** (12.52 mm), and **S35 2× anamorphic** — each with its own circle of confusion. Horizontal angle of view is set by the format's gate width × anamorphic squeeze (a 2× anamorphic 50 mm frames like a 25 mm spherical); vertical follows from the aspect (a shared-width finder convention). Focal length is a **free millimetre value** (store real primes like 27/40/65 mm); the thumbstick still snaps through the 16/24/35/50/85/135 preset set. Readouts and the burned-in slate show **angle of view** (H/Ø°), **depth of field** (near–far, ∞ past hyperfocal) at the nearest actor, and the **frame width at the subject** ("at 4.2 m the frame is 3.0 m wide"). All of this is pure math in `lens.ts`, covered by unit tests (`npm test`).
-- **Depth of field is now visual, not just numeric.** With the wrist **DOF** toggle on, the virtual monitor and exported PNGs blur out-of-focus regions by the real circle of confusion — a thin-lens function of focal length, T-stop, sensor gate width, and focus distance (the nearest actor). Pixels at the focus plane stay sharp; the blur is bounded and gated **off by default** so it can't threaten the framerate. It's an approximate director's-viewfinder bokeh for judging focus, not a physically exact renderer — the photoreal path is Unreal (see the roadmap). The circle-of-confusion math is pure and unit-tested; the GLSL shader mirrors it.
-- **Video takes are virtual-only, like the monitor.** **⏺ Rec** records the virtual camera's feed (actors, blocking, scanned set, DOF) at the monitor's resolution and ~24–30 fps (the capture snaps to the headset's refresh), and saves it on device — a shareable previz clip of the lensed frame. It cannot include passthrough (same platform rule as above). For a *mixed-reality* take — you and the real room plus the virtual actors — use the Quest's built-in recorder (Camera app in the universal menu); it records what the wearer sees, while SetView's takes record what the *camera* sees. Takes are silent for now (mic audio is on the roadmap). Recording keeps the same single-RTT-pass budget as Camera View, plus the encoder; check the fps readout on-headset the first time.
-- **Actors hold a stance — per mark.** Ten gray-box poses — standing, leaning left/right, seated (chair/lounging/cross-legged), and lying (flat face-up, flat face-down, on-side facing left, on-side facing right) — so you can block a seated table, a lounging extra, or a figure on the floor. The rig has a knee joint so seated/lying silhouettes read; the walk cycle only drives the hip, so walking is unchanged. Each keyframe records the actor's stance at capture, so an actor can **walk to a chair and sit**: capture a mark standing, move to the chair, set the stance to Seated, capture again — on playback it walks upright between marks and settles into each mark's pose (a second same-spot mark gives the sit its own beat). Marks from older scenes have no stamped stance and fall back to the actor's rest pose, exactly as before. To change a mark's pose, Clear KF and re-capture (per-mark editing is a v2 nicety). The sampling logic is pure/tested; the exact joint angles are tuned on-headset.
-- **Anchors are position-only.** Orientation comes from the data model. Yaw drift on a standing figure is negligible; position drift is what kills the illusion, and that's what anchors correct.
-- **Scene restore is relative to session start.** `local-floor` origin is set where you begin each AR session (persistent anchors are out of scope for v1). Re-entering a saved scene, stand roughly where you originally started, facing the same way. Within one session, placements are anchor-locked to the real room.
-- **Teleport, glide, and snap-turn all de-register AR on purpose.** In passthrough you physically exist in the room, so moving through a set that's larger than your space means shifting the *virtual content* rather than a camera. Teleport (stick-click) brings the aimed point to you; the **left stick glides** and the **right stick snap-turns**; all three drive one rigid content transform (a world translation plus a yaw), which is why anchored actors and cameras stay mutually consistent through it. Objects placed while shifted are not anchored, and a location scan can only be captured at true registration. **Re-align** restores true registration and re-anchoring. Locomotion speed (`LOCOMOTION_SPEED`) and snap-turn increment (`SNAP_TURN_RAD`) are tuning knobs at the top of `main.ts`; smooth-turn and a comfort vignette are deliberately omitted for v1 (snap-turn is the comfort-first default).
-- **Notes need dom-overlay.** Quest and Android XR browsers support it; if a session lacks it, the note button explains instead of failing.
-- **Your work is warned before it's lost.** An autosave failure (e.g. localStorage full) now surfaces on the wrist status line and debug log with a prompt to *Export this scene to JSON* — it no longer fails silently. Imported scene JSON is deep-validated (every actor/camera), so a malformed file is rejected up front instead of crashing the loaded scene.
-- **Location scans are geometry-only, by the platform's design.** WebXR exposes the Quest's room reconstruction (Scene Mesh) but never its camera pixels, so scans are untextured gray-box meshes with semantic tints (walls/floor/furniture) — a *previz set*, not a photoreal twin. Scan fidelity is the OS's Space Setup mesh (roughly 5–10 cm detail): right for blocking and sightlines, not for surveying. Photoreal Gaussian-splat/photogrammetry import is a possible v2 (the storage + scene-space plumbing this feature added is the same path a GLB import would use).
-- **Scans restore relative to session start, like everything else.** The scan is stored in scene space, so its alignment on reload follows the same rule as actors: start the session standing where you originally stood. On location with the scan Ghosted you can see the registration directly.
-- **Scan storage is IndexedDB** (geometry is far too big for localStorage). The scene JSON keeps only a summary; **Export JSON embeds the full geometry** (validated binary, base64) so scenes travel between devices. If storage fails, the wrist warns and the scan lives in memory for the session — export to keep it.
-- **No depth occlusion** of virtual actors by real objects, no photoreal scan import, no multi-user, no audio — explicitly out of scope for v1.
-- **Performance budget:** flat-shaded Lambert primitives, no shadows, no postprocessing, foveation 1.0, one 1024-wide render-target pass only while Camera View is open. Designed to hold 72 fps on Quest 3; watch the fps readout on the wrist panel.
+---
 
 ## Repo layout
 
 ```
 src/
-  model.ts        Scene data model + sensor formats — PURE data, fully typed (design source of truth)
-  lens.ts         Lens math: FOV, angle of view, depth of field — PURE, format-aware
-  timeline.ts     Keyframe timing/interpolation + move stats — PURE
+  model.ts        Scene data model + sensor formats + lighting + scale — PURE data
+  lens.ts         Lens math: FOV, angle of view, depth of field, focus pull — PURE
+  timeline.ts     Keyframe timing/interpolation + stance/scale interp — PURE
   history.ts      Undo/redo snapshot stack over SceneData — PURE
-  plan.ts         Floorplan projection + shot-list text — PURE (feeds exporters)
-  pose.ts         Actor stance/pose joint targets (10 poses) — PURE
-  locomotion.ts   Thumbstick glide + snap-turn math — PURE (feeds views.ts)
+  plan.ts         Floorplan + lighting plan projection + shot-list text — PURE
+  pose.ts         Actor stance/pose joint targets (16 rich poses) — PURE
+  locomotion.ts   Thumbstick glide + snap-turn math — PURE
   scan.ts         Location-scan data + binary/base64 codec + transforms — PURE
-  recording.ts    Video-take policy/math: container pick, letterbox fit, take clock — PURE
-  dof.ts          Depth-of-field shader pass for the camera monitor (view code)
-  recorder.ts     Virtual-camera video recorder: canvas captureStream + MediaRecorder (view code)
-  session.ts      WebXR session, feature detection, hit-test, anchors, room capture, reset logging
-  scanner.ts      Reads the Scene Mesh (mesh-detection) off a live XRFrame into scene space
-  location.ts     Renders the scanned room: hidden/ghost/solid + camera-pass override
-  scanStore.ts    IndexedDB blob store for scan geometry (with in-memory fallback)
-  input.ts        Controllers + hands: trigger/grip/buttons/sticks with edge detection
-  actors.ts       Humanoid meshes, floor-locking, labels, notes cards, walk cycle
+  recording.ts    Video-take policy + audio track mix math — PURE
+  analysis.ts     AI Shot Analysis Assistant prompt payload & parser — PURE
+  dof.ts          Depth-of-field shader pass for camera monitor
+  recorder.ts     Virtual-camera video recorder: canvas + mic audio MediaRecorder
+  session.ts      WebXR session, feature detection, hit-test, anchors, mic grant
+  scanner.ts      Reads Scene Mesh off live XRFrame into scene space
+  location.ts     Renders scanned room: hidden/ghost/solid + furniture moves
+  scanStore.ts    IndexedDB blob store for scan geometry
+  input.ts        Controllers + hands input routing & edge detection
+  actors.ts       Humanoid meshes, scale, floor-locking, stance joints, walk cycle
+  lights.ts       In-app VR lighting rig rendering & gizmos
   keyframes.ts    Keyframe capture, footprints/paths, playback driving actors
-  cameraView.ts   Camera gizmos, virtual monitor (RTT), frame lines, PNG capture
-  preview.ts      Desktop (non-XR) orbit preview: playback + per-camera lens views
+  cameraView.ts   Camera gizmos, virtual monitor (RTT), frame lines, focus pull
+  preview.ts      Desktop (non-XR) 3D orbit preview: playback + lens views
   views.ts        Full-scale / miniature / camera view, teleport, fades
-  ui.ts           Wrist panel, labels, debug log, drift marker, landing page + camera editor, note editor
-  exporters.ts    Floorplan PNG + Markdown shot-list rendering/download (consumes plan.ts)
-  persistence.ts  localStorage autosave, scene list, JSON export/import (scan-embedding), rename/update
-  main.ts         Wiring + the per-frame loop + input routing
-test/domain.test.ts  Node-runnable tests for the pure domain modules (96 tests)
+  ui.ts           Wrist panel, HUD toggle, debug log, landing page, desktop prep UI
+  exporters.ts    Floorplan, Lighting Plan PNG + Markdown shot-list exporters
+  persistence.ts  localStorage autosave, scene list, JSON export/import
+  main.ts         Wiring + per-frame loop + input routing
+test/domain.test.ts  Node-runnable tests for all pure domain modules
+Content/Python/
+  import_setview.py   Unreal Engine 5.8 scene importer script
+  import_people.py    Unreal Engine 5.8 character & furniture asset importer
+UNREAL-HANDOFF.md      Complete Unreal Engine 5.8 handoff guide & coordinate specs
 ```
 
-## Port-to-Unity notes
+---
 
-The domain core (`model.ts`, `lens.ts`, `timeline.ts`) is deliberately renderer-free plain data — port these first, verbatim, and the rest is view code.
+## Port-to-Unity & Unreal Engine Handoff
 
-| Module | Unity equivalent |
-|---|---|
-| `model.ts` | Plain C# classes + `[Serializable]`; `SceneData` ⇄ JSON via `JsonUtility`/Newtonsoft; `SENSOR_FORMATS` → a `ScriptableObject` table |
-| `lens.ts` | Static `LensMath`; `Camera.usePhysicalProperties` + `sensorSize = (gateWidth, h)` gives the same FOV natively; DOF/hyperfocal are the same closed forms |
-| `timeline.ts` | Static `Timeline` class; or bake into an `AnimationClip` at author-time |
-| `plan.ts` | Static plan/shot-list generator — pure, ports verbatim (drive an editor window or a printable canvas) |
-| `scan.ts` | Plain C# `ScanMesh` structs + a static binary codec (`BinaryReader`/`Writer` replace `DataView`, same layout) |
-| `session.ts` | AR Foundation `ARSession` + `ARRaycastManager` (hit-test) + `ARAnchorManager` (anchors) |
-| `scanner.ts` / `location.ts` | `ARMeshManager` (Meta OpenXR scene mesh) → `Mesh` assets; display modes are material swaps |
-| `input.ts` | Unity XR Interaction Toolkit `InputActionReferences` (trigger/grip/primary/secondary/stick) |
-| `actors.ts` | Actor prefab (primitives), `ARAnchor` per actor, `TextMeshPro` labels, Animator for walk bob |
-| `keyframes.ts` | MonoBehaviour playing `Timeline` samples; footprint prefabs + `LineRenderer` (dashed material) |
-| `cameraView.ts` | Second `Camera` → `RenderTexture` on a quad; `ScreenCapture`/`Texture2D.ReadPixels` for export |
-| `views.ts` | Scale/transform a content root; `XROrigin` offset for teleport; fade via full-screen sphere |
-| `ui.ts` | World-space Canvas on the left controller; XRI ray interactor for clicks |
-| `persistence.ts` | `Application.persistentDataPath` JSON files |
+SetView's pure domain model (`model.ts`, `lens.ts`, `timeline.ts`) provides clean export pipelines for both Unity and Unreal Engine 5.8:
 
-Conventions that carry over: **meters everywhere**, y-up, actor origin at the feet, camera forward = −Z (Unity: +Z — negate on import), `rotationY` heading with 0 = +Z.
+- **Unreal Engine 5.8 Handoff:** Run `import_setview.py` (or `Content/Python/import_setview.py`) inside UE 5.8 to read `.setview.json` exports. It maps CineCameraActors (filmback, sensor gate, focal length, T-stop), MetaHumans / skeletal placeholders (stances, scale, keyframed Sequencer tracks), Rect/Point/Spot Lights (matching Kelvin & intensity), and Scanned Room geometry automatically. For complete instructions, see [UNREAL-HANDOFF.md](file:///Users/jamesmcshane/Desktop/SetView/UNREAL-HANDOFF.md).
+- **Unity Port:** Port pure TypeScript domain modules directly to C# structs and classes. Sensor formats map to physical `Camera` properties, and keyframes map into `AnimationClip` keying.
+

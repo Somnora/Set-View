@@ -13,6 +13,7 @@
 import * as THREE from 'three';
 import {
   aspectValue,
+  computeFocusDistance,
   createCameraSetup,
   cycleTStop,
   DEFAULT_FORMAT_ID,
@@ -37,6 +38,12 @@ function m(v: number): string {
   return v === Infinity ? '∞' : `${v.toFixed(v < 10 ? 1 : 0)}m`;
 }
 
+export function cameraGizmoLabelText(data: CameraSetupData): string {
+  const fmt = sensorFormat(data.formatId);
+  const tStr = `T${data.tStop.toFixed(1).replace(/\.0$/, '')}`;
+  return `${data.name} · ${fmt.short} ${Math.round(data.lensFocalLength)}mm ${tStr}`;
+}
+
 /** Reused each frame by updateFromAnchors to avoid per-camera allocations. */
 const _scratchAnchor = new THREE.Vector3();
 const _ws = new THREE.Vector3();
@@ -52,6 +59,7 @@ export interface CamObject {
   label: Label;
   frustum: THREE.LineSegments;
   anchor: XRAnchor | null;
+  currentFocusDistanceM?: number;
 }
 
 export class CameraSystem {
@@ -245,7 +253,7 @@ export class CameraSystem {
     const d = obj.data;
     obj.root.position.set(d.position.x, d.position.y, d.position.z);
     obj.root.quaternion.set(d.rotation.x, d.rotation.y, d.rotation.z, d.rotation.w);
-    obj.label.setText(`${obj.data.name} · ${Math.round(d.lensFocalLength)}mm`);
+    obj.label.setText(cameraGizmoLabelText(obj.data));
     this.rebuildFrustum(obj);
     if (this.activeId === id) {
       this.refreshRT();
@@ -260,7 +268,7 @@ export class CameraSystem {
     if (!obj) return;
     obj.data.lensFocalLength = stepFocal(obj.data.lensFocalLength, dir);
     this.rebuildFrustum(obj);
-    obj.label.setText(`${obj.data.name} · ${Math.round(obj.data.lensFocalLength)}mm`);
+    obj.label.setText(cameraGizmoLabelText(obj.data));
     this.refreshMonitorInfo();
     this.onChange();
   }
@@ -297,7 +305,7 @@ export class CameraSystem {
     if (obj) {
       obj.data.formatId = next;
       this.rebuildFrustum(obj);
-      obj.label.setText(`${obj.data.name} · ${Math.round(obj.data.lensFocalLength)}mm`);
+      obj.label.setText(cameraGizmoLabelText(obj.data));
       this.refreshMonitorInfo();
     }
     this.rebuildFrameLines();
@@ -312,6 +320,7 @@ export class CameraSystem {
     const obj = this.active;
     if (obj) {
       obj.data.tStop = next;
+      obj.label.setText(cameraGizmoLabelText(obj.data));
       this.refreshMonitorInfo(); // DOF range readout changes with the stop
     }
     this.onChange();
@@ -374,8 +383,8 @@ export class CameraSystem {
 
   // --- per-frame updates ---------------------------------------------------------
 
-  /** Monitor parking, near-head gizmo ghosting, flash restore. Every frame. */
-  update(_dt: number, time: number, headPos: THREE.Vector3, headQuat: THREE.Quaternion): void {
+  /** Monitor parking, near-head gizmo ghosting, smooth rack focus, flash restore. Every frame. */
+  update(dt: number, time: number, headPos: THREE.Vector3, headQuat: THREE.Quaternion): void {
     if (this.monitor.visible) {
       // Park once where the user is looking when the view opens (position is
       // zeroed on entry as the "place me" sentinel), then STAY PUT like a
@@ -395,6 +404,27 @@ export class CameraSystem {
         this.monitor.lookAt(headPos);
       }
     }
+
+    // Smooth rack focus animation across cameras
+    let focusAnimating = false;
+    for (const o of this.objects.values()) {
+      const targetFocus = computeFocusDistance(o.data, this.scene.actors);
+      if (o.currentFocusDistanceM === undefined) {
+        o.currentFocusDistanceM = targetFocus;
+      } else if (dt > 0) {
+        const diff = targetFocus - o.currentFocusDistanceM;
+        if (Math.abs(diff) > 1e-4) {
+          o.currentFocusDistanceM += diff * (1 - Math.exp(-10 * dt));
+          if (this.activeId === o.data.id) focusAnimating = true;
+        } else {
+          o.currentFocusDistanceM = targetFocus;
+        }
+      }
+    }
+    if (focusAnimating) {
+      this.refreshMonitorInfo();
+    }
+
     // Ghost any camera gizmo the user's head is inside (eyes-mode commits
     // place the camera AT the head — without this it covers their face and
     // they have to guess why). World-space check so mini view (scaled-down
@@ -477,8 +507,8 @@ export class CameraSystem {
     src: THREE.WebGLRenderTarget,
     out: THREE.WebGLRenderTarget,
   ): boolean {
-    const focus = this.nearestActorDistance(obj.data);
-    if (focus === null || !src.depthTexture) return false;
+    const focus = obj.currentFocusDistanceM ?? computeFocusDistance(obj.data, this.scene.actors);
+    if (!src.depthTexture) return false;
     if (!this.dofPass) this.dofPass = new DofPass();
     this.dofPass.render(renderer, src.texture, src.depthTexture, out, {
       focusDistM: focus,
@@ -596,14 +626,18 @@ export class CameraSystem {
     const fmt = sensorFormat(cam.formatId);
     const h = hFovDeg(cam.lensFocalLength, fmt);
     const dia = dFovDeg(cam.lensFocalLength, cam.aspect, fmt);
+    const activeObj = this.objects.get(cam.id);
+    const focusDist = activeObj?.currentFocusDistanceM ?? computeFocusDistance(cam, this.scene.actors);
     let s = `${cam.name} · ${Math.round(cam.lensFocalLength)}mm ${fmt.short} · ${cam.aspect} · T${cam.tStop}`;
     s += `\nAoV H${h.toFixed(1)}° Ø${dia.toFixed(1)}°`;
-    const dist = this.nearestActorDistance(cam);
-    if (dist !== null) {
-      const dof = depthOfFieldFor(cam, dist);
-      const fw = frameSizeAtDistance(cam.lensFocalLength, cam.aspect, dist, fmt).width;
-      s += ` · subj ${m(dist)}\nDOF ${m(dof.nearM)}–${m(dof.farM)} · frame ${fw.toFixed(1)}m wide`;
+    const dof = depthOfFieldFor(cam, focusDist);
+    const fw = frameSizeAtDistance(cam.lensFocalLength, cam.aspect, focusDist, fmt).width;
+    let targetTag = '';
+    if (cam.focusTargetActorId) {
+      const targetActor = this.scene.actors.find((a) => a.id === cam.focusTargetActorId);
+      if (targetActor) targetTag = ` (${targetActor.name})`;
     }
+    s += ` · focus ${m(focusDist)}${targetTag}\nDOF ${m(dof.nearM)}–${m(dof.farM)} · frame ${fw.toFixed(1)}m wide`;
     return s;
   }
 
@@ -696,7 +730,7 @@ export class CameraSystem {
       new THREE.LineBasicMaterial({ color: 0x66ccff, transparent: true, opacity: 0.7 }),
     );
 
-    const label = makeLabel(`${data.name} · ${Math.round(data.lensFocalLength)}mm`, 0.055);
+    const label = makeLabel(cameraGizmoLabelText(data), 0.055);
     label.sprite.position.y = 0.16;
 
     root.add(body, lens, accent, frustum, label.sprite);

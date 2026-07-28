@@ -33,6 +33,9 @@ export interface ActorObject {
   kneeR: THREE.Group;
   armL: THREE.Group;
   armR: THREE.Group;
+  elbowL: THREE.Group;
+  elbowR: THREE.Group;
+  spine: THREE.Group;
   body: THREE.Group;
   anchor: XRAnchor | null;
   /** True while grabbed or driven by playback — anchor updates pause. */
@@ -112,7 +115,7 @@ export class ActorManager {
 
   /**
    * Poses the rig into a stance (see pose.ts): whole-body tilt/recline/lie
-   * via the body group Euler + lift, plus hip/knee/shoulder joint rotations.
+   * via the body group Euler + lift, plus hip/knee/spine/shoulder/elbow rotations.
    * Defaults to the actor's rest stance; playback passes the held mark's
    * stance as `override`. This is the "not walking" pose; the walk cycle
    * overrides the limbs (and resets the body upright) while moving.
@@ -128,14 +131,24 @@ export class ActorManager {
     obj.legR.rotation.x = p.hip;
     obj.kneeL.rotation.x = p.knee;
     obj.kneeR.rotation.x = p.knee;
-    obj.armL.rotation.set(p.shoulder, 0, 0);
-    obj.armR.rotation.set(p.shoulder, 0, 0);
+    obj.spine.rotation.x = p.spine;
+    obj.armL.rotation.set(p.shoulderL, 0, 0);
+    obj.armR.rotation.set(p.shoulderR, 0, 0);
+    obj.elbowL.rotation.x = p.elbowL;
+    obj.elbowR.rotation.x = p.elbowR;
   }
 
   /** Sets an actor's rest stance and re-poses it (when not being played back). */
   setStance(obj: ActorObject, stance: StanceId): void {
     obj.data.stance = stance;
     if (!obj.overridden) this.applyStance(obj);
+  }
+
+  /** Sets an actor's scale multiplier and updates root group scale. */
+  setScale(obj: ActorObject, scale: number): void {
+    const clamped = Math.min(3.0, Math.max(0.2, scale));
+    obj.data.scale = clamped;
+    obj.root.scale.setScalar(clamped);
   }
 
   /**
@@ -147,9 +160,6 @@ export class ActorManager {
     obj.anchor = null;
     const p = obj.data.position;
     void this.session.createAnchor(frame, new THREE.Vector3(p.x, p.y, p.z)).then((anchor) => {
-      // The object may have been deleted, replaced by setScene, or re-anchored
-      // again while createAnchor was in flight. If it's no longer the live
-      // object for its id, delete the fresh anchor instead of leaking it.
       if (this.objects.get(obj.data.id) !== obj) {
         anchor?.delete?.();
         return;
@@ -167,7 +177,7 @@ export class ActorManager {
     for (const obj of this.objects.values()) {
       if (!obj.anchor || obj.overridden) continue;
       const p = this.session.anchorPosition(frame, obj.anchor, _scratchAnchor);
-      if (!p) continue; // tracking lost this frame — hold last pose
+      if (!p) continue;
       obj.data.position.x = p.x;
       obj.data.position.y = p.y;
       obj.data.position.z = p.z;
@@ -190,7 +200,6 @@ export class ActorManager {
 
   /** Rebuilds the floating note cards beside an actor. */
   refreshNotes(obj: ActorObject): void {
-    // Free the previous cards' textures/materials — clear() only detaches them.
     for (const child of obj.noteGroup.children) disposeSprite(child as THREE.Sprite);
     obj.noteGroup.clear();
     obj.data.notes.forEach((note, i) => {
@@ -202,7 +211,7 @@ export class ActorManager {
         fg: note.kind === 'dialogue' ? '#cfe0ff' : '#ffe1a8',
       });
       card.sprite.position.set(0, 1.28 - i * 0.16, 0);
-      card.sprite.center.set(-0.15, 0.5); // hang to the actor's right
+      card.sprite.center.set(-0.15, 0.5);
       obj.noteGroup.add(card.sprite);
     });
     obj.noteGroup.visible = this.notesVisible;
@@ -227,14 +236,14 @@ export class ActorManager {
   /**
    * Procedural walk while moving; a stance while at rest (`holdStance` from
    * the held keyframe, else the actor's rest stance). A walking actor always
-   * stands upright (the walk overrides any lean/seat/lie), and straight-leg —
-   * the knees only bend for static poses.
+   * stands upright (the walk overrides any lean/seat/lie).
    */
   setWalk(obj: ActorObject, moving: boolean, speed: number, dt: number, holdStance?: StanceId): void {
     if (moving) {
       obj.walkPhase += dt * speed * 6.5; // step frequency scales with speed
       const s = Math.sin(obj.walkPhase);
       obj.body.rotation.set(0, 0, 0); // upright while walking
+      obj.spine.rotation.set(0, 0, 0);
       obj.legL.rotation.set(0, 0, 0);
       obj.legR.rotation.set(0, 0, 0);
       obj.legL.rotation.x = s * 0.45;
@@ -243,6 +252,8 @@ export class ActorManager {
       obj.kneeR.rotation.x = 0;
       obj.armL.rotation.set(-s * 0.3, 0, 0);
       obj.armR.rotation.set(s * 0.3, 0, 0);
+      obj.elbowL.rotation.x = 0;
+      obj.elbowR.rotation.x = 0;
       obj.body.position.y = Math.abs(Math.cos(obj.walkPhase)) * 0.025;
     } else {
       this.applyStance(obj, holdStance);
@@ -276,10 +287,7 @@ export class ActorManager {
     root.userData.actorId = data.id;
     const body = new THREE.Group(); // bobs vertically while walking
 
-    // Legs: hip pivot (y=0.84) -> thigh -> knee pivot (y=0.50) -> shin. The
-    // knee lets seated/cross-legged/lying poses bend the shin; the walk cycle
-    // only rotates the hip, so straight-leg walking is unchanged. Returns the
-    // hip pivot with its knee pivot attached (out-param captures the knee).
+    // Legs: hip pivot (y=0.84) -> thigh -> knee pivot (y=-0.34) -> shin.
     const knees: THREE.Group[] = [];
     const mkLeg = (x: number) => {
       const hip = new THREE.Group();
@@ -287,7 +295,7 @@ export class ActorManager {
       const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.3, 3, 8), matDark);
       thigh.position.y = -0.17;
       const knee = new THREE.Group();
-      knee.position.y = -0.34; // knee ~y=0.50 in body space
+      knee.position.y = -0.34;
       const shin = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.3, 3, 8), matDark);
       shin.position.y = -0.17;
       knee.add(shin);
@@ -299,27 +307,40 @@ export class ActorManager {
     const legR = mkLeg(0.09);
     const [kneeL, kneeR] = knees;
 
-    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.155, 0.42, 3, 10), mat);
-    torso.position.y = 1.16;
+    // Spine group at waist level (y=0.92) allows torso, head, and articulated arms to tilt forward/back.
+    const spine = new THREE.Group();
+    spine.position.set(0, 0.92, 0);
 
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.155, 0.42, 3, 10), mat);
+    torso.position.y = 0.24;
+
+    // Arms: shoulder pivot (y=0.42 in spine) -> upper arm -> elbow pivot (y=-0.24) -> forearm.
+    const elbows: THREE.Group[] = [];
     const mkArm = (x: number) => {
       const pivot = new THREE.Group();
-      pivot.position.set(x, 1.34, 0);
-      const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.045, 0.48, 3, 8), matDark);
-      arm.position.y = -0.27;
-      pivot.add(arm);
+      pivot.position.set(x, 0.42, 0);
+      const upperArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.042, 0.22, 3, 8), matDark);
+      upperArm.position.y = -0.12;
+      const elbow = new THREE.Group();
+      elbow.position.y = -0.24;
+      const forearm = new THREE.Mesh(new THREE.CapsuleGeometry(0.038, 0.22, 3, 8), matDark);
+      forearm.position.y = -0.12;
+      elbow.add(forearm);
+      pivot.add(upperArm, elbow);
+      elbows.push(elbow);
       return pivot;
     };
     const armL = mkArm(-0.23);
     const armR = mkArm(0.23);
+    const [elbowL, elbowR] = elbows;
 
     const head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 12, 10), mat);
-    head.position.y = 1.56;
-    // A small nose so facing direction reads at a glance (faces +Z).
+    head.position.y = 0.64;
     const nose = new THREE.Mesh(new THREE.ConeGeometry(0.03, 0.07, 6).rotateX(Math.PI / 2), matDark);
-    nose.position.set(0, 1.56, 0.115);
+    nose.position.set(0, 0.64, 0.115);
 
-    body.add(legL, legR, torso, armL, armR, head, nose);
+    spine.add(torso, armL, armR, head, nose);
+    body.add(legL, legR, spine);
     root.add(body);
 
     const ring = new THREE.Mesh(
@@ -343,6 +364,7 @@ export class ActorManager {
     root.add(ring, hoverRing, label.sprite, noteGroup);
     root.position.set(data.position.x, data.position.y, data.position.z);
     root.rotation.y = data.rotationY;
+    root.scale.setScalar(data.scale ?? 1.0);
     this.group.add(root);
 
     const obj: ActorObject = {
@@ -358,6 +380,9 @@ export class ActorManager {
       kneeR,
       armL,
       armR,
+      elbowL,
+      elbowR,
+      spine,
       body,
       anchor: null,
       overridden: false,
@@ -365,7 +390,7 @@ export class ActorManager {
       labelFlashUntil: 0,
     };
     this.objects.set(data.id, obj);
-    this.applyStance(obj); // pose the rest position from data.stance
+    this.applyStance(obj);
     this.refreshNotes(obj);
     return obj;
   }

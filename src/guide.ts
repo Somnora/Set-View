@@ -5,6 +5,8 @@
 // guideView.ts renders these items as chips tethered to the controllers.
 // ---------------------------------------------------------------------------
 
+import type { PlaceArm } from './wheel.ts';
+
 export type GuideMode = 'full' | 'mini' | 'camera';
 export type GuideHand = 'left' | 'right';
 export type GuideAnchor = 'trigger' | 'grip' | 'stick' | 'stick-click' | 'upper' | 'lower' | 'wrist';
@@ -12,7 +14,7 @@ export type GuideAnchor = 'trigger' | 'grip' | 'stick' | 'stick-click' | 'upper'
 export interface GuideContext {
   mode: GuideMode;
   /** Placement arming ('none' = pinch/trigger only selects, never places). */
-  placeMode: 'none' | 'actor' | 'camera';
+  placeMode: PlaceArm;
   /** Frame Lines (eyes-as-camera) active. */
   eyesMode: boolean;
   /** Block = plan the shot; dress = adjust the physical space. */
@@ -48,8 +50,8 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
 
   // Left controller. The tool wheel always rides this hand (raise it to see
   // it); Y also pops the wheel in front of your face, hands-free.
-  items.push({ hand: 'left', anchor: 'wrist', label: 'Tool wheel is on this hand' });
-  items.push({ hand: 'left', anchor: 'upper', label: 'Y: pop the tool menu in front' });
+  items.push({ hand: 'left', anchor: 'wrist', label: 'Tool wheel on this hand (or Wrist Menu)' });
+  items.push({ hand: 'left', anchor: 'upper', label: 'Y: pop tool menu in front' });
   if (ctx.mode === 'full') {
     if (ctx.interaction === 'block') {
       items.push({
@@ -60,7 +62,9 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
             ? 'X: arm actor placing'
             : ctx.placeMode === 'actor'
               ? 'X: switch to camera placing'
-              : 'X: placing off',
+              : ctx.placeMode === 'camera'
+                ? 'X: switch to light placing'
+                : 'X: placing off',
       });
     }
     items.push({ hand: 'left', anchor: 'stick', label: 'Glide through the set' });
@@ -80,7 +84,9 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
           ? 'Select what you point at'
           : ctx.placeMode === 'actor'
             ? 'Place actor on the ring'
-            : 'Place camera at your head',
+            : ctx.placeMode === 'camera'
+              ? 'Place camera at your head'
+              : 'Place light fixture',
     });
     items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab an actor or camera' });
     items.push({ hand: 'right', anchor: 'upper', label: 'B: mark a move for the actor' });

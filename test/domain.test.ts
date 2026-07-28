@@ -8,6 +8,7 @@ import {
   addKeyframe,
   addNote,
   applyMarkOp,
+  computeFocusDistance,
   createActor,
   createCameraSetup,
   createScene,
@@ -16,9 +17,14 @@ import {
   DEFAULT_TSTOP,
   duplicateActor,
   duplicateCameraSetup,
+  createLight,
+  cycleKelvin,
+  duplicateLightSetup,
+  isLightData,
   isSceneData,
   MAX_KEYFRAMES,
   nextFormatId,
+  nextLightName,
   normalizeScene,
   SENSOR_FORMATS,
   sensorFormat,
@@ -39,7 +45,7 @@ import {
   hyperfocalM,
   vFovDeg,
 } from '../src/lens.ts';
-import { cycleStance, isStanceId, poseFor, STANCES } from '../src/pose.ts';
+import { cycleStance, isStanceId, poseFor, STANCES, type StanceId } from '../src/pose.ts';
 import { buildTimeline, lerpAngle, moveStats, sampleTimeline } from '../src/timeline.ts';
 import { ANCHOR_OFFSETS, guideItems } from '../src/guide.ts';
 import {
@@ -78,13 +84,19 @@ import { locomotionAmount, rotateOffsetAboutPivot, snapTurnAngle } from '../src/
 import {
   containScale,
   fileExtensionFor,
+  formatAudioPolicyStatus,
   MAX_RECORD_S,
   pickMimeType,
   RECORD_FPS,
   RECORD_MIME_CANDIDATES,
   RECORD_VIDEO_BPS,
   recordingClock,
+  shouldIncludeAudioTrack,
+  shouldRequestAudio,
 } from '../src/recording.ts';
+import { buildAiShotAnalysisPrompt, renderFloorplanSvg } from '../src/exporters.ts';
+import { simulateAiShotAnalysis } from '../src/ui.ts';
+
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -309,6 +321,40 @@ test('normalizeScene fills tStop/formatId defaults for legacy JSON', () => {
   normalizeScene(norm);
   assert.equal(norm.cameras[0].tStop, DEFAULT_TSTOP);
   assert.equal(norm.cameras[0].formatId, DEFAULT_FORMAT_ID);
+});
+
+test('actor scaling: default scale 1.0, validation, normalization clamping, duplication', () => {
+  const s = createScene('Scale Test');
+  const a = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+  assert.equal(a.scale, 1.0);
+
+  // isActorData validation
+  const rawActor = JSON.parse(JSON.stringify(a));
+  assert.ok(isSceneData(s));
+  rawActor.scale = -0.5;
+  assert.ok(!isSceneData({ ...s, actors: [rawActor] }), 'negative scale rejected');
+  rawActor.scale = 'big';
+  assert.ok(!isSceneData({ ...s, actors: [rawActor] }), 'string scale rejected');
+
+  // normalizeScene repairs out-of-bounds or missing scale
+  const corruptScene = createScene('Corrupt');
+  const ca = createActor(corruptScene, { x: 0, y: 0, z: 0 }, 0);
+  (ca as unknown as Record<string, unknown>).scale = 5.0; // too large (>3.0)
+  normalizeScene(corruptScene);
+  assert.equal(ca.scale, 1.0);
+
+  (ca as unknown as Record<string, unknown>).scale = 0.05; // too small (<0.2)
+  normalizeScene(corruptScene);
+  assert.equal(ca.scale, 1.0);
+
+  delete (ca as unknown as Record<string, unknown>).scale; // missing legacy
+  normalizeScene(corruptScene);
+  assert.equal(ca.scale, 1.0);
+
+  // duplicateActor preserves scale
+  a.scale = 1.25;
+  const dup = duplicateActor(s, a.id)!;
+  assert.equal(dup.scale, 1.25);
 });
 
 // --- timeline -------------------------------------------------------------------
@@ -983,13 +1029,19 @@ test('furniture: placements validate, survive JSON round-trip, bad ones drop', (
 
 // --- stance / pose ------------------------------------------------------------
 
-test('STANCES: all 10 requested poses present, unique ids, finite targets', () => {
+test('STANCES: all 16 requested poses present, unique ids, finite targets', () => {
   const ids = STANCES.map((p) => p.id);
-  const expected = [
+  const expected: StanceId[] = [
     'standing',
     'lean-left',
     'lean-right',
+    'standing_point',
+    'standing_reach',
+    'standing_hands_hips',
+    'standing_crossed_arms',
     'seated-chair',
+    'seated_arms_thighs',
+    'seated_leaning_table',
     'seated-lounge',
     'seated-cross',
     'lying-up',
@@ -997,12 +1049,27 @@ test('STANCES: all 10 requested poses present, unique ids, finite targets', () =
     'lying-left',
     'lying-right',
   ];
+  assert.equal(STANCES.length, 16);
   assert.equal(STANCES.length, expected.length);
   const idSet = new Set<string>(ids);
   for (const id of expected) assert.ok(idSet.has(id), `missing stance ${id}`);
   assert.equal(idSet.size, ids.length, 'stance ids must be unique');
   for (const p of STANCES) {
-    for (const v of [p.bodyRot.x, p.bodyRot.y, p.bodyRot.z, p.bodyLift, p.hip, p.knee, p.shoulder, p.legSplay]) {
+    for (const v of [
+      p.bodyRot.x,
+      p.bodyRot.y,
+      p.bodyRot.z,
+      p.bodyLift,
+      p.hip,
+      p.knee,
+      p.spine,
+      p.shoulder,
+      p.shoulderR,
+      p.shoulderL,
+      p.elbowR,
+      p.elbowL,
+      p.legSplay,
+    ]) {
       assert.ok(Number.isFinite(v), `${p.id} has a non-finite target`);
     }
     assert.ok(typeof p.name === 'string' && p.name.length > 0);
@@ -1012,7 +1079,21 @@ test('STANCES: all 10 requested poses present, unique ids, finite targets', () =
 
 test('standing is the neutral pose (all targets zero)', () => {
   const s = poseFor('standing');
-  for (const v of [s.bodyRot.x, s.bodyRot.y, s.bodyRot.z, s.bodyLift, s.hip, s.knee, s.shoulder, s.legSplay]) {
+  for (const v of [
+    s.bodyRot.x,
+    s.bodyRot.y,
+    s.bodyRot.z,
+    s.bodyLift,
+    s.hip,
+    s.knee,
+    s.spine,
+    s.shoulder,
+    s.shoulderR,
+    s.shoulderL,
+    s.elbowR,
+    s.elbowL,
+    s.legSplay,
+  ]) {
     assert.equal(v, 0);
   }
 });
@@ -1025,12 +1106,21 @@ test('seated/lying poses actually differ from standing', () => {
   assert.equal(poseFor('lean-left').bodyRot.z, -poseFor('lean-right').bodyRot.z); // mirror leans
 });
 
+test('new stances have distinct limb articulation targets', () => {
+  assert.ok(poseFor('standing_point').shoulderR > 1.0, 'pointing extends right shoulder');
+  assert.ok(poseFor('standing_reach').shoulderR > 2.0, 'reaching reaches right arm high');
+  assert.ok(poseFor('standing_hands_hips').elbowR > 1.5, 'hands on hips bends elbows');
+  assert.ok(poseFor('standing_crossed_arms').elbowL > 1.5, 'crossed arms bends elbows');
+  assert.ok(poseFor('seated_arms_thighs').elbowR > 1.0, 'seated arms on thighs bends elbows');
+  assert.ok(poseFor('seated_leaning_table').spine > 0.3, 'leaning forward tilts spine');
+});
+
 test('poseFor falls back to standing for unknown ids', () => {
   assert.equal(poseFor(undefined).id, 'standing');
   assert.equal(poseFor('nonsense').id, 'standing');
 });
 
-test('cycleStance wraps forward and back over all poses', () => {
+test('cycleStance wraps forward and back over all 16 poses', () => {
   const n = STANCES.length;
   let id: string = 'standing';
   const seen = new Set<string>();
@@ -1044,8 +1134,28 @@ test('cycleStance wraps forward and back over all poses', () => {
   assert.equal(cycleStance('nonsense', 1), STANCES[1 % n].id); // unknown treated as index 0
 });
 
-test('isStanceId accepts known ids, rejects junk', () => {
-  assert.ok(isStanceId('seated-cross'));
+test('isStanceId accepts all 16 known ids, rejects junk', () => {
+  const allStances: StanceId[] = [
+    'standing',
+    'lean-left',
+    'lean-right',
+    'standing_point',
+    'standing_reach',
+    'standing_hands_hips',
+    'standing_crossed_arms',
+    'seated-chair',
+    'seated_arms_thighs',
+    'seated_leaning_table',
+    'seated-lounge',
+    'seated-cross',
+    'lying-up',
+    'lying-down',
+    'lying-left',
+    'lying-right',
+  ];
+  for (const id of allStances) {
+    assert.ok(isStanceId(id), `isStanceId failed for ${id}`);
+  }
   assert.ok(!isStanceId('sitting'));
   assert.ok(!isStanceId(42));
   assert.ok(!isStanceId(undefined));
@@ -1449,7 +1559,8 @@ test('wheel: sub-wheels carry live values and hands get a Mark button', () => {
 test('wheel: placement arming cycles Off, Actor, Cam and the Place sector shows it', () => {
   assert.equal(nextPlaceMode('none'), 'actor');
   assert.equal(nextPlaceMode('actor'), 'camera');
-  assert.equal(nextPlaceMode('camera'), 'none');
+  assert.equal(nextPlaceMode('camera'), 'light');
+  assert.equal(nextPlaceMode('light'), 'none');
   const label = (placeMode: 'none' | 'actor' | 'camera') =>
     wheelMenu({ ...WHEEL_BASE, mode: 'block', placeMode }, 'root').sectors.find((s) => s.id === 'wheel-place')
       ?.label ?? '';
@@ -1502,6 +1613,208 @@ test('wheel: hit-testing — hub, sector centers, wrap at 12 o\'clock, outside n
   assert.equal(wheelHit(0.5, 0.02, 8) === null, false, 'ring edge still hits');
   assert.equal(wheelHit(0.02, 0.02, 8), null, 'corner outside the disc');
   assert.equal(wheelHit(0.5, 0.5, 0), 'hub');
+});
+
+// --- AI Shot Analysis Prompt & Simulation --------------------------------------
+
+test('buildAiShotAnalysisPrompt generates structured markdown prompt', () => {
+  const s = createScene('AI Test Scene');
+  const a1 = createActor(s, { x: 0, y: 0, z: 0 }, 0);
+  addKeyframe(a1, { x: 0, y: 0, z: 2 }, 0, 'standing');
+  createCameraSetup(s, { x: 2, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+
+  const prompt = buildAiShotAnalysisPrompt(s);
+  assert.ok(prompt.includes('AI Shot Analysis & Continuity Audit Prompt'));
+  assert.ok(prompt.includes('AI Test Scene'));
+  assert.ok(prompt.includes('Shot Coverage & Gap Identification'));
+  assert.ok(prompt.includes('180-Degree Line Rule & Eyeline Continuity Audit'));
+  assert.ok(prompt.includes('Lens Selection & Perspective Consistency'));
+  assert.ok(prompt.includes('Lighting Plan & Key Light Direction Recommendations'));
+  assert.ok(prompt.includes('Scene Pacing & Blocking Flow Feedback'));
+  assert.ok(prompt.includes('Actor 1'));
+  assert.ok(prompt.includes('CAM A'));
+  assert.ok(prompt.includes('35mm'));
+});
+
+test('renderFloorplanSvg produces SVG XML string with scene elements', () => {
+  const s = createScene('SVG Test');
+  createActor(s, { x: 1, y: 0, z: 1 }, 0);
+  createCameraSetup(s, { x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 50, '16:9');
+
+  const svg = renderFloorplanSvg(s, 500);
+  assert.ok(svg.startsWith('<svg'));
+  assert.ok(svg.endsWith('</svg>'));
+  assert.ok(svg.includes('width="500"'));
+  assert.ok(svg.includes('height="500"'));
+  assert.ok(svg.includes('Actor 1'));
+  assert.ok(svg.includes('CAM A'));
+});
+
+test('simulateAiShotAnalysis generates simulated continuity report', () => {
+  const s = createScene('Sim Test');
+  const report = simulateAiShotAnalysis(s);
+  assert.ok(report.includes('AI Shot Analysis & Continuity Report'));
+  assert.ok(report.includes('Shot Coverage & Gap Identification'));
+  assert.ok(report.includes('180-Degree Line Rule & Eyeline Continuity Audit'));
+  assert.ok(report.includes('Lens Selection & Perspective Consistency'));
+  assert.ok(report.includes('Lighting Plan & Key Light Direction Recommendations'));
+  assert.ok(report.includes('Scene Pacing & Blocking Flow Feedback'));
+});
+
+// --- In-App VR Lighting Rig & Light Plan Tests -------------------------------
+
+test('createLight factory sets default properties and unique names', () => {
+  const scene = createScene('Lighting Scene');
+  const l1 = createLight(scene, [0, 2.5, -1], 'spot');
+  assert.equal(l1.name, 'Key Light 1');
+  assert.equal(l1.type, 'spot');
+  assert.deepEqual(l1.position, [0, 2.5, -1]);
+  assert.equal(l1.intensity, 1.0);
+  assert.equal(l1.colorKelvin, 5600);
+  assert.equal(l1.coneAngleDeg, 45);
+
+  const l2 = createLight(scene, [1, 2, 0], 'point');
+  assert.equal(l2.name, 'Fill Light 2');
+  assert.equal(l2.type, 'point');
+
+  assert.equal(nextLightName(scene), 'Key Light 3');
+});
+
+test('cycleKelvin cycles through standard color temperature presets', () => {
+  assert.equal(cycleKelvin(3200), 4300);
+  assert.equal(cycleKelvin(4300), 5600);
+  assert.equal(cycleKelvin(5600), 6500);
+  assert.equal(cycleKelvin(6500), 3200);
+  // Non-preset values snap to nearest preset then step
+  assert.equal(cycleKelvin(3000), 4300);
+});
+
+test('duplicateLightSetup creates independent light copy with offset position', () => {
+  const scene = createScene('Dup Light');
+  const original = createLight(scene, [0, 3, 0], 0, 0, 'spot');
+  const dup = duplicateLightSetup(scene, original.id)!;
+
+  assert.notEqual(dup.id, original.id);
+  assert.notEqual(dup.name, original.name);
+  assert.equal(dup.position[0], original.position[0] + 0.5);
+  assert.equal(dup.position[1], original.position[1]);
+  assert.equal(dup.position[2], original.position[2]);
+  assert.equal(dup.colorKelvin, original.colorKelvin);
+  assert.equal(scene.lights.length, 2);
+});
+
+test('isLightData validates light objects correctly', () => {
+  const validLight = {
+    id: 'l1',
+    name: 'Key',
+    type: 'spot',
+    position: [0, 2, 0],
+    rotationY: 0,
+    rotationX: 0,
+    intensity: 1.0,
+    colorKelvin: 5600,
+    coneAngleDeg: 45,
+  };
+  assert.ok(isLightData(validLight));
+  assert.equal(isLightData(null), false);
+  assert.equal(isLightData({ ...validLight, type: 'invalid' }), false);
+  assert.equal(isLightData({ ...validLight, intensity: -1 }), false);
+});
+
+test('normalizeScene repairs missing or invalid light fields', () => {
+  const legacyScene: any = {
+    id: 's1',
+    name: 'Legacy Scene',
+    actors: [],
+    cameras: [],
+    // lights array missing
+  };
+  const normalized = normalizeScene(legacyScene);
+  assert.ok(Array.isArray(normalized.lights));
+  assert.equal(normalized.lights.length, 0);
+
+  const corruptedScene: any = {
+    ...normalized,
+    lights: [
+      {
+        id: 'l1',
+        name: 'Bad Light',
+        type: 'spot',
+        position: [0, 2, 0],
+        rotationY: 0,
+        rotationX: 0,
+        intensity: -5, // Invalid negative intensity
+        colorKelvin: 100, // Invalid kelvin
+        coneAngleDeg: 500, // Out of range cone angle
+      },
+    ],
+  };
+  const repaired = normalizeScene(corruptedScene);
+  assert.equal(repaired.lights.length, 1);
+  assert.equal(repaired.lights[0].intensity, 1.0);
+  assert.equal(repaired.lights[0].colorKelvin, 5600);
+  assert.equal(repaired.lights[0].coneAngleDeg, 45);
+});
+
+// --- Optics Focus & Rack Focus Tests ------------------------------------------
+
+test('computeFocusDistance resolves explicit focusDistanceM, target actor, or nearest actor fallback', () => {
+  const scene = createScene('Focus Scene');
+  const actor1 = createActor(scene, { x: 0, y: 0, z: -3 }, 0);
+  actor1.name = 'Alice';
+  const actor2 = createActor(scene, { x: 0, y: 0, z: -5 }, 0);
+  actor2.name = 'Bob';
+  const cam = createCameraSetup(scene, { x: 0, y: 1.5, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+
+  // Fallback: nearest actor (Alice at 3.354m = sqrt(0^2 + 1.5^2 + (-3)^2))
+  approx(computeFocusDistance(cam, scene.actors), vecDistance(cam.position, actor1.position));
+
+  // Targeted actor: Bob (distance sqrt(0^2 + 1.5^2 + (-5)^2) = 5.22m)
+  cam.focusTargetActorId = actor2.id;
+  approx(computeFocusDistance(cam, scene.actors), vecDistance(cam.position, actor2.position));
+
+  // Explicit focus distance overrides target actor
+  cam.focusDistanceM = 2.4;
+  approx(computeFocusDistance(cam, scene.actors), 2.4);
+});
+
+test('normalizeScene validates focus fields and strips dangling target actor ids', () => {
+  const scene = createScene('Norm Focus Scene');
+  const actor = createActor(scene, { x: 0, y: 0, z: -3 }, 0);
+  actor.name = 'Alice';
+  const cam = createCameraSetup(scene, { x: 0, y: 1.5, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }, 35, '2.39:1');
+
+  cam.focusTargetActorId = 'non-existent-actor-id';
+  cam.focusDistanceM = -10; // invalid negative focus distance
+
+  const norm = normalizeScene(scene);
+  const normCam = norm.cameras.find((c) => c.id === cam.id)!;
+  assert.equal(normCam.focusTargetActorId, undefined);
+  assert.equal(normCam.focusDistanceM, undefined);
+
+  // Valid target actor is preserved
+  cam.focusTargetActorId = actor.id;
+  cam.focusDistanceM = 3.5;
+  const norm2 = normalizeScene(scene);
+  const normCam2 = norm2.cameras.find((c) => c.id === cam.id)!;
+  assert.equal(normCam2.focusTargetActorId, actor.id);
+  assert.equal(normCam2.focusDistanceM, 3.5);
+});
+
+// --- Audio Recording Policy Tests ---------------------------------------------
+
+test('audio recording policy functions compute correct request and track inclusion states', () => {
+  assert.equal(shouldRequestAudio(true, true), true);
+  assert.equal(shouldRequestAudio(false, true), false);
+  assert.equal(shouldRequestAudio(true, false), false);
+
+  assert.equal(shouldIncludeAudioTrack(true, true), true);
+  assert.equal(shouldIncludeAudioTrack(true, false), false);
+  assert.equal(shouldIncludeAudioTrack(false, true), false);
+
+  assert.equal(formatAudioPolicyStatus(true, true), 'Mic Audio Active');
+  assert.equal(formatAudioPolicyStatus(true, false), 'Mic Audio Denied (Silent Video)');
+  assert.equal(formatAudioPolicyStatus(false, false), 'Audio Disabled');
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this

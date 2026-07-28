@@ -10,12 +10,15 @@ import {
   MAX_KEYFRAMES,
   SENSOR_FORMATS,
   TRIPOD_HEIGHTS,
+  sensorFormat,
   type ActorData,
   type CameraSetupData,
+  type LightData,
   type MarkOp,
   type SceneData,
 } from './model.ts';
 import { STANCES, type StanceId } from './pose.ts';
+import { buildAiShotAnalysisPrompt } from './exporters.ts';
 
 // --- shared helpers ---------------------------------------------------------
 
@@ -447,6 +450,7 @@ export class UIPanel {
 /** The standard SetView wrist menu layout. */
 export function buildWristPanel(): UIPanel {
   return new UIPanel([
+    [{ id: 'wheel-toggle', label: 'Menu / Tool Wheel', flex: 2 }],
     [
       { id: 'mode-actor', label: 'Place: Actor' },
       { id: 'mode-camera', label: 'Place: Cam' },
@@ -498,6 +502,7 @@ export function buildWristPanel(): UIPanel {
     [
       { id: 'capture', label: '📷 Capture', flex: 1.2 },
       { id: 'record', label: '⏺ Rec' },
+      { id: 'aianalysis', label: '🤖 AI' },
       { id: 'help', label: '?' },
       { id: 'exit', label: 'Exit AR' },
     ],
@@ -526,14 +531,25 @@ export interface LandingCallbacks {
   onRename: (id: string, name: string) => void;
   onExportFloorplan: (id: string) => void;
   onExportShotList: (id: string) => void;
+  onExportAIPrompt?: (id: string) => void;
+  onAiShotAnalysis?: (id: string) => void;
   onRemoveScan: (id: string) => void;
   /** Opens the desktop 3D preview (orbit + playback) for a scene. */
   onPreview: (id: string) => void;
   /** Full scene for the inline camera editor, or null. */
   getScene: (id: string) => SceneData | null;
   onUpdateCamera: (sceneId: string, cameraId: string, patch: Partial<CameraSetupData>) => void;
+  onAddCamera?: (sceneId: string) => void;
+  onDeleteCamera?: (sceneId: string, cameraId: string) => void;
+  onAddActor?: (sceneId: string) => void;
+  onUpdateActor?: (sceneId: string, actorId: string, patch: Partial<ActorData>) => void;
+  onDeleteActor?: (sceneId: string, actorId: string) => void;
+  onAddLight?: (sceneId: string) => void;
+  onUpdateLight?: (sceneId: string, lightId: string, patch: Partial<LightData>) => void;
+  onDeleteLight?: (sceneId: string, lightId: string) => void;
   onSetPace: (sceneId: string, walkSpeed: number) => void;
   onSetStance: (sceneId: string, actorId: string, stance: StanceId) => void;
+  onSetScale?: (sceneId: string, actorId: string, scale: number) => void;
   /** Desktop blocking editor: one mark-list operation (see model.MarkOp). */
   onEditMarks: (sceneId: string, actorId: string, op: MarkOp) => void;
 }
@@ -561,10 +577,13 @@ export class Landing {
       return e;
     };
     const wrap = el('div', 'wrap', this.root);
-    el('h1', '', wrap, 'SetView');
-    el('p', 'sub', wrap, 'AR previsualization & shot blocking — place actors, block moves, find your frame.');
+    const header = el('div', 'brand-header', wrap);
+    const titleBox = el('div', 'brand-title', header);
+    el('span', 'brand-badge', titleBox, 'SETVIEW');
+    el('h1', '', titleBox, 'AR Shot Blocking & 3D Desktop Prep');
+    el('p', 'sub', wrap, 'Professional spatial previsualization — block actor keyframes, configure optical camera physics, rig lighting, and preview in 3D & WebXR.');
     this.diagEl = el('div', 'diag', wrap);
-    this.enterBtn = el('button', 'enter', wrap, 'Enter AR') as HTMLButtonElement;
+    this.enterBtn = el('button', 'enter', wrap, 'Enter WebXR / AR Mode') as HTMLButtonElement;
     this.enterBtn.disabled = true;
     this.enterBtn.onclick = () => this.cb.onEnter();
 
@@ -693,135 +712,321 @@ export class Landing {
     if (name !== null && name.trim()) this.cb.onRename(id, name.trim());
   }
 
-  /** Export buttons + a per-camera editor (lens/format/aspect/T-stop/height). */
+  /** Export buttons + responsive grid for Scene, Cast/Actors, Cameras, and Lighting. */
   private buildPrepPanel(sceneId: string): HTMLElement {
     const panel = document.createElement('div');
     panel.className = 'prep-body';
 
     const exports = document.createElement('div');
     exports.className = 'bar';
-    for (const [label, fn] of [
-      ['⬇ Floorplan PNG', this.cb.onExportFloorplan],
-      ['⬇ Shot List', this.cb.onExportShotList],
-    ] as const) {
+
+    const btn = (label: string, fn?: (id: string) => void) => {
+      if (!fn) return;
       const b = document.createElement('button');
-      b.className = 'small';
+      b.className = 'small primary';
       b.textContent = label;
       b.onclick = () => fn(sceneId);
       exports.appendChild(b);
-    }
+    };
+
+    btn('⬇ Floorplan PNG', this.cb.onExportFloorplan);
+    btn('⬇ Shot List MD', this.cb.onExportShotList);
+    btn('📜 AI Prompt Text', this.cb.onExportAIPrompt ?? this.cb.onExportShotList);
+    btn('🤖 AI Shot Analysis', this.cb.onAiShotAnalysis);
     panel.appendChild(exports);
 
     const scene = this.cb.getScene(sceneId);
-    if (scene) {
-      const pace = document.createElement('div');
-      pace.className = 'cam-edit';
-      const b = document.createElement('b');
-      b.textContent = 'Scene';
-      pace.appendChild(b);
-      const l = document.createElement('label');
-      l.className = 'field';
-      const span = document.createElement('span');
-      span.textContent = 'Move pace m/s';
-      const i = document.createElement('input');
-      i.type = 'number';
-      i.value = String(scene.walkSpeed.toFixed(1));
-      i.step = '0.1';
-      i.min = '0.4';
-      i.max = '3';
-      i.onchange = () => {
-        if (i.value.trim() === '') {
-          i.value = String(scene.walkSpeed.toFixed(1));
-          return;
-        }
-        const n = Number(i.value);
-        if (!Number.isFinite(n)) return;
-        const clamped = Math.min(3, Math.max(0.4, n));
-        i.value = String(clamped.toFixed(1));
-        this.cb.onSetPace(sceneId, clamped);
-      };
-      l.appendChild(span);
-      l.appendChild(i);
-      pace.appendChild(l);
-      panel.appendChild(pace);
+    if (!scene) return panel;
 
-      // Location scan status + remove.
-      const scanRow = document.createElement('div');
-      scanRow.className = 'cam-edit';
-      const sb = document.createElement('b');
-      sb.textContent = 'Location';
-      scanRow.appendChild(sb);
+    const grid = document.createElement('div');
+    grid.className = 'prep-grid';
+
+    // --- Card 1: Scene & Environment ---
+    const envCard = document.createElement('div');
+    envCard.className = 'manager-card';
+    const envTitle = document.createElement('div');
+    envTitle.className = 'card-title';
+    envTitle.innerHTML = '<span>🎬 Scene & Environment</span>';
+    envCard.appendChild(envTitle);
+
+    const paceRow = document.createElement('div');
+    paceRow.className = 'cam-edit';
+    const paceLbl = document.createElement('label');
+    paceLbl.className = 'field';
+    const paceSpan = document.createElement('span');
+    paceSpan.textContent = 'Move pace m/s';
+    const paceInput = document.createElement('input');
+    paceInput.type = 'number';
+    paceInput.value = String(scene.walkSpeed.toFixed(1));
+    paceInput.step = '0.1';
+    paceInput.min = '0.4';
+    paceInput.max = '3.0';
+    paceInput.onchange = () => {
+      const n = Number(paceInput.value);
+      if (Number.isFinite(n)) {
+        const clamped = Math.min(3, Math.max(0.4, n));
+        this.cb.onSetPace(sceneId, clamped);
+      }
+    };
+    paceLbl.appendChild(paceSpan);
+    paceLbl.appendChild(paceInput);
+    paceRow.appendChild(paceLbl);
+    envCard.appendChild(paceRow);
+
+    const scanRow = document.createElement('div');
+    scanRow.className = 'cam-edit';
+    if (scene.scan) {
+      const sc = scene.scan;
+      const size = `${(sc.boundsMax.x - sc.boundsMin.x).toFixed(1)}×${(sc.boundsMax.z - sc.boundsMin.z).toFixed(1)}m`;
       const info = document.createElement('span');
       info.className = 'scan-info';
-      if (scene.scan) {
-        const sc = scene.scan;
-        const size = `${(sc.boundsMax.x - sc.boundsMin.x).toFixed(1)}×${(sc.boundsMax.z - sc.boundsMin.z).toFixed(1)} m`;
-        info.textContent = `scan: ${Math.round(sc.triangles / 1000)}k tris · ${size} · ${new Date(
-          sc.capturedAt,
-        ).toLocaleDateString()}`;
-        scanRow.appendChild(info);
-        const rm = document.createElement('button');
-        rm.className = 'small';
-        rm.textContent = 'Remove scan';
-        rm.onclick = () => this.cb.onRemoveScan(sceneId);
-        scanRow.appendChild(rm);
-      } else {
-        info.textContent = 'no scan — use Scan Room on the wrist menu while on location';
-        scanRow.appendChild(info);
-      }
-      panel.appendChild(scanRow);
+      info.textContent = `📍 Location Scan: ${Math.round(sc.triangles / 1000)}k tris (${size})`;
+      scanRow.appendChild(info);
+      const rm = document.createElement('button');
+      rm.className = 'small';
+      rm.textContent = 'Remove scan';
+      rm.onclick = () => this.cb.onRemoveScan(sceneId);
+      scanRow.appendChild(rm);
+    } else {
+      const info = document.createElement('span');
+      info.className = 'scan-info';
+      info.textContent = '📍 No location scan attached';
+      scanRow.appendChild(info);
+    }
+    envCard.appendChild(scanRow);
+    grid.appendChild(envCard);
 
-      // Cast: per-actor stance (poses are placed in AR; stance is editable here).
-      if (scene.actors.length) {
-        for (const actor of scene.actors) panel.appendChild(this.buildActorEditor(sceneId, actor));
+    // --- Card 2: Cast & Actor Blocking ---
+    const actorCard = document.createElement('div');
+    actorCard.className = 'manager-card';
+    const actorTitle = document.createElement('div');
+    actorTitle.className = 'card-title';
+    actorTitle.innerHTML = `<span>🎭 Cast & Actor Blocking (${scene.actors.length})</span>`;
+    if (this.cb.onAddActor) {
+      const addActorBtn = document.createElement('button');
+      addActorBtn.className = 'small primary';
+      addActorBtn.textContent = '+ Add Actor';
+      addActorBtn.onclick = () => this.cb.onAddActor!(sceneId);
+      actorTitle.appendChild(addActorBtn);
+    }
+    actorCard.appendChild(actorTitle);
+
+    if (scene.actors.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'No actors yet — click "+ Add Actor" or place actors in AR.';
+      actorCard.appendChild(empty);
+    } else {
+      for (const actor of scene.actors) {
+        actorCard.appendChild(this.buildActorEditor(sceneId, actor));
       }
     }
-    if (!scene || scene.cameras.length === 0) {
-      const p = document.createElement('p');
-      p.className = 'empty';
-      p.textContent = 'No cameras yet — commit one in AR to edit its lens here.';
-      panel.appendChild(p);
-      return panel;
+    grid.appendChild(actorCard);
+
+    // --- Card 3: Camera System ---
+    const camCard = document.createElement('div');
+    camCard.className = 'manager-card';
+    const camTitle = document.createElement('div');
+    camTitle.className = 'card-title';
+    camTitle.innerHTML = `<span>🎥 Camera Rig & Optics (${scene.cameras.length})</span>`;
+    if (this.cb.onAddCamera) {
+      const addCamBtn = document.createElement('button');
+      addCamBtn.className = 'small primary';
+      addCamBtn.textContent = '+ Add Camera';
+      addCamBtn.onclick = () => this.cb.onAddCamera!(sceneId);
+      camTitle.appendChild(addCamBtn);
     }
-    for (const cam of scene.cameras) panel.appendChild(this.buildCameraEditor(sceneId, cam));
+    camCard.appendChild(camTitle);
+
+    if (scene.cameras.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'No cameras yet — click "+ Add Camera" or commit one in AR.';
+      camCard.appendChild(empty);
+    } else {
+      for (const cam of scene.cameras) {
+        camCard.appendChild(this.buildCameraEditor(sceneId, cam));
+      }
+    }
+    grid.appendChild(camCard);
+
+    // --- Card 4: Lighting Fixtures ---
+    const lightCard = document.createElement('div');
+    lightCard.className = 'manager-card';
+    const lightTitle = document.createElement('div');
+    lightTitle.className = 'card-title';
+    lightTitle.innerHTML = `<span>💡 Lighting Rig (${scene.lights?.length ?? 0})</span>`;
+    if (this.cb.onAddLight) {
+      const addLightBtn = document.createElement('button');
+      addLightBtn.className = 'small primary';
+      addLightBtn.textContent = '+ Add Light';
+      addLightBtn.onclick = () => this.cb.onAddLight!(sceneId);
+      lightTitle.appendChild(addLightBtn);
+    }
+    lightCard.appendChild(lightTitle);
+
+    if (!scene.lights || scene.lights.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'No lights yet — click "+ Add Light".';
+      lightCard.appendChild(empty);
+    } else {
+      for (const light of scene.lights) {
+        lightCard.appendChild(this.buildLightEditor(sceneId, light));
+      }
+    }
+    grid.appendChild(lightCard);
+
+    panel.appendChild(grid);
     return panel;
   }
 
-  /**
-   * A per-actor blocking editor: rest-stance dropdown + the full mark list
-   * (position / facing / per-mark stance / reorder / delete / add) — author a
-   * scene's blocking at a laptop, then check it with Preview.
-   */
+  private buildLightEditor(sceneId: string, light: LightData): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'cam-edit light-edit';
+
+    const patch = (p: Partial<LightData>) => {
+      if (this.cb.onUpdateLight) this.cb.onUpdateLight(sceneId, light.id, p);
+    };
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = light.name;
+    nameInput.style.fontWeight = 'bold';
+    nameInput.style.width = '100px';
+    nameInput.onchange = () => {
+      if (nameInput.value.trim()) patch({ name: nameInput.value.trim() });
+    };
+    row.appendChild(nameInput);
+
+    const typeSelect = document.createElement('select');
+    typeSelect.className = 'small';
+    for (const t of ['spot', 'point', 'area'] as const) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t.toUpperCase();
+      if (light.type === t) opt.selected = true;
+      typeSelect.appendChild(opt);
+    }
+    typeSelect.onchange = () => patch({ type: typeSelect.value as LightData['type'] });
+    row.appendChild(typeSelect);
+
+    const kelvinBtn = document.createElement('button');
+    kelvinBtn.className = 'small mark-btn';
+    kelvinBtn.textContent = `${light.colorKelvin}K`;
+    const temps = [3200, 4300, 5600, 6500];
+    kelvinBtn.onclick = () => {
+      const idx = temps.indexOf(light.colorKelvin);
+      const next = temps[(idx + 1) % temps.length];
+      patch({ colorKelvin: next });
+    };
+    row.appendChild(kelvinBtn);
+
+    const intInput = document.createElement('input');
+    intInput.type = 'number';
+    intInput.style.width = '55px';
+    intInput.step = '0.1';
+    intInput.min = '0.1';
+    intInput.max = '10.0';
+    intInput.value = light.intensity.toFixed(1);
+    intInput.title = 'Intensity multiplier';
+    intInput.onchange = () => {
+      const v = parseFloat(intInput.value);
+      if (!isNaN(v) && v > 0) patch({ intensity: v });
+    };
+    row.appendChild(intInput);
+
+    if (this.cb.onDeleteLight) {
+      const delBtn = document.createElement('button');
+      delBtn.className = 'small danger';
+      delBtn.textContent = '✕';
+      delBtn.title = 'Delete light';
+      delBtn.onclick = () => this.cb.onDeleteLight!(sceneId, light.id);
+      row.appendChild(delBtn);
+    }
+
+    return row;
+  }
+
+  /** A per-actor blocking editor with color, height scaling, scale, stance, and keyframe marks. */
   private buildActorEditor(sceneId: string, actor: ActorData): HTMLElement {
     const row = document.createElement('div');
     row.className = 'cam-edit actor-edit';
-    const name = document.createElement('b');
-    name.textContent = actor.name;
-    name.style.color = actor.color;
-    row.appendChild(name);
 
-    const l = document.createElement('label');
-    l.className = 'field';
-    const span = document.createElement('span');
-    span.textContent = 'Stance';
-    const sel = document.createElement('select');
+    const patch = (p: Partial<ActorData>) => {
+      if (this.cb.onUpdateActor) this.cb.onUpdateActor(sceneId, actor.id, p);
+    };
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = actor.name;
+    nameInput.style.fontWeight = 'bold';
+    nameInput.style.color = actor.color;
+    nameInput.style.width = '100px';
+    nameInput.onchange = () => patch({ name: nameInput.value.trim() || actor.name });
+    row.appendChild(nameInput);
+
+    const colorInput = document.createElement('input');
+    colorInput.type = 'color';
+    colorInput.value = actor.color;
+    colorInput.title = 'Actor color badge';
+    colorInput.onchange = () => patch({ color: colorInput.value });
+    row.appendChild(colorInput);
+
+    const field = (label: string, input: HTMLElement) => {
+      const l = document.createElement('label');
+      l.className = 'field';
+      const span = document.createElement('span');
+      span.textContent = label;
+      l.appendChild(span);
+      l.appendChild(input);
+      row.appendChild(l);
+    };
+
+    const stanceSel = document.createElement('select');
     for (const p of STANCES) {
       const opt = document.createElement('option');
       opt.value = p.id;
       opt.textContent = p.name;
       if (p.id === (actor.stance ?? 'standing')) opt.selected = true;
-      sel.appendChild(opt);
+      stanceSel.appendChild(opt);
     }
-    sel.onchange = () => this.cb.onSetStance(sceneId, actor.id, sel.value as StanceId);
-    l.appendChild(span);
-    l.appendChild(sel);
-    row.appendChild(l);
+    stanceSel.onchange = () => this.cb.onSetStance(sceneId, actor.id, stanceSel.value as StanceId);
+    field('Stance', stanceSel);
+
+    const numIn = (val: number, step: number, min: number, max: number, fn: (n: number) => void) => {
+      const i = document.createElement('input');
+      i.type = 'number';
+      i.value = String(val);
+      i.step = String(step);
+      i.min = String(min);
+      i.max = String(max);
+      i.onchange = () => {
+        const n = Number(i.value);
+        if (Number.isFinite(n)) fn(Math.min(max, Math.max(min, n)));
+      };
+      return i;
+    };
+
+    field('Height (m)', numIn(actor.heightM ?? 1.75, 0.05, 0.5, 3.0, (n) => patch({ heightM: n })));
+    field('Scale', numIn(actor.scale ?? 1.0, 0.1, 0.2, 5.0, (n) => patch({ scale: n })));
+    field('Rest X', numIn(actor.position.x, 0.1, -20, 20, (x) => patch({ position: { ...actor.position, x } })));
+    field('Rest Z', numIn(actor.position.z, 0.1, -20, 20, (z) => patch({ position: { ...actor.position, z } })));
+
+    if (this.cb.onDeleteActor) {
+      const delBtn = document.createElement('button');
+      delBtn.className = 'small';
+      delBtn.textContent = '✕';
+      delBtn.title = 'Delete Actor';
+      delBtn.onclick = () => this.cb.onDeleteActor!(sceneId, actor.id);
+      row.appendChild(delBtn);
+    }
 
     row.appendChild(this.buildMarksEditor(sceneId, actor));
     return row;
   }
 
-  /** The mark list under an actor row. Every op funnels through onEditMarks. */
+  /** The mark list under an actor row. */
   private buildMarksEditor(sceneId: string, actor: ActorData): HTMLElement {
     const wrap = document.createElement('div');
     wrap.className = 'marks';
@@ -836,7 +1041,7 @@ export class Landing {
       i.onchange = () => {
         const n = Number(i.value);
         if (i.value.trim() === '' || !Number.isFinite(n)) {
-          i.value = value; // restore rather than apply garbage
+          i.value = value;
           return;
         }
         apply(n);
@@ -853,19 +1058,18 @@ export class Landing {
       line.appendChild(idx);
 
       line.appendChild(
-        numCell(kf.position.x.toFixed(1), 'X (m, + = right)', (n) => op({ kind: 'update', index: i, position: { x: n } })),
+        numCell(kf.position.x.toFixed(1), 'X (m)', (n) => op({ kind: 'update', index: i, position: { x: n } })),
       );
       line.appendChild(
-        numCell(kf.position.z.toFixed(1), 'Z (m, 0° faces +Z)', (n) => op({ kind: 'update', index: i, position: { z: n } })),
+        numCell(kf.position.z.toFixed(1), 'Z (m)', (n) => op({ kind: 'update', index: i, position: { z: n } })),
       );
       line.appendChild(
-        numCell(((kf.rotationY * 180) / Math.PI).toFixed(0), 'Facing (degrees)', (n) =>
+        numCell(((kf.rotationY * 180) / Math.PI).toFixed(0), 'Facing (°)', (n) =>
           op({ kind: 'update', index: i, rotationY: (n * Math.PI) / 180 }),
         ),
       );
 
       const stanceSel = document.createElement('select');
-      stanceSel.title = 'Pose held at this mark';
       const rest = document.createElement('option');
       rest.value = '';
       rest.textContent = '(rest stance)';
@@ -891,8 +1095,8 @@ export class Landing {
         b.onclick = fn;
         line.appendChild(b);
       };
-      btn('↑', 'Move mark earlier', i === 0, () => op({ kind: 'move', index: i, dir: -1 }));
-      btn('↓', 'Move mark later', i === actor.keyframes.length - 1, () => op({ kind: 'move', index: i, dir: 1 }));
+      btn('↑', 'Move earlier', i === 0, () => op({ kind: 'move', index: i, dir: -1 }));
+      btn('↓', 'Move later', i === actor.keyframes.length - 1, () => op({ kind: 'move', index: i, dir: 1 }));
       btn('✕', 'Delete mark', false, () => op({ kind: 'remove', index: i }));
       wrap.appendChild(line);
     });
@@ -902,7 +1106,6 @@ export class Landing {
     const add = document.createElement('button');
     add.className = 'small';
     add.textContent = '+ Mark';
-    add.title = 'Append a mark (a step past the last, in the actor’s current stance)';
     add.disabled = actor.keyframes.length >= MAX_KEYFRAMES;
     add.onclick = () => this.cb.onEditMarks(sceneId, actor.id, { kind: 'add' });
     foot.appendChild(add);
@@ -910,8 +1113,8 @@ export class Landing {
     hint.className = 'mark-hint';
     hint.textContent =
       actor.keyframes.length === 0
-        ? 'no marks — the actor holds its placed spot'
-        : `${actor.keyframes.length}/${MAX_KEYFRAMES} marks · check with Preview`;
+        ? 'no marks'
+        : `${actor.keyframes.length}/${MAX_KEYFRAMES} marks`;
     foot.appendChild(hint);
     wrap.appendChild(foot);
     return wrap;
@@ -920,11 +1123,16 @@ export class Landing {
   private buildCameraEditor(sceneId: string, cam: CameraSetupData): HTMLElement {
     const row = document.createElement('div');
     row.className = 'cam-edit';
-    const name = document.createElement('b');
-    name.textContent = cam.name;
-    row.appendChild(name);
 
     const patch = (p: Partial<CameraSetupData>) => this.cb.onUpdateCamera(sceneId, cam.id, p);
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = cam.name;
+    nameInput.style.fontWeight = 'bold';
+    nameInput.style.width = '80px';
+    nameInput.onchange = () => patch({ name: nameInput.value.trim() || cam.name });
+    row.appendChild(nameInput);
 
     const field = (label: string, input: HTMLElement) => {
       const l = document.createElement('label');
@@ -944,15 +1152,8 @@ export class Landing {
       i.min = String(min);
       i.max = String(max);
       i.onchange = () => {
-        if (i.value.trim() === '') {
-          i.value = String(value); // cleared field — restore, don't apply 0
-          return;
-        }
         const n = Number(i.value);
-        if (!Number.isFinite(n)) return;
-        const clamped = Math.min(max, Math.max(min, n)); // min/max attrs don't clamp .value
-        i.value = String(clamped);
-        apply(clamped);
+        if (Number.isFinite(n)) apply(Math.min(max, Math.max(min, n)));
       };
       return i;
     };
@@ -989,7 +1190,6 @@ export class Landing {
     field('T-stop', num(cam.tStop, 0.1, 0.7, 32, (n) => patch({ tStop: n })));
     field('Height m', num(Number(cam.position.y.toFixed(2)), 0.1, 0, 4, (n) => patch({ position: { ...cam.position, y: n } })));
 
-    // Tripod-height presets.
     field(
       'Preset',
       select(
@@ -1003,6 +1203,8 @@ export class Landing {
 
     return row;
   }
+
+
 
   show(visible: boolean): void {
     this.root.style.display = visible ? '' : 'none';
@@ -1094,3 +1296,192 @@ export class NoteEditor {
     this.dialog = null;
   }
 }
+
+// --- AI Shot Analysis Modal ----------------------------------------------------
+
+export function simulateAiShotAnalysis(scene: SceneData): string {
+  const lines: string[] = [];
+  lines.push(`# 🤖 AI Shot Analysis & Continuity Report (Simulated Preview)`);
+  lines.push('');
+  lines.push(`*Generated for Scene: "${scene.name}"*`);
+  lines.push('');
+
+  lines.push(`### 1. Shot Coverage & Gap Identification`);
+  if (scene.cameras.length === 0) {
+    lines.push(`- ⚠️ **Critical Gap**: No cameras defined in scene "${scene.name}". Add a master camera and coverage setups.`);
+  } else if (scene.cameras.length === 1) {
+    lines.push(`- ⚠️ **Coverage Warning**: Only 1 camera setup (${scene.cameras[0].name}) exists. To ensure dialogue and action continuity, add reverse over-the-shoulder (OTS) shots or tight coverage angles.`);
+  } else {
+    lines.push(`- **Camera Coverage**: ${scene.cameras.length} camera setups defined (${scene.cameras.map((c) => c.name).join(', ')}).`);
+    lines.push(`- **Coverage Assessment**: Multi-camera setup provides foundational master and coverage options.`);
+  }
+  if (scene.actors.length === 0) {
+    lines.push(`- ℹ️ **Cast Note**: No actors present. Place actors to evaluate framing and blocking interaction.`);
+  } else {
+    lines.push(`- **Cast Coverage**: ${scene.actors.length} actor(s) (${scene.actors.map((a) => a.name).join(', ')}). All actors have assigned spatial coordinates and stances.`);
+  }
+  lines.push('');
+
+  lines.push(`### 2. 180-Degree Line Rule & Eyeline Continuity Audit`);
+  if (scene.cameras.length >= 2 && scene.actors.length >= 2) {
+    lines.push(`- **Axis Check**: Scene contains ${scene.cameras.length} cameras and ${scene.actors.length} actors. Verify that cameras stay on one side of the primary interaction axis line between ${scene.actors[0].name} and ${scene.actors[1].name}.`);
+    lines.push(`- **Eyeline Alignment**: Ensure key actor facings match cross-shot look directions.`);
+  } else {
+    lines.push(`- **Axis Check**: Add at least 2 actors and 2 cameras to perform an active 180-degree rule and eyeline continuity audit.`);
+  }
+  lines.push('');
+
+  lines.push(`### 3. Lens Selection & Perspective Consistency`);
+  if (scene.cameras.length > 0) {
+    scene.cameras.forEach((c) => {
+      const fmt = sensorFormat(c.formatId);
+      lines.push(`- **${c.name}**: ${Math.round(c.lensFocalLength)}mm on ${fmt.name} (${c.aspect}, T${c.tStop}). ${c.lensFocalLength < 28 ? 'Wide-angle lens: accentuates depth and room space.' : c.lensFocalLength > 70 ? 'Telephoto lens: compresses background depth and isolates subject.' : 'Standard focal length: natural perspective.'}`);
+    });
+  } else {
+    lines.push(`- **Lens Audit**: No cameras defined.`);
+  }
+  lines.push('');
+
+  lines.push(`### 4. Lighting Plan & Key Light Direction Recommendations`);
+  if (scene.actors.length > 0) {
+    const mainActor = scene.actors[0];
+    const facingDeg = ((mainActor.rotationY * 180) / Math.PI).toFixed(0);
+    lines.push(`- **Key Light Direction**: Position key light approximately 45° off-axis relative to ${mainActor.name}'s heading (${facingDeg}°) to create 3/4 Rembrandt or loop lighting.`);
+    lines.push(`- **Fill & Separation**: Place fill on opposite side at 2:1 to 4:1 ratio. Add hair/rim light behind subjects for background separation.`);
+  } else {
+    lines.push(`- **Lighting Plan**: Place actors to generate specific lighting key/fill angle recommendations.`);
+  }
+  lines.push('');
+
+  lines.push(`### 5. Scene Pacing & Blocking Flow Feedback`);
+  lines.push(`- **Pace Setting**: Scene movement pace is set to ${scene.walkSpeed.toFixed(1)} m/s.`);
+  for (const a of scene.actors) {
+    const marksCount = a.keyframes.length;
+    lines.push(`- **${a.name}**: ${marksCount === 0 ? 'Static position' : `${marksCount} mark(s) timeline`}. Rest stance: ${a.stance ?? 'standing'}.`);
+  }
+
+  return lines.join('\n');
+}
+
+export function openAiAnalysisModal(scene: SceneData, overlayRoot?: HTMLElement): void {
+  const promptText = buildAiShotAnalysisPrompt(scene);
+  const container = overlayRoot ?? document.body;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'ai-modal-overlay';
+
+  const dialog = document.createElement('div');
+  dialog.className = 'ai-modal-dialog';
+
+  dialog.innerHTML = `
+    <div class="ai-modal-header">
+      <h2>🤖 AI Shot Analysis & Continuity Assistant</h2>
+      <button class="ai-modal-close" title="Close">✕</button>
+    </div>
+    <div class="ai-modal-toolbar">
+      <input type="password" id="ai-api-key" placeholder="Enter Gemini API Key (optional)" value="${escapeHtml(localStorage.getItem('setview_gemini_api_key') || '')}" />
+      <button class="ai-btn-copy" id="ai-copy-btn">📋 Copy Prompt</button>
+      <button class="ai-btn-run" id="ai-run-btn">🚀 Run Analysis</button>
+    </div>
+    <div class="ai-modal-body">
+      <div class="ai-modal-tabs">
+        <button class="ai-tab-btn active" id="tab-output-btn">Analysis Output</button>
+        <button class="ai-tab-btn" id="tab-prompt-btn">Generated Prompt</button>
+      </div>
+      <div id="ai-tab-output" class="ai-analysis-output">${escapeHtml(simulateAiShotAnalysis(scene))}</div>
+      <textarea id="ai-tab-prompt" class="ai-prompt-preview" readonly style="display: none;"></textarea>
+    </div>
+  `;
+
+  overlay.appendChild(dialog);
+  container.appendChild(overlay);
+
+  const keyInput = dialog.querySelector<HTMLInputElement>('#ai-api-key')!;
+  const copyBtn = dialog.querySelector<HTMLButtonElement>('#ai-copy-btn')!;
+  const runBtn = dialog.querySelector<HTMLButtonElement>('#ai-run-btn')!;
+  const closeBtn = dialog.querySelector<HTMLButtonElement>('.ai-modal-close')!;
+  const outputTabBtn = dialog.querySelector<HTMLButtonElement>('#tab-output-btn')!;
+  const promptTabBtn = dialog.querySelector<HTMLButtonElement>('#tab-prompt-btn')!;
+  const outputEl = dialog.querySelector<HTMLElement>('#ai-tab-output')!;
+  const promptTa = dialog.querySelector<HTMLTextAreaElement>('#ai-tab-prompt')!;
+
+  promptTa.value = promptText;
+
+  const close = () => overlay.remove();
+  overlay.onclick = (e) => {
+    if (e.target === overlay) close();
+  };
+  closeBtn.onclick = close;
+
+  keyInput.onchange = () => {
+    localStorage.setItem('setview_gemini_api_key', keyInput.value.trim());
+  };
+
+  copyBtn.onclick = () => {
+    navigator.clipboard.writeText(promptText).then(() => {
+      copyBtn.textContent = 'Copied! ✓';
+      setTimeout(() => {
+        copyBtn.textContent = '📋 Copy Prompt';
+      }, 2000);
+    }).catch(() => {
+      promptTa.select();
+      document.execCommand('copy');
+      copyBtn.textContent = 'Copied! ✓';
+      setTimeout(() => {
+        copyBtn.textContent = '📋 Copy Prompt';
+      }, 2000);
+    });
+  };
+
+  outputTabBtn.onclick = () => {
+    outputTabBtn.classList.add('active');
+    promptTabBtn.classList.remove('active');
+    outputEl.style.display = 'block';
+    promptTa.style.display = 'none';
+  };
+
+  promptTabBtn.onclick = () => {
+    promptTabBtn.classList.add('active');
+    outputTabBtn.classList.remove('active');
+    promptTa.style.display = 'block';
+    outputEl.style.display = 'none';
+  };
+
+  runBtn.onclick = async () => {
+    const apiKey = keyInput.value.trim();
+    outputTabBtn.click();
+    if (!apiKey) {
+      outputEl.textContent = simulateAiShotAnalysis(scene);
+      return;
+    }
+
+    outputEl.textContent = '⏳ Running AI Shot Analysis with Gemini API…';
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: promptText }] }],
+        }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        outputEl.textContent = `⚠️ Gemini API Request Failed (${res.status}):\n${errText}\n\nFalling back to simulated preview analysis:\n\n` + simulateAiShotAnalysis(scene);
+        return;
+      }
+
+      const json = await res.json();
+      const answer = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (answer) {
+        outputEl.textContent = answer;
+      } else {
+        outputEl.textContent = '⚠️ Unexpected response format from Gemini API. Falling back to simulated preview analysis:\n\n' + simulateAiShotAnalysis(scene);
+      }
+    } catch (e) {
+      outputEl.textContent = `⚠️ Network/API Error: ${(e as Error).message}\n\nFalling back to simulated preview analysis:\n\n` + simulateAiShotAnalysis(scene);
+    }
+  };
+}
+

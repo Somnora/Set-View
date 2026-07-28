@@ -71,3 +71,20 @@ export function recordingClock(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
+
+/** Pure audio recording policy: determines whether audio should be requested for a take. */
+export function shouldRequestAudio(audioRequested: boolean, browserSupportsAudio: boolean): boolean {
+  return audioRequested && browserSupportsAudio;
+}
+
+/** Pure audio recording policy: determines if mic track should be included in output stream. */
+export function shouldIncludeAudioTrack(hasMicPermission: boolean, audioEnabled: boolean): boolean {
+  return hasMicPermission && audioEnabled;
+}
+
+/** Formats user-facing status log string based on audio availability during take. */
+export function formatAudioPolicyStatus(audioEnabled: boolean, audioActive: boolean): string {
+  if (!audioEnabled) return 'Audio Disabled';
+  if (!audioActive) return 'Mic Audio Denied (Silent Video)';
+  return 'Mic Audio Active';
+}

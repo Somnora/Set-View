@@ -5,6 +5,8 @@
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
+import { makeLabel, type Label } from './ui.ts';
+import type { PlaceArm } from './wheel.ts';
 
 export interface SupportReport {
   secureContext: boolean;
@@ -70,13 +72,16 @@ export class SessionManager {
   private controllerHitSources = new Map<XRInputSource, XRHitTestSource>();
   private log: LogFn;
   private anchorsBroken = false;
-  /** Scratch for the current hit point (lastHit.point aliases this). */
-  private readonly hitPoint = new THREE.Vector3();
+  readonly hitPoint = new THREE.Vector3();
+  private ringMesh!: THREE.Mesh;
+  private dotMesh!: THREE.Mesh;
+  private reticleLabel: Label | null = null;
+  private currentReticleMode: PlaceArm | null = null;
 
   constructor(renderer: THREE.WebGLRenderer, log: LogFn) {
     this.renderer = renderer;
     this.log = log;
-    this.reticle = buildReticle();
+    this.reticle = this.buildReticle();
     this.reticle.visible = false;
   }
 
@@ -233,14 +238,59 @@ export class SessionManager {
     return true;
   }
 
-  /** Positions the reticle at the last hit (flat on the floor). */
-  updateReticle(visible: boolean): void {
+  /** Positions the reticle at the last hit (flat on the floor) with mode-specific visuals. */
+  updateReticle(visible: boolean, mode: PlaceArm = 'none'): void {
     if (visible && this.lastHit) {
       this.reticle.visible = true;
       this.reticle.position.copy(this.lastHit.point);
       this.reticle.position.y += 0.005;
+
+      if (this.currentReticleMode !== mode) {
+        this.currentReticleMode = mode;
+        this.applyReticleMode(mode);
+      }
     } else {
       this.reticle.visible = false;
+    }
+  }
+
+  private applyReticleMode(mode: PlaceArm): void {
+    if (!this.ringMesh || !this.dotMesh) return;
+    const ringMat = this.ringMesh.material as THREE.MeshBasicMaterial;
+    const dotMat = this.dotMesh.material as THREE.MeshBasicMaterial;
+
+    switch (mode) {
+      case 'actor':
+        ringMat.color.setHex(0x00ffcc);
+        ringMat.opacity = 0.95;
+        dotMat.color.setHex(0x00ffcc);
+        this.reticleLabel?.setText('PLACE ACTOR', {
+          fontPx: 32,
+          bg: 'rgba(12, 14, 18, 0.9)',
+          fg: '#00ffcc',
+        });
+        break;
+      case 'camera':
+        ringMat.color.setHex(0xffaa00);
+        ringMat.opacity = 0.95;
+        dotMat.color.setHex(0xffaa00);
+        this.reticleLabel?.setText('PLACE CAMERA', {
+          fontPx: 32,
+          bg: 'rgba(12, 14, 18, 0.9)',
+          fg: '#ffaa00',
+        });
+        break;
+      case 'none':
+      default:
+        ringMat.color.setHex(0x8ab4ff);
+        ringMat.opacity = 0.7;
+        dotMat.color.setHex(0xffffff);
+        this.reticleLabel?.setText('SELECT', {
+          fontPx: 32,
+          bg: 'rgba(12, 14, 18, 0.85)',
+          fg: '#ffffff',
+        });
+        break;
     }
   }
 
@@ -302,20 +352,27 @@ export class SessionManager {
     outQuat.set(o.x, o.y, o.z, o.w);
     return true;
   }
-}
+  private buildReticle(): THREE.Group {
+    const g = new THREE.Group();
+    this.ringMesh = new THREE.Mesh(
+      new THREE.RingGeometry(0.055, 0.075, 32).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0x8ab4ff, transparent: true, opacity: 0.7 }),
+    );
+    this.dotMesh = new THREE.Mesh(
+      new THREE.CircleGeometry(0.012, 16).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0xffffff }),
+    );
+    this.dotMesh.position.y = 0.001;
 
-function buildReticle(): THREE.Group {
-  const g = new THREE.Group();
-  const ring = new THREE.Mesh(
-    new THREE.RingGeometry(0.055, 0.075, 32).rotateX(-Math.PI / 2),
-    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 }),
-  );
-  const dot = new THREE.Mesh(
-    new THREE.CircleGeometry(0.012, 16).rotateX(-Math.PI / 2),
-    new THREE.MeshBasicMaterial({ color: 0xffffff }),
-  );
-  dot.position.y = 0.001;
-  g.add(ring, dot);
-  g.renderOrder = 10;
-  return g;
+    this.reticleLabel = makeLabel('SELECT', 0.035, {
+      fontPx: 32,
+      bg: 'rgba(12, 14, 18, 0.85)',
+      fg: '#ffffff',
+    });
+    this.reticleLabel.sprite.position.set(0, 0.12, 0);
+
+    g.add(this.ringMesh, this.dotMesh, this.reticleLabel.sprite);
+    g.renderOrder = 10;
+    return g;
+  }
 }

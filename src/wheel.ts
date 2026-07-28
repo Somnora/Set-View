@@ -18,15 +18,15 @@ export type InteractionMode = 'block' | 'dress';
  * pinch, and third-QA showed each palm tap spawning an actor. Placing is an
  * armed tool: pick it (wheel Place sector / X button), then the pinch places.
  */
-export type PlaceArm = 'none' | 'actor' | 'camera';
+export type PlaceArm = 'none' | 'actor' | 'camera' | 'light';
 
 /** The Place tool cycle (wheel sector and the X button step through it). */
 export function nextPlaceMode(mode: PlaceArm): PlaceArm {
-  return mode === 'none' ? 'actor' : mode === 'actor' ? 'camera' : 'none';
+  return mode === 'none' ? 'actor' : mode === 'actor' ? 'camera' : mode === 'camera' ? 'light' : 'none';
 }
 
 /** Menu levels: the root ring, or one of the sub-wheels. */
-export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit';
+export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit' | 'stance' | 'light';
 
 export interface WheelSector {
   id: string;
@@ -60,6 +60,10 @@ export interface WheelContext {
   dofOn: boolean;
   /** Playback pace (m/s) for the Marks sub-wheel readout. */
   pace: number;
+  /** Active selected light parameters for light sub-wheel readout. */
+  activeLightKelvin?: number;
+  activeLightIntensity?: number;
+  activeLightConeDeg?: number;
 }
 
 export const MAX_SECTORS = 8;
@@ -82,13 +86,20 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
         {
           id: 'wheel-place',
           label:
-            ctx.placeMode === 'none' ? 'Place:\nOff' : ctx.placeMode === 'actor' ? 'Place:\nActor' : 'Place:\nCam',
+            ctx.placeMode === 'none'
+              ? 'Place:\nOff'
+              : ctx.placeMode === 'actor'
+                ? 'Place:\nActor'
+                : ctx.placeMode === 'camera'
+                  ? 'Place:\nCam'
+                  : 'Place:\nLight',
         },
         { id: 'sub-marks', label: 'Marks ▸', submenu: 'marks' },
         { id: 'sub-lens', label: 'Lens ▸', submenu: 'lens' },
         { id: 'wheel-view', label: `View:\n${viewLabel}` },
         { id: 'sub-capture', label: 'Camera ▸', submenu: 'capture' },
         { id: 'sub-edit', label: 'Edit ▸', submenu: 'edit' },
+        { id: 'sub-light', label: 'Light ▸', submenu: 'light' },
         { id: 'wheel-more', label: 'More' },
       ],
     };
@@ -139,8 +150,27 @@ const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelS
     { id: 'redo', label: 'Redo' },
     { id: 'dup', label: 'Duplicate' },
     { id: 'delete', label: 'Delete' },
-    { id: 'stance', label: 'Stance ▸' },
-    { id: 'notes', label: 'Notes' },
+    { id: 'sub-stance', label: 'Stance ▸', submenu: 'stance' },
+    { id: 'sub-light', label: 'Light ▸', submenu: 'light' },
+    { id: 'height-down', label: 'Height −' },
+    { id: 'height-up', label: 'Height +' },
+  ],
+  stance: () => [
+    { id: 'stance', label: 'Cycle\nStance' },
+    { id: 'height-down', label: 'Height −' },
+    { id: 'height-up', label: 'Height +' },
+    { id: 'h-preset-150', label: "5'0\"\n1.50m" },
+    { id: 'h-preset-165', label: "5'5\"\n1.65m" },
+    { id: 'h-preset-175', label: "5'9\"\n1.75m" },
+    { id: 'h-preset-185', label: "6'1\"\n1.85m" },
+    { id: 'h-preset-200', label: "6'7\"\n2.00m" },
+  ],
+  light: (ctx) => [
+    { id: 'light-kelvin', label: `Temp\n${ctx.activeLightKelvin ?? 5600}K` },
+    { id: 'light-dim', label: 'Dim −' },
+    { id: 'light-bright', label: `Power +\n${(ctx.activeLightIntensity ?? 1.0).toFixed(1)}x` },
+    { id: 'light-cone-narrow', label: 'Cone −' },
+    { id: 'light-cone-wide', label: `Cone +\n${ctx.activeLightConeDeg ?? 45}°` },
   ],
 };
 

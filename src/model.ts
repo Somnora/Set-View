@@ -59,6 +59,10 @@ export interface ActorData {
   notes: ActorNote[];
   /** Body pose held at rest (see pose.ts). Absent = 'standing'. */
   stance?: StanceId;
+  /** Height in meters (e.g. 1.75m). */
+  heightM?: number;
+  /** Overall mesh scale multiplier (default 1.0, range 0.2 to 3.0). */
+  scale: number;
 }
 
 export const MAX_KEYFRAMES = 5;
@@ -187,7 +191,13 @@ export interface CameraSetupData {
   tStop: number;
   /** SensorFormat id (see SENSOR_FORMATS). */
   formatId: string;
+  /** Optional focus target actor ID. */
+  focusTargetActorId?: string;
+  /** Optional focus distance in meters. */
+  focusDistanceM?: number;
 }
+
+export type CameraSetup = CameraSetupData;
 
 /**
  * Where a labeled furniture mesh from the scan has been moved to, relative to
@@ -238,6 +248,37 @@ export interface ScanSummary {
   furniture?: FurniturePlacement[];
 }
 
+export type LightType = 'spot' | 'point' | 'area';
+
+export interface LightData {
+  id: string;
+  name: string;
+  type: LightType;
+  /** Position in meters, scene space [x, y, z]. */
+  position: [number, number, number];
+  /** Heading around +Y, radians. */
+  rotationY: number;
+  /** Pitch angle, radians. */
+  rotationX: number;
+  /** Intensity relative 0.1 to 10.0, default 1.0. */
+  intensity: number;
+  /** Color temperature in Kelvin (3200 Warm, 4300 Neutral-Warm, 5600 Daylight, 6500 Cool, default 5600). */
+  colorKelvin: number;
+  /** Spot light cone angle in degrees (default 45). */
+  coneAngleDeg: number;
+}
+
+export const KELVIN_PRESETS = [3200, 4300, 5600, 6500] as const;
+
+export function cycleKelvin(k: number): number {
+  const p = KELVIN_PRESETS;
+  let i = 0;
+  for (let idx = 1; idx < p.length; idx++) {
+    if (Math.abs(p[idx] - k) < Math.abs(p[i] - k)) i = idx;
+  }
+  return p[(i + 1) % p.length];
+}
+
 export interface SceneData {
   version: 1;
   id: string;
@@ -246,6 +287,7 @@ export interface SceneData {
   updatedAt: number;
   actors: ActorData[];
   cameras: CameraSetupData[];
+  lights: LightData[];
   /** Playback pace for blocking moves (m/s); drives segment timing. */
   walkSpeed: number;
   /** Captured location scan, if any. Absent/null = no scan. */
@@ -282,6 +324,7 @@ export function createScene(name: string): SceneData {
     updatedAt: now,
     actors: [],
     cameras: [],
+    lights: [],
     walkSpeed: WALK_SPEED_MS,
     scan: null,
   };
@@ -312,6 +355,7 @@ export function createActor(scene: SceneData, position: Vec3, rotationY: number)
     keyframes: [],
     notes: [],
     stance: DEFAULT_STANCE,
+    scale: 1.0,
   };
   scene.actors.push(actor);
   return actor;
@@ -343,6 +387,64 @@ export function duplicateCameraSetup(scene: SceneData, id: string): CameraSetupD
   return copy;
 }
 
+/** First unused "Key Light N" / "Fill Light N" / "Light N" name for a scene. */
+export function nextLightName(scene: SceneData, type: LightType = 'spot'): string {
+  const prefix = type === 'spot' ? 'Key Light' : type === 'point' ? 'Fill Light' : 'Light';
+  let n = (scene.lights?.length ?? 0) + 1;
+  while (scene.lights?.some((l) => l.name === `${prefix} ${n}`)) n++;
+  return `${prefix} ${n}`;
+}
+
+/** Creates a light setup with unique name and defaults. */
+export function createLight(
+  scene: SceneData,
+  position: [number, number, number],
+  rotationYOrType: number | LightType = 0,
+  rotationX = 0,
+  type: LightType = 'spot',
+  colorKelvin = 5600,
+  intensity = 1.0,
+  coneAngleDeg = 45,
+): LightData {
+  let rotY = 0;
+  let lightType: LightType = 'spot';
+  if (typeof rotationYOrType === 'string') {
+    lightType = rotationYOrType;
+  } else {
+    rotY = rotationYOrType;
+    lightType = type;
+  }
+
+  const light: LightData = {
+    id: uid(),
+    name: nextLightName(scene, lightType),
+    type: lightType,
+    position: [...position],
+    rotationY: rotY,
+    rotationX,
+    intensity,
+    colorKelvin,
+    coneAngleDeg,
+  };
+  if (!scene.lights) scene.lights = [];
+  scene.lights.push(light);
+  return light;
+}
+
+/** Deep-clones a light into the scene: new id, unique name, offset position. */
+export function duplicateLightSetup(scene: SceneData, idOrLight: string | LightData): LightData | null {
+  if (!scene.lights) return null;
+  const targetId = typeof idOrLight === 'string' ? idOrLight : idOrLight.id;
+  const src = scene.lights.find((l) => l.id === targetId);
+  if (!src) return null;
+  const copy: LightData = JSON.parse(JSON.stringify(src));
+  copy.id = uid();
+  copy.position = [src.position[0] + 0.5, src.position[1], src.position[2]];
+  copy.name = nextLightName(scene, copy.type);
+  scene.lights.push(copy);
+  return copy;
+}
+
 export function createCameraSetup(
   scene: SceneData,
   position: Vec3,
@@ -351,6 +453,8 @@ export function createCameraSetup(
   aspect: AspectName,
   tStop: number = DEFAULT_TSTOP,
   formatId: string = DEFAULT_FORMAT_ID,
+  focusTargetActorId?: string,
+  focusDistanceM?: number,
 ): CameraSetupData {
   // First unused letter (A, B, C...) so deleting a middle camera never yields
   // a duplicate name on the next add. Past 26 cameras, fall back to a numeric
@@ -367,6 +471,8 @@ export function createCameraSetup(
     aspect,
     tStop,
     formatId,
+    ...(focusTargetActorId ? { focusTargetActorId } : {}),
+    ...(focusDistanceM !== undefined && isFiniteNum(focusDistanceM) && focusDistanceM > 0 ? { focusDistanceM } : {}),
   };
   scene.cameras.push(cam);
   return cam;
@@ -494,7 +600,8 @@ function isActorData(v: unknown): boolean {
     a.keyframes.every(
       (k) => isVec3((k as TransformKeyframe)?.position) && isFiniteNum((k as TransformKeyframe)?.rotationY),
     ) &&
-    Array.isArray(a.notes)
+    Array.isArray(a.notes) &&
+    (a.scale === undefined || (isFiniteNum(a.scale) && a.scale > 0))
   );
 }
 function isCameraData(v: unknown): boolean {
@@ -508,7 +615,53 @@ function isCameraData(v: unknown): boolean {
     isQuat(c.rotation) &&
     isFiniteNum(c.lensFocalLength) &&
     c.lensFocalLength > 0 &&
-    (ASPECT_NAMES as readonly string[]).includes(c.aspect)
+    (ASPECT_NAMES as readonly string[]).includes(c.aspect) &&
+    (c.focusTargetActorId === undefined || typeof c.focusTargetActorId === 'string') &&
+    (c.focusDistanceM === undefined || (isFiniteNum(c.focusDistanceM) && c.focusDistanceM > 0))
+  );
+}
+
+/**
+ * Calculates the active focus distance (meters) for a camera.
+ * Precedence:
+ * 1. Explicit `focusDistanceM` if valid and positive.
+ * 2. Distance to `focusTargetActorId` if set and actor exists.
+ * 3. Distance to the nearest actor in `actors`.
+ * 4. Fallback default of 3.0 meters.
+ */
+export function computeFocusDistance(cam: CameraSetupData, actors: ActorData[]): number {
+  if (cam.focusDistanceM !== undefined && isFiniteNum(cam.focusDistanceM) && cam.focusDistanceM > 0) {
+    return cam.focusDistanceM;
+  }
+  if (cam.focusTargetActorId) {
+    const target = actors.find((a) => a.id === cam.focusTargetActorId);
+    if (target) return vecDistance(cam.position, target.position);
+  }
+  let closest: number | null = null;
+  for (const actor of actors) {
+    const d = vecDistance(cam.position, actor.position);
+    if (closest === null || d < closest) closest = d;
+  }
+  return closest ?? 3.0;
+}
+
+export function isLightData(v: unknown): v is LightData {
+  const l = v as LightData;
+  return (
+    !!l &&
+    typeof l === 'object' &&
+    typeof l.id === 'string' &&
+    typeof l.name === 'string' &&
+    (l.type === 'spot' || l.type === 'point' || l.type === 'area') &&
+    Array.isArray(l.position) &&
+    l.position.length === 3 &&
+    l.position.every(isFiniteNum) &&
+    isFiniteNum(l.rotationY) &&
+    isFiniteNum(l.rotationX) &&
+    isFiniteNum(l.intensity) &&
+    l.intensity >= 0 &&
+    isFiniteNum(l.colorKelvin) &&
+    isFiniteNum(l.coneAngleDeg)
   );
 }
 
@@ -545,6 +698,7 @@ export function isSceneData(v: unknown): v is SceneData {
     s.actors.every(isActorData) &&
     Array.isArray(s.cameras) &&
     s.cameras.every(isCameraData) &&
+    (s.lights === undefined || (Array.isArray(s.lights) && s.lights.every(isLightData))) &&
     (s.scan == null || isScanSummary(s.scan))
   );
 }
@@ -559,8 +713,22 @@ export function normalizeScene(s: SceneData): SceneData {
     s.scan.furniture = s.scan.furniture.filter(isFurniturePlacement);
     if (s.scan.furniture.length === 0) delete s.scan.furniture;
   }
+  if (!Array.isArray(s.lights)) {
+    s.lights = [];
+  } else {
+    for (const l of s.lights) {
+      if (l.type !== 'spot' && l.type !== 'point' && l.type !== 'area') l.type = 'spot';
+      if (!isFiniteNum(l.rotationY)) l.rotationY = 0;
+      if (!isFiniteNum(l.rotationX)) l.rotationX = 0;
+      if (!isFiniteNum(l.intensity) || l.intensity <= 0) l.intensity = 1.0;
+      if (!isFiniteNum(l.colorKelvin) || l.colorKelvin < 1000 || l.colorKelvin > 12000) l.colorKelvin = 5600;
+      if (!isFiniteNum(l.coneAngleDeg) || l.coneAngleDeg < 5 || l.coneAngleDeg > 170) l.coneAngleDeg = 45;
+    }
+  }
   for (const a of s.actors) {
     if (!isStanceId(a.stance)) a.stance = DEFAULT_STANCE;
+    if (!isFiniteNum(a.heightM) || a.heightM <= 0) a.heightM = 1.75;
+    if (!isFiniteNum(a.scale) || a.scale < 0.2 || a.scale > 3.0) a.scale = 1.0;
     for (const k of a.keyframes) {
       // Invalid mark stance falls back to "absent" (= the actor's rest
       // stance at playback), not DEFAULT — deleting preserves legacy meaning.
@@ -572,6 +740,16 @@ export function normalizeScene(s: SceneData): SceneData {
     if (!isFiniteNum(c.tStop) || c.tStop <= 0) c.tStop = DEFAULT_TSTOP;
     if (typeof c.formatId !== 'string' || !SENSOR_FORMATS.some((f) => f.id === c.formatId)) {
       c.formatId = DEFAULT_FORMAT_ID;
+    }
+    if (c.focusTargetActorId !== undefined) {
+      if (typeof c.focusTargetActorId !== 'string' || !s.actors.some((a) => a.id === c.focusTargetActorId)) {
+        delete c.focusTargetActorId;
+      }
+    }
+    if (c.focusDistanceM !== undefined) {
+      if (!isFiniteNum(c.focusDistanceM) || c.focusDistanceM <= 0) {
+        delete c.focusDistanceM;
+      }
     }
   }
   return s;

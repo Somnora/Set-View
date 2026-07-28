@@ -26,6 +26,7 @@ export class MonitorRecorder {
   private media: MediaRecorder | null = null;
   private track: CanvasCaptureMediaStreamTrack | null = null;
   private canvas: HTMLCanvasElement | null = null;
+  private micStream: MediaStream | null = null;
   /** Ends the current take (bound per-take in start; carries the save flag). */
   private stopRequest: ((save: boolean) => void) | null = null;
   private prevCanvasW = 0;
@@ -61,18 +62,18 @@ export class MonitorRecorder {
 
   /**
    * Starts a take at exactly `videoW`×`videoH` (the feed RT size — pixel-for-
-   * pixel, no rescale). Returns the filename the take will save as, or null
-   * when video capture isn't available. The canvas backbuffer is resized for
-   * the duration of the take and restored on stop; its CSS size is untouched
-   * and XR presentation never reads it.
+   * pixel, no rescale). Requests microphone audio if audioEnabled is true and
+   * mixes it into the take stream. Returns the filename the take will save as, or
+   * null when video capture isn't available.
    */
-  start(
+  async start(
     renderer: THREE.WebGLRenderer,
     videoW: number,
     videoH: number,
     baseName: string,
     nowMs: number,
-  ): string | null {
+    audioEnabled = true,
+  ): Promise<string | null> {
     if (this.media) return null;
     const canvas = renderer.domElement;
     if (typeof MediaRecorder === 'undefined' || typeof canvas.captureStream !== 'function') {
@@ -80,6 +81,16 @@ export class MonitorRecorder {
     }
     const mime = pickMimeType(RECORD_MIME_CANDIDATES, (t) => MediaRecorder.isTypeSupported(t));
     if (!mime) return null;
+
+    let micStream: MediaStream | null = null;
+    if (audioEnabled && typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch {
+        // Microphone access denied or unsupported — fall back gracefully to silent recording
+        micStream = null;
+      }
+    }
 
     const prevW = canvas.width;
     const prevH = canvas.height;
@@ -92,18 +103,37 @@ export class MonitorRecorder {
       // frameRequestRate 0 = manual frames: requestFrame after each blit keeps
       // capture correct even when the hidden 2D page isn't being composited.
       stream = canvas.captureStream(0);
+      if (micStream) {
+        for (const aTrack of micStream.getAudioTracks()) {
+          stream.addTrack(aTrack);
+        }
+      }
       const t0: MediaStreamTrack | undefined = stream.getVideoTracks()[0];
       if (t0 && 'requestFrame' in t0) {
         track = t0 as CanvasCaptureMediaStreamTrack;
       } else {
         // No manual control on this platform — sample canvas updates instead.
         for (const t of stream.getTracks()) t.stop();
+        if (micStream) for (const t of micStream.getTracks()) t.stop();
         stream = canvas.captureStream(RECORD_FPS);
+        if (micStream) {
+          try {
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            for (const aTrack of micStream.getAudioTracks()) {
+              stream.addTrack(aTrack);
+            }
+          } catch {
+            micStream = null;
+          }
+        }
       }
       media = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: RECORD_VIDEO_BPS });
     } catch {
       canvas.width = prevW;
       canvas.height = prevH;
+      if (micStream) {
+        for (const t of micStream.getTracks()) t.stop();
+      }
       return null;
     }
 
@@ -115,6 +145,9 @@ export class MonitorRecorder {
       if (finalized) return;
       finalized = true;
       for (const t of stream.getTracks()) t.stop();
+      if (micStream) {
+        for (const t of micStream.getTracks()) t.stop();
+      }
       // Platform-initiated stop (track died, OS pressure): we didn't go
       // through stop(), so the canvas is still hijacked — detach now.
       if (this.media === media) this.detach();
@@ -155,6 +188,7 @@ export class MonitorRecorder {
     this.media = media;
     this.track = track;
     this.canvas = canvas;
+    this.micStream = micStream;
     this.prevCanvasW = prevW;
     this.prevCanvasH = prevH;
     this.startedAtMs = nowMs;
@@ -164,6 +198,7 @@ export class MonitorRecorder {
     } catch {
       this.detach(); // restores the canvas; fields were just set above
       for (const t of stream.getTracks()) t.stop();
+      if (micStream) for (const t of micStream.getTracks()) t.stop();
       return null;
     }
     return filename;
@@ -241,6 +276,10 @@ export class MonitorRecorder {
       this.canvas.width = this.prevCanvasW;
       this.canvas.height = this.prevCanvasH;
     }
+    if (this.micStream) {
+      for (const t of this.micStream.getTracks()) t.stop();
+      this.micStream = null;
+    }
     this.canvas = null;
     this.media = null;
     this.track = null;
@@ -253,3 +292,5 @@ export class MonitorRecorder {
     this.blitMat.dispose();
   }
 }
+
+export { MonitorRecorder as RecorderManager };
