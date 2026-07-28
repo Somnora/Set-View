@@ -139,14 +139,22 @@ export class InputManager {
    * joint not tracked this frame). Writes into `out` and returns it.
    */
   fingertip(hand: Hand, out: THREE.Vector3): THREE.Vector3 | null {
+    return this.jointPosition(hand, 'index-finger-tip', out);
+  }
+
+  /**
+   * World position of any specified WebXR hand joint, or null if not tracked.
+   * Writes into `out` and returns it.
+   */
+  jointPosition(hand: Hand, jointName: string, out: THREE.Vector3): THREE.Vector3 | null {
     if (!this.state[hand].isHand) return null;
     const i = this.handedness.indexOf(hand);
     if (i < 0) return null;
     const joints = (this.handSpaces[i] as THREE.XRHandSpace).joints;
-    const tip = joints?.['index-finger-tip'];
-    if (!tip) return null;
-    tip.updateMatrixWorld();
-    return out.setFromMatrixPosition(tip.matrixWorld);
+    const joint = joints?.[jointName as keyof typeof joints];
+    if (!joint) return null;
+    joint.updateMatrixWorld();
+    return out.setFromMatrixPosition(joint.matrixWorld);
   }
 
   /** Poll gamepad buttons/axes with edge detection. Call once per frame. */

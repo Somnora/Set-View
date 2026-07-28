@@ -8,6 +8,8 @@ import * as THREE from 'three';
 import {
   addNote,
   applyMarkOp,
+  computeFocusDistance,
+  createCameraSetup,
   createScene,
   duplicateActor,
   duplicateCameraSetup,
@@ -30,7 +32,7 @@ import { KeyframeSystem } from './keyframes.ts';
 import { CameraSystem, type CamObject } from './cameraView.ts';
 import { DesktopPreview } from './preview.ts';
 import { MonitorRecorder } from './recorder.ts';
-import { recordingClock } from './recording.ts';
+import { recordingClock, shouldIncludeAudioTrack } from './recording.ts';
 import { ViewManager } from './views.ts';
 import { GUIDE_AUTO_SHOW_S, type GuideContext } from './guide.ts';
 import { GuideView } from './guideView.ts';
@@ -45,6 +47,8 @@ import { WheelPanel } from './wheelView.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
 import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, openAiAnalysisModal, type UIPanel } from './ui.ts';
+import { ViewfinderRig } from './viewfinder.ts';
+import { DirectorSmartwatch } from './smartwatch.ts';
 
 // Wrist-panel mount relative to the LEFT controller grip space.
 // Tune on-headset if the panel sits awkwardly (see TESTING.md).
@@ -112,6 +116,8 @@ class App {
   private landing: Landing;
   private noteEditor: NoteEditor;
   private driftMarker: DriftMarker;
+  private viewfinder = new ViewfinderRig();
+  private smartwatch = new DirectorSmartwatch();
 
   // interaction state
   /** Dress = adjust the physical space; Block = plan the shot. */
@@ -253,6 +259,8 @@ class App {
     this.wheel.group.position.set(0, 0.05, -0.04);
     this.wheel.onPress = (id) => this.onWheelPress(id);
 
+    this.setupViewfinderAndSmartwatch();
+
     this.landing = new Landing(document.getElementById('landing')!, {
       onEnter: () => void this.startAR(),
       onNew: () => {
@@ -308,6 +316,8 @@ class App {
       this.wrist.setStatus(m);
     };
 
+    this.setupViewfinderAndSmartwatch();
+
     // Fires whichever way a take ends (wrist toggle, camera deleted, session
     // end, MAX_RECORD_S cap, encoder error) — the file is already downloading.
     this.recorder.onStopped = (saved) => {
@@ -331,6 +341,52 @@ class App {
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(innerWidth, innerHeight);
     });
+  }
+
+  private setupViewfinderAndSmartwatch(): void {
+    this.scene3.add(this.viewfinder.group);
+    this.wristMount.add(this.smartwatch.group);
+
+    this.viewfinder.onStampCamera = (pos, dir, focalMm) => {
+      const rotY = Math.atan2(-dir.x, -dir.z);
+      const cam = createCameraSetup(
+        this.sceneData,
+        { x: pos.x, y: pos.y, z: pos.z },
+        { x: 0, y: Math.sin(rotY / 2), z: 0, w: Math.cos(rotY / 2) },
+        focalMm as any,
+        '16:9'
+      );
+      this.cams.adopt(cam);
+      this.cams.setActive(cam.id);
+      this.history.record(this.sceneData);
+      this.markDirty();
+      this.debug.log(`🎥 Stamped ${cam.name} (${focalMm}mm) via Two-Hand Viewfinder`);
+    };
+
+    this.smartwatch.onPress = (id) => {
+      if (id === 'cam') {
+        if (this.sceneData.cameras.length > 0) {
+          const active = this.cams.active;
+          const idx = this.sceneData.cameras.findIndex((c) => c.id === active?.data.id);
+          const nextCam = this.sceneData.cameras[(idx + 1) % this.sceneData.cameras.length];
+          this.cams.setActive(nextCam.id);
+          this.debug.log(`🎥 Smartwatch: Selected ${nextCam.name}`);
+        }
+      } else if (id === 'rec') {
+        this.toggleRecording();
+      } else if (id === 'focus') {
+        const activeCam = this.cams.active;
+        if (activeCam && this.sceneData.actors.length > 0) {
+          const nearestDist = computeFocusDistance(activeCam.data, this.sceneData.actors);
+          activeCam.data.focusDistanceM = nearestDist;
+          this.debug.log(`🎯 Smartwatch: Rack focus set to ${nearestDist.toFixed(2)}m`);
+        }
+      } else if (id === 'wheel') {
+        this.toggleMenuInFront();
+      } else if (id === 'ai') {
+        openAiAnalysisModal(this.sceneData);
+      }
+    };
   }
 
   // --- scene management -------------------------------------------------------
@@ -1656,6 +1712,32 @@ class App {
     this.wheel.group.visible = this.wheelShown;
     // The wrist panel is always accessible on the left wrist when hand is tracked.
     this.wrist.group.visible = this.wheelShown;
+
+    // Update Two-Hand Viewfinder gesture
+    this.viewfinder.update(this.input, this.camera, dt);
+
+    // Update Director's Smartwatch Slate
+    const activeCam = this.cams.active;
+    const focusDist = activeCam ? computeFocusDistance(activeCam.data, this.sceneData.actors) : 2.5;
+    this.smartwatch.update(
+      {
+        sceneName: this.sceneData.name || 'Untitled Scene',
+        activeCamName: activeCam?.data.name || 'CAM A',
+        focalLengthMm: activeCam?.data.lensFocalLength || 35,
+        tStop: activeCam?.data.tStop || 2.8,
+        formatShort: sensorFormat(activeCam?.data.formatId ?? 's35').short,
+        focusDistanceM: focusDist,
+        focusTargetName: activeCam?.data.focusTargetActorId
+          ? this.sceneData.actors.find((a) => a.id === activeCam.data.focusTargetActorId)?.name
+          : undefined,
+        recording: this.recorder.recording,
+        recordingClock: recordingClock(this.recorder.elapsedS(time)),
+        audioActive: shouldIncludeAudioTrack(true, true),
+        takeCount: 0,
+      },
+      this.input,
+      time
+    );
 
     // Controls-guide chips ride the same grip spaces; expire the auto-show.
     if (leftGrip && this.guide.left.parent !== leftGrip) leftGrip.add(this.guide.left);

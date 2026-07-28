@@ -4,6 +4,9 @@
 // via TESTING.md.
 
 import assert from 'node:assert/strict';
+import * as THREE from 'three';
+import { computeViewfinderFocalLength, evaluateViewfinderGesture } from '../src/viewfinder.ts';
+import { DirectorSmartwatch } from '../src/smartwatch.ts';
 import {
   addKeyframe,
   addNote,
@@ -1815,6 +1818,43 @@ test('audio recording policy functions compute correct request and track inclusi
   assert.equal(formatAudioPolicyStatus(true, true), 'Mic Audio Active');
   assert.equal(formatAudioPolicyStatus(true, false), 'Mic Audio Denied (Silent Video)');
   assert.equal(formatAudioPolicyStatus(false, false), 'Audio Disabled');
+});
+
+// --- Viewfinder & Smartwatch Tests ---------------------------------------------
+
+test('viewfinder focal length math and gesture evaluation', () => {
+  // 1. Focal length math
+  const fStandard = computeViewfinderFocalLength(0.2, 0.4, 24.89);
+  assert.ok(fStandard >= 18 && fStandard <= 100, 'Calculates reasonable focal length');
+
+  const fWide = computeViewfinderFocalLength(0.4, 0.3, 24.89);
+  assert.ok(fWide <= 35, 'Wide frame gives wide angle lens');
+
+  const fTele = computeViewfinderFocalLength(0.1, 0.5, 24.89);
+  assert.ok(fTele >= 50, 'Narrow distant frame gives telephoto lens');
+
+  // Fallback for invalid frame
+  assert.equal(computeViewfinderFocalLength(0.01, 0.1), 35);
+
+  // 2. Gesture evaluation
+  const head = new THREE.Vector3(0, 1.6, 0);
+  const lIndex = new THREE.Vector3(-0.1, 1.6, -0.4);
+  const lThumb = new THREE.Vector3(-0.1, 1.5, -0.4);
+  const rIndex = new THREE.Vector3(0.1, 1.6, -0.4);
+  const rThumb = new THREE.Vector3(0.1, 1.5, -0.4);
+
+  const state = evaluateViewfinderGesture(lIndex, lThumb, rIndex, rThumb, head);
+  assert.ok(state !== null, 'Valid viewfinder gesture recognized');
+  assert.equal(state.active, true);
+  assert.ok(state.widthM > 0.15 && state.widthM < 0.25);
+  assert.ok(state.focalLengthMm >= 18);
+
+  // Invalid gesture (missing hand point)
+  assert.equal(evaluateViewfinderGesture(null, lThumb, rIndex, rThumb, head), null);
+
+  // Smartwatch initialization
+  const sw = new DirectorSmartwatch();
+  assert.ok(sw.group.children.length >= 2, 'Smartwatch group built with chassis and screen');
 });
 
 // ScanStore's IndexedDB-free contract: Node has no indexedDB, so this
