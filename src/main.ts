@@ -3550,7 +3550,41 @@ class App {
         const ratio = this.keyframes.duration > 0 ? patch.currentTimeS / this.keyframes.duration : 0;
         this.keyframes.scrubTo(ratio);
       }
+    } else if (patch.type.startsWith('solar_')) {
+      this.solarRenderer.setConfig(this.sceneData.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
+    } else if (patch.type.startsWith('icvfx_')) {
+      this.icvfxRenderer.setConfig(this.sceneData.icvfx || createLedVolumeConfig());
+    } else if (patch.type.startsWith('acoustics_')) {
+      this.acousticsRenderer.setConfig(this.sceneData.acoustics || createAcousticsConfig());
+    } else if (patch.type.startsWith('set_dressing_')) {
+      this.setDressingRenderer.setConfig(this.sceneData.setDressing || createSetDressingConfig());
+      // Dressing mutates the prop list itself, not just the config.
+      this.props.setScene(this.sceneData);
+      this.contentVersion++;
+    } else if (patch.type.startsWith('profiler_')) {
+      this.profilerRuntime.updateConfig(this.sceneData.profiler ?? createVRProfilerConfig());
+    } else if (
+      patch.type.startsWith('light_') ||
+      patch.type.startsWith('atmosphere_') ||
+      patch.type.startsWith('dmx_') ||
+      patch.type.startsWith('splat_cloud_') ||
+      patch.type.startsWith('architecture_') ||
+      patch.type.startsWith('audio_cue_')
+    ) {
+      // Types the union defines and a peer may send, but which have no cheap targeted
+      // refresh here. Rebuilding everything is heavier than necessary and correct,
+      // which is the right way round: a patch that silently fails to reach its
+      // renderer leaves the receiving peer looking at stale geometry while their
+      // scene data has already moved on.
+      this.applySceneToSubsystems(this.sceneData);
     }
+
+    // Persist, but deliberately do NOT record history: a remote peer's edit does not
+    // belong in this user's undo stack. Without this the debounced autosave never
+    // fired for anything received over the wire, so remote work survived only if the
+    // beforeunload handler got to run. A crash, a forced quit or a flat headset lost
+    // every remote change made since the local user last touched something.
+    this.persistence.markDirty(this.sceneData);
   }
 
   private async openPropsLibrary(): Promise<void> {
