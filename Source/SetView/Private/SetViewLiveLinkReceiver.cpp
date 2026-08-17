@@ -91,33 +91,75 @@ void ASetViewLiveLinkReceiver::ProcessIncomingData(const FString& JsonString)
 	if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
 	{
 		FSetViewCameraPacket Packet;
-		Packet.CameraName = JsonObject->GetStringField(TEXT("camera_name"));
 
-		// Coordinate transformation from SetView (meters, Y-up) to UE5 (cm, Z-up)
-		// Location: UE X = SV -Z * 100, UE Y = SV X * 100, UE Z = SV Y * 100
-		if (JsonObject->HasField(TEXT("location")))
+		// Schema is encodeLiveLinkCameraPacket() in src/livelink.ts:
+		//   { subjectName, transform: { setView: {...},
+		//                               unreal: { location, rotation, quaternion } },
+		//     camera: { focalLengthMm, apertureTStop, ... }, status: { isRecording, ... } }
+		// This used to read camera_name / location / rotation / focal_length / aperture at
+		// the top level -- none of which the packet has ever contained -- so every field
+		// silently came back empty.
+		JsonObject->TryGetStringField(TEXT("subjectName"), Packet.CameraName);
+
+		// transform.unreal is ALREADY in Unreal space: centimetres and Rotator degrees,
+		// converted by ueCoords.ts. Do not re-convert here. Keeping the SetView -> Unreal
+		// handedness convention in exactly one place is what stopped this pipeline from
+		// exporting mirrored scenes; a second copy in C++ would reopen that.
+		const TSharedPtr<FJsonObject>* TransformObj = nullptr;
+		if (JsonObject->TryGetObjectField(TEXT("transform"), TransformObj) && TransformObj)
 		{
-			TSharedPtr<FJsonObject> LocObj = JsonObject->GetObjectField(TEXT("location"));
-			double SvX = LocObj->GetNumberField(TEXT("x"));
-			double SvY = LocObj->GetNumberField(TEXT("y"));
-			double SvZ = LocObj->GetNumberField(TEXT("z"));
-			Packet.Location = FVector(-SvZ * 100.0, SvX * 100.0, SvY * 100.0);
+			const TSharedPtr<FJsonObject>* UnrealObj = nullptr;
+			if ((*TransformObj)->TryGetObjectField(TEXT("unreal"), UnrealObj) && UnrealObj)
+			{
+				const TSharedPtr<FJsonObject>* LocObj = nullptr;
+				if ((*UnrealObj)->TryGetObjectField(TEXT("location"), LocObj) && LocObj)
+				{
+					Packet.Location = FVector(
+						(*LocObj)->GetNumberField(TEXT("x")),
+						(*LocObj)->GetNumberField(TEXT("y")),
+						(*LocObj)->GetNumberField(TEXT("z")));
+				}
+
+				const TSharedPtr<FJsonObject>* RotObj = nullptr;
+				if ((*UnrealObj)->TryGetObjectField(TEXT("rotation"), RotObj) && RotObj)
+				{
+					Packet.Rotation = FRotator(
+						(*RotObj)->GetNumberField(TEXT("pitch")),
+						(*RotObj)->GetNumberField(TEXT("yaw")),
+						(*RotObj)->GetNumberField(TEXT("roll")));
+				}
+			}
 		}
 
-		// Rotation: Rotator degrees (Roll, Pitch, Yaw)
-		if (JsonObject->HasField(TEXT("rotation")))
+		const TSharedPtr<FJsonObject>* CameraObj = nullptr;
+		if (JsonObject->TryGetObjectField(TEXT("camera"), CameraObj) && CameraObj)
 		{
-			TSharedPtr<FJsonObject> RotObj = JsonObject->GetObjectField(TEXT("rotation"));
-			double Pitch = RotObj->GetNumberField(TEXT("pitch"));
-			double Yaw = RotObj->GetNumberField(TEXT("yaw"));
-			double Roll = RotObj->GetNumberField(TEXT("roll"));
-			Packet.Rotation = FRotator(Pitch, Yaw, Roll);
+			double FocalLengthMm = 0.0;
+			if ((*CameraObj)->TryGetNumberField(TEXT("focalLengthMm"), FocalLengthMm))
+			{
+				Packet.FocalLength = static_cast<float>(FocalLengthMm);
+			}
+			double ApertureTStop = 0.0;
+			if ((*CameraObj)->TryGetNumberField(TEXT("apertureTStop"), ApertureTStop))
+			{
+				Packet.Aperture = static_cast<float>(ApertureTStop);
+			}
 		}
 
-		Packet.FocalLength = JsonObject->GetNumberField(TEXT("focal_length"));
-		Packet.Aperture = JsonObject->GetNumberField(TEXT("aperture"));
-		Packet.bIsRecording = JsonObject->GetBoolField(TEXT("is_recording"));
-		Packet.ActiveTakeName = JsonObject->GetStringField(TEXT("active_take"));
+		const TSharedPtr<FJsonObject>* StatusObj = nullptr;
+		if (JsonObject->TryGetObjectField(TEXT("status"), StatusObj) && StatusObj)
+		{
+			(*StatusObj)->TryGetBoolField(TEXT("isRecording"), Packet.bIsRecording);
+		}
+
+		// The camera packet carries no take name -- metadata is free-form extraProperties,
+		// so read it only if the sender chose to put one there. Left empty otherwise
+		// rather than filled with a stand-in that would read as real take data.
+		const TSharedPtr<FJsonObject>* MetadataObj = nullptr;
+		if (JsonObject->TryGetObjectField(TEXT("metadata"), MetadataObj) && MetadataObj)
+		{
+			(*MetadataObj)->TryGetStringField(TEXT("activeTake"), Packet.ActiveTakeName);
+		}
 
 		if (TargetCameraActor)
 		{

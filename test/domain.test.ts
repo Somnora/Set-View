@@ -15,6 +15,7 @@ import {
   applyMarkOp,
   autoVillageLayoutMode,
   calculateLetterboxRect,
+  aspectValue,
   check180LineOfAction,
   computeFocusDistance,
   computeVillageLayout,
@@ -289,6 +290,7 @@ import {
   generateFinalCutProXml,
 } from '../src/nleExport.ts';
 import {
+  escapeUsdString,
   exportUe5BridgePackage,
   generateOpenUsdScene,
   generateUe5JsonManifest,
@@ -5550,6 +5552,81 @@ test('generateOpenUsdScene: prim rotations decode back to the exact Unreal FRota
   assert.ok(Math.abs(gotF.x - expectBasis.forward.x) < 1e-5);
   assert.ok(Math.abs(gotF.y - expectBasis.forward.y) < 1e-5);
   assert.ok(Math.abs(gotF.z - expectBasis.forward.z) < 1e-5);
+});
+
+test('escapeUsdString: line terminators and control characters cannot break out of a USD literal', () => {
+  // A raw newline splits the literal across source lines and makes the WHOLE stage
+  // unparseable, not just the one attribute. Actor notes carry multi-line dialogue,
+  // so this is reachable from ordinary scene data.
+  assert.equal(escapeUsdString('line one\nline two'), 'line one\\nline two');
+  assert.equal(escapeUsdString('carriage\rreturn'), 'carriage\\rreturn');
+  assert.equal(escapeUsdString('tab\there'), 'tab\\there');
+  assert.equal(escapeUsdString('back\\slash'), 'back\\\\slash');
+  assert.equal(escapeUsdString('say "hi"'), 'say \\"hi\\"');
+  assert.equal(escapeUsdString('bell\x07here'), 'bell\\x07here');
+
+  // Nothing in the escaped output may be a raw line terminator or a bare quote.
+  const nasty = 'A\nB\r\nC\tD "E" \\F\x00G';
+  const escaped = escapeUsdString(nasty);
+  assert.ok(!/[\n\r]/.test(escaped), 'escaped output still contains a raw line terminator');
+  assert.ok(!/(^|[^\\])"/.test(escaped), 'escaped output still contains an unescaped quote');
+
+  // Non-ASCII is legal in USD strings and must survive untouched.
+  assert.equal(escapeUsdString('café 🎬'), 'café 🎬');
+});
+
+test('generateOpenUsdScene: a multi-line actor note does not break the stage', () => {
+  const scene = createScene('Note Probe');
+  const actor = createActor(scene, { x: 1, y: 0, z: 2 }, 0);
+  actor.notes = [
+    { id: 'n1', kind: 'dialogue', text: "I can't do this.\nNot after what happened." },
+    { id: 'n2', kind: 'action', text: 'Turns\r\nsharply\taway' },
+  ] as typeof actor.notes;
+  scene.actors.push(actor);
+
+  const usda = generateOpenUsdScene(scene, { fps: 24, scaleFactor: 100.0 });
+
+  // Every `custom string ... = "..."` must open and close on one physical line.
+  const noteLines = usda.split('\n').filter((l) => l.includes('custom string notes'));
+  assert.ok(noteLines.length > 0, 'expected the note attribute to be emitted');
+  for (const line of noteLines) {
+    const quotes = (line.match(/(?<!\\)"/g) ?? []).length;
+    assert.equal(quotes, 2, `note literal is not closed on its own line: ${line}`);
+  }
+
+  // Balanced quotes across the whole stage: an unterminated literal shows up here.
+  const allQuotes = (usda.match(/(?<!\\)"/g) ?? []).length;
+  assert.equal(allQuotes % 2, 0, 'stage has an odd number of unescaped quotes (unterminated literal)');
+});
+
+test('aspectValue: an off-union aspect falls back instead of poisoning exports with NaN', () => {
+  // Reachable at runtime from imported JSON or a cast even though the type forbids it.
+  // Without a default branch this returned undefined, callers divided by it, and the
+  // USD exporter emitted `verticalAperture = NaN` - not a legal float literal, so the
+  // entire stage failed to load.
+  assert.ok(Number.isFinite(aspectValue('16:9')));
+  assert.ok(Number.isFinite(aspectValue('2.39:1')));
+  assert.ok(Number.isFinite(aspectValue('4:3')));
+  assert.ok(Number.isFinite(aspectValue('2.39' as never)), 'off-union aspect must not return undefined');
+
+  const scene = createScene('Aspect Probe');
+  const cam = createCameraSetup(
+    scene,
+    { x: 0, y: 1.6, z: 0 },
+    { x: 0, y: 0, z: 0, w: 1 },
+    35,
+    '2.39' as never,
+  );
+  scene.cameras.push(cam);
+  const usda = generateOpenUsdScene(scene, { fps: 24, scaleFactor: 100.0 });
+
+  // Match NaN/undefined only where a NUMBER is authored, so a scene or actor NAME
+  // that happens to contain the letters cannot mask or fake this assertion.
+  const badNumeric = usda
+    .split('\n')
+    .filter((l) => /=\s*-?(NaN|undefined)\b/.test(l) || /\(\s*-?(NaN|undefined)\b/.test(l));
+  assert.deepEqual(badNumeric, [], `USD stage authored a non-finite number: ${badNumeric.join(' | ')}`);
+  assert.ok(/float verticalAperture = [0-9]/.test(usda), 'verticalAperture must be a real number');
 });
 
 test('generateUe5PythonImportScript: embedded payload is valid JSON and survives hostile scene names', () => {

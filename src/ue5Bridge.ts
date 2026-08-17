@@ -72,8 +72,45 @@ export function slug(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'scene';
 }
 
+/**
+ * Escapes a string for a double-quoted USD (.usda) string literal.
+ *
+ * Line terminators matter as much as quotes here: a raw newline splits the
+ * literal across source lines and makes the ENTIRE stage unparseable, not just
+ * the one attribute. Actor notes routinely carry multi-line dialogue, so this is
+ * reachable from ordinary scene data rather than from hostile input.
+ */
 export function escapeUsdString(str: string): string {
-  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  let out = '';
+  for (const ch of str) {
+    if (ch === '\\') {
+      out += '\\\\';
+      continue;
+    }
+    if (ch === '"') {
+      out += '\\"';
+      continue;
+    }
+    if (ch === '\n') {
+      out += '\\n';
+      continue;
+    }
+    if (ch === '\r') {
+      out += '\\r';
+      continue;
+    }
+    if (ch === '\t') {
+      out += '\\t';
+      continue;
+    }
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) {
+      out += `\\x${code.toString(16).padStart(2, '0')}`;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
 }
 
 /**

@@ -55,17 +55,30 @@ ASPECT_RATIOS: Dict[str, float] = {
     '4:3': 4.0 / 3.0,
 }
 
+_HALF_PI = math.pi / 2.0
+
+# Whole-body Euler applied about the feet origin, mirroring src/pose.ts `bodyRot`
+# (Three.js Euler order 'XYZ', radians) plus the vertical lift in metres.
+#
+# These are stored as the SetView-side rotation rather than as pre-baked Unreal
+# pitch/roll degrees on purpose. The baked table used to carry the wrong sign on
+# BOTH pitch and roll -- an actor SetView showed lying on their back imported
+# face-down, and every lean/roll came out mirrored -- because the degrees were
+# hand-maintained and never revisited when the basis map was corrected to
+# determinant -1. Deriving the rotator from these values through
+# sv_direction_to_ue + ue_basis_to_rotator keeps exactly one definition of the
+# handedness convention, so a stance cannot drift away from it again.
 STANCES: Dict[str, Dict[str, Any]] = {
-    'standing': {'bodyLift': 0.0, 'pitch': 0.0, 'roll': 0.0},
-    'lean-left': {'bodyLift': 0.0, 'pitch': 0.0, 'roll': 11.46},
-    'lean-right': {'bodyLift': 0.0, 'pitch': 0.0, 'roll': -11.46},
-    'seated-chair': {'bodyLift': -0.42, 'pitch': 0.0, 'roll': 0.0},
-    'seated-lounge': {'bodyLift': -0.50, 'pitch': -20.05, 'roll': 0.0},
-    'seated-cross': {'bodyLift': -0.62, 'pitch': 0.0, 'roll': 0.0},
-    'lying-up': {'bodyLift': 0.0, 'pitch': -90.0, 'roll': 0.0},
-    'lying-down': {'bodyLift': 0.0, 'pitch': 90.0, 'roll': 0.0},
-    'lying-left': {'bodyLift': 0.0, 'pitch': -90.0, 'roll': 90.0},
-    'lying-right': {'bodyLift': 0.0, 'pitch': -90.0, 'roll': -90.0},
+    'standing': {'bodyLift': 0.0, 'bodyRot': (0.0, 0.0, 0.0)},
+    'lean-left': {'bodyLift': 0.0, 'bodyRot': (0.0, 0.0, 0.2)},
+    'lean-right': {'bodyLift': 0.0, 'bodyRot': (0.0, 0.0, -0.2)},
+    'seated-chair': {'bodyLift': -0.42, 'bodyRot': (0.0, 0.0, 0.0)},
+    'seated-lounge': {'bodyLift': -0.50, 'bodyRot': (-0.35, 0.0, 0.0)},
+    'seated-cross': {'bodyLift': -0.62, 'bodyRot': (0.0, 0.0, 0.0)},
+    'lying-up': {'bodyLift': 0.0, 'bodyRot': (-_HALF_PI, 0.0, 0.0)},
+    'lying-down': {'bodyLift': 0.0, 'bodyRot': (_HALF_PI, 0.0, 0.0)},
+    'lying-left': {'bodyLift': 0.0, 'bodyRot': (-_HALF_PI, 0.0, _HALF_PI)},
+    'lying-right': {'bodyLift': 0.0, 'bodyRot': (-_HALF_PI, 0.0, -_HALF_PI)},
 }
 
 
@@ -138,6 +151,65 @@ def ue_basis_to_rotator(
     pitch_deg = math.degrees(math.atan2(f[2], horiz_dist))
     roll_deg = math.degrees(math.atan2(-r[2], u[2]))
     return (pitch_deg, yaw_deg, roll_deg)
+
+
+def _quat_from_euler_xyz(x: float, y: float, z: float) -> Dict[str, float]:
+    """Three.js Quaternion.setFromEuler with the default 'XYZ' order (radians)."""
+    c1, c2, c3 = math.cos(x / 2), math.cos(y / 2), math.cos(z / 2)
+    s1, s2, s3 = math.sin(x / 2), math.sin(y / 2), math.sin(z / 2)
+    return {
+        'x': s1 * c2 * c3 + c1 * s2 * s3,
+        'y': c1 * s2 * c3 - s1 * c2 * s3,
+        'z': c1 * c2 * s3 + s1 * s2 * c3,
+        'w': c1 * c2 * c3 - s1 * s2 * s3,
+    }
+
+
+def _quat_mul(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
+    """Hamilton product a*b, i.e. apply b first then a (parent * child)."""
+    return {
+        'x': a['w'] * b['x'] + a['x'] * b['w'] + a['y'] * b['z'] - a['z'] * b['y'],
+        'y': a['w'] * b['y'] - a['x'] * b['z'] + a['y'] * b['w'] + a['z'] * b['x'],
+        'z': a['w'] * b['z'] + a['x'] * b['y'] - a['y'] * b['x'] + a['z'] * b['w'],
+        'w': a['w'] * b['w'] - a['x'] * b['x'] - a['y'] * b['y'] - a['z'] * b['z'],
+    }
+
+
+def _quat_rotate(q: Dict[str, float], v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """Rotates a vector by a quaternion (v' = q v q*)."""
+    x, y, z, w = q['x'], q['y'], q['z'], q['w']
+    tx = 2.0 * (y * v[2] - z * v[1])
+    ty = 2.0 * (z * v[0] - x * v[2])
+    tz = 2.0 * (x * v[1] - y * v[0])
+    return (
+        v[0] + w * tx + (y * tz - z * ty),
+        v[1] + w * ty + (z * tx - x * tz),
+        v[2] + w * tz + (x * ty - y * tx),
+    )
+
+
+def sv_actor_rotator(rotation_y_rad: float, stance: str) -> Tuple[float, float, float]:
+    """
+    Full Unreal Rotator for an actor, combining heading with the stance body Euler.
+
+    SetView builds the actor as `root.rotation.y = rotationY` with a child
+    `body.rotation.set(bodyRot)` (src/actors.ts), so the world rotation is
+    R_y(heading) * R_xyz(bodyRot). Actors face local +Z (rotationY 0 = +Z), unlike
+    cameras which look down -Z -- do not route actors through sv_quat_to_ue_rotator.
+
+    The whole basis is mapped and re-extracted rather than assembling
+    (stance_pitch, heading_yaw, stance_roll) component-wise. That shortcut is only
+    valid when the three commute; with a 90-degree stance pitch (any of the lying
+    poses) yaw and roll gimbal-couple and the actor lands in the wrong orientation.
+    """
+    info = STANCES.get(stance, STANCES['standing'])
+    bx, by, bz = info['bodyRot']
+    q = _quat_mul(_quat_from_euler_xyz(0.0, rotation_y_rad, 0.0), _quat_from_euler_xyz(bx, by, bz))
+
+    forward = sv_direction_to_ue(_quat_rotate(q, (0.0, 0.0, 1.0)))
+    right = sv_direction_to_ue(_quat_rotate(q, (1.0, 0.0, 0.0)))
+    up = sv_direction_to_ue(_quat_rotate(q, (0.0, 1.0, 0.0)))
+    return ue_basis_to_rotator(forward, right, up)
 
 
 def sv_quat_to_ue_rotator(q: Dict[str, float]) -> Tuple[float, float, float]:
@@ -396,7 +468,7 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
     for a_data in actors_data:
         actor_name = a_data.get('name', 'Actor')
         pos_ue = sv_to_ue_location(a_data.get('position', {}))
-        yaw_ue = sv_heading_to_ue_yaw(a_data.get('rotationY', 0.0))
+        rotation_y = a_data.get('rotationY', 0.0)
         stance = a_data.get('stance', 'standing')
         stance_info = STANCES.get(stance, STANCES['standing'])
 
@@ -404,7 +476,7 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         lift_cm = stance_info['bodyLift'] * 100.0
         pos_ue = (pos_ue[0], pos_ue[1], pos_ue[2] + lift_cm)
 
-        rot_ue = (stance_info['pitch'], yaw_ue, stance_info['roll'])
+        rot_ue = sv_actor_rotator(rotation_y, stance)
 
         # Try spawning skeletal mesh actor or placeholder
         act = editor_actor_subsystem.spawn_actor_from_class(
@@ -628,14 +700,14 @@ def verify_scene_json(file_path: str, verbose: bool = True) -> bool:
         act_name = a.get('name', f"Actor_{idx+1}")
         stance = a.get('stance', 'standing')
         pos_ue = sv_to_ue_location(a.get('position', {}))
-        yaw_ue = sv_heading_to_ue_yaw(a.get('rotationY', 0.0))
+        rot_ue = sv_actor_rotator(a.get('rotationY', 0.0), stance)
         kfs = a.get('keyframes', [])
 
         if verbose:
             print(f"[Actor {act_name}]")
             print(f"  Stance: {stance}")
             print(f"  Unreal Location (cm): ({pos_ue[0]:.2f}, {pos_ue[1]:.2f}, {pos_ue[2]:.2f})")
-            print(f"  Unreal Yaw (deg): {yaw_ue:.2f}")
+            print(f"  Unreal Rotator (deg): Pitch={rot_ue[0]:.2f}, Yaw={rot_ue[1]:.2f}, Roll={rot_ue[2]:.2f}")
             print(f"  Keyframe Marks: {len(kfs)}")
 
             total_dist_m = 0.0

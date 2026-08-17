@@ -167,6 +167,44 @@ def run_coordinate_tests():
     assert faces[0] == "f 1 3 2", f"OBJ winding must be reversed for the det -1 map, got '{faces[0]}'"
     print("  [ok] scan OBJ writer uses the shared map and reverses triangle winding")
 
+    # --- Actor stance orientation ------------------------------------------
+    # The stance table used to carry hand-baked Unreal degrees with the wrong sign on
+    # BOTH pitch and roll: an actor SetView showed lying on their back imported
+    # face-down, and every lean came out mirrored. Now derived from pose.ts bodyRot
+    # through the same det -1 basis map, so it cannot drift from the convention again.
+    #
+    # UE forward = (CP*CY, CP*SY, SP): pitch +90 points the body's forward UP (supine),
+    # pitch -90 points it DOWN (prone).
+    supine = m.sv_actor_rotator(0.0, "lying-up")
+    prone = m.sv_actor_rotator(0.0, "lying-down")
+    assert abs(supine[0] - 90.0) < 1e-6, f"lying-up must pitch +90 (face up), got {supine[0]}"
+    assert abs(prone[0] + 90.0) < 1e-6, f"lying-down must pitch -90 (face down), got {prone[0]}"
+    assert abs(supine[0] - prone[0]) > 1.0, "supine and prone must not import identically"
+    print("  [ok] lying-up imports face UP and lying-down imports face DOWN")
+
+    # Leans are mirror images of each other, and the handedness flip negates roll.
+    left = m.sv_actor_rotator(0.0, "lean-left")
+    right = m.sv_actor_rotator(0.0, "lean-right")
+    assert abs(left[2] + right[2]) < 1e-6, f"lean roll must be symmetric, got {left[2]} / {right[2]}"
+    assert abs(left[2] + 11.46) < 0.01, f"lean-left roll must be -11.46 after the flip, got {left[2]}"
+
+    # Heading must compose with a 90-degree stance pitch without gimbal-coupling into
+    # roll. Building (stance_pitch, heading_yaw, stance_roll) component-wise silently
+    # failed this, which is why the whole basis is mapped and re-extracted instead.
+    for heading_deg in (0.0, 45.0, 90.0, 180.0, 270.0):
+        rot = m.sv_actor_rotator(math.radians(heading_deg), "lying-left")
+        assert abs(rot[0] - 90.0) < 1e-6, (
+            f"lying-left pitch must stay +90 at heading {heading_deg}, got {rot[0]}"
+        )
+    print("  [ok] stance orientation survives composition with heading")
+
+    # Every stance must produce a finite, in-range rotator.
+    for stance in m.STANCES:
+        p, y, r = m.sv_actor_rotator(0.7, stance)
+        for v, label in ((p, "pitch"), (y, "yaw"), (r, "roll")):
+            assert v == v and abs(v) <= 360.0, f"{stance} produced a bad {label}: {v}"
+    print(f"  [ok] all {len(m.STANCES)} stances produce finite rotators")
+
     print("Coordinate handedness tests passed.")
 
 

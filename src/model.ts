@@ -772,6 +772,12 @@ export function aspectValue(a: AspectName): number {
       return 16 / 9;
     case '4:3':
       return 4 / 3;
+    default:
+      // Unreachable through the type, but reachable at runtime from imported JSON
+      // or a cast. Without this the function returns undefined, and callers divide
+      // by it -- an exporter then emits `verticalAperture = NaN`, which is not a
+      // legal USD float literal and fails the whole stage load.
+      return 16 / 9;
   }
 }
 
