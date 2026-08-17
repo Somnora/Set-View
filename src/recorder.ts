@@ -18,10 +18,23 @@ import {
   RECORD_MIME_CANDIDATES,
   RECORD_VIDEO_BPS,
 } from './recording.ts';
+import { createTakeRecord, type TakeRecord } from './dailies.ts';
+
+export interface TakeMetadata {
+  cameraName?: string;
+  focalLengthMm?: number;
+  tStop?: number;
+  aspect?: string;
+  formatShort?: string;
+}
 
 export class MonitorRecorder {
   /** Fired once per take after it finalizes: saved filename, or null if discarded. */
   onStopped: (savedFilename: string | null) => void = () => {};
+  /** Fired when a valid take has been finalized and recorded. */
+  onTakeCreated: (take: TakeRecord) => void = () => {};
+
+  takeCount = 0;
 
   private media: MediaRecorder | null = null;
   private track: CanvasCaptureMediaStreamTrack | null = null;
@@ -73,6 +86,7 @@ export class MonitorRecorder {
     baseName: string,
     nowMs: number,
     audioEnabled = true,
+    meta?: TakeMetadata,
   ): Promise<string | null> {
     if (this.media) return null;
     const canvas = renderer.domElement;
@@ -158,7 +172,23 @@ export class MonitorRecorder {
         a.href = url;
         a.download = filename;
         a.click();
-        setTimeout(() => URL.revokeObjectURL(url), 10_000);
+        
+        this.takeCount++;
+        const durationS = Math.max(0, (performance.now() - (this.startedAtMs || performance.now())) / 1000);
+        const record = createTakeRecord({
+          takeNumber: this.takeCount,
+          sceneName: baseName.split('_')[0] || 'Scene',
+          durationS,
+          blob,
+          url,
+          cameraName: meta?.cameraName ?? 'CAM A',
+          focalLengthMm: meta?.focalLengthMm ?? 35,
+          tStop: meta?.tStop ?? 2.8,
+          aspect: meta?.aspect ?? '16:9',
+          formatShort: meta?.formatShort ?? 'S35',
+          hasAudio: !!micStream,
+        });
+        this.onTakeCreated(record);
         this.onStopped(filename);
       } else {
         this.onStopped(null);

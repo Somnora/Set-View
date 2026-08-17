@@ -4,8 +4,17 @@
 // ---------------------------------------------------------------------------
 
 import { createScene, isSceneData, normalizeScene, uid, type SceneData } from './model.ts';
-import { downloadFloorplan, downloadShotList } from './exporters.ts';
-import { decodeScan, encodeScan, summarizeScan } from './scan.ts';
+import {
+  createSyntheticLocationScan,
+  downloadFloorplan,
+  downloadLocationScanPackage,
+  downloadScanGeoJson,
+  downloadScanObj,
+  downloadScanPly,
+  downloadScanUsd,
+  downloadShotList,
+} from './exporters.ts';
+import { decodeScan, encodeScan, summarizeScan, type LocationScan } from './scan.ts';
 import { ScanStore } from './scanStore.ts';
 
 /** Exported scene files optionally embed the scan geometry as base64. */
@@ -210,6 +219,63 @@ export class Persistence {
     if (scene) downloadShotList(scene);
   }
 
+  /** Downloads Wavefront OBJ + MTL 3D scan mesh files. */
+  async exportScanObj(id: string): Promise<void> {
+    const scene = this.loadScene(id);
+    if (!scene?.scan) return;
+    const scan = await this.scans.getScan(scene.scan.id);
+    if (scan) downloadScanObj(scan, `${scene.name}_scan`);
+  }
+
+  /** Downloads Stanford PLY 3D mesh file. */
+  async exportScanPly(id: string, binary = false): Promise<void> {
+    const scene = this.loadScene(id);
+    if (!scene?.scan) return;
+    const scan = await this.scans.getScan(scene.scan.id);
+    if (scan) downloadScanPly(scan, `${scene.name}_scan`, binary);
+  }
+
+  /** Downloads USDA OpenUSD 3D mesh representation. */
+  async exportScanUsd(id: string): Promise<void> {
+    const scene = this.loadScene(id);
+    if (!scene?.scan) return;
+    const scan = await this.scans.getScan(scene.scan.id);
+    if (scan) downloadScanUsd(scan, `${scene.name}_scan`);
+  }
+
+  /** Downloads RFC 7946 2D architectural room and furniture GeoJSON. */
+  async exportScanGeoJson(id: string): Promise<void> {
+    const scene = this.loadScene(id);
+    if (!scene?.scan) return;
+    const scan = await this.scans.getScan(scene.scan.id);
+    if (scan) downloadScanGeoJson(scan, `${scene.name}_footprint`);
+  }
+
+  /** Downloads comprehensive 3D scan deliverable package (OBJ, PLY, USD, GeoJSON). */
+  async exportScanPackage(id: string): Promise<void> {
+    const scene = this.loadScene(id);
+    if (!scene?.scan) return;
+    const scan = await this.scans.getScan(scene.scan.id);
+    if (scan) downloadLocationScanPackage(scan, `${scene.name}_scan`);
+  }
+
+  /** Attaches a synthetic 3D room scan to a scene for desktop scouting & testing. */
+  async attachSyntheticScan(
+    id: string,
+    widthM = 6.0,
+    depthM = 5.0,
+    heightM = 2.8,
+    furnitureLabels = ['couch', 'table', 'desk'],
+  ): Promise<LocationScan | null> {
+    const scene = this.loadScene(id);
+    if (!scene) return null;
+    const scan = createSyntheticLocationScan(widthM, depthM, heightM, furnitureLabels);
+    await this.scans.putScan(scan);
+    scene.scan = summarizeScan(scan);
+    this.saveNow(scene);
+    return scan;
+  }
+
   async importScene(file: File): Promise<SceneData | null> {
     try {
       const data = JSON.parse(await file.text()) as SceneFile;
@@ -227,7 +293,7 @@ export class Persistence {
         await this.scans.putScan(embedded);
         data.scan = summarizeScan(embedded);
       } else {
-        if (data.scan) this.onError('imported scene had an unreadable scan — geometry dropped');
+        if (data.scan) this.onError('imported scene had an unreadable scan (geometry dropped)');
         data.scan = null;
       }
       this.saveNow(data);

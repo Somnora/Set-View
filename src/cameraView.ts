@@ -12,8 +12,11 @@
 
 import * as THREE from 'three';
 import {
+  addCameraKeyframe,
   aspectValue,
+  check180LineOfAction,
   computeFocusDistance,
+  computeVillageLayout,
   createCameraSetup,
   cycleTStop,
   DEFAULT_FORMAT_ID,
@@ -27,11 +30,24 @@ import {
   type FocalLength,
   type SceneData,
   type SensorFormat,
+  type VideoVillageLayoutMode,
 } from './model.ts';
-import { depthOfFieldFor, dFovDeg, frameSizeAtDistance, hFovDeg, vFovDeg } from './lens.ts';
+import {
+  classifyShotSize,
+  depthOfFieldFor,
+  dFovDeg,
+  findCamerasInFrustums,
+  frameSizeAtDistance,
+  hFovDeg,
+  vFovDeg,
+} from './lens.ts';
+import { classifyCameraMove } from './timeline.ts';
+import { secondsToSmpte } from './timecode.ts';
+import { TakeLibrary, type TakeRecord } from './dailies.ts';
 import { DofPass } from './dof.ts';
 import type { SessionManager } from './session.ts';
 import { disposeTree, makeLabel, type Label } from './ui.ts';
+import { CameraGripVisualizer } from './cameraGripRenderer.ts';
 
 /** Formats a distance in meters as e.g. '3.4m' or '∞'. */
 function m(v: number): string {
@@ -65,6 +81,8 @@ export interface CamObject {
 export class CameraSystem {
   /** All camera gizmos; child of contentRoot. */
   readonly gizmoGroup = new THREE.Group();
+  /** Physical camera grip rigs (tripods, cranes, dollies, drones); child of contentRoot. */
+  readonly gripVisualizer = new CameraGripVisualizer();
   /** Floating director's monitor; child of the scene root (world space). */
   readonly monitor = new THREE.Group();
   /** Frame-line overlay; child of the user camera. */
@@ -82,6 +100,8 @@ export class CameraSystem {
   currentTStop: number = DEFAULT_TSTOP;
   /** Simulated depth-of-field blur on the monitor + captures (off by default). */
   dofEnabled = false;
+  /** Video Village multi-camera split monitoring layout mode. */
+  villageMode: VideoVillageLayoutMode = 'single';
   onChange: () => void = () => {};
 
   private scene: SceneData;
@@ -99,9 +119,13 @@ export class CameraSystem {
   private frameRect = new THREE.Group();
   private frameLabel: Label;
   private frameLabelFlashUntil = 0;
-  // Reused across renderPass frames to avoid per-frame allocations.
   private readonly visRestore: [THREE.Object3D, boolean][] = [];
   private readonly prevColor = new THREE.Color();
+
+  private takeLibrary: TakeLibrary | null = null;
+  private dailiesVideo: HTMLVideoElement | null = null;
+  private dailiesTexture: THREE.VideoTexture | null = null;
+  private isDailiesReview = false;
 
   constructor(scene: SceneData, session: SessionManager, contentRoot: THREE.Group) {
     this.scene = scene;
@@ -111,6 +135,7 @@ export class CameraSystem {
     this.rtCamera = new THREE.PerspectiveCamera(40, 2.39, 0.05, 100);
     contentRoot.add(this.rtCamera);
     contentRoot.add(this.gizmoGroup);
+    contentRoot.add(this.gripVisualizer.container);
 
     this.monitorGrid = new THREE.GridHelper(24, 24, 0x46536b, 0x272e3d);
     this.monitorGrid.position.y = 0.002;
@@ -156,6 +181,7 @@ export class CameraSystem {
     this.objects.clear();
     this.activeId = null;
     for (const c of scene.cameras) this.buildGizmo(c);
+    this.gripVisualizer.updateAll(scene.cameras, 0, 0);
     if (scene.cameras.length) this.setActive(scene.cameras[scene.cameras.length - 1].id);
     this.refreshMonitorInfo();
   }
@@ -215,6 +241,7 @@ export class CameraSystem {
     this.gizmoGroup.remove(obj.root);
     disposeTree(obj.root);
     this.objects.delete(id);
+    this.gripVisualizer.removeCameraRig(id);
     this.scene.cameras = this.scene.cameras.filter((c) => c.id !== id);
     if (this.activeId === id) {
       // Promote the next camera via setActive (not a bare activeId assignment)
@@ -242,6 +269,23 @@ export class CameraSystem {
     this.refreshMonitorInfo();
   }
 
+  /** Updates the Video Village multi-camera split monitoring layout mode. */
+  setVillageMode(mode: VideoVillageLayoutMode): void {
+    this.villageMode = mode;
+    this.refreshRT();
+    this.refreshMonitorInfo();
+    this.onChange();
+  }
+
+  /** Cycles through Video Village multi-cam split monitoring modes: single -> split-2h -> grid-3 -> grid-4 -> pip. */
+  cycleVillageMode(): VideoVillageLayoutMode {
+    const modes: VideoVillageLayoutMode[] = ['single', 'split-2h', 'grid-3', 'grid-4', 'pip'];
+    const idx = modes.indexOf(this.villageMode);
+    const nextMode = modes[(idx + 1) % modes.length];
+    this.setVillageMode(nextMode);
+    return nextMode;
+  }
+
   /**
    * Re-syncs one camera's visuals from its (externally mutated) data — used by
    * the landing-page editor. Cheaper and less side-effecting than setScene: no
@@ -255,6 +299,8 @@ export class CameraSystem {
     obj.root.quaternion.set(d.rotation.x, d.rotation.y, d.rotation.z, d.rotation.w);
     obj.label.setText(cameraGizmoLabelText(obj.data));
     this.rebuildFrustum(obj);
+    this.gripVisualizer.syncCameraRig(d);
+    this.gripVisualizer.updateAll(this.scene.cameras, 0, 0);
     if (this.activeId === id) {
       this.refreshRT();
       this.refreshMonitorInfo();
@@ -335,6 +381,182 @@ export class CameraSystem {
     this.eyesMode = on;
     this.frameLines.visible = on;
     if (on) this.rebuildFrameLines();
+  }
+
+  /** Captures the active or specified camera pose and optical settings as a keyframe. */
+  addKeyframe(id?: string): boolean {
+    const targetId = id ?? this.activeId;
+    if (!targetId) return false;
+    const obj = this.objects.get(targetId);
+    if (!obj) return false;
+    const ok = addCameraKeyframe(
+      obj.data,
+      obj.data.position,
+      obj.data.rotation,
+      obj.data.lensFocalLength,
+      obj.data.focusDistanceM,
+      obj.data.focusTargetActorId,
+      1.0,
+    );
+    if (ok) {
+      this.refreshMonitorInfo();
+      this.onChange();
+    }
+    return ok;
+  }
+
+  /** Clears all keyframe marks for a camera. */
+  clearKeyframes(id?: string): void {
+    const targetId = id ?? this.activeId;
+    if (!targetId) return;
+    const obj = this.objects.get(targetId);
+    if (!obj) return;
+    obj.data.keyframes = [];
+    this.refreshMonitorInfo();
+    this.onChange();
+  }
+
+  /** Sets or clears dynamic look-at target actor for camera motion tracking. */
+  setLookAtTarget(targetActorId?: string, cameraId?: string): void {
+    const targetCamId = cameraId ?? this.activeId;
+    if (!targetCamId) return;
+    const obj = this.objects.get(targetCamId);
+    if (!obj) return;
+    obj.data.lookAtTargetActorId = targetActorId;
+    this.refreshMonitorInfo();
+    this.onChange();
+  }
+
+  // --- Dailies Take Review ---------------------------------------------------
+
+  setTakeLibrary(library: TakeLibrary): void {
+    this.takeLibrary = library;
+  }
+
+  get dailiesActive(): boolean {
+    return this.isDailiesReview;
+  }
+
+  get dailiesTake(): TakeRecord | null {
+    return this.takeLibrary?.activeTake ?? null;
+  }
+
+  get dailiesVideoElement(): HTMLVideoElement | null {
+    return this.dailiesVideo;
+  }
+
+  enterDailies(take?: TakeRecord): void {
+    const targetTake = take ?? this.takeLibrary?.activeTake;
+    if (!targetTake) return;
+    if (!this.dailiesVideo && typeof document !== 'undefined') {
+      this.dailiesVideo = document.createElement('video');
+      this.dailiesVideo.crossOrigin = 'anonymous';
+      this.dailiesVideo.playsInline = true;
+      this.dailiesVideo.autoplay = false;
+      this.dailiesVideo.loop = true;
+    }
+    if (!this.dailiesVideo) return;
+    this.isDailiesReview = true;
+    this.dailiesVideo.src = targetTake.url;
+    this.dailiesVideo.currentTime = 0;
+    this.dailiesVideo.play().catch(() => {});
+    if (this.dailiesTexture) {
+      this.dailiesTexture.dispose();
+    }
+    this.dailiesTexture = new THREE.VideoTexture(this.dailiesVideo);
+    this.dailiesTexture.colorSpace = THREE.SRGBColorSpace;
+    this.monitorImageMat.map = this.dailiesTexture;
+    this.monitorImageMat.color.set(0xffffff);
+    this.monitorImageMat.needsUpdate = true;
+    this.refreshMonitorInfo();
+  }
+
+  exitDailies(): void {
+    this.isDailiesReview = false;
+    if (this.dailiesVideo) {
+      this.dailiesVideo.pause();
+    }
+    if (this.rt) {
+      this.monitorImageMat.map = this.rt.texture;
+      this.monitorImageMat.color.set(0xffffff);
+      this.monitorImageMat.needsUpdate = true;
+    }
+    this.refreshMonitorInfo();
+  }
+
+  toggleDailies(): boolean {
+    if (this.isDailiesReview) {
+      this.exitDailies();
+      return false;
+    } else {
+      if (this.takeLibrary && this.takeLibrary.count > 0) {
+        this.enterDailies();
+        return true;
+      }
+      return false;
+    }
+  }
+
+  playDailies(): void {
+    if (this.dailiesVideo && this.isDailiesReview) {
+      this.dailiesVideo.play().catch(() => {});
+      this.refreshMonitorInfo();
+    }
+  }
+
+  pauseDailies(): void {
+    if (this.dailiesVideo && this.isDailiesReview) {
+      this.dailiesVideo.pause();
+      this.refreshMonitorInfo();
+    }
+  }
+
+  togglePlayDailies(): boolean {
+    if (!this.dailiesVideo || !this.isDailiesReview) return false;
+    if (this.dailiesVideo.paused) {
+      this.playDailies();
+      return true;
+    } else {
+      this.pauseDailies();
+      return false;
+    }
+  }
+
+  seekDailies(seconds: number): void {
+    if (!this.dailiesVideo || !this.isDailiesReview) return;
+    const dur = this.dailiesVideo.duration || (this.takeLibrary?.activeTake?.durationS ?? 0);
+    this.dailiesVideo.currentTime = Math.max(0, Math.min(dur, seconds));
+    this.refreshMonitorInfo();
+  }
+
+  scrubDailies(normalizedRatio: number): void {
+    if (!this.dailiesVideo || !this.isDailiesReview) return;
+    const dur = this.dailiesVideo.duration || (this.takeLibrary?.activeTake?.durationS ?? 0);
+    if (dur > 0) {
+      this.seekDailies(normalizedRatio * dur);
+    }
+  }
+
+  stepDailiesFrames(deltaFrames: number, fps = 24): void {
+    if (!this.dailiesVideo || !this.isDailiesReview) return;
+    this.pauseDailies();
+    this.seekDailies(this.dailiesVideo.currentTime + deltaFrames / fps);
+  }
+
+  nextTake(): void {
+    if (!this.takeLibrary) return;
+    const next = this.takeLibrary.nextTake();
+    if (next && this.isDailiesReview) {
+      this.enterDailies(next);
+    }
+  }
+
+  prevTake(): void {
+    if (!this.takeLibrary) return;
+    const prev = this.takeLibrary.prevTake();
+    if (prev && this.isDailiesReview) {
+      this.enterDailies(prev);
+    }
   }
 
   /** Position-only re-anchor (mirrors ActorManager.reanchor). */
@@ -439,6 +661,7 @@ export class CameraSystem {
       const d = o.root.getWorldPosition(_wp).distanceTo(headPos);
       o.root.visible = d > threshold;
     }
+    this.gripVisualizer.updateAll(this.scene.cameras, dt, time / 1000);
     if (this.frameLabelFlashUntil && time > this.frameLabelFlashUntil) {
       this.frameLabelFlashUntil = 0;
       this.rebuildFrameLines();
@@ -451,25 +674,35 @@ export class CameraSystem {
   }
 
   /**
-   * Renders the active camera's view into the monitor texture and returns it
+   * Renders the active camera's view (or multi-camera Video Village split) into the monitor texture and returns it
    * (null when there is no active camera). `hidden` is every UI/overlay
    * object that must not appear in the frame. Called while Camera View is
-   * open OR a video take is rolling — with the monitor hidden the map update
-   * is just a texture-reference swap.
+   * open OR a video take is rolling.
    */
   renderMonitor(
     renderer: THREE.WebGLRenderer,
     scene3: THREE.Scene,
     hidden: THREE.Object3D[],
   ): THREE.Texture | null {
-    const obj = this.active;
-    if (!obj) return null;
+    if (this.isDailiesReview && this.dailiesTexture) {
+      this.refreshMonitorInfo();
+      return this.dailiesTexture;
+    }
+
     if (!this.rt) this.refreshRT();
     if (!this.rt) return null;
-    this.poseRtCamera(obj);
-    this.renderPass(renderer, scene3, this.rt, hidden);
+
+    if (this.villageMode === 'single' || this.scene.cameras.length <= 1) {
+      const obj = this.active;
+      if (!obj) return null;
+      this.poseRtCamera(obj);
+      this.renderPass(renderer, scene3, this.rt, hidden);
+    } else {
+      this.renderVillagePass(renderer, scene3, this.rt, hidden);
+    }
+
     const outTex =
-      this.dofEnabled && this.rtDof && this.runDof(renderer, obj, this.rt, this.rtDof)
+      this.dofEnabled && this.rtDof && this.active && this.runDof(renderer, this.active, this.rt, this.rtDof)
         ? this.rtDof.texture
         : this.rt.texture;
     if (this.monitorImageMat.map !== outTex) {
@@ -619,8 +852,7 @@ export class CameraSystem {
 
   /**
    * Full cinematographer readout for a camera: lens, format, aspect, angle of
-   * view, and — when there's a subject to focus on — depth of field and the
-   * frame width at that distance.
+   * view, shot scale classification, guardrail telemetry, and depth of field.
    */
   private cameraReadout(cam: CameraSetupData): string {
     const fmt = sensorFormat(cam.formatId);
@@ -628,7 +860,8 @@ export class CameraSystem {
     const dia = dFovDeg(cam.lensFocalLength, cam.aspect, fmt);
     const activeObj = this.objects.get(cam.id);
     const focusDist = activeObj?.currentFocusDistanceM ?? computeFocusDistance(cam, this.scene.actors);
-    let s = `${cam.name} · ${Math.round(cam.lensFocalLength)}mm ${fmt.short} · ${cam.aspect} · T${cam.tStop}`;
+    const framing = classifyShotSize(cam.lensFocalLength, cam.aspect, cam.formatId, focusDist);
+    let s = `${cam.name} · ${Math.round(cam.lensFocalLength)}mm ${fmt.short} · ${cam.aspect} · T${cam.tStop} · [${framing.shotSize}]`;
     s += `\nAoV H${h.toFixed(1)}° Ø${dia.toFixed(1)}°`;
     const dof = depthOfFieldFor(cam, focusDist);
     const fw = frameSizeAtDistance(cam.lensFocalLength, cam.aspect, focusDist, fmt).width;
@@ -638,6 +871,28 @@ export class CameraSystem {
       if (targetActor) targetTag = ` (${targetActor.name})`;
     }
     s += ` · focus ${m(focusDist)}${targetTag}\nDOF ${m(dof.nearM)}–${m(dof.farM)} · frame ${fw.toFixed(1)}m wide`;
+
+    if (cam.keyframes && cam.keyframes.length >= 2) {
+      const move = classifyCameraMove(cam.keyframes);
+      s += `\nMove: [${move.moveType.toUpperCase()}] · ${cam.keyframes.length} marks · ${move.totalDistanceM.toFixed(1)}m · ${move.durationS.toFixed(1)}s`;
+    }
+    if (cam.lookAtTargetActorId) {
+      const targetActor = this.scene.actors.find((a) => a.id === cam.lookAtTargetActorId);
+      if (targetActor) s += `\nTarget Lock: 🎯 ${targetActor.name}`;
+    }
+
+    if (this.scene.actors.length >= 2) {
+      const axis = check180LineOfAction(this.scene.cameras, this.scene.actors[0].position, this.scene.actors[1].position);
+      if (axis.hasCrossing) {
+        s += '\n⚠️ 180° AXIS CROSSING DETECTED';
+      }
+    }
+
+    const collisions = findCamerasInFrustums(this.scene.cameras).filter((c) => c.observerCamId === cam.id);
+    if (collisions.length > 0) {
+      s += `\n⚠️ IN SHOT: ${collisions.map((c) => c.observedCamName).join(', ')}`;
+    }
+
     return s;
   }
 
@@ -647,13 +902,6 @@ export class CameraSystem {
     rt: THREE.WebGLRenderTarget,
     hidden: THREE.Object3D[],
   ): void {
-    // Snapshot state we're about to mutate. The restore runs in `finally` so a
-    // single render throw (context loss, shader error) can never leave
-    // xr.enabled=false — which would freeze/black the headset for the rest of
-    // the session — nor leave HUD objects hidden or the RT bound. All mutations
-    // live inside the try so any throw is fully unwound. renderPass is
-    // intentionally NOT re-entrant (single setAnimationLoop caller), so the
-    // shared visRestore/prevColor scratch is safe.
     for (const o of hidden) this.visRestore.push([o, o.visible]);
     const xrWas = renderer.xr.enabled;
     const prevTarget = renderer.getRenderTarget();
@@ -678,10 +926,68 @@ export class CameraSystem {
     }
   }
 
+  /**
+   * Multi-Camera Video Village RTT Pass: partitions the render target into
+   * aspect-accurate tiled camera viewports with live letterboxing.
+   */
+  private renderVillagePass(
+    renderer: THREE.WebGLRenderer,
+    scene3: THREE.Scene,
+    rt: THREE.WebGLRenderTarget,
+    hidden: THREE.Object3D[],
+  ): void {
+    const layout = computeVillageLayout(this.scene.cameras, this.villageMode, 16 / 9);
+    for (const o of hidden) this.visRestore.push([o, o.visible]);
+    const xrWas = renderer.xr.enabled;
+    const prevTarget = renderer.getRenderTarget();
+    renderer.getClearColor(this.prevColor);
+    const prevAlpha = renderer.getClearAlpha();
+    const prevScissorTest = renderer.getScissorTest();
+
+    const rtW = rt.width;
+    const rtH = rt.height;
+
+    try {
+      for (const o of hidden) o.visible = false;
+      this.monitorGrid.visible = true;
+      renderer.xr.enabled = false;
+      renderer.setRenderTarget(rt);
+      renderer.setClearColor(0x0a0d14, 1);
+      renderer.clear();
+      renderer.setScissorTest(true);
+
+      for (const slot of layout.activeSlots) {
+        const obj = this.objects.get(slot.cameraId);
+        if (!obj) continue;
+        this.poseRtCamera(obj);
+
+        const vx = Math.round(slot.frameRect.x * rtW);
+        const vy = Math.round((1 - slot.frameRect.y - slot.frameRect.height) * rtH);
+        const vw = Math.max(1, Math.round(slot.frameRect.width * rtW));
+        const vh = Math.max(1, Math.round(slot.frameRect.height * rtH));
+
+        renderer.setViewport(vx, vy, vw, vh);
+        renderer.setScissor(vx, vy, vw, vh);
+        renderer.render(scene3, this.rtCamera);
+      }
+    } finally {
+      renderer.setScissorTest(prevScissorTest);
+      renderer.setViewport(0, 0, rtW, rtH);
+      renderer.setScissor(0, 0, rtW, rtH);
+      renderer.setRenderTarget(prevTarget);
+      renderer.setClearColor(this.prevColor, prevAlpha);
+      renderer.xr.enabled = xrWas;
+      this.monitorGrid.visible = false;
+      for (const [o, v] of this.visRestore) o.visible = v;
+      this.visRestore.length = 0;
+    }
+  }
+
   private refreshRT(): void {
     const obj = this.active;
-    if (!obj) return;
-    const aspect = aspectValue(obj.data.aspect);
+    if (!obj && this.scene.cameras.length === 0) return;
+    const isMulti = this.villageMode !== 'single' && this.scene.cameras.length > 1;
+    const aspect = isMulti ? 16 / 9 : (obj ? aspectValue(obj.data.aspect) : 16 / 9);
     const w = RT_BASE_W;
     const h = Math.round(w / aspect);
     if (this.rt && this.rt.width === w && this.rt.height === h) return;
@@ -702,6 +1008,29 @@ export class CameraSystem {
   }
 
   private refreshMonitorInfo(): void {
+    if (this.isDailiesReview && this.takeLibrary?.activeTake) {
+      const take = this.takeLibrary.activeTake;
+      const curr = this.dailiesVideo?.currentTime ?? 0;
+      const smpteCurr = secondsToSmpte(curr, 24).formatted;
+      const smpteTotal = secondsToSmpte(take.durationS, 24).formatted;
+      const status = this.dailiesVideo && !this.dailiesVideo.paused ? '▶ PLAY' : '⏸ PAUSE';
+      this.monitorInfo.setText(
+        `DAILIES REVIEW [${status}] · TAKE ${take.takeNumber}/${this.takeLibrary.count}\n${take.cameraName} (${Math.round(take.focalLengthMm)}mm T${take.tStop.toFixed(1)}) · ${smpteCurr} / ${smpteTotal}`,
+        { fontPx: 26, mono: true },
+      );
+      return;
+    }
+    if (this.villageMode !== 'single' && this.scene.cameras.length > 1) {
+      const modeLabel = this.villageMode.toUpperCase();
+      const camSummaries = this.scene.cameras.map((c) => {
+        const focus = computeFocusDistance(c, this.scene.actors);
+        const shot = classifyShotSize(c.lensFocalLength, c.aspect, c.formatId, focus);
+        const activeMarker = c.id === this.activeId ? '▶ ' : '';
+        return `${activeMarker}${c.name} (${Math.round(c.lensFocalLength)}mm ${shot.shotSize})`;
+      }).join(' · ');
+      this.monitorInfo.setText(`VIDEO VILLAGE [${modeLabel}]\n${camSummaries}`, { fontPx: 26, mono: true });
+      return;
+    }
     const obj = this.active;
     this.monitorInfo.setText(
       obj ? this.cameraReadout(obj.data) : 'NO CAMERA — turn on Frame Lines, walk, press A',

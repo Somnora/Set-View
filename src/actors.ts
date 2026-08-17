@@ -14,6 +14,10 @@ import { createActor } from './model.ts';
 import { poseFor, type StanceId } from './pose.ts';
 import type { SessionManager } from './session.ts';
 import { disposeSprite, disposeTree, makeLabel, type Label } from './ui.ts';
+import {
+  HumanoidCharacterRenderer,
+  type SkinnedHumanoidInstance,
+} from './characterRenderer.ts';
 
 /** Reused each frame by updateFromAnchors to avoid per-actor allocations. */
 const _scratchAnchor = new THREE.Vector3();
@@ -37,6 +41,7 @@ export interface ActorObject {
   elbowR: THREE.Group;
   spine: THREE.Group;
   body: THREE.Group;
+  skinnedInstance?: SkinnedHumanoidInstance;
   anchor: XRAnchor | null;
   /** True while grabbed or driven by playback — anchor updates pause. */
   overridden: boolean;
@@ -62,6 +67,7 @@ export class ActorManager {
     this.scene = scene;
     for (const obj of this.objects.values()) {
       obj.anchor?.delete?.();
+      obj.skinnedInstance?.dispose();
       this.group.remove(obj.root);
       disposeTree(obj.root);
     }
@@ -92,6 +98,7 @@ export class ActorManager {
     const obj = this.objects.get(id);
     if (!obj) return;
     obj.anchor?.delete?.();
+    obj.skinnedInstance?.dispose();
     this.group.remove(obj.root);
     disposeTree(obj.root);
     this.objects.delete(id);
@@ -361,6 +368,13 @@ export class ActorManager {
 
     const noteGroup = new THREE.Group();
 
+    let skinnedInstance: SkinnedHumanoidInstance | undefined;
+    if (data.rigType === 'realistic_humanoid') {
+      skinnedInstance = HumanoidCharacterRenderer.createSkinnedHumanoid(data);
+      body.visible = false;
+      root.add(skinnedInstance.group);
+    }
+
     root.add(ring, hoverRing, label.sprite, noteGroup);
     root.position.set(data.position.x, data.position.y, data.position.z);
     root.rotation.y = data.rotationY;
@@ -384,6 +398,7 @@ export class ActorManager {
       elbowR,
       spine,
       body,
+      skinnedInstance,
       anchor: null,
       overridden: false,
       walkPhase: 0,
@@ -393,6 +408,28 @@ export class ActorManager {
     this.applyStance(obj);
     this.refreshNotes(obj);
     return obj;
+  }
+
+  /** Updates skinned humanoid animations and real-time IK. */
+  updateAnimations(timeS: number): void {
+    for (const obj of this.objects.values()) {
+      if (obj.skinnedInstance) {
+        obj.skinnedInstance.update(timeS, this.scene);
+      }
+    }
+  }
+
+  /** Rebuilds an actor visual (e.g. after toggling rigType or reloading mocap). */
+  rebuildVisual(id: string): ActorObject | null {
+    const old = this.objects.get(id);
+    if (!old) return null;
+    const data = old.data;
+    old.anchor?.delete?.();
+    old.skinnedInstance?.dispose();
+    this.group.remove(old.root);
+    disposeTree(old.root);
+    this.objects.delete(id);
+    return this.buildObject(data);
   }
 }
 

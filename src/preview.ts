@@ -9,23 +9,37 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { aspectValue, sensorFormat, type SceneData } from './model.ts';
-import { vFovDeg } from './lens.ts';
+import { aspectValue, computeFocusDistance, computeVillageLayout, createAtmosphereConfig, type SceneData } from './model.ts';
+import { classifyShotSize, vFovDeg } from './lens.ts';
+import { buildCameraTimeline, buildTimeline, sampleCameraTimeline, sampleTimeline } from './timeline.ts';
 import type { KeyframeSystem } from './keyframes.ts';
-
-function fmtTime(s: number): string {
-  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
-}
+import { generateDawStemManifest } from './audioCues.ts';
+import { openAiAnalysisModal, openDailiesVideoStudioModal } from './ui.ts';
+import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
+import { VolumetricManager } from './volumetrics.ts';
 
 export class DesktopPreview {
   /** True while the preview owns the renderer's animation loop. */
   active = false;
   onClose: () => void = () => {};
+  onOpenCollab?: () => void;
+  onOpenProps?: () => void;
+  onOpenLiveLink?: () => void;
+  onOpenDmxBridge?: () => void;
+  onOpenIcvfx?: () => void;
+  onOpenAcoustics?: () => void;
+  onOpenSolar?: () => void;
+  onOpenScreenplay?: () => void;
+  onOpenWebXRProfiler?: () => void;
+  onOpenVRComfort?: () => void;
+  onOpenSetDressing?: () => void;
+
 
   private renderer: THREE.WebGLRenderer;
   private scene3: THREE.Scene;
   private contentRoot: THREE.Group;
   private keyframes: KeyframeSystem;
+  private volumetrics: VolumetricManager | null = null;
   /** Objects that live in the scene for AR but must not show on desktop. */
   private hideInPreview: THREE.Object3D[];
 
@@ -49,6 +63,8 @@ export class DesktopPreview {
   private bar: HTMLDivElement | null = null;
   private playBtn: HTMLButtonElement | null = null;
   private lensBtn: HTMLButtonElement | null = null;
+  private loopBtn: HTMLButtonElement | null = null;
+  private rateBtn: HTMLButtonElement | null = null;
   private scrub: HTMLInputElement | null = null;
   private clock: HTMLSpanElement | null = null;
   private letterbox: [HTMLDivElement, HTMLDivElement] | null = null;
@@ -91,6 +107,13 @@ export class DesktopPreview {
     this.grid = new THREE.GridHelper(20, 20, 0x3c4a63, 0x232a36);
     this.scene3.add(this.grid);
 
+    this.volumetrics = new VolumetricManager(this.scene3);
+    this.volumetrics.update(
+      scene.atmosphere ?? createAtmosphereConfig('clear'),
+      scene.lights ?? [],
+      this.camera,
+    );
+
     // Frame the scene: orbit target at the content center, dolly back by size.
     const center = new THREE.Vector3(0, 0.9, 0);
     let radius = 4;
@@ -118,6 +141,9 @@ export class DesktopPreview {
     this.renderer.setAnimationLoop(null);
     this.keyframes.stop();
     window.removeEventListener('keydown', this.keyHandler);
+
+    this.volumetrics?.dispose();
+    this.volumetrics = null;
 
     this.controls?.dispose();
     this.controls = null;
@@ -152,16 +178,92 @@ export class DesktopPreview {
     const dt = this.lastT ? Math.min((t - this.lastT) / 1000, 0.1) : 0;
     this.lastT = t;
     this.keyframes.tick(dt);
+    this.volumetrics?.tick(dt, this.sceneData?.atmosphere, this.sceneData?.lights ?? [], this.camera);
     this.syncBar();
 
     const canvas = this.renderer.domElement;
-    if (!this.applyLensView()) {
+    if (this.lensIndex === -1) {
+      if (this.letterbox) {
+        this.letterbox[0].style.display = 'none';
+        this.letterbox[1].style.display = 'none';
+      }
+      this.renderVillageView(canvas);
+    } else if (!this.applyLensView()) {
       this.camera.fov = 55;
       this.camera.aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
       this.camera.updateProjectionMatrix();
       this.controls?.update();
+      this.renderer.render(this.scene3, this.camera);
+    } else {
+      this.renderer.render(this.scene3, this.camera);
     }
-    this.renderer.render(this.scene3, this.camera);
+  }
+
+  /**
+   * Renders the multi-camera Video Village viewport matrix directly on the canvas.
+   */
+  private renderVillageView(canvas: HTMLCanvasElement): void {
+    const s = this.sceneData;
+    if (!s || !s.cameras.length) return;
+    const w = canvas.clientWidth;
+    const h = Math.max(1, canvas.clientHeight);
+    const aspect = w / h;
+    const layout = computeVillageLayout(s.cameras, 'grid-4', aspect);
+
+    const prevScissorTest = this.renderer.getScissorTest();
+    this.renderer.setScissorTest(true);
+    this.renderer.setClearColor(0x0a0d14, 1);
+    this.renderer.clear();
+
+    for (const slot of layout.activeSlots) {
+      const d = s.cameras.find((c) => c.id === slot.cameraId);
+      if (!d) continue;
+
+      let pos = d.position;
+      let rot = d.rotation;
+      let focal = d.lensFocalLength;
+      if (d.keyframes && d.keyframes.length >= 2) {
+        const tl = buildCameraTimeline(d.keyframes);
+        let lookPos: { x: number; y: number; z: number } | undefined;
+        if (d.lookAtTargetActorId) {
+          const target = s.actors.find((a) => a.id === d.lookAtTargetActorId);
+          if (target) {
+            if (target.keyframes && target.keyframes.length >= 2) {
+              const atl = buildTimeline(target.keyframes, s.walkSpeed);
+              const asamp = sampleTimeline(target.keyframes, atl, this.keyframes.t);
+              if (asamp) lookPos = { x: asamp.position.x, y: asamp.position.y + 1.4, z: asamp.position.z };
+            } else {
+              lookPos = { x: target.position.x, y: target.position.y + 1.4, z: target.position.z };
+            }
+          }
+        }
+        const sample = sampleCameraTimeline(d.keyframes, tl, this.keyframes.t, lookPos);
+        if (sample) {
+          pos = sample.position;
+          rot = sample.rotation;
+          focal = sample.lensFocalLength;
+        }
+      }
+
+      this.camera.fov = vFovDeg(focal, d.aspect, d.formatId);
+      this.camera.aspect = aspectValue(d.aspect);
+      this.camera.updateProjectionMatrix();
+      this.camera.position.set(pos.x, pos.y, pos.z);
+      this.camera.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+
+      const vx = Math.round(slot.frameRect.x * w);
+      const vy = Math.round((1 - slot.frameRect.y - slot.frameRect.height) * h);
+      const vw = Math.max(1, Math.round(slot.frameRect.width * w));
+      const vh = Math.max(1, Math.round(slot.frameRect.height * h));
+
+      this.renderer.setViewport(vx, vy, vw, vh);
+      this.renderer.setScissor(vx, vy, vw, vh);
+      this.renderer.render(this.scene3, this.camera);
+    }
+
+    this.renderer.setScissorTest(prevScissorTest);
+    this.renderer.setViewport(0, 0, w, h);
+    this.renderer.setScissor(0, 0, w, h);
   }
 
   /**
@@ -172,13 +274,40 @@ export class DesktopPreview {
    */
   private applyLensView(): boolean {
     const s = this.sceneData;
-    if (this.lensIndex === null || !s || !s.cameras.length) return false;
+    if (this.lensIndex === null || this.lensIndex < 0 || !s || !s.cameras.length) return false;
     const d = s.cameras[Math.min(this.lensIndex, s.cameras.length - 1)];
-    this.camera.fov = vFovDeg(d.lensFocalLength, d.aspect, d.formatId);
+
+    let pos = d.position;
+    let rot = d.rotation;
+    let focal = d.lensFocalLength;
+    if (d.keyframes && d.keyframes.length >= 2) {
+      const tl = buildCameraTimeline(d.keyframes);
+      let lookPos: { x: number; y: number; z: number } | undefined;
+      if (d.lookAtTargetActorId) {
+        const target = s.actors.find((a) => a.id === d.lookAtTargetActorId);
+        if (target) {
+          if (target.keyframes && target.keyframes.length >= 2) {
+            const atl = buildTimeline(target.keyframes, s.walkSpeed);
+            const asamp = sampleTimeline(target.keyframes, atl, this.keyframes.t);
+            if (asamp) lookPos = { x: asamp.position.x, y: asamp.position.y + 1.4, z: asamp.position.z };
+          } else {
+            lookPos = { x: target.position.x, y: target.position.y + 1.4, z: target.position.z };
+          }
+        }
+      }
+      const sample = sampleCameraTimeline(d.keyframes, tl, this.keyframes.t, lookPos);
+      if (sample) {
+        pos = sample.position;
+        rot = sample.rotation;
+        focal = sample.lensFocalLength;
+      }
+    }
+
+    this.camera.fov = vFovDeg(focal, d.aspect, d.formatId);
     this.camera.aspect = this.fitLetterbox(aspectValue(d.aspect));
     this.camera.updateProjectionMatrix();
-    this.camera.position.set(d.position.x, d.position.y, d.position.z);
-    this.camera.quaternion.set(d.rotation.x, d.rotation.y, d.rotation.z, d.rotation.w);
+    this.camera.position.set(pos.x, pos.y, pos.z);
+    this.camera.quaternion.set(rot.x, rot.y, rot.z, rot.w);
     return true;
   }
 
@@ -214,7 +343,11 @@ export class DesktopPreview {
       return b;
     };
     this.lensBtn = btn('View: Orbit', () => this.cycleLens());
+    btn('|< -1F', () => { this.keyframes.stepFrames(-1); this.syncBar(); });
     this.playBtn = btn('▶ Play', () => this.togglePlay());
+    btn('+1F >|', () => { this.keyframes.stepFrames(1); this.syncBar(); });
+    this.loopBtn = btn('🔁 Loop', () => { this.keyframes.toggleLoop(); this.syncBar(); });
+    this.rateBtn = btn('⚡ 1.0x', () => { this.keyframes.cycleRate(); this.syncBar(); });
     btn('⏹ Stop', () => this.keyframes.stop());
     this.scrub = document.createElement('input');
     this.scrub.type = 'range';
@@ -224,9 +357,81 @@ export class DesktopPreview {
     this.scrub.oninput = () => this.keyframes.scrubTo(Number(this.scrub!.value) / 1000);
     bar.appendChild(this.scrub);
     this.clock = document.createElement('span');
-    this.clock.textContent = '0:00 / 0:00';
+    this.clock.textContent = '00:00:00:00 / 00:00:00:00';
+    this.clock.style.fontFamily = 'monospace';
     bar.appendChild(this.clock);
+
+    if (this.sceneData?.audioCues && this.sceneData.audioCues.length > 0) {
+      btn('🎵 Export DAW Stems', () => this.exportDawStems());
+    }
+
+    if (this.sceneData) {
+      btn('🎬 Storyboards & Continuity', () => openAiAnalysisModal(this.sceneData!));
+      btn('🎬 Dailies Video Reel', () => {
+        openDailiesVideoStudioModal(
+          this.sceneData!,
+          async (options, onProgress) => {
+            const renderer = new AnimaticVideoRenderer();
+            return await renderer.renderAnimaticVideo(
+              this.sceneData!,
+              undefined,
+              options,
+              onProgress,
+              this.scene3,
+              this.contentRoot,
+            );
+          },
+          document.body,
+        );
+      });
+    }
+
+    if (this.onOpenCollab) {
+      btn('👥 Collab', () => this.onOpenCollab?.());
+    }
+
+    if (this.onOpenProps) {
+      btn('📦 Props', () => this.onOpenProps?.());
+    }
+
+    if (this.onOpenLiveLink) {
+      btn('📡 LiveLink', () => this.onOpenLiveLink?.());
+    }
+
+    if (this.onOpenDmxBridge) {
+      btn('💡 DMX', () => this.onOpenDmxBridge?.());
+    }
+
+    if (this.onOpenIcvfx) {
+      btn('🎬 ICVFX', () => this.onOpenIcvfx?.());
+    }
+
+    if (this.onOpenAcoustics) {
+      btn('🎙️ Audio', () => this.onOpenAcoustics?.());
+    }
+
+    if (this.onOpenSolar) {
+      btn('☀️ Sun', () => this.onOpenSolar?.());
+    }
+
+    if (this.onOpenScreenplay) {
+      btn('📜 Script', () => this.onOpenScreenplay?.());
+    }
+
+    if (this.onOpenWebXRProfiler) {
+      btn('⚡ Profiler', () => this.onOpenWebXRProfiler?.());
+    }
+
+    if (this.onOpenVRComfort) {
+      btn('🛡️ Comfort', () => this.onOpenVRComfort?.());
+    }
+
+    if (this.onOpenSetDressing) {
+      btn('🎲 Dressing', () => this.onOpenSetDressing?.());
+    }
+
     btn('✕ Close', () => this.close());
+
     document.body.appendChild(bar);
     this.bar = bar;
 
@@ -239,22 +444,53 @@ export class DesktopPreview {
     this.letterbox = [mkBar(), mkBar()];
   }
 
+  private exportDawStems(): void {
+    if (!this.sceneData) return;
+    const cues = this.sceneData.audioCues ?? [];
+    const manifest = generateDawStemManifest(cues, this.keyframes.duration, this.sceneData.name, 24);
+
+    // Download JSON Manifest
+    const jsonBlob = new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' });
+    const jsonUrl = URL.createObjectURL(jsonBlob);
+    const jsonLink = document.createElement('a');
+    jsonLink.href = jsonUrl;
+    jsonLink.download = `${this.sceneData.name.replace(/\s+/g, '_')}_stem_manifest.json`;
+    jsonLink.click();
+    URL.revokeObjectURL(jsonUrl);
+
+    // Download CSV EDL
+    const edlBlob = new Blob([manifest.csvEdl], { type: 'text/csv' });
+    const edlUrl = URL.createObjectURL(edlBlob);
+    const edlLink = document.createElement('a');
+    edlLink.href = edlUrl;
+    edlLink.download = `${this.sceneData.name.replace(/\s+/g, '_')}_audio_edl.csv`;
+    edlLink.click();
+    URL.revokeObjectURL(edlUrl);
+  }
+
   private syncBar(): void {
     if (!this.bar) return;
     if (this.playBtn) this.playBtn.textContent = this.keyframes.playing ? '⏸ Pause' : '▶ Play';
+    if (this.loopBtn) {
+      this.loopBtn.textContent = this.keyframes.isLooping ? '🔁 Loop [ON]' : '🔁 Loop';
+      this.loopBtn.style.color = this.keyframes.isLooping ? '#38bdf8' : '';
+    }
+    if (this.rateBtn) {
+      this.rateBtn.textContent = `⚡ ${this.keyframes.playbackRate}x`;
+    }
     if (this.scrub && this.keyframes.duration > 0 && this.keyframes.playing) {
       this.scrub.value = String(Math.round(this.keyframes.normalizedT * 1000));
     }
     if (this.clock) {
-      this.clock.textContent = `${fmtTime(this.keyframes.t)} / ${fmtTime(this.keyframes.duration)}`;
+      this.clock.textContent = `${this.keyframes.smpteTimecode} / ${this.keyframes.smpteDuration}`;
     }
-    if (this.lensIndex === null && this.letterbox) {
+    if ((this.lensIndex === null || this.lensIndex === -1) && this.letterbox) {
       this.letterbox[0].style.display = 'none';
       this.letterbox[1].style.display = 'none';
     }
   }
 
-  /** Orbit → CAM A → CAM B → … → Orbit. Lens view disables orbiting. */
+  /** Orbit → CAM A → CAM B → Video Village (if 2+ cams) → Orbit. */
   private cycleLens(): void {
     const s = this.sceneData;
     const n = s?.cameras.length ?? 0;
@@ -263,17 +499,27 @@ export class DesktopPreview {
       if (this.lensBtn) this.lensBtn.textContent = 'View: Orbit (no cams)';
       return;
     }
-    this.lensIndex = this.lensIndex === null ? 0 : this.lensIndex + 1;
-    if (this.lensIndex >= n) this.lensIndex = null;
+    if (this.lensIndex === null) {
+      this.lensIndex = 0;
+    } else if (this.lensIndex >= 0 && this.lensIndex < n - 1) {
+      this.lensIndex += 1;
+    } else if (this.lensIndex === n - 1 && n > 1) {
+      this.lensIndex = -1; // Video Village
+    } else {
+      this.lensIndex = null;
+    }
+
     if (this.controls) this.controls.enabled = this.lensIndex === null;
     if (this.lensBtn) {
       if (this.lensIndex === null) {
         this.lensBtn.textContent = 'View: Orbit';
+      } else if (this.lensIndex === -1) {
+        this.lensBtn.textContent = `View: 🎬 Video Village (${n} Cams)`;
       } else {
         const d = s!.cameras[this.lensIndex];
-        this.lensBtn.textContent = `View: ${d.name} · ${Math.round(d.lensFocalLength)}mm ${
-          sensorFormat(d.formatId).short
-        } · ${d.aspect}`;
+        const focus = computeFocusDistance(d, s!.actors);
+        const shot = classifyShotSize(d.lensFocalLength, d.aspect, d.formatId, focus);
+        this.lensBtn.textContent = `View: ${d.name} · ${Math.round(d.lensFocalLength)}mm [${shot.shotSize}] · ${d.aspect}`;
       }
     }
   }
@@ -284,10 +530,28 @@ export class DesktopPreview {
   }
 
   private onKey(e: KeyboardEvent): void {
-    if (e.key === 'Escape') this.close();
-    else if (e.key === ' ') {
+    if (e.key === 'Escape') {
+      this.close();
+    } else if (e.key === ' ') {
       e.preventDefault();
       this.togglePlay();
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      this.keyframes.stepFrames(e.shiftKey ? -10 : -1);
+      this.syncBar();
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      this.keyframes.stepFrames(e.shiftKey ? 10 : 1);
+      this.syncBar();
+    } else if (e.key === 'i' || e.key === 'I') {
+      this.keyframes.setInPoint();
+      this.syncBar();
+    } else if (e.key === 'o' || e.key === 'O') {
+      this.keyframes.setOutPoint();
+      this.syncBar();
+    } else if (e.key === 'l' || e.key === 'L') {
+      this.keyframes.toggleLoop();
+      this.syncBar();
     }
   }
 }

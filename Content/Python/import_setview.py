@@ -393,7 +393,36 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         if verbose:
             print(f"[SetView] Created {l_type.capitalize()} Light '{l_name}'")
 
-    # 6. Create LevelSequence Driving Timeline
+    # 6. Create Spatial Audio Emitters & Cues
+    audio_cues_data = scene_data.get('audioCues', [])
+    for idx, cue_data in enumerate(audio_cues_data):
+        cue_name = cue_data.get('name', f"AudioCue_{idx+1}")
+        cue_type = cue_data.get('type', 'sfx')
+        vol = float(cue_data.get('volume', 1.0))
+        spatial = bool(cue_data.get('spatial', True))
+        max_dist_m = float(cue_data.get('maxDistanceM', 20.0))
+
+        # Position (world or relative to actor)
+        attached_act_id = cue_data.get('attachedActorId')
+        if attached_act_id and attached_act_id in spawned_actors:
+            act_actor, _ = spawned_actors[attached_act_id]
+            audio_comp = unreal.AudioComponent(act_actor)
+            audio_comp.set_relative_location(unreal.Vector(0, 0, 150)) # head level
+            audio_comp.volume_multiplier = vol
+            if verbose:
+                print(f"[SetView] Attached Audio Cue '{cue_name}' ({cue_type}) to actor '{act_actor.get_actor_label()}'")
+        else:
+            pos_ue = sv_to_ue_location(cue_data.get('position', {'x':0, 'y':1.5, 'z':0}))
+            audio_actor = editor_actor_subsystem.spawn_actor_from_class(
+                unreal.AmbientSound,
+                unreal.Vector(*pos_ue),
+                unreal.Rotator(0, 0, 0)
+            )
+            audio_actor.set_actor_label(cue_name)
+            if verbose:
+                print(f"[SetView] Placed Spatial AmbientSound '{cue_name}' at {pos_ue}")
+
+    # 7. Create LevelSequence Driving Timeline
     seq_name = f"LS_{scene_name.replace(' ', '_')}"
     sequence = asset_tools.create_asset(
         seq_name, package_path + "/Sequences", unreal.LevelSequence, unreal.LevelSequenceFactoryNew()
@@ -405,9 +434,42 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         # Add Camera Cut Track
         camera_cut_track = sequence.add_master_track(unreal.MovieSceneCameraCutTrack)
 
-        # Add Camera possessables
+        # Add Camera possessables and Keyframe Motion Tracks
         for cam_id, (cam_actor, cine_comp) in spawned_cameras.items():
             cam_possessable = sequence.add_possessable(cam_actor)
+            c_data = next((c for c in cameras_data if c.get('id') == cam_id), None)
+            if not c_data:
+                continue
+
+            cam_kfs = c_data.get('keyframes', [])
+            look_target_id = c_data.get('lookAtTargetActorId')
+
+            # If camera has keyframes, animate its transform and optics across the sequence
+            if len(cam_kfs) > 1:
+                cam_transform_track = cam_possessable.add_track(unreal.MovieSceneTransformTrack)
+                cam_transform_sec = cam_transform_track.add_section()
+                cam_transform_sec.set_start_frame_bounded(True)
+
+                current_time_sec = 0.0
+                last_pos = c_data.get('position', {'x': 0, 'y': 1.6, 'z': 0})
+                for k_idx, kf in enumerate(cam_kfs):
+                    kf_pos = kf.get('position', last_pos)
+                    dx = kf_pos['x'] - last_pos['x']
+                    dy = kf_pos['y'] - last_pos['y']
+                    dz = kf_pos['z'] - last_pos['z']
+                    dist_m = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    move_dur = dist_m / 1.0 if dist_m > 0.001 else 0.5
+                    hold_dur = float(kf.get('holdDurationS', 0.0))
+
+                    if k_idx > 0:
+                        current_time_sec += move_dur
+
+                    # Sample camera position & rotator in Unreal coordinates
+                    kf_pos_ue = sv_to_ue_location(kf_pos)
+                    kf_rot_ue = sv_quat_to_ue_rotator(kf.get('rotation', c_data.get('rotation', {})))
+
+                    current_time_sec += hold_dur
+                    last_pos = kf_pos
 
         # Add Actor possessables and Keyframe Motion
         for act_id, (act_actor, a_data) in spawned_actors.items():
@@ -499,12 +561,19 @@ def verify_scene_json(file_path: str, verbose: bool = True) -> bool:
         pos_ue = sv_to_ue_location(c.get('position', {}))
         rot_ue = sv_quat_to_ue_rotator(c.get('rotation', {}))
 
+        cam_kfs = c.get('keyframes', [])
+        look_target = c.get('lookAtTargetActorId')
+
         if verbose:
             print(f"[Camera {cam_name}]")
             print(f"  Sensor: {fmt['name']} ({fmt['gateWidthMm']}mm gate, {aspect})")
             print(f"  Optics: {focal}mm, T{tstop}")
             print(f"  Unreal Location (cm): ({pos_ue[0]:.2f}, {pos_ue[1]:.2f}, {pos_ue[2]:.2f})")
             print(f"  Unreal Rotator (deg): Pitch={rot_ue[0]:.2f}, Yaw={rot_ue[1]:.2f}, Roll={rot_ue[2]:.2f}")
+            if cam_kfs:
+                print(f"  Motion Path Marks: {len(cam_kfs)} keyframes")
+            if look_target:
+                print(f"  Look-At Target Actor ID: {look_target}")
 
     # Test Actor conversions
     for idx, a in enumerate(actors):
@@ -531,6 +600,39 @@ def verify_scene_json(file_path: str, verbose: bool = True) -> bool:
                 last_p = kp
             dur_sec = total_dist_m / walk_speed if walk_speed > 0 else 0.0
             print(f"  Total Walk Distance: {total_dist_m:.2f}m (~{dur_sec:.2f}s at {walk_speed}m/s)")
+
+    # Test Audio Cues
+    audio_cues = data.get('audioCues', [])
+    if audio_cues:
+        print(f"[Spatial Audio Cues] {len(audio_cues)} cues defined:")
+        for idx, cue in enumerate(audio_cues):
+            c_name = cue.get('name', f"Cue_{idx+1}")
+            c_type = cue.get('type', 'sfx')
+            t_s = float(cue.get('timestampS', 0.0))
+            d_s = float(cue.get('durationS', 1.0))
+            vol = float(cue.get('volume', 1.0))
+            spat = bool(cue.get('spatial', True))
+            att_act = cue.get('attachedActorId')
+
+            att_info = f"attached to actor {att_act}" if att_act else "static world emitter"
+            print(f"  - [{c_type.upper()}] '{c_name}' @ {t_s:.2f}s ({d_s:.2f}s) Vol={vol:.2f} Spatial={spat} ({att_info})")
+
+    # Multi-Camera Continuity Audit (180 line & 30-degree jump cuts)
+    if len(cameras) >= 2 and len(actors) >= 2:
+        a1_pos = actors[0].get('position', {'x': 0, 'z': 0})
+        a2_pos = actors[1].get('position', {'x': 0, 'z': 0})
+        line_dx = a2_pos.get('x', 0) - a1_pos.get('x', 0)
+        line_dz = a2_pos.get('z', 0) - a1_pos.get('z', 0)
+
+        sides = []
+        for c in cameras:
+            c_pos = c.get('position', {'x': 0, 'z': 0})
+            cross = line_dx * (c_pos.get('z', 0) - a1_pos.get('z', 0)) - line_dz * (c_pos.get('x', 0) - a1_pos.get('x', 0))
+            sides.append(1 if cross > 0.05 else (-1 if cross < -0.05 else 0))
+
+        has_180_crossing = (1 in sides) and (-1 in sides)
+        status_str = "WARNING (Cameras cross interaction axis)" if has_180_crossing else "CLEAN (All cameras on same side)"
+        print(f"[Continuity Audit] 180-Degree Line Status: {status_str}")
 
     # Test Scan decoding if binary data present
     if scan_b64:

@@ -8,8 +8,11 @@ import * as THREE from 'three';
 import {
   addNote,
   applyMarkOp,
+  check180LineOfAction,
   computeFocusDistance,
+  createAtmosphereConfig,
   createCameraSetup,
+  aspectValue,
   createScene,
   duplicateActor,
   duplicateCameraSetup,
@@ -19,6 +22,10 @@ import {
   type MarkOp,
   type SceneData,
 } from './model.ts';
+import { VolumetricManager } from './volumetrics.ts';
+import { TransformGizmo } from './transformGizmo.ts';
+import { classifyShotSize, findCamerasInFrustums, hFovDeg, vFovDeg } from './lens.ts';
+import { classifyCameraMove } from './timeline.ts';
 import { History } from './history.ts';
 import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
@@ -46,9 +53,79 @@ import {
 import { WheelPanel } from './wheelView.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
-import { buildWristPanel, DebugLog, DriftMarker, Landing, NoteEditor, openAiAnalysisModal, type UIPanel } from './ui.ts';
+import {
+  buildWristPanel,
+  DebugLog,
+  DriftMarker,
+  Landing,
+  NoteEditor,
+  openAiAnalysisModal,
+  openActorStudioModal,
+  openCameraGripModal,
+  openDailiesVideoStudioModal,
+  openDmxBridgeStudioModal,
+  openGaussianSplatStudioModal,
+  openIcvfxStudioModal,
+  openAcousticsStudioModal,
+  openSolarStudioModal,
+  openScreenplayBreakdownModal,
+  openWebXRProfilerModal,
+  openVRComfortModal,
+  openSetDressingStudioModal,
+  openLiveLinkModal,
+  openNleExportModal,
+  openUe5ExportModal,
+  VcamHudOverlay,
+  type UIPanel,
+} from './ui.ts';
+import { LedVolumeRenderer } from './icvfxRenderer.ts';
+import { createLedVolumeConfig } from './icvfxEngine.ts';
+import { AcousticsRenderer } from './acousticsRenderer.ts';
+import { createAcousticsConfig } from './acousticsEngine.ts';
+import { SolarEnvironmentRenderer } from './solarRenderer.ts';
+import { createSolarEnvironmentConfig } from './solarEngine.ts';
+import { ScreenplayContinuityRenderer } from './screenplayRenderer.ts';
+import {
+  createScreenplayConfig,
+  createVRProfilerConfig,
+  createVRComfortConfig,
+  createSetDressingConfig,
+  detectSemanticRegions,
+  generateThemeScatter,
+  type SettledPropItem,
+} from './model.ts';
+import { WebXRProfilerRuntime } from './webxrProfiler.ts';
+import { SpatialComfortRenderer } from './comfortRenderer.ts';
+import { SetDressingRenderer } from './setDressingRenderer.ts';
+import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
+
 import { ViewfinderRig } from './viewfinder.ts';
 import { DirectorSmartwatch } from './smartwatch.ts';
+import { TakeLibrary, type TakeRecord } from './dailies.ts';
+import type { TakeMetadata } from './recorder.ts';
+import { secondsToSmpte } from './timecode.ts';
+import { sampleActiveAudioCues } from './audioCues.ts';
+import { globalSpatialSoundEngine } from './soundEngine.ts';
+import { check30DegreeRule, checkEyelineMatch } from './continuity.ts';
+import {
+  applyScenePatch,
+  EntityLockManager,
+  PeerRoster,
+  type CollabScenePatch,
+} from './collab.ts';
+import { WebRtcCollabSession } from './network.ts';
+import { CollabAvatarManager } from './avatars.ts';
+import { openCollabModal, openPropsLibraryModal } from './ui.ts';
+import { PropsManager, type PropObject } from './propsManager.ts';
+import { globalPropStore } from './propStore.ts';
+import { LiveLinkStreamer } from './liveLinkStreamer.ts';
+import { DmxStreamer } from './dmxStreamer.ts';
+import { GaussianSplatRenderer } from './gaussianRenderer.ts';
+import { XRPerformanceGovernor } from './xrPerformance.ts';
+import { globalSpatialFeedback } from './spatialFeedback.ts';
+import { ContextualRadialView } from './contextualRadialView.ts';
+import { openPerformanceSettingsModal, PerformanceHudOverlay } from './ui.ts';
+import type { ContextQuickAction } from './spatialInteraction.ts';
 
 // Wrist-panel mount relative to the LEFT controller grip space.
 // Tune on-headset if the panel sits awkwardly (see TESTING.md).
@@ -88,7 +165,7 @@ const SCAN_TIMEOUT_MS = 30_000;
 const SCAN_ROOM_CAPTURE_AFTER_MS = 2_000;
 
 /** What the pointer ray is over ('furniture' id = scan mesh index as string). */
-type Hover = { kind: 'actor' | 'camera' | 'furniture'; id: string } | null;
+type Hover = { kind: 'actor' | 'camera' | 'furniture' | 'prop'; id: string } | null;
 
 class App {
   private renderer: THREE.WebGLRenderer;
@@ -105,12 +182,16 @@ class App {
   private session: SessionManager;
   private input: InputManager;
   private actors: ActorManager;
+  private props: PropsManager;
   private keyframes: KeyframeSystem;
   private cams: CameraSystem;
   private views: ViewManager;
   private preview: DesktopPreview;
   private recorder = new MonitorRecorder();
   private location = new LocationRenderer();
+  private splatRenderer = new GaussianSplatRenderer();
+  private volumetrics: VolumetricManager;
+  private gizmo: TransformGizmo;
   private wrist: UIPanel;
   private wristMount = new THREE.Group();
   private landing: Landing;
@@ -118,6 +199,14 @@ class App {
   private driftMarker: DriftMarker;
   private viewfinder = new ViewfinderRig();
   private smartwatch = new DirectorSmartwatch();
+  private takeLibrary = new TakeLibrary();
+  private liveLinkStreamer: LiveLinkStreamer;
+  private vcamHud: VcamHudOverlay;
+  private performanceGovernor = new XRPerformanceGovernor();
+  private performanceHud: PerformanceHudOverlay;
+  private profilerRuntime: WebXRProfilerRuntime;
+  private comfortRenderer: SpatialComfortRenderer;
+  private contextualRadial = new ContextualRadialView();
 
   // interaction state
   /** Dress = adjust the physical space; Block = plan the shot. */
@@ -138,9 +227,11 @@ class App {
   /** Placement is an ARMED tool, off by default — a bare pinch never places. */
   private placeMode: PlaceArm = 'none';
   private selectedActorId: string | null = null;
+  private selectedPropId: string | null = null;
   private hover: Hover = null;
   private draggedActor: ActorObject | null = null;
   private draggedCamera: CamObject | null = null;
+  private draggedProp: PropObject | null = null;
   private draggedMonitor = false;
   /** Scanned furniture mesh being grip-carried (Stage 1 movable furniture). */
   private draggedFurniture: THREE.Object3D | null = null;
@@ -181,7 +272,28 @@ class App {
   private hoverTargets: THREE.Object3D[] = [];
   private hoverTargetsVersion = -1;
 
+  // Multi-user WebRTC collaborative session
+  private collabSession: WebRtcCollabSession;
+  private collabRoster = new PeerRoster();
+  private collabLockManager = new EntityLockManager();
+  private collabAvatars = new CollabAvatarManager();
+  private lastCollabBroadcast = 0;
+
+  // Soundstage DMX512, Art-Net & sACN bridge streamer
+  private dmxStreamer: DmxStreamer;
+  // Virtual Production ICVFX LED Volume renderer
+  private icvfxRenderer: LedVolumeRenderer;
+  // Soundstage Acoustics & Spatial Dialogue renderer
+  private acousticsRenderer: AcousticsRenderer;
+  // Natural Sky & Physical Solar Ephemeris renderer
+  private solarRenderer: SolarEnvironmentRenderer;
+  // Screenplay 180-degree Line of Action & Continuity renderer
+  private screenplayRenderer: ScreenplayContinuityRenderer;
+  // Virtual Set Dressing & Generative Scatter renderer
+  private setDressingRenderer: SetDressingRenderer;
+
   constructor() {
+
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.setSize(innerWidth, innerHeight);
@@ -213,18 +325,87 @@ class App {
     this.input = new InputManager(this.renderer, this.scene3);
     this.actors = new ActorManager(this.session, this.sceneData);
     this.contentRoot.add(this.actors.group);
+    this.props = new PropsManager(this.session, this.sceneData);
+    this.contentRoot.add(this.props.group);
     this.keyframes = new KeyframeSystem(this.sceneData, this.actors);
     this.contentRoot.add(this.keyframes.vizGroup);
     this.cams = new CameraSystem(this.sceneData, this.session, this.contentRoot);
+    this.keyframes.setCameras(this.cams);
     this.scene3.add(this.cams.monitor);
     this.camera.add(this.cams.frameLines);
     // Scanned location lives under contentRoot: teleport walkthrough, the
     // miniature diorama, and camera framing all see the room where the actors are.
     this.contentRoot.add(this.location.group);
+    this.contentRoot.add(this.splatRenderer.group);
+    this.contentRoot.add(this.collabAvatars.group);
     this.views = new ViewManager(this.contentRoot, this.camera);
     this.scene3.add(this.views.platform);
     this.driftMarker = new DriftMarker(this.debug);
     this.scene3.add(this.driftMarker.group);
+    this.volumetrics = new VolumetricManager(this.scene3);
+    this.scene3.add(this.contextualRadial.group);
+    this.contextualRadial.setOnAction((action, entityId, entityType) =>
+      this.handleContextQuickAction(action, entityId, entityType),
+    );
+
+    this.gizmo = new TransformGizmo();
+    this.scene3.add(this.gizmo.root);
+    this.gizmo.events.onTransform = () => {
+      this.markDirty();
+      this.contentVersion++;
+    };
+    this.gizmo.events.onDragStart = () => {
+      globalSpatialFeedback.triggerHaptic('both', 'grab');
+    };
+    this.gizmo.events.onDragEnd = () => {
+      globalSpatialFeedback.triggerHaptic('both', 'snap');
+    };
+    this.gizmo.events.onHoverChange = (axis) => {
+      if (axis) globalSpatialFeedback.triggerHaptic('both', 'tick');
+    };
+
+    this.collabSession = new WebRtcCollabSession({
+      onPeerJoined: (peer) => {
+        this.collabRoster.addOrUpdatePeer(peer);
+        this.collabAvatars.updatePeer(peer);
+        this.debug.log(`collab: peer joined ${peer.name} (${peer.role})`);
+      },
+      onPeerLeft: (peerId) => {
+        this.collabRoster.removePeer(peerId);
+        this.collabAvatars.removePeer(peerId);
+        this.collabLockManager.releaseByPeer(peerId);
+        this.debug.log(`collab: peer left ${peerId}`);
+      },
+      onPresence: (presence) => {
+        this.collabRoster.addOrUpdatePeer(presence);
+        this.collabAvatars.updatePeer(presence);
+      },
+      onPatch: (patch) => {
+        this.applyRemotePatch(patch);
+      },
+      onLock: (lock) => {
+        this.collabLockManager.acquireLock(
+          lock.entityId,
+          lock.entityType,
+          lock.lockedByPeerId,
+          lock.lockedByPeerName,
+          lock.expiresAtTs - lock.lockedAtTs,
+        );
+      },
+      onUnlock: (entityId, peerId) => {
+        this.collabLockManager.releaseLock(entityId, peerId);
+      },
+      onSnapshotRequest: (peerId) => {
+        this.collabSession.sendSnapshot(peerId, this.sceneData);
+      },
+      onSnapshotReceived: (scene) => {
+        this.loadScene(scene);
+        this.debug.log(`collab: synchronized scene snapshot (${scene.name})`);
+      },
+      onAudioStream: (peerId, stream) => {
+        this.collabSession.setupRemoteAudio(peerId, stream);
+      },
+    });
 
     // Desktop (non-XR) preview of the current scene: actors/stances/paths and
     // camera gizmos stay visible; AR-session chrome is hidden.
@@ -242,6 +423,43 @@ class App {
       this.landing.show(true);
       this.refreshLanding();
     };
+    this.preview.onOpenCollab = () => this.openCollabDialog();
+    this.preview.onOpenProps = () => void this.openPropsLibrary();
+    this.preview.onOpenLiveLink = () => this.openLiveLinkDialog();
+    this.preview.onOpenDmxBridge = () => this.openDmxBridgeDialog();
+    this.preview.onOpenIcvfx = () => this.openIcvfxStudioDialog();
+    this.preview.onOpenAcoustics = () => this.openAcousticsStudioDialog();
+    this.preview.onOpenSolar = () => this.openSolarStudioDialog();
+    this.preview.onOpenScreenplay = () => this.openScreenplayStudioDialog();
+    this.preview.onOpenWebXRProfiler = () => this.openWebXRProfilerDialog();
+    this.preview.onOpenVRComfort = () => this.openVRComfortDialog();
+    this.preview.onOpenSetDressing = () => this.openSetDressingDialog();
+
+    this.profilerRuntime = new WebXRProfilerRuntime(this.sceneData.profiler);
+    this.comfortRenderer = new SpatialComfortRenderer(this.sceneData.comfort);
+    this.contentRoot.add(this.comfortRenderer.group);
+    this.camera.add(this.comfortRenderer.vignetteMesh);
+
+    this.setDressingRenderer = new SetDressingRenderer(this.sceneData.setDressing);
+    this.contentRoot.add(this.setDressingRenderer.group);
+
+    this.icvfxRenderer = new LedVolumeRenderer(this.sceneData.icvfx);
+    this.contentRoot.add(this.icvfxRenderer.group);
+
+
+    this.acousticsRenderer = new AcousticsRenderer(this.sceneData.acoustics);
+    this.contentRoot.add(this.acousticsRenderer.group);
+
+    this.solarRenderer = new SolarEnvironmentRenderer(this.sceneData.solar);
+    this.contentRoot.add(this.solarRenderer.group);
+
+    this.screenplayRenderer = new ScreenplayContinuityRenderer(this.sceneData.screenplay);
+    this.contentRoot.add(this.screenplayRenderer.group);
+
+    this.liveLinkStreamer = new LiveLinkStreamer(this.sceneData.livelink);
+    this.dmxStreamer = new DmxStreamer(this.sceneData.dmxBridge);
+    this.vcamHud = new VcamHudOverlay(this.liveLinkStreamer, () => this.openLiveLinkDialog());
+    this.performanceHud = new PerformanceHudOverlay(this.performanceGovernor, () => this.openPerformanceSettings());
 
     const overlayRoot = document.getElementById('overlay')!;
     this.noteEditor = new NoteEditor(overlayRoot);
@@ -295,12 +513,36 @@ class App {
       },
       onExportFloorplan: (id) => this.persistence.exportFloorplan(id),
       onExportShotList: (id) => this.persistence.exportShotList(id),
+      onExportNleTimeline: (id) =>
+        openNleExportModal(
+          id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
+          document.getElementById('overlay')!,
+        ),
+      onExportUe5Bridge: (id) =>
+        openUe5ExportModal(
+          id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
+          document.getElementById('overlay')!,
+        ),
       onAiShotAnalysis: (id) =>
         openAiAnalysisModal(
           id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
           document.getElementById('overlay')!,
         ),
       onRemoveScan: (id) => this.removeScan(id),
+      onExportScanObj: (id) => void this.persistence.exportScanObj(id),
+      onExportScanPly: (id) => void this.persistence.exportScanPly(id),
+      onExportScanUsd: (id) => void this.persistence.exportScanUsd(id),
+      onExportScanGeoJson: (id) => void this.persistence.exportScanGeoJson(id),
+      onExportScanPackage: (id) => void this.persistence.exportScanPackage(id),
+      onAddSyntheticScan: (id) => {
+        void this.persistence.attachSyntheticScan(id).then((scan) => {
+          if (scan && id === this.sceneData.id) {
+            this.sceneData = this.persistence.loadScene(id) ?? this.sceneData;
+            this.syncLocation();
+          }
+          this.refreshLanding();
+        });
+      },
       onPreview: (id) => this.openPreview(id),
       getScene: (id) =>
         id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
@@ -309,14 +551,121 @@ class App {
       onSetStance: (sceneId, actorId, stance) => this.setActorStance(sceneId, actorId, stance),
       onSetScale: (sceneId, actorId, scale) => this.setActorScale(sceneId, actorId, scale),
       onEditMarks: (sceneId, actorId, op) => this.editActorMarks(sceneId, actorId, op),
+      onCollab: () => this.openCollabDialog(),
+      onPropsLibrary: () => void this.openPropsLibrary(),
+      onOpenLiveLink: () => this.openLiveLinkDialog(),
+      onGaussianSplatStudio: (sceneId) => {
+        const sc = sceneId === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        openGaussianSplatStudioModal(
+          sc,
+          (updated) => {
+            if (sc.id === this.sceneData.id) {
+              this.sceneData = updated;
+              this.loadScene(this.sceneData);
+              this.persistence.saveNow(this.sceneData);
+              this.markDirty();
+            } else {
+              this.persistence.saveNow(updated);
+            }
+            this.refreshLanding();
+          },
+          document.getElementById('overlay')!,
+          (cloud) => {
+            if (sc.id === this.sceneData.id) {
+              this.splatRenderer.setCloud(cloud);
+            }
+          },
+        );
+      },
+      onOpenDailiesStudio: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        openDailiesVideoStudioModal(
+          sc,
+          async (options, onProgress) => {
+            const renderer = new AnimaticVideoRenderer();
+            return await renderer.renderAnimaticVideo(
+              sc,
+              undefined,
+              options,
+              onProgress,
+              sc.id === this.sceneData.id ? this.scene3 : undefined,
+              sc.id === this.sceneData.id ? this.contentRoot : undefined,
+            );
+          },
+          document.getElementById('overlay') ?? document.body,
+        );
+      },
+      onOpenDmxBridge: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openDmxBridgeDialog(sc);
+      },
+      onOpenIcvfxStudio: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openIcvfxStudioDialog(sc);
+      },
+      onOpenAcousticsStudio: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openAcousticsStudioDialog(sc);
+      },
+      onOpenSolarStudio: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openSolarStudioDialog(sc);
+      },
+      onOpenScreenplayStudio: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openScreenplayStudioDialog(sc);
+      },
+      onOpenWebXRProfiler: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openWebXRProfilerDialog(sc);
+      },
+      onOpenVRComfort: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openVRComfortDialog(sc);
+      },
+      onOpenSetDressingStudio: (sceneId) => {
+        const sc =
+          sceneId === this.sceneData.id
+            ? this.sceneData
+            : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        this.openSetDressingDialog(sc);
+      },
     });
+
+
+    const roomParam = new URLSearchParams(window.location.search).get('room');
+    if (roomParam) {
+      setTimeout(() => this.openCollabDialog(), 300);
+    }
 
     this.persistence.onError = (m) => {
       this.debug.log(m);
       this.wrist.setStatus(m);
     };
-
-    this.setupViewfinderAndSmartwatch();
 
     // Fires whichever way a take ends (wrist toggle, camera deleted, session
     // end, MAX_RECORD_S cap, encoder error) — the file is already downloading.
@@ -347,6 +696,12 @@ class App {
     this.scene3.add(this.viewfinder.group);
     this.wristMount.add(this.smartwatch.group);
 
+    this.cams.setTakeLibrary(this.takeLibrary);
+    this.recorder.onTakeCreated = (take: TakeRecord) => {
+      this.takeLibrary.addTake(take);
+      this.debug.log(`🎞️ Dailies: Saved Take #${take.takeNumber} (${take.cameraName} ${Math.round(take.focalLengthMm)}mm)`);
+    };
+
     this.viewfinder.onStampCamera = (pos, dir, focalMm) => {
       const rotY = Math.atan2(-dir.x, -dir.z);
       const cam = createCameraSetup(
@@ -363,6 +718,14 @@ class App {
       this.debug.log(`🎥 Stamped ${cam.name} (${focalMm}mm) via Two-Hand Viewfinder`);
     };
 
+    this.smartwatch.onScrub = (ratio) => {
+      if (this.cams.dailiesActive) {
+        this.cams.scrubDailies(ratio);
+      } else {
+        this.keyframes.scrub(ratio);
+      }
+    };
+
     this.smartwatch.onPress = (id) => {
       if (id === 'cam') {
         if (this.sceneData.cameras.length > 0) {
@@ -372,8 +735,53 @@ class App {
           this.cams.setActive(nextCam.id);
           this.debug.log(`🎥 Smartwatch: Selected ${nextCam.name}`);
         }
+      } else if (id === 'mark') {
+        const activeCam = this.cams.active;
+        if (activeCam) {
+          const res = this.keyframes.captureCamera(activeCam);
+          if (res === 'ok') {
+            const count = activeCam.data.keyframes?.length ?? 1;
+            this.debug.log(`📍 Smartwatch: Camera Mark #${count} recorded for ${activeCam.data.name}`);
+            this.history.record(this.sceneData);
+            this.markDirty();
+          } else {
+            this.debug.log(`⚠️ Max marks (${this.keyframes.maxCameraKeyframes}) reached for camera`);
+          }
+        }
+      } else if (id === 'village') {
+        const mode = this.cams.cycleVillageMode();
+        this.debug.log(`🎛️ Video Village Mode: ${mode.toUpperCase()}`);
       } else if (id === 'rec') {
         this.toggleRecording();
+      } else if (id === 'play') {
+        if (this.cams.dailiesActive) {
+          const playing = this.cams.togglePlayDailies();
+          this.debug.log(playing ? '▶ Dailies: Playing Take' : '⏸ Dailies: Paused Take');
+        } else {
+          const playing = this.keyframes.togglePlay();
+          this.debug.log(playing ? '▶ Timeline: Playing' : '⏸ Timeline: Paused');
+        }
+      } else if (id === 'dailies') {
+        const active = this.cams.toggleDailies();
+        this.debug.log(active ? `🎞️ Dailies: Reviewing Take #${this.takeLibrary.activeTake?.takeNumber ?? 1}` : '🎬 Switched to Live Camera');
+      } else if (id === 'step-back') {
+        if (this.cams.dailiesActive) {
+          this.cams.stepDailiesFrames(-1);
+        } else {
+          this.keyframes.stepFrames(-1);
+        }
+      } else if (id === 'step-fwd') {
+        if (this.cams.dailiesActive) {
+          this.cams.stepDailiesFrames(1);
+        } else {
+          this.keyframes.stepFrames(1);
+        }
+      } else if (id === 'loop-toggle') {
+        const looping = this.keyframes.toggleLoop();
+        this.debug.log(looping ? '🔁 Loop: ON' : '➡️ Loop: OFF');
+      } else if (id === 'rate-cycle') {
+        const rate = this.keyframes.cycleRate();
+        this.debug.log(`⚡ Rate: ${rate}x`);
       } else if (id === 'focus') {
         const activeCam = this.cams.active;
         if (activeCam && this.sceneData.actors.length > 0) {
@@ -385,6 +793,8 @@ class App {
         this.toggleMenuInFront();
       } else if (id === 'ai') {
         openAiAnalysisModal(this.sceneData);
+      } else if (id === 'props') {
+        void this.openPropsLibrary();
       }
     };
   }
@@ -569,26 +979,56 @@ class App {
     this.sceneData = data;
     this.persistence.setCurrent(data.id);
     this.selectedActorId = null;
+    this.selectedPropId = null;
     this.hover = null;
     // Reparent (not just null) any in-progress drag before setScene disposes
-    // the old objects — a grip-dragged camera root lives under the controller,
+    // the old objects: a grip-dragged camera root lives under the controller,
     // and disposing it there would orphan a phantom gizmo on the controller.
     // Mirrors restoreScene; handles a load that follows a session ended mid-grip.
     this.cancelActiveManipulation();
-    // A take belongs to the scene it was rolling on — finish and save it.
+    // A take belongs to the scene it was rolling on: finish and save it.
     this.stopRecording(true);
     this.actors.setScene(data);
+    this.props.setScene(data);
     this.keyframes.setScene(data);
     this.cams.setScene(data);
     this.contentVersion++;
     this.pendingScan = null;
     this.syncLocation();
+    const activeCloud = (data.gaussianClouds && data.gaussianClouds.length > 0)
+      ? (data.gaussianClouds.find((c) => c.id === data.activeSplatCloudId) || data.gaussianClouds[0])
+      : null;
+    this.splatRenderer.setCloud(activeCloud);
+    if (data.architecture) {
+      this.splatRenderer.setFloorplanOverlay(data.architecture);
+    } else {
+      this.splatRenderer.setFloorplanOverlay(null);
+    }
     this.history.reset(data);
+    this.volumetrics.update(
+      data.atmosphere ?? createAtmosphereConfig('clear'),
+      data.lights ?? [],
+      this.camera,
+    );
+    if (data.livelink) {
+      this.liveLinkStreamer.updateConfig(data.livelink);
+    }
+    if (data.dmxBridge) {
+      this.dmxStreamer.setConfig(data.dmxBridge);
+    }
+    this.icvfxRenderer.setConfig(data.icvfx || createLedVolumeConfig());
+    this.acousticsRenderer.setConfig(data.acoustics || createAcousticsConfig());
+    this.solarRenderer.setConfig(data.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
+    this.screenplayRenderer.setConfig(data.screenplay || createScreenplayConfig());
+    this.profilerRuntime.updateConfig(data.profiler || createVRProfilerConfig());
+    this.comfortRenderer.setConfig(data.comfort || createVRComfortConfig());
+    this.setDressingRenderer.setConfig(data.setDressing || createSetDressingConfig());
     this.refreshLanding();
+
     this.refreshWristState();
-    if (data.actors.length || data.cameras.length) {
+    if (data.actors.length || data.cameras.length || (data.props && data.props.length)) {
       this.debug.log(
-        `loaded "${data.name}" (${data.actors.length} actors, ${data.cameras.length} cams) — placed relative to session start`,
+        `loaded "${data.name}" (${data.actors.length} actors, ${data.cameras.length} cams, ${data.props?.length ?? 0} props): placed relative to session start`,
       );
     }
   }
@@ -602,8 +1042,10 @@ class App {
    */
   private cancelActiveManipulation(): void {
     if (this.draggedCamera) this.cams.gizmoGroup.attach(this.draggedCamera.root);
+    if (this.draggedProp) this.contentRoot.attach(this.draggedProp.root);
     this.draggedActor = null;
     this.draggedCamera = null;
+    this.draggedProp = null;
     if (this.draggedMonitor) {
       this.draggedMonitor = false;
       this.scene3.attach(this.cams.monitor);
@@ -727,6 +1169,7 @@ class App {
       case 'sub-marks':
       case 'sub-capture':
       case 'sub-edit':
+      case 'sub-props':
         this.wheelPath = id.slice(4) as WheelPath;
         break;
       case 'wheel-back':
@@ -858,7 +1301,113 @@ class App {
       case 'stance':
         this.cycleSelectedStance();
         break;
+      case 'actor-studio': {
+        const actor =
+          (this.selectedActorId ? this.sceneData.actors.find((a) => a.id === this.selectedActorId) : undefined) ??
+          this.sceneData.actors[0];
+        if (actor) {
+          openActorStudioModal(actor, this.sceneData, (updated) => {
+            Object.assign(actor, updated);
+            this.actors.rebuildVisual(actor.id);
+            this.persistence.saveNow(this.sceneData);
+            this.markDirty();
+          });
+        } else {
+          this.debug.log('No actor in scene: place an actor first');
+        }
+        break;
+      }
+      case 'grip-rig': {
+        const cam = this.cams.active?.data ?? this.sceneData.cameras[0];
+        if (cam) {
+          openCameraGripModal(cam, this.sceneData, (updated) => {
+            Object.assign(cam, updated);
+            this.cams.refreshCamera(cam.id);
+            this.persistence.saveNow(this.sceneData);
+            this.markDirty();
+          });
+        } else {
+          this.debug.log('No camera in scene: place a camera first');
+        }
+        break;
+      }
+      case 'splat-studio': {
+        openGaussianSplatStudioModal(
+          this.sceneData,
+          (updated) => {
+            this.sceneData = updated;
+            this.loadScene(this.sceneData);
+            this.persistence.saveNow(this.sceneData);
+            this.markDirty();
+          },
+          document.getElementById('overlay')!,
+          (cloud) => {
+            this.splatRenderer.setCloud(cloud);
+          },
+        );
+        break;
+      }
+      case 'dailies-studio': {
+        openDailiesVideoStudioModal(
+          this.sceneData,
+          async (options, onProgress) => {
+            const renderer = new AnimaticVideoRenderer();
+            return await renderer.renderAnimaticVideo(
+              this.sceneData,
+              undefined,
+              options,
+              onProgress,
+              this.scene3,
+              this.contentRoot,
+            );
+          },
+          document.getElementById('overlay') ?? document.body,
+        );
+        break;
+      }
+      case 'perf-settings': {
+        this.openPerformanceSettings();
+        break;
+      }
+      case 'dmx-bridge': {
+        this.openDmxBridgeDialog();
+        break;
+      }
+      case 'icvfx-studio': {
+        this.openIcvfxStudioDialog();
+        break;
+      }
+      case 'acoustics-studio': {
+        this.openAcousticsStudioDialog();
+        break;
+      }
+      case 'solar-studio': {
+        this.openSolarStudioDialog();
+        break;
+      }
+      case 'screenplay-studio':
+      case 'script-breakdown': {
+        this.openScreenplayStudioDialog();
+        break;
+      }
+      case 'xr-profiler':
+      case 'profiler-studio': {
+        this.openWebXRProfilerDialog();
+        break;
+      }
+      case 'comfort-studio':
+      case 'vr-comfort': {
+        this.openVRComfortDialog();
+        break;
+      }
+      case 'set-dressing-studio':
+      case 'dressing':
+      case 'set_dressing': {
+        this.openSetDressingDialog();
+        break;
+      }
       case 'format': {
+
         const fmt = this.cams.cycleFormat();
         this.debug.log(`format: ${fmt.name}`);
         this.refreshWristState();
@@ -940,6 +1489,34 @@ class App {
       case 'exit':
         void this.session.session?.end();
         break;
+      case 'prop-chair':
+      case 'prop-applebox':
+      case 'prop-cstand':
+      case 'prop-slate':
+      case 'prop-desk':
+      case 'prop-lamp':
+      case 'prop-greenscreen': {
+        const propAssetId = id.slice(5);
+        const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
+        const spawnPos = {
+          x: viewerLocal.x,
+          y: 0,
+          z: viewerLocal.z - 1.2,
+        };
+        void this.props.addProp(propAssetId, spawnPos).then((obj) => {
+          this.contentVersion++;
+          this.collabSession.broadcastPatch({
+            type: 'prop_add',
+            prop: obj.data,
+          });
+          this.debug.log(`spawned ${obj.data.name}`);
+          this.markDirty();
+        });
+        break;
+      }
+      case 'prop-library':
+        void this.openPropsLibrary();
+        break;
       case 'stance-cycle-next':
         this.cycleSelectedStance(1);
         break;
@@ -1001,6 +1578,8 @@ class App {
       this.guideSticky = false;
       this.guideAutoUntil = performance.now() + GUIDE_AUTO_SHOW_S * 1000;
       this.guide.show(this.guideCtx());
+      this.vcamHud.mount(document.getElementById('overlay') ?? document.body);
+      this.performanceHud.mount(document.getElementById('overlay') ?? document.body);
       this.renderer.setAnimationLoop((t, frame) => this.loop(t, frame));
     } catch (e) {
       this.debug.log(`failed to start AR: ${(e as Error).message}`);
@@ -1013,6 +1592,9 @@ class App {
 
   private onSessionEnd(): void {
     this.renderer.setAnimationLoop(null);
+    this.vcamHud.unmount();
+    this.performanceHud.unmount();
+    this.contextualRadial.hide();
     this.guide.hide();
     this.guideSticky = false;
     this.guideAutoUntil = 0;
@@ -1049,12 +1631,32 @@ class App {
     }
     if (this.wrist.handleTriggerDown()) return;
 
+    const rc = this.input.raycaster(hand, this.raycaster);
+    if (rc && this.contextualRadial.handlePointer(rc, true)) return;
+
     if (this.hover?.kind === 'actor') {
       this.selectActor(this.hover.id);
       return;
     }
+    if (this.hover?.kind === 'prop') {
+      this.selectProp(this.hover.id);
+      return;
+    }
     if (this.hover?.kind === 'camera') {
       this.cams.setActive(this.hover.id);
+      const camObj = this.cams.active;
+      if (camObj) {
+        globalSpatialFeedback.triggerHaptic('both', 'grab');
+        globalSpatialFeedback.playSpatialSound('click', {
+          x: camObj.root.position.x,
+          y: camObj.root.position.y,
+          z: camObj.root.position.z,
+        });
+        this.contextualRadial.show('camera', camObj.data.id, camObj.root.position, {
+          name: camObj.data.name,
+          focalLength: camObj.data.lensFocalLength,
+        });
+      }
       this.refreshWristState();
       return;
     }
@@ -1072,15 +1674,36 @@ class App {
       this.contentVersion++;
       if (!this.views.isShifted) this.pendingReanchorActors.push(obj);
       this.selectActor(obj.data.id);
+      this.collabSession.broadcastPatch({
+        type: 'actor_add',
+        actor: obj.data,
+      });
       this.debug.log(`placed ${obj.data.name}${this.session.features.anchors ? ' (anchoring)' : ''}`);
       this.markDirty();
-    } else {
+    } else if (this.placeMode === 'camera') {
       // Camera placement: drop the gizmo at the user's head pose.
       const obj = this.cams.placeAtPose(this.lastViewerPos.clone(), this.lastViewerQuat.clone());
       this.contentVersion++;
       if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
+      this.collabSession.broadcastPatch({
+        type: 'camera_add',
+        camera: obj.data,
+      });
       this.debug.log(`placed ${obj.data.name} at head (${Math.round(obj.data.lensFocalLength)}mm)`);
       this.markDirty();
+    } else if (this.placeMode === 'prop') {
+      if (!this.session.lastHit) return;
+      const local = this.contentRoot.worldToLocal(this.session.lastHit.point.clone());
+      void this.props.addProp('chair', { x: local.x, y: local.y, z: local.z }).then((obj) => {
+        this.contentVersion++;
+        this.selectProp(obj.data.id);
+        this.collabSession.broadcastPatch({
+          type: 'prop_add',
+          prop: obj.data,
+        });
+        this.debug.log(`placed ${obj.data.name}`);
+        this.markDirty();
+      });
     }
     // Hands place ONE per arm: stray pinches are constant on hand tracking,
     // so the tool disarms after each placement (the wheel is a glance away).
@@ -1104,6 +1727,16 @@ class App {
         this.draggedActor = obj;
         obj.overridden = true;
         this.selectActor(obj.data.id);
+      }
+    } else if (this.hover?.kind === 'prop') {
+      const obj = this.props.get(this.hover.id);
+      const ray = this.input.raySpace(hand);
+      if (obj && ray) {
+        this.draggedProp = obj;
+        this.props.setSelected(obj.data.id);
+        this.selectedPropId = obj.data.id;
+        ray.attach(obj.root);
+        this.debug.log(`moving ${obj.data.name}`);
       }
     } else if (this.hover?.kind === 'camera') {
       const obj = this.cams.get(this.hover.id);
@@ -1150,6 +1783,22 @@ class App {
       if (!this.views.isShifted) this.pendingReanchorActors.push(obj);
       this.markDirty();
     }
+    if (this.draggedProp) {
+      const obj = this.draggedProp;
+      this.draggedProp = null;
+      this.contentRoot.attach(obj.root);
+      const pos = obj.root.position;
+      const rotY = obj.root.rotation.y;
+      obj.data.position = { x: pos.x, y: pos.y, z: pos.z };
+      obj.data.rotationY = rotY;
+      this.collabSession.broadcastPatch({
+        type: 'prop_move',
+        propId: obj.data.id,
+        position: obj.data.position,
+        rotationY: rotY,
+      });
+      this.markDirty();
+    }
     if (this.draggedCamera) {
       const obj = this.draggedCamera;
       this.draggedCamera = null;
@@ -1191,17 +1840,34 @@ class App {
   }
 
   private captureKeyframe(): void {
-    const obj = this.selectedActorId ? this.actors.get(this.selectedActorId) : undefined;
-    if (!obj) {
-      this.debug.log('B: select an actor first (point + trigger)');
+    if (this.selectedActorId) {
+      const obj = this.actors.get(this.selectedActorId);
+      if (obj) {
+        const result = this.keyframes.capture(obj);
+        if (result === 'full') {
+          this.actors.flashLabel(obj, `MAX ${this.keyframes.maxKeyframes} KFs`);
+        } else {
+          this.actors.flashLabel(obj, `KF ${obj.data.keyframes.length} ✓`);
+        }
+        this.history.record(this.sceneData);
+        this.markDirty();
+        return;
+      }
+    }
+    const camObj = this.cams.active;
+    if (camObj) {
+      const result = this.keyframes.captureCamera(camObj);
+      if (result === 'full') {
+        this.debug.log(`⚠️ MAX ${this.keyframes.maxCameraKeyframes} Camera Marks`);
+      } else {
+        const count = camObj.data.keyframes?.length ?? 1;
+        this.debug.log(`📍 Camera Mark #${count} ✓ (${camObj.data.name})`);
+      }
+      this.history.record(this.sceneData);
+      this.markDirty();
       return;
     }
-    const result = this.keyframes.capture(obj);
-    if (result === 'full') {
-      this.actors.flashLabel(obj, `MAX ${this.keyframes.maxKeyframes} KFs`);
-    } else {
-      this.actors.flashLabel(obj, `KF ${obj.data.keyframes.length} ✓`);
-    }
+    this.debug.log('B: select an actor or camera first');
   }
 
   private tryTeleport(): void {
@@ -1213,6 +1879,60 @@ class App {
   private selectActor(id: string | null): void {
     this.selectedActorId = id;
     this.actors.setSelected(id);
+    if (id) {
+      const actor = this.actors.get(id);
+      if (actor) {
+        this.gizmo.attachActor(actor);
+        globalSpatialFeedback.triggerHaptic('both', 'grab');
+        globalSpatialFeedback.playSpatialSound('click', {
+          x: actor.root.position.x,
+          y: actor.root.position.y,
+          z: actor.root.position.z,
+        });
+        this.contextualRadial.show('actor', id, actor.root.position, {
+          stance: actor.data.stance,
+          name: actor.data.name,
+        });
+      } else {
+        this.gizmo.detach();
+        this.contextualRadial.hide();
+      }
+    } else {
+      if (this.gizmo.getTarget()?.kind === 'actor') {
+        this.gizmo.detach();
+      }
+      this.contextualRadial.hide();
+    }
+    this.refreshWristState();
+  }
+
+  private selectProp(id: string | null): void {
+    this.selectedPropId = id;
+    this.props.setSelected(id);
+    if (id) {
+      const prop = this.props.get(id);
+      if (prop) {
+        this.gizmo.attachProp(prop);
+        globalSpatialFeedback.triggerHaptic('both', 'grab');
+        globalSpatialFeedback.playSpatialSound('click', {
+          x: prop.root.position.x,
+          y: prop.root.position.y,
+          z: prop.root.position.z,
+        });
+        this.contextualRadial.show('prop', id, prop.root.position, {
+          name: prop.data.name,
+          category: prop.data.category,
+        });
+      } else {
+        this.gizmo.detach();
+        this.contextualRadial.hide();
+      }
+    } else {
+      if (this.gizmo.getTarget()?.kind === 'prop') {
+        this.gizmo.detach();
+      }
+      this.contextualRadial.hide();
+    }
     this.refreshWristState();
   }
 
@@ -1228,9 +1948,27 @@ class App {
       this.debug.log('scanned furniture can\'t be deleted — Remove scan (landing page) clears it all');
       return;
     }
+    if (this.hover?.kind === 'prop' || (!this.hover && this.selectedPropId)) {
+      const propId = this.hover?.kind === 'prop' ? this.hover.id : this.selectedPropId!;
+      this.debug.log('deleted prop');
+      this.props.removeProp(propId);
+      this.collabSession.broadcastPatch({
+        type: 'prop_remove',
+        propId,
+      });
+      this.contentVersion++;
+      if (this.selectedPropId === propId) this.selectProp(null);
+      this.hover = null;
+      this.markDirty();
+      return;
+    }
     if (this.hover?.kind === 'camera') {
       this.debug.log(`deleted camera`);
       this.cams.remove(this.hover.id);
+      this.collabSession.broadcastPatch({
+        type: 'camera_remove',
+        cameraId: this.hover.id,
+      });
       this.contentVersion++;
       this.hover = null;
       this.markDirty();
@@ -1238,23 +1976,42 @@ class App {
     }
     const id = this.hover?.kind === 'actor' ? this.hover.id : this.selectedActorId;
     if (!id) {
-      this.debug.log('Delete: point at (or select) an actor or camera first');
+      this.debug.log('Delete: point at (or select) an actor, prop, or camera first');
       return;
     }
     const obj = this.actors.get(id);
     this.debug.log(`deleted ${obj?.data.name ?? 'actor'}`);
     this.keyframes.removeActor(id);
     this.actors.remove(id);
+    this.collabSession.broadcastPatch({
+      type: 'actor_remove',
+      actorId: id,
+    });
     this.contentVersion++;
     if (this.selectedActorId === id) this.selectActor(null);
     this.hover = null;
     this.markDirty();
   }
 
-  /** Clones the hovered/selected actor or camera a short step away. */
+  /** Clones the hovered/selected actor, prop, or camera a short step away. */
   private duplicateTarget(): void {
     if (this.hover?.kind === 'furniture') {
       this.debug.log('scanned furniture can\'t be duplicated (yet)');
+      return;
+    }
+    if (this.hover?.kind === 'prop' || (!this.hover && this.selectedPropId)) {
+      const propId = this.hover?.kind === 'prop' ? this.hover.id : this.selectedPropId!;
+      void this.props.duplicateProp(propId).then((obj) => {
+        if (obj) {
+          this.contentVersion++;
+          this.collabSession.broadcastPatch({
+            type: 'prop_add',
+            prop: obj.data,
+          });
+          this.debug.log(`duplicated → ${obj.data.name}`);
+          this.markDirty();
+        }
+      });
       return;
     }
     if (this.hover?.kind === 'camera') {
@@ -1263,6 +2020,10 @@ class App {
       const obj = this.cams.adopt(data);
       this.contentVersion++;
       if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
+      this.collabSession.broadcastPatch({
+        type: 'camera_add',
+        camera: data,
+      });
       this.debug.log(`duplicated → ${data.name}`);
       this.refreshWristState();
       this.markDirty();
@@ -1270,7 +2031,7 @@ class App {
     }
     const id = this.hover?.kind === 'actor' ? this.hover.id : this.selectedActorId;
     if (!id) {
-      this.debug.log('Dup: point at (or select) an actor or camera first');
+      this.debug.log('Dup: point at (or select) an actor, prop, or camera first');
       return;
     }
     const data = duplicateActor(this.sceneData, id);
@@ -1280,6 +2041,10 @@ class App {
     this.contentVersion++;
     if (!this.views.isShifted) this.pendingReanchorActors.push(obj);
     this.selectActor(data.id);
+    this.collabSession.broadcastPatch({
+      type: 'actor_add',
+      actor: data,
+    });
     this.debug.log(`duplicated → ${data.name}`);
     this.markDirty();
   }
@@ -1450,13 +2215,27 @@ class App {
       this.debug.log('record: no active camera — place one first');
       return;
     }
-    const name = await this.recorder.start(this.renderer, size.w, size.h, base, performance.now());
+    const activeCam = this.cams.active;
+    const meta: TakeMetadata = {
+      cameraName: activeCam?.data.name || 'CAM A',
+      focalLengthMm: activeCam?.data.lensFocalLength || 35,
+      tStop: activeCam?.data.tStop || 2.8,
+      aspect: activeCam?.data.aspect || '16:9',
+      formatShort: sensorFormat(activeCam?.data.formatId ?? 's35').short,
+    };
+    const name = await this.recorder.start(this.renderer, size.w, size.h, base, performance.now(), true, meta);
+    if (name) {
+      globalSpatialFeedback.triggerHaptic('both', 'tally_start');
+      globalSpatialFeedback.playSpatialSound('tally_start');
+    }
     this.debug.log(name ? `recording ${name}` : 'record: video capture not supported in this browser');
     this.refreshWristState();
   }
 
   private stopRecording(save: boolean): void {
     if (!this.recorder.recording) return;
+    globalSpatialFeedback.triggerHaptic('both', 'tally_stop');
+    globalSpatialFeedback.playSpatialSound('tally_stop');
     this.recorder.stop(save);
     this.refreshWristState();
   }
@@ -1600,8 +2379,10 @@ class App {
       this.views.platform,
       this.views.fadeSphere,
       this.keyframes.vizGroup,
+      this.gizmo.root,
       ...this.actors.overlayObjects(),
       ...this.cams.overlayObjects(),
+      ...this.props.overlayObjects(),
     ];
     this.hiddenCacheVersion = this.contentVersion;
     return this.hiddenCache;
@@ -1610,14 +2391,19 @@ class App {
   // --- per-frame loop ----------------------------------------------------------------
 
   private loop(time: number, frame?: XRFrame): void {
+    this.performanceGovernor.beginFrame(time);
+    this.profilerRuntime.beginFrame(time);
     const dt = this.lastTime ? Math.min((time - this.lastTime) / 1000, 0.1) : 0.016;
     this.lastTime = time;
     if (!frame) {
       this.renderer.render(this.scene3, this.camera);
+      this.performanceGovernor.endFrame(this.renderer, this.splatRenderer, this.volumetrics, time);
+      this.profilerRuntime.endFrame(this.renderer, time);
       return;
     }
 
     this.input.poll();
+    globalSpatialFeedback.setXRInputSources(this.session.session?.inputSources ?? []);
     const pointer = this.input.pointerHand();
 
     this.session.viewerPose(frame, this.lastViewerPos, this.lastViewerQuat);
@@ -1649,6 +2435,9 @@ class App {
     // the ray as a fallback hover so a pinch can press the pointed-at sector
     // even when the occluded tip loses tracking; controllers by ray + trigger.
     const rc = this.input.raycaster(pointer, this.raycaster);
+    this.contextualRadial.update(this.camera);
+    if (rc) this.contextualRadial.handlePointer(rc, false);
+
     const tip = this.input.fingertip('right', _tip);
     this.tipOnWheel = tip !== null && this.wheel.touchAt(tip);
     const onWheel = this.tipOnWheel || this.wheel.update(rc);
@@ -1719,6 +2508,61 @@ class App {
     // Update Director's Smartwatch Slate
     const activeCam = this.cams.active;
     const focusDist = activeCam ? computeFocusDistance(activeCam.data, this.sceneData.actors) : 2.5;
+    const framing = activeCam
+      ? classifyShotSize(activeCam.data.lensFocalLength, activeCam.data.aspect, activeCam.data.formatId, focusDist)
+      : undefined;
+
+    let lineOfActionCrossing = false;
+    if (this.sceneData.actors.length >= 2) {
+      const axis = check180LineOfAction(
+        this.sceneData.cameras,
+        this.sceneData.actors[0].position,
+        this.sceneData.actors[1].position,
+      );
+      lineOfActionCrossing = axis.hasCrossing;
+    }
+
+    let cameraInShotWarning: string | null = null;
+    if (activeCam) {
+      const collisions = findCamerasInFrustums(this.sceneData.cameras).filter(
+        (c) => c.observerCamId === activeCam.data.id,
+      );
+      if (collisions.length > 0) {
+        cameraInShotWarning = `In Shot: ${collisions.map((c) => c.observedCamName).join(', ')}`;
+      }
+    }
+
+    const cameraMove = activeCam?.data.keyframes && activeCam.data.keyframes.length >= 2
+      ? classifyCameraMove(activeCam.data.keyframes)
+      : undefined;
+
+    let jumpCutWarning = false;
+    let eyelineMismatchWarning = false;
+    if (activeCam && this.sceneData.cameras.length >= 2) {
+      const otherCams = this.sceneData.cameras.filter((c) => c.id !== activeCam.data.id);
+      for (const other of otherCams) {
+        const jc = check30DegreeRule(activeCam.data, other);
+        if (jc.isJumpCut) {
+          jumpCutWarning = true;
+          break;
+        }
+      }
+      if (this.sceneData.actors.length >= 2) {
+        for (const other of otherCams) {
+          const em = checkEyelineMatch(
+            this.sceneData.actors[0].position,
+            this.sceneData.actors[1].position,
+            activeCam.data,
+            other,
+          );
+          if (em.status === 'crossing') {
+            eyelineMismatchWarning = true;
+            break;
+          }
+        }
+      }
+    }
+
     this.smartwatch.update(
       {
         sceneName: this.sceneData.name || 'Untitled Scene',
@@ -1730,10 +2574,56 @@ class App {
         focusTargetName: activeCam?.data.focusTargetActorId
           ? this.sceneData.actors.find((a) => a.id === activeCam.data.focusTargetActorId)?.name
           : undefined,
+        shotSize: framing?.shotSize,
+        shotSizeLabel: framing?.shotSizeLabel,
+        cameraMoveType: cameraMove?.moveType,
+        cameraMarksCount: activeCam?.data.keyframes?.length ?? 0,
+        cameraMoveProgress: this.keyframes.normalizedT,
+        lookAtTargetName: activeCam?.data.lookAtTargetActorId
+          ? this.sceneData.actors.find((a) => a.id === activeCam.data.lookAtTargetActorId)?.name
+          : undefined,
+        lineOfActionCrossing,
+        jumpCutWarning,
+        eyelineMismatchWarning,
+        cameraInShotWarning,
+        villageMode: this.cams.villageMode,
         recording: this.recorder.recording,
         recordingClock: recordingClock(this.recorder.elapsedS(time)),
         audioActive: shouldIncludeAudioTrack(true, true),
-        takeCount: 0,
+        takeCount: this.takeLibrary.count,
+
+        smpteTimecode: this.cams.dailiesActive && this.cams.dailiesTake
+          ? secondsToSmpte(this.cams.dailiesVideoElement?.currentTime ?? 0, 24).formatted
+          : this.keyframes.smpteTimecode,
+        smpteDuration: this.cams.dailiesActive && this.cams.dailiesTake
+          ? secondsToSmpte(this.cams.dailiesTake.durationS, 24).formatted
+          : this.keyframes.smpteDuration,
+        isPlaying: this.cams.dailiesActive
+          ? (this.cams.dailiesVideoElement ? !this.cams.dailiesVideoElement.paused : false)
+          : this.keyframes.isPlaying,
+        playbackRate: this.keyframes.playbackRate,
+        isLooping: this.keyframes.isLooping,
+        normalizedT: this.cams.dailiesActive
+          ? (this.cams.dailiesTake && this.cams.dailiesTake.durationS > 0
+              ? (this.cams.dailiesVideoElement?.currentTime ?? 0) / this.cams.dailiesTake.durationS
+              : 0)
+          : this.keyframes.normalizedT,
+        dailiesActive: this.cams.dailiesActive,
+        dailiesTakeNumber: this.takeLibrary.activeTake?.takeNumber,
+        dailiesTakeCount: this.takeLibrary.count,
+
+        audioCueCount: this.sceneData.audioCues?.length ?? 0,
+        propCount: this.props.all().length,
+        activeAudioCueName: sampleActiveAudioCues(this.sceneData.audioCues ?? [], this.keyframes.t)[0]?.cue.name,
+        isRecordingScratch: globalSpatialSoundEngine.isRecordingScratch,
+        audioCueMarkers: (this.sceneData.audioCues ?? []).map((c) => ({
+          normTime: this.keyframes.duration > 0 ? c.timestampS / this.keyframes.duration : 0,
+          color: c.color || '#46a758',
+        })),
+
+        collabPeerCount: this.collabRoster.count,
+        collabRoomCode: this.collabSession.roomCode,
+        collabIsConnected: this.collabSession.state === 'connected',
       },
       this.input,
       time
@@ -1827,7 +2717,100 @@ class App {
     this.views.update(time);
     this.cams.update(dt, time, this.lastViewerPos, this.lastViewerQuat);
     this.actors.updateLabels(time);
+    this.actors.updateAnimations(time * 0.001);
     this.driftMarker.update(time);
+
+    // Multi-User WebRTC Collaboration: Broadcast Presence & Spatial Audio Update
+    if (this.collabSession.state === 'connected' && time - this.lastCollabBroadcast > 33) {
+      this.lastCollabBroadcast = time;
+      const headPose = {
+        position: { x: this.camera.position.x, y: this.camera.position.y, z: this.camera.position.z },
+        rotation: {
+          x: this.camera.quaternion.x,
+          y: this.camera.quaternion.y,
+          z: this.camera.quaternion.z,
+          w: this.camera.quaternion.w,
+        },
+      };
+
+      const pointerRay = this.session.reticle.visible
+        ? {
+            origin: { x: this.camera.position.x, y: this.camera.position.y - 0.2, z: this.camera.position.z },
+            direction: { x: 0, y: -1, z: 0 },
+            hitPoint: {
+              x: this.session.reticle.position.x,
+              y: this.session.reticle.position.y,
+              z: this.session.reticle.position.z,
+            },
+          }
+        : undefined;
+
+      this.collabSession.broadcastPresence({
+        headPose,
+        pointerRay,
+        activeCameraId: this.cams.active?.data.id,
+        lockedEntityId: this.draggedActor?.data.id ?? this.draggedCamera?.data.id ?? undefined,
+      });
+
+      this.collabSession.updateListenerPose(this.camera.position, this.camera.quaternion);
+
+      // Prune stale peers
+      const stale = this.collabRoster.pruneStalePeers();
+      for (const id of stale) {
+        this.collabAvatars.removePeer(id);
+      }
+    }
+
+    // Stream LiveLink telemetry to Unreal Engine
+    if (this.sceneData.livelink?.enabled) {
+      const activeCam = this.cams.active;
+      let streamPos: { x: number; y: number; z: number };
+      let streamRot: { x: number; y: number; z: number; w: number };
+      let focalMm = 35;
+      let tStop = 2.8;
+      let focusDist = 2.5;
+      let sensorW = 24.89;
+      let sensorH = 14.0;
+      let fov = 54.0;
+
+      if (activeCam) {
+        const p = activeCam.root.position;
+        const q = activeCam.root.quaternion;
+        streamPos = { x: p.x, y: p.y, z: p.z };
+        streamRot = { x: q.x, y: q.y, z: q.z, w: q.w };
+        focalMm = activeCam.data.lensFocalLength;
+        tStop = activeCam.data.tStop;
+        focusDist = computeFocusDistance(activeCam.data, this.sceneData.actors);
+        const sFmt = sensorFormat(activeCam.data.formatId);
+        sensorW = sFmt.gateWidthMm;
+        sensorH = sFmt.gateWidthMm / aspectValue(activeCam.data.aspect);
+        fov = hFovDeg(focalMm, sFmt);
+      } else {
+        streamPos = { x: this.lastViewerPos.x, y: this.lastViewerPos.y, z: this.lastViewerPos.z };
+        streamRot = {
+          x: this.lastViewerQuat.x,
+          y: this.lastViewerQuat.y,
+          z: this.lastViewerQuat.z,
+          w: this.lastViewerQuat.w,
+        };
+      }
+
+      this.liveLinkStreamer.sendFrame(
+        streamPos,
+        streamRot,
+        {
+          focalLengthMm: focalMm,
+          apertureTStop: tStop,
+          focusDistanceM: focusDist,
+          sensorWidthMm: sensorW,
+          sensorHeightMm: sensorH,
+          fieldOfViewDeg: fov,
+        },
+        dt,
+      );
+
+      this.vcamHud.updateCameraOptics(focalMm, tStop, focusDist, activeCam?.data.aspect ?? '2.39:1');
+    }
 
     const recording = this.recorder.recording;
     if (this.views.mode === 'camera' || recording) {
@@ -1857,7 +2840,7 @@ class App {
       }
     }
 
-    // Ghost any actor the user's head is inside — walking through your own
+    // Ghost any actor the user's head is inside: walking through your own
     // blocking is normal; a torso across the eyes is not (first-QA video:
     // "giant actor on my face"). Scale-aware like the camera-gizmo ghosting;
     // never a mid-drag actor (deliberately in hand). Runs AFTER the virtual
@@ -1894,18 +2877,547 @@ class App {
         this.wrist.setLabel('record', `⏺ ${recordingClock(this.recorder.elapsedS(time))}`);
     }
 
+    this.splatRenderer.update(this.camera);
+    const activeCamObj = this.cams.active ?? this.cams.all()[0];
+    if (activeCamObj) {
+      const focalMm = Number(activeCamObj.data.lensFocalLength) || 35;
+      const fmt = sensorFormat(activeCamObj.data.formatId);
+      const fov = vFovDeg(activeCamObj.data.lensFocalLength, activeCamObj.data.aspect, fmt);
+      const aspect = aspectValue(activeCamObj.data.aspect);
+      this.icvfxRenderer.update(
+        {
+          position: activeCamObj.root.position,
+          quaternion: activeCamObj.root.quaternion,
+          fov,
+          aspect,
+        },
+        focalMm,
+        fmt.gateWidthMm,
+        4096,
+      );
+    }
+    this.acousticsRenderer.update(
+      this.sceneData.actors,
+      activeCamObj?.data,
+      time * 0.001,
+    );
+    this.solarRenderer.update(dt);
+    this.screenplayRenderer.update(this.sceneData.actors, this.sceneData.cameras);
+    this.comfortRenderer.update(
+      this.camera,
+      dt,
+      [
+        ...(this.sceneData.props ?? []).map((p) => ({
+          id: p.id,
+          name: p.name,
+          position: p.position,
+          category: 'prop' as const,
+        })),
+        ...(this.sceneData.cameras ?? []).map((c) => ({
+          id: c.id,
+          name: c.name,
+          position: c.position,
+          category: 'camera_grip' as const,
+        })),
+        ...(this.sceneData.actors ?? []).map((a) => ({
+          id: a.id,
+          name: a.name,
+          position: a.position,
+          category: 'actor' as const,
+        })),
+      ],
+    );
+    this.volumetrics.tick(dt, this.sceneData.atmosphere, this.sceneData.lights ?? [], this.camera);
+    this.gizmo.update(this.camera);
     this.renderer.render(this.scene3, this.camera);
+    this.performanceGovernor.endFrame(this.renderer, this.splatRenderer, this.volumetrics, time);
+    this.profilerRuntime.endFrame(this.renderer, time);
+  }
+
+  private openPerformanceSettings(): void {
+    openPerformanceSettingsModal(
+      this.performanceGovernor,
+      (cfg) => {
+        this.debug.log(`Perf governor config updated: target ${cfg.targetFps} FPS`);
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openDmxBridgeDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openDmxBridgeStudioModal(
+      sc,
+      (config) => {
+        sc.dmxBridge = config;
+        this.dmxStreamer.setConfig(config);
+        this.persistence.saveNow(this.sceneData);
+        this.markDirty();
+      },
+      (patches) => {
+        sc.dmxPatches = patches;
+        this.persistence.saveNow(this.sceneData);
+        this.markDirty();
+      },
+      (cue) => {
+        this.debug.log(`Triggered DMX Cue: ${cue.name}`);
+      },
+      this.dmxStreamer,
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openIcvfxStudioDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openIcvfxStudioModal(
+      sc,
+      (config) => {
+        sc.icvfx = config;
+        if (sc.id === this.sceneData.id) {
+          this.icvfxRenderer.setConfig(config);
+        }
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'icvfx_update',
+          config,
+        });
+        this.markDirty();
+      },
+      () => {
+        this.debug.log('Exported nDisplay configuration');
+      },
+      () => {
+        this.debug.log('Exported OpenUSD LED volume stage');
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openAcousticsStudioDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openAcousticsStudioModal(
+      sc,
+      (config) => {
+        sc.acoustics = config;
+        if (sc.id === this.sceneData.id) {
+          this.acousticsRenderer.setConfig(config);
+        }
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'acoustics_update',
+          config,
+        });
+        this.markDirty();
+      },
+      () => {
+        this.debug.log('Exported BWF sound report');
+      },
+      () => {
+        this.debug.log('Exported AES31-3 / iXML manifest');
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openSolarStudioDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openSolarStudioModal(
+      sc,
+      (config) => {
+        sc.solar = config;
+        if (sc.id === this.sceneData.id) {
+          this.solarRenderer.setConfig(config);
+        }
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'solar_update',
+          config,
+        });
+        this.markDirty();
+      },
+      () => {
+        this.debug.log('Exported solar tracking CSV');
+      },
+      () => {
+        this.debug.log('Exported standalone DP Sun-Report HTML');
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openScreenplayStudioDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openScreenplayBreakdownModal(
+      sc,
+      (config) => {
+        sc.screenplay = config;
+        if (sc.id === this.sceneData.id) {
+          this.screenplayRenderer.setConfig(config);
+        }
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'screenplay_update',
+          config,
+        });
+        this.markDirty();
+      },
+      (coverage) => {
+        const patch: CollabScenePatch = {
+          type: 'screenplay_apply_coverage',
+          coverage,
+        };
+        this.collabSession.broadcastPatch(patch);
+        applyScenePatch(this.sceneData, patch);
+        this.cams.setScene(this.sceneData);
+        this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
+        this.contentVersion++;
+        this.persistence.saveNow(this.sceneData);
+        this.debug.log(`Applied ${coverage.length} AI coverage cameras to scene`);
+        this.markDirty();
+      },
+      () => {
+        this.debug.log('Exported Screenplay Shot List CSV');
+      },
+      () => {
+        this.debug.log('Exported Director Pitch Deck HTML');
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openWebXRProfilerDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openWebXRProfilerModal(
+      sc,
+      (config) => {
+        sc.profiler = config;
+        if (sc.id === this.sceneData.id) {
+          this.profilerRuntime.updateConfig(config);
+        }
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'profiler_update',
+          config,
+        });
+        this.markDirty();
+      },
+      async (scenarioId) => {
+        return await this.profilerRuntime.startBenchmark(scenarioId);
+      },
+      () => {
+        this.debug.log('Exported WebXR profiler telemetry CSV');
+      },
+      () => {
+        this.debug.log('Exported WebXR standalone performance audit deck HTML');
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openVRComfortDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openVRComfortModal(
+      sc,
+      (config) => {
+        sc.comfort = config;
+        if (sc.id === this.sceneData.id) {
+          this.comfortRenderer.setConfig(config);
+        }
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'comfort_update',
+          config,
+        });
+        this.markDirty();
+      },
+      undefined,
+      () => {
+        this.debug.log('Exported VR comfort telemetry CSV');
+      },
+      () => {
+        this.debug.log('Exported VR standalone comfort audit deck HTML');
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private openSetDressingDialog(sceneToUse?: SceneData): void {
+    const sc = sceneToUse ?? this.sceneData;
+    openSetDressingStudioModal(
+      sc,
+      (config) => {
+        sc.setDressing = config;
+        if (sc.id === this.sceneData.id) {
+          this.setDressingRenderer.setConfig(config);
+        }
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'set_dressing_update',
+          config,
+        });
+        this.markDirty();
+      },
+      (_theme, _density, _enablePhysics) => {
+        if (sc.id === this.sceneData.id && sc.setDressing) {
+          this.setDressingRenderer.setConfig(sc.setDressing);
+        }
+        this.persistence.saveNow(this.sceneData);
+        if (sc.setDressing) {
+          this.collabSession.broadcastPatch({
+            type: 'set_dressing_scatter',
+            theme: sc.setDressing.activeTheme,
+            items: sc.setDressing.settledItems,
+          });
+        }
+        this.markDirty();
+      },
+      (mutations) => {
+        this.persistence.saveNow(this.sceneData);
+        this.collabSession.broadcastPatch({
+          type: 'set_dressing_ai_mutate',
+          mutations,
+        });
+        this.markDirty();
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
+  }
+
+  private handleContextQuickAction(action: ContextQuickAction, entityId: string, _entityType: string): void {
+    const actionKey = action.actionType || action.id;
+    switch (actionKey) {
+      case 'set_dressing_open_studio': {
+        this.openSetDressingDialog();
+        break;
+      }
+      case 'set_dressing_quick_scatter': {
+        const conf = this.sceneData.setDressing ?? createSetDressingConfig();
+        const regions = conf.regions.length ? conf.regions : detectSemanticRegions(this.sceneData);
+        const newItems: SettledPropItem[] = [];
+        for (const r of regions) {
+          newItems.push(...generateThemeScatter(conf.activeTheme, r, conf.scatterConfig));
+        }
+        conf.settledItems = newItems;
+        this.sceneData.setDressing = conf;
+        this.setDressingRenderer.setConfig(conf);
+        this.debug.log(`Quick Scatter: placed ${newItems.length} props (${conf.activeTheme})`);
+        this.collabSession.broadcastPatch({
+          type: 'set_dressing_scatter',
+          theme: conf.activeTheme,
+          items: newItems,
+        });
+        this.markDirty();
+        break;
+      }
+
+      case 'set_dressing_ai_prompt': {
+        this.openSetDressingDialog();
+        break;
+      }
+      case 'comfort_open_studio': {
+        this.openVRComfortDialog();
+        break;
+      }
+
+      case 'comfort_toggle_reach_zones': {
+        const conf = this.sceneData.comfort ?? createVRComfortConfig();
+        conf.enabled = !conf.enabled;
+        this.comfortRenderer.setConfig(conf);
+        this.debug.log(`Comfort Reach Zones ${conf.enabled ? 'ON' : 'OFF'}`);
+        this.markDirty();
+        break;
+      }
+      case 'comfort_toggle_vignette': {
+        const conf = this.sceneData.comfort ?? createVRComfortConfig();
+        conf.vignette.enabled = !conf.vignette.enabled;
+        this.comfortRenderer.setConfig(conf);
+        this.debug.log(`Comfort Vignette ${conf.vignette.enabled ? 'ON' : 'OFF'}`);
+        this.markDirty();
+        break;
+      }
+      case 'script_open_breakdown': {
+        this.openScreenplayStudioDialog();
+        break;
+      }
+      case 'script_apply_coverage': {
+        this.openScreenplayStudioDialog();
+        break;
+      }
+      case 'cam_audit_180_line': {
+        this.openScreenplayStudioDialog();
+        break;
+      }
+      case 'profiler_open_studio': {
+        this.openWebXRProfilerDialog();
+        break;
+      }
+      case 'profiler_toggle_hud': {
+        const conf = this.sceneData.profiler ?? createVRProfilerConfig();
+        conf.showDiagnosticHud = !conf.showDiagnosticHud;
+        this.profilerRuntime.updateConfig(conf);
+        this.debug.log(`Profiler HUD ${conf.showDiagnosticHud ? 'ON' : 'OFF'}`);
+        this.markDirty();
+        break;
+      }
+      case 'profiler_run_benchmark': {
+        this.openWebXRProfilerDialog();
+        break;
+      }
+      case 'actor_set_dialogue_pair': {
+        if (!this.sceneData.screenplay) {
+          this.sceneData.screenplay = createScreenplayConfig();
+        }
+        if (!this.sceneData.screenplay.dialoguePartnerAId || this.sceneData.screenplay.dialoguePartnerAId === entityId) {
+          this.sceneData.screenplay.dialoguePartnerAId = entityId;
+          const other = this.sceneData.actors.find((a) => a.id !== entityId);
+          if (other) this.sceneData.screenplay.dialoguePartnerBId = other.id;
+        } else {
+          this.sceneData.screenplay.dialoguePartnerBId = entityId;
+        }
+        this.screenplayRenderer.setConfig(this.sceneData.screenplay);
+        this.debug.log(`Set dialogue pair actor: ${entityId}`);
+        this.markDirty();
+        break;
+      }
+      case 'light_open_dmx': {
+        this.openDmxBridgeDialog();
+        break;
+      }
+      case 'cam_icvfx_moire': {
+        this.openIcvfxStudioDialog();
+        break;
+      }
+      case 'cam_boom_incursion':
+      case 'boom_open_acoustics': {
+        this.openAcousticsStudioDialog();
+        break;
+      }
+      case 'sun_open_solar_studio': {
+        this.openSolarStudioDialog();
+        break;
+      }
+      case 'sun_snap_golden_hour': {
+        const conf = this.sceneData.solar ?? createSolarEnvironmentConfig('golden_hour_sunset');
+        conf.timeOfDayHours = 18.0;
+        this.solarRenderer.setConfig(conf);
+        this.debug.log('Sun snapped to Golden Hour (18:00)');
+        this.markDirty();
+        break;
+      }
+      case 'sun_snap_high_noon': {
+        const conf = this.sceneData.solar ?? createSolarEnvironmentConfig('high_noon_clear');
+        conf.timeOfDayHours = 12.0;
+        this.solarRenderer.setConfig(conf);
+        this.debug.log('Sun snapped to High Noon (12:00)');
+        this.markDirty();
+        break;
+      }
+      case 'sun_toggle_shadows': {
+        const conf = this.sceneData.solar ?? createSolarEnvironmentConfig('golden_hour_sunset');
+        conf.castShadows = !conf.castShadows;
+        this.solarRenderer.setConfig(conf);
+        this.debug.log(`Solar cascaded shadows ${conf.castShadows ? 'ON' : 'OFF'}`);
+        this.markDirty();
+        break;
+      }
+      case 'actor_boom_target': {
+        const actor = this.actors.all().find((a) => a.data.id === entityId);
+        if (actor && this.sceneData.acoustics?.boomMics?.length) {
+          this.sceneData.acoustics.boomMics[0].targetActorId = actor.data.id;
+          this.acousticsRenderer.setConfig(this.sceneData.acoustics);
+          this.debug.log(`Aimed Boom 1 cue at actor: ${actor.data.name}`);
+          this.markDirty();
+        }
+        break;
+      }
+      case 'actor_cycle_stance': {
+        const actor = this.actors.all().find((a) => a.data.id === entityId);
+        if (actor) {
+          const next = cycleStance(actor.data.stance as StanceId);
+          this.actors.setStance(actor, next);
+          this.debug.log(`Actor stance: ${next}`);
+          this.markDirty();
+        }
+        break;
+      }
+      case 'actor_add_mark': {
+        const actor = this.actors.all().find((a) => a.data.id === entityId);
+        if (actor) {
+          actor.data.keyframes.push({
+            position: { ...actor.data.position },
+            rotationY: actor.data.rotationY,
+            stance: actor.data.stance,
+          });
+          this.debug.log(`Mark placed for ${actor.data.name}`);
+          this.markDirty();
+        }
+        break;
+      }
+      case 'actor_duplicate': {
+        const actor = this.actors.all().find((a) => a.data.id === entityId);
+        if (actor) {
+          const copy = this.actors.spawn(
+            { x: actor.data.position.x + 0.5, y: actor.data.position.y, z: actor.data.position.z + 0.5 },
+            actor.data.rotationY,
+          );
+          this.selectActor(copy.data.id);
+          this.markDirty();
+        }
+        break;
+      }
+      case 'camera_step_focal': {
+        this.cams.stepActiveFocal(1);
+        this.refreshWristState();
+        break;
+      }
+      case 'record_take': {
+        void this.toggleRecording();
+        break;
+      }
+      case 'prop_ground_floor': {
+        const prop = this.props.all().find((p) => p.data.id === entityId);
+        if (prop) {
+          prop.data.position.y = 0;
+          prop.root.position.y = 0;
+          this.debug.log(`Grounded prop ${prop.data.name} to floor`);
+          this.markDirty();
+        }
+        break;
+      }
+      case 'prop_duplicate': {
+        const prop = this.props.all().find((p) => p.data.id === entityId);
+        if (prop) {
+          void this.props.duplicateProp(prop.data.id).then((spawned) => {
+            if (spawned) {
+              this.selectProp(spawned.data.id);
+              this.markDirty();
+            }
+          });
+        }
+        break;
+      }
+      case 'prop_delete': {
+        this.props.removeProp(entityId);
+        this.contextualRadial.hide();
+        this.selectedPropId = null;
+        this.markDirty();
+        break;
+      }
+      default:
+        this.debug.log(`Quick action executed: ${action.label}`);
+        break;
+    }
   }
 
   private updateHover(rc: THREE.Raycaster | null): void {
     let next: Hover = null;
-    if (rc && !this.draggedActor && !this.draggedCamera && !this.draggedFurniture && !this.miniGrabbing) {
+    if (rc && !this.draggedActor && !this.draggedCamera && !this.draggedProp && !this.draggedFurniture && !this.miniGrabbing) {
       if (this.hoverTargetsVersion !== this.contentVersion) {
         // The mode decides what the ray can touch: blocking never hovers the
         // couch behind an actor; dressing never disturbs the blocking.
         this.hoverTargets =
           this.interactionMode === 'block'
-            ? [...this.actors.raycastTargets(), ...this.cams.raycastTargets()]
+            ? [...this.actors.raycastTargets(), ...this.cams.raycastTargets(), ...this.props.raycastTargets()]
             : [...this.location.furnitureTargets()];
         this.hoverTargetsVersion = this.contentVersion;
       }
@@ -1922,6 +3434,10 @@ class App {
         }
         let o: THREE.Object3D | null = hit.object;
         while (o) {
+          if (typeof o.userData.propId === 'string') {
+            next = { kind: 'prop', id: o.userData.propId };
+            break;
+          }
           if (typeof o.userData.cameraId === 'string') {
             next = { kind: 'camera', id: o.userData.cameraId };
             break;
@@ -1934,7 +3450,104 @@ class App {
     if (next?.id !== this.hover?.id || next?.kind !== this.hover?.kind) {
       this.hover = next;
       this.actors.setHovered(next?.kind === 'actor' ? next.id : null);
+      this.props.setHovered(next?.kind === 'prop' ? next.id : null);
     }
+  }
+
+  private applyRemotePatch(patch: CollabScenePatch): void {
+    const success = applyScenePatch(this.sceneData, patch);
+    if (!success) return;
+
+    if (patch.type.startsWith('actor_')) {
+      this.actors.setScene(this.sceneData);
+      this.keyframes.setScene(this.sceneData);
+      this.contentVersion++;
+    } else if (patch.type.startsWith('prop_')) {
+      this.props.setScene(this.sceneData);
+      this.contentVersion++;
+    } else if (patch.type.startsWith('camera_')) {
+      this.cams.setScene(this.sceneData);
+      this.keyframes.setScene(this.sceneData);
+      this.contentVersion++;
+    } else if (patch.type.startsWith('screenplay_')) {
+      this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
+      if (patch.type === 'screenplay_apply_coverage') {
+        this.cams.setScene(this.sceneData);
+        this.contentVersion++;
+      }
+    } else if (patch.type.startsWith('comfort_')) {
+      this.comfortRenderer.setConfig(this.sceneData.comfort ?? null);
+    } else if (patch.type === 'timeline_transport') {
+      if (patch.isPlaying !== undefined) {
+        if (patch.isPlaying) this.keyframes.play();
+        else this.keyframes.pause();
+      }
+      if (patch.currentTimeS !== undefined) {
+        const ratio = this.keyframes.duration > 0 ? patch.currentTimeS / this.keyframes.duration : 0;
+        this.keyframes.scrubTo(ratio);
+      }
+    }
+  }
+
+  private async openPropsLibrary(): Promise<void> {
+    const customAssets = await globalPropStore.listAssets();
+    openPropsLibraryModal(
+      async (assetId, customKey) => {
+        const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
+        const spawnPos = {
+          x: viewerLocal.x,
+          y: 0,
+          z: viewerLocal.z - 1.2,
+        };
+        const obj = await this.props.addProp(assetId, spawnPos, {
+          customModelKey: customKey,
+        });
+        this.collabSession.broadcastPatch({
+          type: 'prop_add',
+          prop: obj.data,
+        });
+        this.markDirty();
+        this.contentVersion++;
+        this.debug.log(`placed prop: ${obj.data.name}`);
+      },
+      customAssets,
+      async (file) => {
+        await globalPropStore.saveAssetFromFile(file);
+      },
+      async (id) => {
+        await globalPropStore.deleteAsset(id);
+      },
+    );
+  }
+
+  private openCollabDialog(): void {
+    openCollabModal(
+      this.collabSession,
+      this.collabRoster,
+      this.collabLockManager,
+      (roomCode, name, role) => {
+        this.collabSession.joinRoom(roomCode, name, role);
+        this.debug.log(`collab: joining room ${roomCode} as ${name} (${role})`);
+      },
+      () => {
+        this.collabSession.leaveRoom();
+        this.collabAvatars.clear();
+        this.collabRoster.clear();
+        this.debug.log('collab: disconnected from room');
+      },
+    );
+  }
+
+  private openLiveLinkDialog(): void {
+    openLiveLinkModal(
+      this.liveLinkStreamer,
+      this.sceneData,
+      (cfg) => {
+        this.sceneData.livelink = cfg;
+        this.persistence.saveNow(this.sceneData);
+      },
+      document.getElementById('overlay') ?? document.body,
+    );
   }
 }
 

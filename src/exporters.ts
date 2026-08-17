@@ -481,29 +481,221 @@ export function buildAIPrompt(scene: SceneData): string {
   return parts.join(' ');
 }
 
-/** Simulates AI Shot Analysis evaluation for offline/mock usage. */
-export function simulateAiShotAnalysis(scene: SceneData): string {
-  const lines: string[] = [];
-  lines.push('# AI Shot Analysis & Continuity Report');
-  lines.push('');
-  lines.push(`Scene: **${scene.name}** | ${scene.cameras.length} Camera(s) | ${scene.actors.length} Actor(s)`);
-  lines.push('');
-  lines.push('## Shot Coverage & Gap Identification');
-  lines.push('- Coverage looks complete across primary actors.');
-  lines.push('');
-  lines.push('## 180-Degree Line Rule & Eyeline Continuity Audit');
-  lines.push('- All cameras respect the axis of action.');
-  lines.push('');
-  lines.push('## Lens Selection & Perspective Consistency');
-  lines.push('- Focal length selection is consistent across setups.');
-  lines.push('');
-  lines.push('## Lighting Plan & Key Light Direction Recommendations');
-  lines.push('- Key light direction aligns with subject facing angles.');
-  lines.push('');
-  lines.push('## Scene Pacing & Blocking Flow Feedback');
-  lines.push(`- Blocking pace (${scene.walkSpeed.toFixed(1)} m/s) feels natural.`);
-  return lines.join('\n');
+import {
+  buildAiContinuityPromptPackage,
+  generateScriptBreakdownFromScene,
+  generateStoryboard,
+  simulateAiContinuityBreakdown,
+} from './continuity.ts';
+
+/** Exports standalone printable Storyboard HTML file. */
+export function exportStoryboardHtml(scene: SceneData): void {
+  const script = generateScriptBreakdownFromScene(scene);
+  const sheet = generateStoryboard(scene, script);
+  const html = sheet.htmlDocument;
+  download(`${slug(scene.name)}.storyboard.html`, new Blob([html], { type: 'text/html;charset=utf-8' }));
 }
 
+/** Exports standalone SVG Storyboard multi-panel sheet. */
+export function exportStoryboardSvg(scene: SceneData): void {
+  const sheet = generateStoryboard(scene);
+  download(`${slug(scene.name)}.storyboard.svg`, new Blob([sheet.svgDocument], { type: 'image/svg+xml;charset=utf-8' }));
+}
 
+/** Exports AI Cinematography & Continuity Prompt Markdown package. */
+export function exportAiPromptPackage(scene: SceneData): void {
+  const prompt = buildAiContinuityPromptPackage(scene);
+  download(`${slug(scene.name)}.ai-prompt.md`, new Blob([prompt], { type: 'text/markdown;charset=utf-8' }));
+}
+
+/** Simulates AI Shot Analysis & Continuity evaluation for offline/mock usage. */
+export function simulateAiShotAnalysis(scene: SceneData): string {
+  return simulateAiContinuityBreakdown(scene);
+}
+
+import {
+  exportSceneTimeline,
+  generateCmx3600Edl,
+  generateFinalCutProXml,
+  generateFcpxml,
+  generateCsvShotList,
+  generateAvidMarkerList,
+  type NleExportFormat,
+  type NleExportOptions,
+} from './nleExport.ts';
+
+import {
+  calculateMeshAABB,
+  calculateMeshNormals,
+  compute2DConvexHull,
+  createSyntheticLocationScan,
+  exportScanAsGeoJson,
+  exportScanAsObj,
+  exportScanAsPly,
+  exportScanAsUsd,
+  getSemanticColor,
+  SEMANTIC_PALETTE,
+  type GeoJsonScanCollection,
+  type GeoJsonScanFeature,
+  type ObjExportResult,
+  type SemanticColor,
+} from './scanExporters.ts';
+import type { LocationScan } from './scan.ts';
+import {
+  exportUe5BridgePackage,
+  generateOpenUsdScene,
+  generateUe5JsonManifest,
+  generateUe5PythonImportScript,
+  hexToRgb,
+  resolveUe5ExportOptions,
+  svHeadingToUeYaw,
+  svQuatToUeRotator,
+  svToUeLocation,
+  type Ue5BridgePackageResult,
+  type Ue5ExportFormat,
+  type Ue5ExportOptions,
+  type UeRotator,
+  type UnrealVersion,
+} from './ue5Bridge.ts';
+
+export {
+  exportSceneTimeline,
+  generateCmx3600Edl,
+  generateFinalCutProXml,
+  generateFcpxml,
+  generateCsvShotList,
+  generateAvidMarkerList,
+  type NleExportFormat,
+  type NleExportOptions,
+  exportScanAsObj,
+  exportScanAsPly,
+  exportScanAsUsd,
+  exportScanAsGeoJson,
+  createSyntheticLocationScan,
+  getSemanticColor,
+  calculateMeshNormals,
+  calculateMeshAABB,
+  compute2DConvexHull,
+  SEMANTIC_PALETTE,
+  type ObjExportResult,
+  type SemanticColor,
+  type GeoJsonScanCollection,
+  type GeoJsonScanFeature,
+  exportUe5BridgePackage,
+  generateOpenUsdScene,
+  generateUe5JsonManifest,
+  generateUe5PythonImportScript,
+  hexToRgb,
+  resolveUe5ExportOptions,
+  svHeadingToUeYaw,
+  svQuatToUeRotator,
+  svToUeLocation,
+  type Ue5BridgePackageResult,
+  type Ue5ExportFormat,
+  type Ue5ExportOptions,
+  type UeRotator,
+  type UnrealVersion,
+};
+
+/** Downloads the generated NLE timeline export file based on the requested format. */
+export function downloadNleTimelineExport(
+  scene: SceneData,
+  format: NleExportFormat,
+  options?: NleExportOptions,
+): void {
+  const res = exportSceneTimeline(scene, format, options);
+  download(res.filename, new Blob([res.content], { type: res.mimeType }));
+}
+
+/** Downloads standard CMX 3600 EDL file. */
+export function downloadCmx3600Edl(scene: SceneData, options?: NleExportOptions): void {
+  downloadNleTimelineExport(scene, 'cmx3600_edl', options);
+}
+
+/** Downloads Apple Final Cut Pro 7 / Adobe Premiere Pro XML file. */
+export function downloadFinalCutProXml(scene: SceneData, options?: NleExportOptions): void {
+  downloadNleTimelineExport(scene, 'fcp7_xml', options);
+}
+
+/** Downloads Final Cut Pro X FCPXML file. */
+export function downloadFcpxml(scene: SceneData, options?: NleExportOptions): void {
+  downloadNleTimelineExport(scene, 'fcpxml', options);
+}
+
+/** Downloads Production CSV Shot List file. */
+export function downloadCsvShotList(scene: SceneData, options?: NleExportOptions): void {
+  downloadNleTimelineExport(scene, 'csv_shotlist', options);
+}
+
+/** Downloads Avid Media Composer Marker List file. */
+export function downloadAvidMarkerList(scene: SceneData, options?: NleExportOptions): void {
+  downloadNleTimelineExport(scene, 'avid_markers', options);
+}
+
+/** Downloads Wavefront OBJ + MTL 3D scan mesh files. */
+export function downloadScanObj(scan: LocationScan, baseName = 'location_scan'): void {
+  const safeBase = slug(baseName);
+  const mtlFilename = `${safeBase}.mtl`;
+  const res = exportScanAsObj(scan, mtlFilename);
+  download(`${safeBase}.obj`, new Blob([res.obj], { type: 'text/plain;charset=utf-8' }));
+  download(mtlFilename, new Blob([res.mtl], { type: 'text/plain;charset=utf-8' }));
+}
+
+/** Downloads Stanford PLY 3D mesh (ASCII or binary). */
+export function downloadScanPly(scan: LocationScan, baseName = 'location_scan', binary = false): void {
+  const safeBase = slug(baseName);
+  const data = exportScanAsPly(scan, binary);
+  if (typeof data === 'string') {
+    download(`${safeBase}.ply`, new Blob([data], { type: 'text/plain;charset=utf-8' }));
+  } else {
+    download(`${safeBase}.ply`, new Blob([data as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' }));
+  }
+}
+
+/** Downloads USDA OpenUSD 3D mesh file for Unreal Engine 5, Maya, or Blender. */
+export function downloadScanUsd(scan: LocationScan, baseName = 'location_scan'): void {
+  const safeBase = slug(baseName);
+  const usd = exportScanAsUsd(scan);
+  download(`${safeBase}.usda`, new Blob([usd], { type: 'text/plain;charset=utf-8' }));
+}
+
+/** Downloads 2D architectural room footprint and furniture boundary polygon GeoJSON. */
+export function downloadScanGeoJson(scan: LocationScan, baseName = 'location_scan'): void {
+  const safeBase = slug(baseName);
+  const geojson = exportScanAsGeoJson(scan);
+  download(`${safeBase}.geojson`, new Blob([geojson], { type: 'application/geo+json;charset=utf-8' }));
+}
+
+/** Downloads all 3D scan formats as a comprehensive location scouting deliverable set. */
+export function downloadLocationScanPackage(scan: LocationScan, baseName = 'location_scan'): void {
+  downloadScanObj(scan, baseName);
+  downloadScanPly(scan, baseName);
+  downloadScanUsd(scan, baseName);
+  downloadScanGeoJson(scan, baseName);
+}
+
+/** Downloads the Unreal Engine 5 Bridge package for the requested format. */
+export function downloadUe5BridgePackage(
+  scene: SceneData,
+  format: Ue5ExportFormat,
+  options?: Ue5ExportOptions,
+): void {
+  const res = exportUe5BridgePackage(scene, format, options);
+  download(res.filename, new Blob([res.content], { type: res.mimeType }));
+}
+
+/** Downloads Universal Scene Description USDA ASCII format for OpenUSD and Unreal Engine USD Stage. */
+export function downloadOpenUsdScene(scene: SceneData, options?: Ue5ExportOptions): void {
+  downloadUe5BridgePackage(scene, 'open_usd', options);
+}
+
+/** Downloads self-contained Unreal Engine 5 Python automation import script. */
+export function downloadUe5PythonImportScript(scene: SceneData, options?: Ue5ExportOptions): void {
+  downloadUe5BridgePackage(scene, 'ue5_python_script', options);
+}
+
+/** Downloads formatted UE5 JSON manifest interchange for custom C++ plugins or LiveLink. */
+export function downloadUe5JsonManifest(scene: SceneData, options?: Ue5ExportOptions): void {
+  downloadUe5BridgePackage(scene, 'ue5_json_manifest', options);
+}
 

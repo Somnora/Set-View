@@ -4,13 +4,15 @@
 // and cameras (teleport walkthrough, miniature diorama, camera view).
 //
 // Display modes:
-//   hidden — on location, the real room is visible in passthrough; default.
-//   ghost  — translucent overlay for checking scan/world alignment.
-//   solid  — gray-box set for walking the location anywhere (VR walkthrough).
+//   hidden    - on location, the real room is visible in passthrough; default.
+//   ghost     - translucent overlay for checking scan/world alignment.
+//   solid     - gray-box set for walking the location anywhere (VR walkthrough).
+//   wireframe - semantic wireframe overlay for scouting spatial layout.
+//
 // Whatever the mode, the virtual camera pass temporarily forces solid so the
 // monitor and photo captures frame shots inside the scanned set.
 //
-// Perf: flat Lambert per the app-wide budget (no shadows, no textures — the
+// Perf: flat Lambert per the app-wide budget (no shadows, no textures - the
 // platform never exposes camera imagery, so scans are untextured by design).
 // ---------------------------------------------------------------------------
 
@@ -18,9 +20,10 @@ import * as THREE from 'three';
 import type { FurniturePlacement } from './model.ts';
 import { isMovableScanMesh, meshFootprintCenter, quatYaw, type LocationScan } from './scan.ts';
 
-export type LocationMode = 'hidden' | 'ghost' | 'solid';
+export type LocationMode = 'hidden' | 'ghost' | 'solid' | 'wireframe';
 
 const GHOST_OPACITY = 0.35;
+const WIREFRAME_OPACITY = 0.85;
 
 /** Subtle semantic tints so walls/floor/furniture read at a glance. */
 const LABEL_COLORS: Record<string, number> = {
@@ -28,6 +31,7 @@ const LABEL_COLORS: Record<string, number> = {
   ceiling: 0xb9bec8,
   'wall face': 0x9aa1ac,
   wall: 0x9aa1ac,
+  walls: 0x9aa1ac,
   table: 0x7a8aa6,
   desk: 0x7a8aa6,
   couch: 0x7a8aa6,
@@ -44,8 +48,16 @@ interface FurnitureEntry {
   /** Index into the scan's mesh list (the placement key). */
   meshIndex: number;
   label: string;
-  /** Captured footprint center — the mesh's rest position after re-centering. */
+  /** Captured footprint center - the mesh's rest position after re-centering. */
   center: THREE.Vector3;
+}
+
+export interface RoomDimensions {
+  min: THREE.Vector3;
+  max: THREE.Vector3;
+  widthM: number;
+  depthM: number;
+  heightM: number;
 }
 
 export class LocationRenderer {
@@ -53,34 +65,76 @@ export class LocationRenderer {
   readonly group = new THREE.Group();
   mode: LocationMode = 'hidden';
 
+  /** Whether a wireframe edge overlay is active on top of solid / ghost rendering. */
+  wireframeOverlay = false;
+
+  /** Floor level vertical offset in meters (for manual or auto leveling). */
+  floorOffset = 0;
+
+  /** Whether the room bounding box visualizer is enabled. */
+  showBounds = false;
+
   /** One shared material per distinct color; retuned when the mode changes. */
   private materials = new Map<number, THREE.MeshLambertMaterial>();
   private cameraPassRestore: LocationMode | null = null;
   /** Labeled (non-global) scan meshes, movable in Stage 1. */
   private furniture: FurnitureEntry[] = [];
+  /** Active scan geometry bounding box info. */
+  private activeDimensions: RoomDimensions | null = null;
+  /** Bounding box visualization group. */
+  private boundsGroup = new THREE.Group();
+  /** Wireframe overlay line segments. */
+  private wireframeLines: THREE.LineSegments[] = [];
 
   constructor() {
     this.group.name = 'location-scan';
     this.group.visible = false;
+    this.boundsGroup.name = 'location-scan-bounds';
+    this.boundsGroup.visible = false;
+    this.group.add(this.boundsGroup);
   }
 
   get hasScan(): boolean {
-    return this.group.children.length > 0;
+    return this.furniture.length > 0 || this.group.children.some((c) => c !== this.boundsGroup);
+  }
+
+  get dimensions(): RoomDimensions | null {
+    return this.activeDimensions;
   }
 
   /** Replaces the displayed scan (null clears). Disposes prior geometry. */
   setScan(scan: LocationScan | null): void {
     this.clear();
     if (!scan) return;
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let minZ = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let maxZ = -Infinity;
+
     scan.meshes.forEach((m, meshIndex) => {
       const geo = new THREE.BufferGeometry();
       const movable = isMovableScanMesh(m.label);
       let center = new THREE.Vector3();
+
+      for (let i = 0; i + 2 < m.positions.length; i += 3) {
+        const x = m.positions[i];
+        const y = m.positions[i + 1];
+        const z = m.positions[i + 2];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+      }
+
       if (movable) {
         // Re-center the geometry on its XZ footprint and put the offset in the
         // object's position, so yawing the mesh pivots the couch about itself
-        // instead of orbiting the scene origin. The stored buffer is untouched
-        // (positions may be shared with the persisted scan) — copy first.
+        // instead of orbiting the scene origin. The stored buffer is untouched.
         const c = meshFootprintCenter(m.positions);
         center = new THREE.Vector3(c.x, 0, c.z);
         const local = new Float32Array(m.positions);
@@ -92,9 +146,9 @@ export class LocationRenderer {
       } else {
         geo.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
       }
-      // Indices fit u16 for typical room meshes; three picks the array type.
+
       geo.setIndex(new THREE.BufferAttribute(m.indices, 1));
-      geo.computeVertexNormals(); // untextured Lambert needs normals to read as 3D
+      geo.computeVertexNormals();
       const mesh = new THREE.Mesh(geo, this.material(labelColor(m.label)));
       mesh.name = `scan:${m.label}`;
       if (movable) {
@@ -103,8 +157,104 @@ export class LocationRenderer {
         this.furniture.push({ mesh, meshIndex, label: m.label, center });
       }
       this.group.add(mesh);
+
+      // Create optional wireframe overlay edges
+      const wireGeo = new THREE.WireframeGeometry(geo);
+      const wireMat = new THREE.LineBasicMaterial({
+        color: labelColor(m.label),
+        transparent: true,
+        opacity: 0.4,
+      });
+      const wireLine = new THREE.LineSegments(wireGeo, wireMat);
+      wireLine.name = `scan-wire:${m.label}`;
+      if (movable) {
+        wireLine.position.copy(center);
+      }
+      wireLine.visible = this.wireframeOverlay;
+      this.wireframeLines.push(wireLine);
+      this.group.add(wireLine);
     });
+
+    if (minX !== Infinity) {
+      this.activeDimensions = {
+        min: new THREE.Vector3(minX, minY, minZ),
+        max: new THREE.Vector3(maxX, maxY, maxZ),
+        widthM: maxX - minX,
+        depthM: maxZ - minZ,
+        heightM: maxY - minY,
+      };
+      this.rebuildBoundingBox();
+    }
+
+    this.group.position.y = this.floorOffset;
     this.applyMode();
+  }
+
+  // --- floor leveling & alignment --------------------------------------------
+
+  /** Sets vertical floor leveling offset in meters. */
+  setFloorOffset(offsetY: number): void {
+    this.floorOffset = offsetY;
+    this.group.position.y = this.floorOffset;
+  }
+
+  /** Automatically adjusts floor level so the lowest floor geometry rests at y=0. */
+  autoLevelFloor(): number {
+    if (!this.activeDimensions) return 0;
+    const lowestY = this.activeDimensions.min.y;
+    const correction = -lowestY;
+    this.setFloorOffset(correction);
+    return correction;
+  }
+
+  // --- wireframe overlay & bounding box visualization ------------------------
+
+  setWireframeOverlay(enabled: boolean): void {
+    this.wireframeOverlay = enabled;
+    for (const w of this.wireframeLines) {
+      w.visible = enabled && this.mode !== 'hidden';
+    }
+  }
+
+  toggleBounds(show?: boolean): boolean {
+    this.showBounds = show !== undefined ? show : !this.showBounds;
+    this.boundsGroup.visible = this.showBounds && this.mode !== 'hidden' && this.hasScan;
+    return this.showBounds;
+  }
+
+  private rebuildBoundingBox(): void {
+    while (this.boundsGroup.children.length > 0) {
+      const child = this.boundsGroup.children[0];
+      this.boundsGroup.remove(child);
+      if ((child as THREE.Mesh).geometry) {
+        (child as THREE.Mesh).geometry.dispose();
+      }
+    }
+
+    if (!this.activeDimensions) return;
+    const { min, max, widthM, depthM, heightM } = this.activeDimensions;
+    if (widthM <= 0 || depthM <= 0 || heightM <= 0) return;
+
+    const center = new THREE.Vector3(
+      (min.x + max.x) / 2,
+      (min.y + max.y) / 2,
+      (min.z + max.z) / 2,
+    );
+
+    const boxGeo = new THREE.BoxGeometry(widthM, heightM, depthM);
+    const wireGeo = new THREE.WireframeGeometry(boxGeo);
+    boxGeo.dispose();
+
+    const lineMat = new THREE.LineBasicMaterial({
+      color: 0x66ccff,
+      transparent: true,
+      opacity: 0.75,
+    });
+
+    const wireBox = new THREE.LineSegments(wireGeo, lineMat);
+    wireBox.position.copy(center);
+    this.boundsGroup.add(wireBox);
+    this.boundsGroup.visible = this.showBounds && this.mode !== 'hidden';
   }
 
   // --- movable furniture (Stage 1) -------------------------------------------
@@ -115,10 +265,17 @@ export class LocationRenderer {
       const p = placements?.find((x) => x.meshIndex === f.meshIndex);
       f.mesh.position.set(f.center.x + (p?.dx ?? 0), 0, f.center.z + (p?.dz ?? 0));
       f.mesh.rotation.set(0, p?.rotY ?? 0, 0);
+
+      // Match wireframe overlay placement if present
+      const wire = this.wireframeLines.find((w) => w.name === `scan-wire:${f.label}`);
+      if (wire) {
+        wire.position.copy(f.mesh.position);
+        wire.rotation.copy(f.mesh.rotation);
+      }
     }
   }
 
-  /** Raycast targets for grab — only while the scan is actually visible. */
+  /** Raycast targets for grab - only while the scan is actually visible. */
   furnitureTargets(): THREE.Object3D[] {
     if (this.mode === 'hidden' || this.furniture.length === 0) return [];
     return this.furniture.map((f) => f.mesh);
@@ -130,8 +287,7 @@ export class LocationRenderer {
 
   /**
    * Settles a just-released (or drag-cancelled) furniture mesh back onto the
-   * floor plane — position y to 0, rotation to pure yaw — and returns its
-   * placement for the scene JSON. The mesh must already be back under `group`.
+   * floor plane: position y to 0, rotation to pure yaw; returns placement.
    */
   commitFurniture(mesh: THREE.Object3D): FurniturePlacement | null {
     const f = this.furniture.find((x) => x.mesh === mesh);
@@ -154,7 +310,7 @@ export class LocationRenderer {
   }
 
   cycleMode(): LocationMode {
-    const order: LocationMode[] = ['hidden', 'ghost', 'solid'];
+    const order: LocationMode[] = ['hidden', 'ghost', 'solid', 'wireframe'];
     this.setMode(order[(order.indexOf(this.mode) + 1) % order.length]);
     return this.mode;
   }
@@ -162,7 +318,7 @@ export class LocationRenderer {
   /**
    * Forces the scan visible + solid for the virtual camera's render pass, so
    * the monitor/captures show shots composed inside the scanned set even when
-   * the wearer has it hidden. Call end… in a finally.
+   * the wearer has it hidden. Call endCameraPass in a finally.
    */
   beginCameraPass(): void {
     if (this.cameraPassRestore !== null || !this.hasScan) return;
@@ -189,24 +345,38 @@ export class LocationRenderer {
 
   private applyMode(): void {
     this.group.visible = this.mode !== 'hidden' && this.hasScan;
+    this.boundsGroup.visible = this.showBounds && this.mode !== 'hidden' && this.hasScan;
+
     const ghost = this.mode === 'ghost';
+    const isWireframe = this.mode === 'wireframe';
+
     for (const mat of this.materials.values()) {
-      mat.transparent = ghost;
-      mat.opacity = ghost ? GHOST_OPACITY : 1;
-      // Ghost overlays passthrough without stomping the depth of virtual set
-      // pieces behind it; solid occludes like a real set wall.
-      mat.depthWrite = !ghost;
+      mat.wireframe = isWireframe;
+      mat.transparent = ghost || isWireframe;
+      mat.opacity = ghost ? GHOST_OPACITY : isWireframe ? WIREFRAME_OPACITY : 1;
+      mat.depthWrite = !ghost && !isWireframe;
       mat.needsUpdate = false;
+    }
+
+    for (const w of this.wireframeLines) {
+      w.visible = (this.wireframeOverlay || isWireframe) && this.mode !== 'hidden';
     }
   }
 
   private clear(): void {
     for (const child of [...this.group.children]) {
+      if (child === this.boundsGroup) continue;
       this.group.remove(child);
       (child as THREE.Mesh).geometry?.dispose();
     }
     this.furniture = [];
-    // Materials are shared/reused across scans; keep them.
+    this.wireframeLines = [];
+    this.activeDimensions = null;
+    while (this.boundsGroup.children.length > 0) {
+      const b = this.boundsGroup.children[0];
+      this.boundsGroup.remove(b);
+      (b as THREE.Mesh).geometry?.dispose();
+    }
   }
 }
 

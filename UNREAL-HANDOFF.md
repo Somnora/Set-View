@@ -13,6 +13,7 @@ Once a scene is authored and exported to `.setview.json`, the Unreal Engine impo
 - **Skeletal / MetaHuman Actors**: Placed at exact positions, facing headings, scales, and stance targets (10 body poses).
 - **LevelSequence Assets**: Generated automatically at SetView's configured walk speed (`walkSpeed` in m/s) driving actor keyframe motion, stance holds, and camera cuts over the timeline.
 - **Cine Light Actors**: Spot, Point, and Rect lights created matching SetView light placements, intensities, color temperatures, and cone angles.
+- **Spatial Audio Emitters & Sound Cues**: AmbientSound actors and AudioComponents attached to actors or cameras, with calibrated attenuation radii and roll-off curves.
 - **Location Scan Static Meshes**: Decodes embedded WebXR room mesh binary geometry (`scanData`) into a `StaticMeshActor` with movable furniture placements (`scan.furniture`).
 
 ---
@@ -85,18 +86,65 @@ python3 Content/Python/import_people.py --people-dir /path/to/avatars --furnitur
 
 ---
 
+## AI Shot Continuity & Storyboard Engine
+
+SetView includes an automated multi-camera continuity audit and visual storyboard generation engine:
+
+### 1. Screenplay Breakdown & Beat Parsing
+- Ingests standard screenplay text (sluglines, character names, parentheticals, dialogue, and sound cues).
+- Automatically pairs dialogue beats with closest camera setups and computes estimated shot durations.
+
+### 2. Multi-Camera Continuity Auditing
+- **180-Degree Line of Action**: Evaluates the axis vector connecting primary actors and detects cameras crossing the 180-degree boundary.
+- **30-Degree Jump Cut Rule**: Flags cuts between cameras where optical angle delta is under 30 degrees and focal length difference is under 20 percent.
+- **Eyeline Match Analysis**: Projects actor gaze vectors into camera screen coordinates to verify complementary screen-left and screen-right looks across reverse angles.
+- **Screen Direction Continuity**: Tracks actor spatial trajectory vectors across camera view spaces to prevent jarring motion reversals.
+- **Shot Scale Progression**: Flags abrupt shot size leaps (for example, Extreme Close-Up jumping to Extreme Wide Shot) without transitional framing.
+- **Frustum Incursion**: Detects when camera hardware enters the active field of view of another camera setup.
+
+### 3. Visual Storyboards & Production Exports
+- **Vector Storyboard Panels**: Produces SVG panels with aspect-accurate viewfinders, rule-of-thirds composition grids, actor stance silhouettes, distance tags, and depth-of-field brackets.
+- **Printable HTML Binder**: Generates standalone, styled HTML storyboard sheets with shot numbers, optics specifications, script dialogue snippets, and continuity warning tags.
+- **AI Cinematographer Prompt Package**: Formats 3D blocking, camera optics, and spatial metadata into structured prompts for downstream AI analysis.
+
+---
+
+## Multi-Track Spatial Audio & DAW Stems Export
+
+SetView generates audio stem manifests and CSV EDLs for Pro Tools, Reaper, Premiere Pro, and DaVinci Resolve:
+- **Track Separation**: Stems are grouped across Dialogue, Foley, Sound FX, Ambience, and Director Notes.
+- **Timecode Accuracy**: Every cue exports SMPTE In and Out timestamps matching the scene timeline frame rate.
+- **Position Tracking**: Actor-attached dialogue cues track the actor mouth/head position across blocking keyframes.
+- **Export Options**: Desktop and VR review panels allow downloading both `.json` stem manifests and `.csv` EDL cue sheets.
+
+---
+
+## Automated Virtual Set Dressing & AI Generative Spatial Scatter
+
+SetView includes a procedural set dressing engine and Gemini AI Omni Set Director with companion Unreal Engine 5 integration:
+- **Procedural Poisson Scatter**: Blue-noise spatial distribution across semantic stage regions (floor, perimeter walls, furniture tabletops).
+- **Chaos Physics Settling**: Gravitational settling with planar impulse separation and vertical stacking rules for props.
+- **Unreal Engine 5 Bridge (`setview_setdressing_bridge.py`)**: Spawns `StaticMeshActor` instances with materials, nanite meshes, and simulated physics in Unreal Engine 5.8.
+- **Top-Down Director Deck & Manifests**: Exports RFC 4180 CSV manifests and standalone SVG/HTML director pitch decks for art department teams.
+
+---
+
 ## Step-by-Step Handoff Workflow
 
 1. **Author Scene in SetView**:
    - Open SetView on Meta Quest or desktop browser.
    - Scan room or set up blocking, place actors with stances, place cameras with target optics.
+   - Open Set Dressing Studio (via wrist menu or desktop toolbar) to procedurally scatter props or run Gemini AI Omni Director prompts.
+   - Audit camera continuity using the in-VR HUD or desktop Storyboards modal.
    - Click **Export JSON** on the prep panel or wrist menu to download `scene-name.setview.json`.
 
 2. **Run Importer in Unreal Engine**:
    - Open your UE 5.8 project.
    - Run `import_setview.py` passing the path to `scene-name.setview.json`.
+   - Run `setview_setdressing_bridge.py` to procedurally spawn and settle dressed props.
 
 3. **Review & Render**:
-   - Inspect the spawned `CineCameraActor` instances under World Outliner.
+   - Inspect the spawned `CineCameraActor` and set dressing prop instances under World Outliner.
    - Open the generated `LevelSequence` asset under `/Game/SetView/{SceneName}/Sequences/` to scrub actor blocking and camera cuts.
    - Assign MetaHuman materials/rigs or lighting passes for final output render.
+

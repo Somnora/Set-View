@@ -1,11 +1,11 @@
 // ---------------------------------------------------------------------------
 // Scan blob storage: IndexedDB keyed by scan id. Location scans are megabytes
-// of Float32Array — far beyond the localStorage quota the scene JSON lives in,
+// of Float32Array (far beyond the localStorage quota the scene JSON lives in),
 // so geometry is stored here and SceneData carries only a ScanSummary.
 //
 // Everything degrades gracefully: if IndexedDB is unavailable (private mode,
 // storage pressure) an in-memory Map keeps the current session working and
-// the caller's summary still round-trips through file export.
+// the caller summary still round-trips through file export.
 // ---------------------------------------------------------------------------
 
 import { isLocationScan, type LocationScan } from './scan.ts';
@@ -14,12 +14,24 @@ const DB_NAME = 'setview';
 const DB_VERSION = 1;
 const STORE = 'scans';
 
+/** Calculates memory and disk footprint of a LocationScan in bytes. */
+export function estimateScanSizeBytes(scan: LocationScan): number {
+  let bytes = 64; // base object overhead
+  for (const m of scan.meshes) {
+    bytes += 32; // mesh descriptor overhead
+    bytes += m.label.length * 2;
+    bytes += m.positions.byteLength;
+    bytes += m.indices.byteLength;
+  }
+  return bytes;
+}
+
 export class ScanStore {
   /** Notified on storage failures so the UI can warn (headsets have no console). */
   onError: (msg: string) => void = () => {};
 
   private dbPromise: Promise<IDBDatabase | null> | null = null;
-  /** Fallback when IndexedDB is unavailable — session-lifetime only. */
+  /** Fallback when IndexedDB is unavailable (session lifetime only). */
   private memory = new Map<string, LocationScan>();
 
   private open(): Promise<IDBDatabase | null> {
@@ -63,7 +75,7 @@ export class ScanStore {
     const db = await this.open();
     if (!db) {
       this.memory.set(scan.id, scan);
-      this.onError('scan kept in memory only — storage unavailable; Export the scene to keep it');
+      this.onError('scan kept in memory only (storage unavailable); Export the scene to keep it');
       return false;
     }
     return new Promise((resolve) => {
@@ -73,12 +85,12 @@ export class ScanStore {
         tx.oncomplete = () => resolve(true);
         tx.onerror = tx.onabort = () => {
           this.memory.set(scan.id, scan);
-          this.onError('scan save failed — kept in memory; Export the scene to keep it');
+          this.onError('scan save failed (kept in memory); Export the scene to keep it');
           resolve(false);
         };
       } catch {
         this.memory.set(scan.id, scan);
-        this.onError('scan save failed — kept in memory; Export the scene to keep it');
+        this.onError('scan save failed (kept in memory); Export the scene to keep it');
         resolve(false);
       }
     });
@@ -101,6 +113,7 @@ export class ScanStore {
     });
   }
 
+  /** Deletes a scan from both persistent storage and memory cache. */
   async deleteScan(id: string): Promise<void> {
     this.memory.delete(id);
     const db = await this.open();
@@ -135,9 +148,25 @@ export class ScanStore {
     });
   }
 
+  /** Returns approximate storage size of a specific scan in bytes. */
+  async getScanSizeBytes(id: string): Promise<number> {
+    const scan = await this.getScan(id);
+    return scan ? estimateScanSizeBytes(scan) : 0;
+  }
+
+  /** Returns total approximate byte size of all scans in storage. */
+  async getTotalStorageBytes(): Promise<number> {
+    const ids = await this.listScanIds();
+    let total = 0;
+    for (const id of ids) {
+      total += await this.getScanSizeBytes(id);
+    }
+    return total;
+  }
+
   /**
-   * Deletes blobs not referenced by any scene. Run once at app start —
-   * replaced/abandoned scans (e.g. re-scan then undo, deleted scenes) are left
+   * Deletes blobs not referenced by any scene. Run once at app start:
+   * replaced or abandoned scans (e.g. re-scan then undo, deleted scenes) are left
    * behind deliberately during the session so undo keeps working, and swept
    * here on the next launch.
    */
@@ -151,5 +180,21 @@ export class ScanStore {
       }
     }
     return removed;
+  }
+
+  /** Clears all scans in both storage and memory cache. */
+  async clearAllScans(): Promise<void> {
+    this.memory.clear();
+    const db = await this.open();
+    if (!db) return;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(STORE, 'readwrite');
+        tx.objectStore(STORE).clear();
+        tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
   }
 }

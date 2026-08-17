@@ -1,12 +1,12 @@
 // ---------------------------------------------------------------------------
-// Palm tool wheel — PURE, renderer-free (the tested surface).
+// Palm tool wheel: PURE, renderer-free (the tested surface).
 //
 // The wheel is the app's top-level menu: look at your left palm and a ring of
 // tools appears in it. Tap a sector with a fingertip (or point + trigger with
-// a controller) to press. Some sectors open a SUB-WHEEL in place — the hub
+// a controller) to press. Some sectors open a SUB-WHEEL in place: the hub
 // turns into Back. Two modes split the two jobs on a set:
-//   block — plan the shot: actors, cameras, marks, lenses.
-//   dress — adjust the physical space: scan the room, move scanned furniture.
+//   block: plan the shot: actors, cameras, marks, lenses.
+//   dress: adjust the physical space: scan the room, move scanned furniture.
 // wheelView.ts renders this; main.ts owns the current path and routes presses.
 // ---------------------------------------------------------------------------
 
@@ -14,19 +14,27 @@ export type InteractionMode = 'block' | 'dress';
 
 /**
  * Placement arming. 'none' is the DEFAULT: a bare trigger/pinch must never
- * create content — on hand tracking every stray thumb-index touch reads as a
+ * create content; on hand tracking every stray thumb-index touch reads as a
  * pinch, and third-QA showed each palm tap spawning an actor. Placing is an
  * armed tool: pick it (wheel Place sector / X button), then the pinch places.
  */
-export type PlaceArm = 'none' | 'actor' | 'camera' | 'light';
+export type PlaceArm = 'none' | 'actor' | 'camera' | 'light' | 'prop';
 
 /** The Place tool cycle (wheel sector and the X button step through it). */
 export function nextPlaceMode(mode: PlaceArm): PlaceArm {
-  return mode === 'none' ? 'actor' : mode === 'actor' ? 'camera' : mode === 'camera' ? 'light' : 'none';
+  return mode === 'none'
+    ? 'actor'
+    : mode === 'actor'
+      ? 'camera'
+      : mode === 'camera'
+        ? 'light'
+        : mode === 'light'
+          ? 'prop'
+          : 'none';
 }
 
 /** Menu levels: the root ring, or one of the sub-wheels. */
-export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit' | 'stance' | 'light';
+export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit' | 'stance' | 'light' | 'props';
 
 export interface WheelSector {
   id: string;
@@ -50,7 +58,7 @@ export interface WheelContext {
   recording: boolean;
   /** A location scan exists in the scene (enables Room cycling). */
   hasScan: boolean;
-  locationMode: 'hidden' | 'ghost' | 'solid';
+  locationMode: 'hidden' | 'ghost' | 'solid' | 'wireframe';
   /** Active-camera lens state, for value labels in the Lens sub-wheel. */
   lensFocal: number;
   tStop: number;
@@ -92,7 +100,9 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
                 ? 'Place:\nActor'
                 : ctx.placeMode === 'camera'
                   ? 'Place:\nCam'
-                  : 'Place:\nLight',
+                  : ctx.placeMode === 'light'
+                    ? 'Place:\nLight'
+                    : 'Place:\nProp',
         },
         { id: 'sub-marks', label: 'Marks ▸', submenu: 'marks' },
         { id: 'sub-lens', label: 'Lens ▸', submenu: 'lens' },
@@ -114,6 +124,8 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
           ? `Room:\n${ctx.locationMode[0].toUpperCase()}${ctx.locationMode.slice(1)}`
           : 'Room:\n(scan first)',
       },
+      { id: 'splat-studio', label: '3DGS\nStudio ✨' },
+      { id: 'sub-props', label: 'Props ▸', submenu: 'props' },
       { id: 'wheel-view', label: `View:\n${viewLabel}` },
       { id: 'sub-capture', label: 'Camera ▸', submenu: 'capture' },
       { id: 'sub-edit', label: 'Edit ▸', submenu: 'edit' },
@@ -150,10 +162,9 @@ const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelS
     { id: 'redo', label: 'Redo' },
     { id: 'dup', label: 'Duplicate' },
     { id: 'delete', label: 'Delete' },
+    { id: 'sub-props', label: 'Props ▸', submenu: 'props' },
     { id: 'sub-stance', label: 'Stance ▸', submenu: 'stance' },
     { id: 'sub-light', label: 'Light ▸', submenu: 'light' },
-    { id: 'height-down', label: 'Height −' },
-    { id: 'height-up', label: 'Height +' },
   ],
   stance: () => [
     { id: 'stance', label: 'Cycle\nStance' },
@@ -171,6 +182,16 @@ const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelS
     { id: 'light-bright', label: `Power +\n${(ctx.activeLightIntensity ?? 1.0).toFixed(1)}x` },
     { id: 'light-cone-narrow', label: 'Cone −' },
     { id: 'light-cone-wide', label: `Cone +\n${ctx.activeLightConeDeg ?? 45}°` },
+  ],
+  props: () => [
+    { id: 'prop-chair', label: "Director's\nChair" },
+    { id: 'prop-applebox', label: 'Apple\nBox' },
+    { id: 'prop-cstand', label: 'C-Stand' },
+    { id: 'prop-slate', label: 'Film\nSlate' },
+    { id: 'prop-desk', label: 'Desk' },
+    { id: 'prop-lamp', label: 'Floor\nLamp' },
+    { id: 'prop-greenscreen', label: 'Green\nScreen' },
+    { id: 'prop-library', label: 'Prop\nLibrary 📦' },
   ],
 };
 

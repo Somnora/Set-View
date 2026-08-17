@@ -11,7 +11,15 @@
 // target (desqueezed) aspect, which is what the delivered frame looks like.
 // ---------------------------------------------------------------------------
 
-import { aspectValue, sensorFormat, type AspectName, type SensorFormat } from './model.ts';
+import {
+  aspectValue,
+  sensorFormat,
+  type AspectName,
+  type CameraSetupData,
+  type Quat,
+  type SensorFormat,
+  type Vec3,
+} from './model.ts';
 
 /** Historical Super-35 gate width, kept for reference/tests. */
 export const SUPER35_WIDTH_MM = 24.89;
@@ -130,4 +138,210 @@ export function cocDiameterMm(focalMm: number, fNumber: number, focusM: number, 
   const F = focalMm / 1000; // focal length in metres
   if (!(subjectM > 0) || !(focusM > F) || !(fNumber > 0)) return 0;
   return ((F * F * Math.abs(subjectM - focusM)) / (fNumber * subjectM * (focusM - F))) * 1000;
+}
+
+// --- Shot framing & coverage telemetry --------------------------------------
+
+export type ShotSize = 'ECU' | 'CU' | 'MCU' | 'MS' | 'MLS' | 'WS' | 'EWS';
+
+export interface ShotFramingTelemetry {
+  shotSize: ShotSize;
+  shotSizeLabel: string;
+  subjectDistanceM: number;
+  fieldWidthM: number;
+  fieldHeightM: number;
+  subjectFrameCoveragePct: number;
+}
+
+export function shotSizeDescription(size: ShotSize): string {
+  switch (size) {
+    case 'ECU':
+      return 'Extreme Close-Up (ECU)';
+    case 'CU':
+      return 'Close-Up (CU)';
+    case 'MCU':
+      return 'Medium Close-Up (MCU)';
+    case 'MS':
+      return 'Medium Shot (MS)';
+    case 'MLS':
+      return 'Medium Long Shot / Cowboy (MLS)';
+    case 'WS':
+      return 'Wide Shot / Full (WS)';
+    case 'EWS':
+      return 'Extreme Wide Shot (EWS)';
+  }
+}
+
+/**
+ * Classifies shot scale (ECU through EWS) based on lens optics, sensor gate,
+ * distance, and subject height.
+ */
+export function classifyShotSize(
+  focalMm: number,
+  aspect: AspectName,
+  format: SensorFormat | string,
+  subjectDistanceM: number,
+  subjectHeightM: number = 1.75,
+): ShotFramingTelemetry {
+  const dist = Math.max(0.01, subjectDistanceM);
+  const height = subjectHeightM > 0 ? subjectHeightM : 1.75;
+  const fovH = hFovRad(focalMm, format);
+  const fovV = vFovRad(focalMm, aspect, format);
+
+  const fieldWidthM = 2 * dist * Math.tan(fovH / 2);
+  const fieldHeightM = 2 * dist * Math.tan(fovV / 2);
+  const subjectFrameCoveragePct = fieldHeightM > 0 ? (height / fieldHeightM) * 100 : 0;
+
+  let shotSize: ShotSize = 'WS';
+  if (subjectFrameCoveragePct >= 150) shotSize = 'ECU';
+  else if (subjectFrameCoveragePct >= 80) shotSize = 'CU';
+  else if (subjectFrameCoveragePct >= 50) shotSize = 'MCU';
+  else if (subjectFrameCoveragePct >= 35) shotSize = 'MS';
+  else if (subjectFrameCoveragePct >= 25) shotSize = 'MLS';
+  else if (subjectFrameCoveragePct >= 14) shotSize = 'WS';
+  else shotSize = 'EWS';
+
+  return {
+    shotSize,
+    shotSizeLabel: shotSizeDescription(shotSize),
+    subjectDistanceM: dist,
+    fieldWidthM,
+    fieldHeightM,
+    subjectFrameCoveragePct,
+  };
+}
+
+// --- Pure quaternion & frustum collision mathematics ------------------------
+
+/**
+ * Rotates a 3D vector by a quaternion (pure, no Three.js).
+ */
+export function quatRotateVector(q: Quat, v: Vec3): Vec3 {
+  const qx = q.x;
+  const qy = q.y;
+  const qz = q.z;
+  const qw = q.w;
+
+  // t = 2 * cross(q.xyz, v)
+  const tx = 2 * (qy * v.z - qz * v.y);
+  const ty = 2 * (qz * v.x - qx * v.z);
+  const tz = 2 * (qx * v.y - qy * v.x);
+
+  // v' = v + qw * t + cross(q.xyz, t)
+  return {
+    x: v.x + qw * tx + (qy * tz - qz * ty),
+    y: v.y + qw * ty + (qz * tx - qx * tz),
+    z: v.z + qw * tz + (qx * ty - qy * tx),
+  };
+}
+
+/**
+ * Rotates a 3D vector by the inverse (conjugate) of a quaternion.
+ */
+export function quatInverseRotateVector(q: Quat, v: Vec3): Vec3 {
+  // Conjugate quaternion has negated xyz
+  const qx = -q.x;
+  const qy = -q.y;
+  const qz = -q.z;
+  const qw = q.w;
+
+  const tx = 2 * (qy * v.z - qz * v.y);
+  const ty = 2 * (qz * v.x - qx * v.z);
+  const tz = 2 * (qx * v.y - qy * v.x);
+
+  return {
+    x: v.x + qw * tx + (qy * tz - qz * ty),
+    y: v.y + qw * ty + (qz * tx - qx * tz),
+    z: v.z + qw * tz + (qx * ty - qy * tx),
+  };
+}
+
+/**
+ * Tests whether a 3D scene point lies inside a camera's field of view frustum.
+ * Camera space convention: forward is -Z, right is +X, up is +Y.
+ */
+export function isPointInFrustum(
+  point: Vec3,
+  camPos: Vec3,
+  camRot: Quat,
+  focalMm: number,
+  aspect: AspectName,
+  format: SensorFormat | string,
+  nearM: number = 0.1,
+  farM: number = 100.0,
+): boolean {
+  const relPoint: Vec3 = {
+    x: point.x - camPos.x,
+    y: point.y - camPos.y,
+    z: point.z - camPos.z,
+  };
+
+  const localPoint = quatInverseRotateVector(camRot, relPoint);
+  // In camera local coordinates, forward direction is -Z
+  const forwardDist = -localPoint.z;
+
+  if (forwardDist < nearM || forwardDist > farM) {
+    return false;
+  }
+
+  const halfFovH = hFovRad(focalMm, format) / 2;
+  const halfFovV = vFovRad(focalMm, aspect, format) / 2;
+
+  const maxHalfWidth = forwardDist * Math.tan(halfFovH);
+  const maxHalfHeight = forwardDist * Math.tan(halfFovV);
+
+  return Math.abs(localPoint.x) <= maxHalfWidth && Math.abs(localPoint.y) <= maxHalfHeight;
+}
+
+export interface CameraFrustumCollision {
+  observerCamId: string;
+  observerCamName: string;
+  observedCamId: string;
+  observedCamName: string;
+  distanceM: number;
+}
+
+/**
+ * Identifies pairs of cameras where one camera is visible within the lens view frustum of another.
+ */
+export function findCamerasInFrustums(
+  cameras: CameraSetupData[],
+  nearM: number = 0.1,
+  farM: number = 50.0,
+): CameraFrustumCollision[] {
+  const collisions: CameraFrustumCollision[] = [];
+
+  for (const observer of cameras) {
+    for (const observed of cameras) {
+      if (observer.id === observed.id) continue;
+
+      const inside = isPointInFrustum(
+        observed.position,
+        observer.position,
+        observer.rotation,
+        observer.lensFocalLength,
+        observer.aspect,
+        observer.formatId,
+        nearM,
+        farM,
+      );
+
+      if (inside) {
+        const dx = observed.position.x - observer.position.x;
+        const dy = observed.position.y - observer.position.y;
+        const dz = observed.position.z - observer.position.z;
+        const distanceM = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+        collisions.push({
+          observerCamId: observer.id,
+          observerCamName: observer.name,
+          observedCamId: observed.id,
+          observedCamName: observed.name,
+          distanceM,
+        });
+      }
+    }
+  }
+
+  return collisions;
 }

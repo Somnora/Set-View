@@ -118,6 +118,28 @@ def create_sample_setview_json(path: str):
                 "color": "#3e9bf0"
             }
         ],
+        "audioCues": [
+            {
+                "id": "cue-1",
+                "name": "Lead Actor Dialogue",
+                "type": "dialogue",
+                "timestampS": 1.5,
+                "durationS": 2.8,
+                "volume": 0.9,
+                "spatial": True,
+                "attachedActorId": "act-1",
+                "transcript": "We have to get moving before sunrise."
+            },
+            {
+                "id": "cue-2",
+                "name": "Rain Ambience",
+                "type": "ambience",
+                "timestampS": 0.0,
+                "durationS": 10.0,
+                "volume": 0.4,
+                "spatial": False
+            }
+        ],
         "scan": {
             "id": "scan-456",
             "capturedAt": 1720500000000,
