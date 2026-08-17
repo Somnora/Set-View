@@ -15,12 +15,23 @@ import {
   sensorFormat,
   type ActorData,
   type CameraSetupData,
-  type Quat,
   type SceneData,
   type Vec3,
 } from './model.ts';
 import { poseFor, type StanceId } from './pose.ts';
 import { BUILTIN_PROPS } from './props.ts';
+import {
+  svHeadingToUeYaw,
+  svQuatToUeRotator,
+  svToUeLocation,
+  ueRotatorToUeQuat,
+  type UeRotator,
+} from './ueCoords.ts';
+
+// The SetView -> Unreal coordinate contract lives in one place (./ueCoords.ts);
+// re-exported here so existing consumers of the bridge keep working.
+export { svHeadingToUeYaw, svQuatToUeRotator, svToUeLocation };
+export type { UeRotator };
 
 export type Ue5ExportFormat = 'open_usd' | 'ue5_python_script' | 'ue5_json_manifest';
 
@@ -49,12 +60,6 @@ export interface Ue5ExportOptions {
   includeProps?: boolean;
 }
 
-export interface UeRotator {
-  pitch: number;
-  yaw: number;
-  roll: number;
-}
-
 export interface Ue5BridgePackageResult {
   filename: string;
   mimeType: string;
@@ -71,85 +76,105 @@ export function escapeUsdString(str: string): string {
   return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+/**
+ * Escapes a string for embedding inside a double-quoted Python literal (single
+ * or triple quoted). Every backslash, quote, line terminator and C0 control
+ * character is escaped, so no scene / actor / prop name can close the literal
+ * early. Used for short display strings only -- bulk payloads go through
+ * {@link base64EncodeUtf8}, which cannot be broken at all.
+ */
 export function escapePythonString(str: string): string {
-  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  let out = '';
+  for (const ch of str) {
+    if (ch === '\\') {
+      out += '\\\\';
+      continue;
+    }
+    if (ch === '"') {
+      out += '\\"';
+      continue;
+    }
+    if (ch === '\n') {
+      out += '\\n';
+      continue;
+    }
+    if (ch === '\r') {
+      out += '\\r';
+      continue;
+    }
+    if (ch === '\t') {
+      out += '\\t';
+      continue;
+    }
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) {
+      out += `\\x${code.toString(16).padStart(2, '0')}`;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+const B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/**
+ * Base64-encodes a string as UTF-8 without `btoa` or `Buffer`, so the module
+ * stays pure and behaves identically in the browser and in plain Node.
+ */
+export function base64EncodeUtf8(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const has1 = i + 1 < bytes.length;
+    const has2 = i + 2 < bytes.length;
+    const b1 = has1 ? bytes[i + 1] : 0;
+    const b2 = has2 ? bytes[i + 2] : 0;
+    out += B64_ALPHABET[b0 >> 2];
+    out += B64_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)];
+    out += has1 ? B64_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=';
+    out += has2 ? B64_ALPHABET[b2 & 0x3f] : '=';
+  }
+  return out;
+}
+
+/**
+ * Renders a base64 blob as a wrapped Python implicit-concatenation literal.
+ * The base64 alphabet contains no quote, backslash or newline, so the emitted
+ * literal is unconditionally well formed however hostile the source text was.
+ */
+function pythonBase64Literal(b64: string, indent: string, columns = 76): string {
+  if (!b64) return '""';
+  const chunks: string[] = [];
+  for (let i = 0; i < b64.length; i += columns) {
+    chunks.push(`${indent}    "${b64.slice(i, i + columns)}"`);
+  }
+  return `(\n${chunks.join('\n')}\n${indent})`;
+}
+
+/**
+ * Formats an Unreal FRotator as a USD `xformOp:orient` quaternion literal.
+ *
+ * `xformOp:rotateXYZ` on a Z-up stage takes its three components as rotations
+ * about X, then Y, then Z. An Unreal FRotator is pitch about Y, yaw about Z and
+ * roll about X -- and Unreal's left-handed pitch/roll run opposite to USD's
+ * right-handed ones -- so writing (pitch, yaw, roll) straight into those slots
+ * puts the yaw where the pitch belongs and tips every prim onto its side.
+ *
+ * `xformOp:orient` carries no axis order at all, so it cannot be mis-slotted by
+ * this exporter or misread downstream. The quaternion comes straight from the
+ * single shared convention in ./ueCoords.ts (`ueRotatorToUeQuat`, which mirrors
+ * FRotator::Quaternion()); USD writes quaternion literals real part first.
+ */
+export function usdOrientLiteral(rot: UeRotator): string {
+  const q = ueRotatorToUeQuat(rot);
+  return `(${q.w.toFixed(6)}, ${q.x.toFixed(6)}, ${q.y.toFixed(6)}, ${q.z.toFixed(6)})`;
 }
 
 export function sanitizePrimName(name: string): string {
   const cleaned = name.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+/, '');
   return cleaned ? (cleaned.match(/^[0-9]/) ? `Prim_${cleaned}` : cleaned) : 'Prim';
-}
-
-/**
- * Converts SetView coordinates (meters, Y-up, right-handed) to Unreal Engine coordinates (cm, Z-up, left-handed).
- * SetView: +X right, +Y up, +Z towards viewer / south.
- * Unreal:  +X forward (SetView +Z), +Y right (SetView +X), +Z up (SetView +Y).
- */
-export function svToUeLocation(pos: Vec3, scaleFactor: number = 100.0): Vec3 {
-  const x = Number.isFinite(pos.x) ? pos.x : 0;
-  const y = Number.isFinite(pos.y) ? pos.y : 0;
-  const z = Number.isFinite(pos.z) ? pos.z : 0;
-  return {
-    x: z * scaleFactor,
-    y: x * scaleFactor,
-    z: y * scaleFactor,
-  };
-}
-
-/**
- * Converts SetView heading rotationY (radians around +Y, 0 = +Z) to Unreal Yaw (degrees around +Z, 0 = +X).
- */
-export function svHeadingToUeYaw(rotationYRad: number): number {
-  if (!Number.isFinite(rotationYRad)) return 0;
-  return (rotationYRad * 180) / Math.PI;
-}
-
-/**
- * Converts Three.js / SetView camera orientation quaternion to Unreal Engine Rotator (Pitch, Yaw, Roll in degrees).
- * Parity matches Unreal CineCameraActor view direction.
- */
-export function svQuatToUeRotator(q: Quat): UeRotator {
-  const qx = Number.isFinite(q.x) ? q.x : 0;
-  const qy = Number.isFinite(q.y) ? q.y : 0;
-  const qz = Number.isFinite(q.z) ? q.z : 0;
-  const qw = Number.isFinite(q.w) ? q.w : 1;
-
-  // Camera forward vector in SetView Three.js camera space: R * (0, 0, -1)
-  const fx_sv = -2.0 * (qx * qz + qw * qy);
-  const fy_sv = -2.0 * (qy * qz - qw * qx);
-  const fz_sv = -(1.0 - 2.0 * (qx * qx + qy * qy));
-
-  // Camera up vector in SetView Three.js camera space: R * (0, 1, 0)
-  const ux_sv = 2.0 * (qx * qy - qw * qz);
-  const uy_sv = 1.0 - 2.0 * (qx * qx + qz * qz);
-  const uz_sv = 2.0 * (qy * qz + qw * qx);
-
-  // Camera right vector in SetView Three.js camera space: R * (1, 0, 0)
-  const rx_sv = 1.0 - 2.0 * (qy * qy + qz * qz);
-  const rz_sv = 2.0 * (qx * qz - qw * qy);
-
-  // Remap SetView basis (x=right, y=up, z=back) to Unreal basis (x=fwd, y=right, z=up)
-  const fx_ue = fz_sv;
-  const fy_ue = fx_sv;
-  const fz_ue = fy_sv;
-
-  const ux_ue = uz_sv;
-  const uy_ue = ux_sv;
-  const uz_ue = uy_sv;
-
-  const rx_ue = rz_sv;
-  const ry_ue = rx_sv;
-
-  const yawDeg = (Math.atan2(fy_ue, fx_ue) * 180) / Math.PI;
-  const horizDist = Math.sqrt(fx_ue * fx_ue + fy_ue * fy_ue);
-  const pitchDeg = (Math.atan2(fz_ue, horizDist) * 180) / Math.PI;
-  const rollDeg = (Math.atan2(ux_ue * ry_ue - uy_ue * rx_ue, uz_ue) * 180) / Math.PI;
-
-  return {
-    pitch: Number.isFinite(pitchDeg) ? pitchDeg : 0,
-    yaw: Number.isFinite(yawDeg) ? yawDeg : 0,
-    roll: Number.isFinite(rollDeg) ? rollDeg : 0,
-  };
 }
 
 /**
@@ -462,7 +487,7 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
       }
       lines.push('            }');
 
-      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]');
+      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]');
       lines.push('            double3 xformOp:translate.timeSamples = {');
       for (const s of keyframeSamples) {
         const p = s.value.location;
@@ -470,10 +495,9 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
       }
       lines.push('            }');
 
-      lines.push('            float3 xformOp:rotateXYZ.timeSamples = {');
+      lines.push('            quatf xformOp:orient.timeSamples = {');
       for (const s of keyframeSamples) {
-        const r = s.value.rotation;
-        lines.push(`                ${s.frame}: (${r.pitch.toFixed(2)}, ${r.yaw.toFixed(2)}, ${r.roll.toFixed(2)}),`);
+        lines.push(`                ${s.frame}: ${usdOrientLiteral(s.value.rotation)},`);
       }
       lines.push('            }');
     } else {
@@ -482,9 +506,9 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
       const rot = svQuatToUeRotator(cam.rotation);
       lines.push(`            float focalLength = ${focalLengthMm.toFixed(2)}`);
       lines.push(`            float focusDistance = ${focusDistCm.toFixed(2)}`);
-      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]');
+      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]');
       lines.push(`            double3 xformOp:translate = (${loc.x.toFixed(2)}, ${loc.y.toFixed(2)}, ${loc.z.toFixed(2)})`);
-      lines.push(`            float3 xformOp:rotateXYZ = (${rot.pitch.toFixed(2)}, ${rot.yaw.toFixed(2)}, ${rot.roll.toFixed(2)})`);
+      lines.push(`            quatf xformOp:orient = ${usdOrientLiteral(rot)}`);
     }
 
     lines.push('        }');
@@ -501,6 +525,7 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
       const loc = svToUeLocation({ x: light.position[0], y: light.position[1], z: light.position[2] }, options.scaleFactor);
       const yawDeg = svHeadingToUeYaw(light.rotationY);
       const pitchDeg = (light.rotationX * 180) / Math.PI;
+      const orient = usdOrientLiteral({ pitch: pitchDeg, yaw: yawDeg, roll: 0 });
       const intensity = light.intensity * 2500.0; // Scaled for Lumen
       const kelvin = light.colorKelvin;
 
@@ -515,9 +540,9 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
         lines.push('            float inputs:radius = 15.0');
         lines.push(`            float inputs:shaping:cone:angle = ${(light.coneAngleDeg / 2).toFixed(2)}`);
         lines.push('            float inputs:shaping:cone:softness = 0.1');
-        lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]');
+        lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]');
         lines.push(`            double3 xformOp:translate = (${loc.x.toFixed(2)}, ${loc.y.toFixed(2)}, ${loc.z.toFixed(2)})`);
-        lines.push(`            float3 xformOp:rotateXYZ = (${pitchDeg.toFixed(2)}, ${yawDeg.toFixed(2)}, 0)`);
+        lines.push(`            quatf xformOp:orient = ${orient}`);
         lines.push('        }');
       } else if (light.type === 'area') {
         lines.push(`        def RectLight "${lightPrimName}" (`);
@@ -529,9 +554,9 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
         lines.push(`            float inputs:intensity = ${intensity.toFixed(2)}`);
         lines.push('            float inputs:width = 120.0');
         lines.push('            float inputs:height = 80.0');
-        lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]');
+        lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]');
         lines.push(`            double3 xformOp:translate = (${loc.x.toFixed(2)}, ${loc.y.toFixed(2)}, ${loc.z.toFixed(2)})`);
-        lines.push(`            float3 xformOp:rotateXYZ = (${pitchDeg.toFixed(2)}, ${yawDeg.toFixed(2)}, 0)`);
+        lines.push(`            quatf xformOp:orient = ${orient}`);
         lines.push('        }');
       } else {
         // Point light
@@ -543,9 +568,9 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
         lines.push(`            float inputs:colorTemperature = ${kelvin}`);
         lines.push(`            float inputs:intensity = ${intensity.toFixed(2)}`);
         lines.push('            float inputs:radius = 20.0');
-        lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]');
+        lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]');
         lines.push(`            double3 xformOp:translate = (${loc.x.toFixed(2)}, ${loc.y.toFixed(2)}, ${loc.z.toFixed(2)})`);
-        lines.push(`            float3 xformOp:rotateXYZ = (${pitchDeg.toFixed(2)}, ${yawDeg.toFixed(2)}, 0)`);
+        lines.push(`            quatf xformOp:orient = ${orient}`);
         lines.push('        }');
       }
     }
@@ -584,7 +609,7 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
     }
 
     if (keyframeSamples && keyframeSamples.length > 1) {
-      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]');
+      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]');
       lines.push('            double3 xformOp:translate.timeSamples = {');
       for (const s of keyframeSamples) {
         const p = s.value.location;
@@ -593,12 +618,12 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
       }
       lines.push('            }');
 
-      lines.push('            float3 xformOp:rotateXYZ.timeSamples = {');
+      lines.push('            quatf xformOp:orient.timeSamples = {');
       for (const s of keyframeSamples) {
         const st = poseFor(s.value.stance);
         const pitch = (st.bodyRot.x * 180) / Math.PI;
         const roll = (st.bodyRot.z * 180) / Math.PI;
-        lines.push(`                ${s.frame}: (${pitch.toFixed(2)}, ${s.value.yaw.toFixed(2)}, ${roll.toFixed(2)}),`);
+        lines.push(`                ${s.frame}: ${usdOrientLiteral({ pitch, yaw: s.value.yaw, roll })},`);
       }
       lines.push('            }');
       lines.push(`            float3 xformOp:scale = (${scale.toFixed(3)}, ${scale.toFixed(3)}, ${scale.toFixed(3)})`);
@@ -609,9 +634,9 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
       const pitch = (stanceInfo.bodyRot.x * 180) / Math.PI;
       const roll = (stanceInfo.bodyRot.z * 180) / Math.PI;
 
-      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]');
+      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]');
       lines.push(`            double3 xformOp:translate = (${loc.x.toFixed(2)}, ${loc.y.toFixed(2)}, ${(loc.z + liftCm).toFixed(2)})`);
-      lines.push(`            float3 xformOp:rotateXYZ = (${pitch.toFixed(2)}, ${yaw.toFixed(2)}, ${roll.toFixed(2)})`);
+      lines.push(`            quatf xformOp:orient = ${usdOrientLiteral({ pitch, yaw, roll })}`);
       lines.push(`            float3 xformOp:scale = (${scale.toFixed(3)}, ${scale.toFixed(3)}, ${scale.toFixed(3)})`);
     }
 
@@ -670,9 +695,9 @@ export function generateOpenUsdScene(scene: SceneData, opts?: Ue5ExportOptions):
       lines.push(`            custom string assetId = "${prop.assetId}"`);
       lines.push(`            custom string category = "${prop.category}"`);
       lines.push(`            custom bool unreal:useNanite = ${options.useNanite ? 1 : 0}`);
-      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]');
+      lines.push('            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]');
       lines.push(`            double3 xformOp:translate = (${loc.x.toFixed(2)}, ${loc.y.toFixed(2)}, ${loc.z.toFixed(2)})`);
-      lines.push(`            float3 xformOp:rotateXYZ = (${pitch.toFixed(2)}, ${yaw.toFixed(2)}, ${roll.toFixed(2)})`);
+      lines.push(`            quatf xformOp:orient = ${usdOrientLiteral({ pitch, yaw, roll })}`);
       lines.push(`            float3 xformOp:scale = (${sx.toFixed(3)}, ${sy.toFixed(3)}, ${sz.toFixed(3)})`);
 
       lines.push('            def Mesh "ProxyMesh"');
@@ -759,6 +784,7 @@ import os
 import sys
 import math
 import json
+import base64
 import argparse
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -770,7 +796,13 @@ except ImportError:
     IN_UNREAL = False
 
 # --- Embedded Scene Data Payload ---------------------------------------------
-SCENE_DATA_PAYLOAD = json.loads(r'''${escapePythonString(sceneJsonString)}''')
+# The scene JSON travels as base64-encoded UTF-8. Hand-escaping it into a Python
+# literal is not safe: a quote, backslash, newline or a ''' sequence inside a
+# scene, actor or prop name closes the literal early and the script dies on
+# import. Base64 uses none of those characters, so this cannot be broken.
+SCENE_DATA_B64 = ${pythonBase64Literal(base64EncodeUtf8(sceneJsonString), '')}
+
+SCENE_DATA_PAYLOAD = json.loads(base64.b64decode(SCENE_DATA_B64).decode("utf-8"))
 
 # --- Configuration & Sensor Formats ------------------------------------------
 FPS = ${options.fps}
@@ -810,17 +842,44 @@ STANCES = {
 
 # --- Coordinate Math Helpers -------------------------------------------------
 
+def sv_direction_to_ue(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """
+    Maps a SetView direction vector into Unreal's axis convention (no unit scaling).
+    Determinant -1 basis map: (x, y, z) -> (-z, x, y). A determinant +1 permutation
+    such as (z, x, y) is a pure rotation, so it mirrors the scene and reverses all
+    screen direction.
+    """
+    return (-v[2], v[0], v[1])
+
+
 def sv_to_ue_location(pos: Dict[str, float]) -> Tuple[float, float, float]:
-    """Converts SetView coordinates (meters, Y-up) to Unreal Engine (cm, Z-up)."""
+    """Converts SetView coordinates (meters, Y-up, right-handed) to Unreal (cm, Z-up, left-handed)."""
     x_sv = float(pos.get('x', 0.0))
     y_sv = float(pos.get('y', 0.0))
     z_sv = float(pos.get('z', 0.0))
-    return (z_sv * SCALE_FACTOR, x_sv * SCALE_FACTOR, y_sv * SCALE_FACTOR)
+    d = sv_direction_to_ue((x_sv, y_sv, z_sv))
+    return (d[0] * SCALE_FACTOR, d[1] * SCALE_FACTOR, d[2] * SCALE_FACTOR)
 
 
 def sv_heading_to_ue_yaw(rotation_y_rad: float) -> float:
-    """Converts SetView heading rotationY (radians) to Unreal Yaw (degrees)."""
-    return math.degrees(float(rotation_y_rad))
+    """
+    Converts SetView heading rotationY (radians around +Y, 0 = +Z) to Unreal Yaw
+    (degrees around +Z, 0 = +X). SetView +Z maps to Unreal -X, hence the 180 offset.
+    """
+    return 180.0 - math.degrees(float(rotation_y_rad))
+
+
+def ue_basis_to_rotator(
+    f: Tuple[float, float, float],
+    r: Tuple[float, float, float],
+    u: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """Extracts an Unreal Rotator (Pitch, Yaw, Roll) from an Unreal orthonormal frame."""
+    yaw_deg = math.degrees(math.atan2(f[1], f[0]))
+    horiz_dist = math.sqrt(f[0] * f[0] + f[1] * f[1])
+    pitch_deg = math.degrees(math.atan2(f[2], horiz_dist))
+    roll_deg = math.degrees(math.atan2(-r[2], u[2]))
+    return (pitch_deg, yaw_deg, roll_deg)
 
 
 def sv_quat_to_ue_rotator(q: Dict[str, float]) -> Tuple[float, float, float]:
@@ -830,27 +889,33 @@ def sv_quat_to_ue_rotator(q: Dict[str, float]) -> Tuple[float, float, float]:
     qz = float(q.get('z', 0.0))
     qw = float(q.get('w', 1.0))
 
-    fx_sv = -2.0 * (qx * qz + qw * qy)
-    fy_sv = -2.0 * (qy * qz - qw * qx)
-    fz_sv = -(1.0 - 2.0 * (qx * qx + qy * qy))
+    q_len = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if q_len > 1e-9:
+        qx, qy, qz, qw = qx / q_len, qy / q_len, qz / q_len, qw / q_len
+    else:
+        qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
 
-    ux_sv = 2.0 * (qx * qy - qw * qz)
-    uy_sv = 1.0 - 2.0 * (qx * qx + qz * qz)
-    uz_sv = 2.0 * (qy * qz + qw * qx)
+    f_sv = (
+        -2.0 * (qx * qz + qw * qy),
+        -2.0 * (qy * qz - qw * qx),
+        -(1.0 - 2.0 * (qx * qx + qy * qy)),
+    )
+    u_sv = (
+        2.0 * (qx * qy - qw * qz),
+        1.0 - 2.0 * (qx * qx + qz * qz),
+        2.0 * (qy * qz + qw * qx),
+    )
+    r_sv = (
+        1.0 - 2.0 * (qy * qy + qz * qz),
+        2.0 * (qx * qy + qw * qz),
+        2.0 * (qx * qz - qw * qy),
+    )
 
-    rx_sv = 1.0 - 2.0 * (qy * qy + qz * qz)
-    ry_sv = 2.0 * (qx * qy + qw * qz)
-
-    fx_ue, fy_ue, fz_ue = fz_sv, fx_sv, fy_sv
-    ux_ue, uy_ue, uz_ue = uz_sv, ux_sv, uy_sv
-    rx_ue, ry_ue = rx_sv, ry_sv
-
-    yaw_deg = math.degrees(math.atan2(fy_ue, fx_ue))
-    horiz_dist = math.sqrt(fx_ue * fx_ue + fy_ue * fy_ue)
-    pitch_deg = math.degrees(math.atan2(fz_ue, horiz_dist))
-    roll_deg = math.degrees(math.atan2(ux_ue * ry_ue - uy_ue * rx_ue, uz_ue))
-
-    return (pitch_deg, yaw_deg, roll_deg)
+    return ue_basis_to_rotator(
+        sv_direction_to_ue(f_sv),
+        sv_direction_to_ue(r_sv),
+        sv_direction_to_ue(u_sv),
+    )
 
 
 def hex_to_linear_color(hex_str: str) -> Tuple[float, float, float, float]:

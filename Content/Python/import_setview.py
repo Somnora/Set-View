@@ -71,73 +71,116 @@ STANCES: Dict[str, Dict[str, Any]] = {
 
 # --- Coordinate System Conversions -------------------------------------------
 
+SCALE_M_TO_CM = 100.0
+
+
+def sv_direction_to_ue(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """
+    Maps a SetView direction vector into Unreal's axis convention (no unit scaling).
+
+    SetView is right-handed (+X right, +Y up, camera looks down -Z); Unreal is
+    left-handed (+X forward, +Y right, +Z up). A right-handed -> left-handed
+    conversion REQUIRES a determinant -1 basis map, i.e. an odd number of axis
+    negations: (x, y, z) -> (-z, x, y), matrix [[0,0,-1],[1,0,0],[0,1,0]].
+
+    The determinant +1 permutation (x, y, z) -> (z, x, y) is a pure rotation. It
+    looks self-consistent but produces a clean mirror image of the scene, which
+    silently reverses every screen direction (and invalidates line-of-action /
+    eyeline continuity).
+    """
+    return (-v[2], v[0], v[1])
+
+
+def ue_direction_to_sv(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """Inverse of sv_direction_to_ue: (x, y, z)_ue -> (y, z, -x)_sv."""
+    return (v[1], v[2], -v[0])
+
+
 def sv_to_ue_location(pos: Dict[str, float]) -> Tuple[float, float, float]:
     """
     Converts SetView coordinates (meters, Y-up, right-handed) to Unreal Engine (cm, Z-up, left-handed).
-    SetView: +X right, +Y up, +Z down/towards camera.
-    Unreal:  +X forward (SetView +Z), +Y right (SetView +X), +Z up (SetView +Y).
+      x_ue = -z_sv * 100,  y_ue = x_sv * 100,  z_ue = y_sv * 100
     """
     x_sv = float(pos.get('x', 0.0))
     y_sv = float(pos.get('y', 0.0))
     z_sv = float(pos.get('z', 0.0))
 
-    x_ue = z_sv * 100.0
-    y_ue = x_sv * 100.0
-    z_ue = y_sv * 100.0
-    return (x_ue, y_ue, z_ue)
+    d = sv_direction_to_ue((x_sv, y_sv, z_sv))
+    return (d[0] * SCALE_M_TO_CM, d[1] * SCALE_M_TO_CM, d[2] * SCALE_M_TO_CM)
 
 
 def sv_heading_to_ue_yaw(rotation_y_rad: float) -> float:
     """
     Converts SetView heading rotationY (radians around +Y, 0 = +Z) to Unreal Yaw (degrees around +Z, 0 = +X).
+
+    Under the determinant -1 map a SetView heading of 0 (facing +Z) points along
+    Unreal -X, which is yaw 180; the sweep direction also reverses. Hence
+    yaw = 180 - degrees(rotationY): 0 -> 180, 90 -> 90, 180 -> 0, 270 -> -90.
     """
-    return math.degrees(rotation_y_rad)
+    return 180.0 - math.degrees(float(rotation_y_rad))
+
+
+def ue_basis_to_rotator(
+    f: Tuple[float, float, float],
+    r: Tuple[float, float, float],
+    u: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """
+    Extracts an Unreal Rotator (Pitch, Yaw, Roll in degrees) from an Unreal
+    orthonormal frame (forward / right / up), matching Unreal's FRotationMatrix:
+      forward = (CP*CY, CP*SY, SP)
+      right   = (SR*SP*CY - CR*SY, SR*SP*SY + CR*CY, -SR*CP)
+      up      = (-(CR*SP*CY + SR*SY), CY*SR - CR*SP*SY, CR*CP)
+    so roll follows from atan2(-right.z, up.z).
+    """
+    yaw_deg = math.degrees(math.atan2(f[1], f[0]))
+    horiz_dist = math.sqrt(f[0] * f[0] + f[1] * f[1])
+    pitch_deg = math.degrees(math.atan2(f[2], horiz_dist))
+    roll_deg = math.degrees(math.atan2(-r[2], u[2]))
+    return (pitch_deg, yaw_deg, roll_deg)
 
 
 def sv_quat_to_ue_rotator(q: Dict[str, float]) -> Tuple[float, float, float]:
     """
     Converts Three.js / SetView camera quaternion to Unreal Engine Rotator (Pitch, Yaw, Roll in degrees).
-    Three.js camera default forward is (0, 0, -1), up is (0, 1, 0).
+    Three.js camera default forward is (0, 0, -1), up is (0, 1, 0), right is (1, 0, 0).
+    An identity quaternion yields (0, 0, 0): the Unreal camera faces +X.
     """
     qx = float(q.get('x', 0.0))
     qy = float(q.get('y', 0.0))
     qz = float(q.get('z', 0.0))
     qw = float(q.get('w', 1.0))
 
-    # Rotation matrix elements from quaternion
+    q_len = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if q_len > 1e-9:
+        qx, qy, qz, qw = qx / q_len, qy / q_len, qz / q_len, qw / q_len
+    else:
+        qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+
     # Forward vector in Three.js camera space: R * (0, 0, -1)
-    fx_sv = -2.0 * (qx * qz + qw * qy)
-    fy_sv = -2.0 * (qy * qz - qw * qx)
-    fz_sv = -(1.0 - 2.0 * (qx * qx + qy * qy))
-
+    f_sv = (
+        -2.0 * (qx * qz + qw * qy),
+        -2.0 * (qy * qz - qw * qx),
+        -(1.0 - 2.0 * (qx * qx + qy * qy)),
+    )
     # Up vector in Three.js camera space: R * (0, 1, 0)
-    ux_sv = 2.0 * (qx * qy - qw * qz)
-    uy_sv = 1.0 - 2.0 * (qx * qx + qz * qz)
-    uz_sv = 2.0 * (qy * qz + qw * qx)
+    u_sv = (
+        2.0 * (qx * qy - qw * qz),
+        1.0 - 2.0 * (qx * qx + qz * qz),
+        2.0 * (qy * qz + qw * qx),
+    )
+    # Right vector in Three.js camera space: R * (1, 0, 0)
+    r_sv = (
+        1.0 - 2.0 * (qy * qy + qz * qz),
+        2.0 * (qx * qy + qw * qz),
+        2.0 * (qx * qz - qw * qy),
+    )
 
-    # Map Three.js vector (vx, vy, vz) to Unreal vector (vz, vx, vy)
-    fx_ue, fy_ue, fz_ue = fz_sv, fx_sv, fy_sv
-    ux_ue, uy_ue, uz_ue = uz_sv, ux_sv, uy_sv
-
-    # Compute Yaw (deg)
-    yaw_deg = math.degrees(math.atan2(fy_ue, fx_ue))
-
-    # Compute Pitch (deg)
-    horiz_dist = math.sqrt(fx_ue * fx_ue + fy_ue * fy_ue)
-    pitch_deg = math.degrees(math.atan2(fz_ue, horiz_dist))
-
-    # Compute Roll (deg) from Up vector
-    # World up in UE is (0, 0, 1). Project Up vector onto camera right/up plane.
-    # Right vector in UE: F x U_world or R_mat
-    rx_sv = 1.0 - 2.0 * (qy * qy + qz * qz)
-    ry_sv = 2.0 * (qx * qy + qw * qz)
-    rz_sv = 2.0 * (qx * qz - qw * qy)
-    rx_ue, ry_ue, rz_ue = rz_sv, rx_sv, ry_sv
-
-    # Roll = atan2(U . R_horiz, U . U_horiz)
-    roll_deg = math.degrees(math.atan2(ux_ue * ry_ue - uy_ue * rx_ue, uz_ue))
-
-    return (pitch_deg, yaw_deg, roll_deg)
+    return ue_basis_to_rotator(
+        sv_direction_to_ue(f_sv),
+        sv_direction_to_ue(r_sv),
+        sv_direction_to_ue(u_sv),
+    )
 
 
 def hex_to_rgb(hex_str: str) -> Tuple[float, float, float]:
@@ -224,16 +267,21 @@ def export_scan_to_obj(meshes: List[Dict[str, Any]], obj_path: str) -> bool:
                 indices = mesh['indices']
 
                 for i in range(0, len(positions), 3):
-                    # Convert SV (x, y, z) meters -> UE OBJ (z*100, x*100, y*100) cm
-                    x_sv, y_sv, z_sv = positions[i], positions[i+1], positions[i+2]
-                    x_ue, y_ue, z_ue = z_sv * 100.0, x_sv * 100.0, y_sv * 100.0
+                    # Single shared handedness contract: SV meters -> UE cm (det -1).
+                    x_ue, y_ue, z_ue = sv_to_ue_location({
+                        'x': positions[i],
+                        'y': positions[i+1],
+                        'z': positions[i+2],
+                    })
                     f.write(f"v {x_ue:.4f} {y_ue:.4f} {z_ue:.4f}\n")
 
                 for i in range(0, len(indices), 3):
                     i0 = indices[i] + v_offset
                     i1 = indices[i+1] + v_offset
                     i2 = indices[i+2] + v_offset
-                    f.write(f"f {i0} {i1} {i2}\n")
+                    # The det -1 vertex map flips triangle handedness, so the winding
+                    # must be reversed or every imported scan face renders inside-out.
+                    f.write(f"f {i0} {i2} {i1}\n")
 
                 v_offset += len(positions) // 3
         return True

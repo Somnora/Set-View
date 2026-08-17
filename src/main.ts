@@ -976,8 +976,17 @@ class App {
   }
 
   private loadScene(data: SceneData): void {
+    const previousSceneId = this.sceneData.id;
     this.sceneData = data;
     this.persistence.setCurrent(data.id);
+    if (previousSceneId !== data.id) {
+      // DRS remembers the lowest render scale that juddered and never climbs back to it -
+      // that memory is what makes it settle instead of cycling. It is evidence about ONE
+      // scene's weight, so a different scene must not inherit it, or a light scene loaded
+      // after a heavy one would be stuck at the heavy one's resolution forever. Reloading
+      // the same scene (undo, restore, re-open) keeps it: the content is the same.
+      this.performanceGovernor.clearKnownBadRenderScale();
+    }
     this.selectedActorId = null;
     this.selectedPropId = null;
     this.hover = null;
@@ -2397,7 +2406,9 @@ class App {
     this.lastTime = time;
     if (!frame) {
       this.renderer.render(this.scene3, this.camera);
-      this.performanceGovernor.endFrame(this.renderer, this.splatRenderer, this.volumetrics, time);
+      // No timestamp: `time` is the frame *start*, so handing it to endFrame too would
+      // report a zero-length CPU span. The governor measures frame time end-to-end.
+      this.performanceGovernor.endFrame(this.renderer, this.splatRenderer, this.volumetrics);
       this.profilerRuntime.endFrame(this.renderer, time);
       return;
     }
@@ -2930,7 +2941,9 @@ class App {
     this.volumetrics.tick(dt, this.sceneData.atmosphere, this.sceneData.lights ?? [], this.camera);
     this.gizmo.update(this.camera);
     this.renderer.render(this.scene3, this.camera);
-    this.performanceGovernor.endFrame(this.renderer, this.splatRenderer, this.volumetrics, time);
+    // See the non-XR path above: endFrame stamps its own clock so the begin->end span
+    // is real CPU time rather than a zero delta against the frame-start timestamp.
+    this.performanceGovernor.endFrame(this.renderer, this.splatRenderer, this.volumetrics);
     this.profilerRuntime.endFrame(this.renderer, time);
   }
 

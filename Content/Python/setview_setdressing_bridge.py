@@ -62,6 +62,15 @@ def ue5_to_setview_coordinates(ue_x: float, ue_y: float, ue_z: float) -> Tuple[f
     return (round(x_m, 4), round(y_m, 4), round(z_m, 4))
 
 
+def setview_heading_to_ue5_yaw(rotation_y_rad: float) -> float:
+    """
+    Converts a SetView heading (radians around +Y, 0 = +Z) to an Unreal Yaw
+    (degrees around +Z, 0 = +X). Paired with the determinant -1 position map
+    above: SetView +Z is Unreal -X, so heading 0 is yaw 180.
+    """
+    return 180.0 - math.degrees(float(rotation_y_rad))
+
+
 def calculate_bounding_box_volume(bounds_min: Dict[str, float], bounds_max: Dict[str, float]) -> float:
     """Calculates 3D bounding box volume in cubic meters."""
     width = max(0.0, bounds_max.get("x", 0.0) - bounds_min.get("x", 0.0))
@@ -138,7 +147,8 @@ def spawn_manifest_props_in_ue5(
         pos = it.get("position", {"x": 0.0, "y": 0.0, "z": 0.0})
         ue_pos = setview_to_ue5_coordinates(pos["x"], pos["y"], pos["z"])
         rot_y = it.get("rotationY", 0.0)
-        ue_rot = (0.0, 0.0, math.degrees(rot_y))
+        # unreal.Rotator is (pitch, yaw, roll): the heading belongs in YAW.
+        ue_rot = (0.0, setview_heading_to_ue5_yaw(rot_y), 0.0)
 
         actor_location = unreal.Vector(ue_pos[0], ue_pos[1], ue_pos[2])
         actor_rotation = unreal.Rotator(ue_rot[0], ue_rot[1], ue_rot[2])

@@ -5,9 +5,170 @@ Verification script for import_setview.py and import_people.py JSON compatibilit
 import os
 import sys
 import json
+import math
 import base64
 import struct
 import subprocess
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, "Content", "Python"))
+
+import import_setview  # noqa: E402
+
+
+# --- Independent Unreal oracle ------------------------------------------------
+
+def ue_rotation_matrix(pitch_deg, yaw_deg, roll_deg):
+    """
+    Unreal's own FRotationMatrix, written out independently of import_setview so
+    the coordinate tests below have an oracle they do not share code with.
+    Returns (forward, right, up) — the three matrix rows.
+    """
+    sp, cp = math.sin(math.radians(pitch_deg)), math.cos(math.radians(pitch_deg))
+    sy, cy = math.sin(math.radians(yaw_deg)), math.cos(math.radians(yaw_deg))
+    sr, cr = math.sin(math.radians(roll_deg)), math.cos(math.radians(roll_deg))
+    forward = (cp * cy, cp * sy, sp)
+    right = (sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp)
+    up = (-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp)
+    return forward, right, up
+
+
+def dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def run_coordinate_tests():
+    """
+    Locks the SetView -> Unreal handedness contract.
+
+    SetView is right-handed (Y-up, camera looks down -Z); Unreal is left-handed
+    (Z-up, +X forward, +Y right). The conversion therefore needs a determinant -1
+    basis map. A determinant +1 permutation such as (x, y, z) -> (z, x, y) is a
+    pure rotation: it mirrors the scene, so every screen direction reverses while
+    the export still looks internally consistent.
+    """
+    print("\n--- Testing SetView -> Unreal coordinate handedness ---")
+
+    m = import_setview
+
+    # 1. Determinant of the position basis map must be -1.
+    ex = m.sv_to_ue_location({"x": 1.0, "y": 0.0, "z": 0.0})
+    ey = m.sv_to_ue_location({"x": 0.0, "y": 1.0, "z": 0.0})
+    ez = m.sv_to_ue_location({"x": 0.0, "y": 0.0, "z": 1.0})
+    s = m.SCALE_M_TO_CM
+    col = lambda v: (v[0] / s, v[1] / s, v[2] / s)
+    a, b, c = col(ex), col(ey), col(ez)
+    det = (
+        a[0] * (b[1] * c[2] - b[2] * c[1])
+        - b[0] * (a[1] * c[2] - a[2] * c[1])
+        + c[0] * (a[1] * b[2] - a[2] * b[1])
+    )
+    assert abs(det - (-1.0)) < 1e-9, f"basis map determinant must be -1 (right-handed -> left-handed), got {det}"
+    print(f"  [ok] position basis map determinant = {det:.1f}")
+
+    # 2. Up stays up: SetView +Y -> Unreal +Z.
+    assert col(ey) == (0.0, 0.0, 1.0), f"SetView +Y must map to Unreal +Z, got {col(ey)}"
+    assert col(ex) == (0.0, 1.0, 0.0), f"SetView +X must map to Unreal +Y, got {col(ex)}"
+    assert col(ez) == (-1.0, 0.0, 0.0), f"SetView +Z must map to Unreal -X, got {col(ez)}"
+    print("  [ok] up stays up (+Y_sv -> +Z_ue), +X_sv -> +Y_ue, +Z_sv -> -X_ue")
+
+    # 3. Screen direction: identity camera at the origin, actor 5m in front and
+    #    1m to the camera's RIGHT must still be in front and to the RIGHT.
+    cam_ue = m.sv_to_ue_location({"x": 0.0, "y": 0.0, "z": 0.0})
+    actor_ue = m.sv_to_ue_location({"x": 1.0, "y": 0.0, "z": -5.0})
+    pitch, yaw, roll = m.sv_quat_to_ue_rotator({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0})
+    fwd, right, up = ue_rotation_matrix(pitch, yaw, roll)
+    rel = sub(actor_ue, cam_ue)
+    assert abs(dot(rel, fwd) - 500.0) < 1e-6, f"actor must stay 5m in front, got {dot(rel, fwd)}cm"
+    assert dot(rel, right) > 0.0, "MIRRORED: actor 1m to camera right came out on the left"
+    assert abs(dot(rel, right) - 100.0) < 1e-6, f"actor must stay 1m to the right, got {dot(rel, right)}cm"
+    assert abs(dot(rel, up)) < 1e-6
+    print("  [ok] screen direction preserved (5m front / 1m camera-right survives the handoff)")
+
+    # 4. Heading round-trip: the yaw-derived facing direction must equal the
+    #    SetView facing vector pushed through the position map.
+    for deg in (0.0, 90.0, 180.0, 270.0, 37.5, -60.0):
+        rot_y = math.radians(deg)
+        facing_sv = {"x": math.sin(rot_y), "y": 0.0, "z": math.cos(rot_y)}
+        facing_ue = col(m.sv_to_ue_location(facing_sv))
+        yaw_deg = m.sv_heading_to_ue_yaw(rot_y)
+        from_yaw = (math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg)), 0.0)
+        for got, want, axis in zip(from_yaw, facing_ue, "xyz"):
+            assert abs(got - want) < 1e-9, f"heading {deg}deg: yaw facing {axis} mismatch ({got} vs {want})"
+    assert abs(m.sv_heading_to_ue_yaw(0.0) - 180.0) < 1e-9
+    assert abs(m.sv_heading_to_ue_yaw(math.radians(90.0)) - 90.0) < 1e-9
+    assert abs(m.sv_heading_to_ue_yaw(math.radians(180.0)) - 0.0) < 1e-9
+    assert abs(m.sv_heading_to_ue_yaw(math.radians(270.0)) - (-90.0)) < 1e-9
+    print("  [ok] heading yaw agrees with the position map for 0/90/180/270 and off-axis headings")
+
+    # 5. Roll sign: a Three.js camera rolled +alpha about its own local +Z (which
+    #    points BACKWARD) must come out as Unreal roll -alpha; the handedness flip
+    #    reverses roll. Unreal roll is positive when up leans toward +Y.
+    for alpha_deg in (30.0, -30.0, 12.5):
+        a_rad = math.radians(alpha_deg)
+        q = {"x": 0.0, "y": 0.0, "z": math.sin(a_rad / 2), "w": math.cos(a_rad / 2)}
+        pitch, yaw, roll = m.sv_quat_to_ue_rotator(q)
+        assert abs(pitch) < 1e-9, f"pure roll leaked into pitch: {pitch}"
+        assert abs(yaw) < 1e-9, f"pure roll leaked into yaw: {yaw}"
+        assert abs(roll - (-alpha_deg)) < 1e-9, f"roll sign wrong: expected {-alpha_deg}, got {roll}"
+        _, _, up_v = ue_rotation_matrix(pitch, yaw, roll)
+        assert math.copysign(1.0, up_v[1]) == math.copysign(1.0, -alpha_deg), "up vector leans the wrong way"
+    print("  [ok] roll sign is negated by the handedness flip (three.js +30 -> Unreal -30)")
+
+    # 6. Full rotator parity: the extracted rotator must rebuild exactly the
+    #    Unreal basis you get by pushing the SetView camera basis through the map.
+    for q in (
+        {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        {"x": 0.0, "y": 0.7071067811865476, "z": 0.0, "w": 0.7071067811865476},
+        {"x": 0.1830127, "y": 0.6830127, "z": 0.1830127, "w": 0.6830127},
+        {"x": -0.2705981, "y": 0.6532815, "z": 0.2705981, "w": 0.6532815},
+    ):
+        qn = math.sqrt(sum(v * v for v in q.values()))
+        qx, qy, qz, qw = q["x"] / qn, q["y"] / qn, q["z"] / qn, q["w"] / qn
+        f_sv = (-2.0 * (qx * qz + qw * qy), -2.0 * (qy * qz - qw * qx), -(1.0 - 2.0 * (qx * qx + qy * qy)))
+        u_sv = (2.0 * (qx * qy - qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz + qw * qx))
+        r_sv = (1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy + qw * qz), 2.0 * (qx * qz - qw * qy))
+        want = (
+            m.sv_direction_to_ue(f_sv),
+            m.sv_direction_to_ue(r_sv),
+            m.sv_direction_to_ue(u_sv),
+        )
+        got = ue_rotation_matrix(*m.sv_quat_to_ue_rotator(q))
+        for g_vec, w_vec in zip(got, want):
+            for g, w in zip(g_vec, w_vec):
+                assert abs(g - w) < 1e-9, f"rotator basis mismatch: {got} vs {want}"
+    print("  [ok] quaternion -> rotator -> Unreal basis is exact for yaw/pitch/roll combinations")
+
+    # 7. The OBJ scan writer must share the helper AND reverse triangle winding,
+    #    otherwise the det -1 vertex map turns every face inside-out.
+    import tempfile
+
+    mesh = {
+        "label": "winding",
+        "positions": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        "indices": [0, 1, 2],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        obj_path = os.path.join(tmp, "scan.obj")
+        assert m.export_scan_to_obj([mesh], obj_path)
+        with open(obj_path, "r", encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+    verts = [tuple(float(t) for t in ln.split()[1:]) for ln in lines if ln.startswith("v ")]
+    faces = [ln for ln in lines if ln.startswith("f ")]
+    for got, sv in zip(verts, ({"x": 0, "y": 0, "z": 0}, {"x": 1, "y": 0, "z": 0}, {"x": 0, "y": 0, "z": 1})):
+        want = m.sv_to_ue_location(sv)
+        assert all(abs(g - w) < 1e-6 for g, w in zip(got, want)), (
+            f"OBJ vertex map diverged from sv_to_ue_location: {got} vs {want}"
+        )
+    assert faces[0] == "f 1 3 2", f"OBJ winding must be reversed for the det -1 map, got '{faces[0]}'"
+    print("  [ok] scan OBJ writer uses the shared map and reverses triangle winding")
+
+    print("Coordinate handedness tests passed.")
+
 
 def create_sample_setview_json(path: str):
     # Construct binary location scan data
@@ -157,6 +318,8 @@ def create_sample_setview_json(path: str):
     print(f"Created sample scene JSON at {path}")
 
 def run_tests():
+    run_coordinate_tests()
+
     sample_json = "/Users/jamesmcshane/Desktop/SetView/test/sample_scene.setview.json"
     create_sample_setview_json(sample_json)
 

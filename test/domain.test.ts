@@ -302,6 +302,16 @@ import {
   type Ue5ExportOptions,
 } from '../src/ue5Bridge.ts';
 import {
+  svDirectionToUe,
+  svQuatToBasis,
+  ueBasisToRotator,
+  ueDirectionToSv,
+  ueRotatorToBasis,
+  ueRotatorToSvQuat,
+  ueToSvLocation,
+  ueYawToSvHeading,
+} from '../src/ueCoords.ts';
+import {
   type DoorType,
   type WallFinishType,
   type WindowType,
@@ -357,14 +367,17 @@ import {
   v3,
 } from '../src/characterRig.ts';
 import {
+  DRS_NO_KNOWN_BAD_SCALE,
   RollingFrameStats,
+  SessionFrameLedger,
   calculateAdaptiveLODBudget,
-  calculateAdaptiveRenderScale,
+  calculateSessionRenderScale,
   createGovernorConfig,
   estimateGCPressure,
   isGovernorConfig,
   normalizeGovernorConfig,
 } from '../src/performanceGovernor.ts';
+import { XRPerformanceGovernor } from '../src/xrPerformance.ts';
 import {
   calculateAngularSnap45_90,
   calculateMagneticSnap,
@@ -5143,14 +5156,16 @@ test('exportSceneTimeline: unifies all 5 export formats with correct filenames a
 });
 
 test('UE5 Bridge: coordinate conversion and rotator math', () => {
+  // SetView (right-handed, Y-up, m) -> Unreal (left-handed, Z-up, cm) needs a
+  // determinant -1 basis map: x_ue = -z_sv, y_ue = x_sv, z_ue = y_sv.
   const pos = { x: 2.5, y: 1.8, z: -4.0 };
   const ueLoc = svToUeLocation(pos, 100.0);
-  assert.equal(ueLoc.x, -400.0);
+  assert.equal(ueLoc.x, 400.0);
   assert.equal(ueLoc.y, 250.0);
   assert.equal(ueLoc.z, 180.0);
 
   const ueLocCustom = svToUeLocation(pos, 50.0);
-  assert.equal(ueLocCustom.x, -200.0);
+  assert.equal(ueLocCustom.x, 200.0);
   assert.equal(ueLocCustom.y, 125.0);
   assert.equal(ueLocCustom.z, 90.0);
 
@@ -5159,14 +5174,17 @@ test('UE5 Bridge: coordinate conversion and rotator math', () => {
   assert.equal(invalidLoc.y, 0);
   assert.equal(invalidLoc.z, 0);
 
-  assert.equal(svHeadingToUeYaw(0), 0);
+  // SetView heading 0 faces +Z, which is Unreal -X => yaw 180.
+  assert.equal(svHeadingToUeYaw(0), 180);
   assert.equal(Math.round(svHeadingToUeYaw(Math.PI / 2)), 90);
-  assert.equal(Math.round(svHeadingToUeYaw(-Math.PI / 2)), -90);
+  assert.equal(Math.round(svHeadingToUeYaw(Math.PI)), 0);
+  assert.equal(Math.round(svHeadingToUeYaw(-Math.PI / 2)), 270);
 
+  // An identity SetView camera quaternion looks down -Z, i.e. Unreal +X: rotator (0, 0, 0).
   const idRot = svQuatToUeRotator({ x: 0, y: 0, z: 0, w: 1 });
-  assert.equal(typeof idRot.pitch, 'number');
-  assert.equal(typeof idRot.yaw, 'number');
-  assert.equal(typeof idRot.roll, 'number');
+  assert.ok(Math.abs(idRot.pitch) < 1e-9);
+  assert.ok(Math.abs(idRot.yaw) < 1e-9);
+  assert.ok(Math.abs(idRot.roll) < 1e-9);
 
   assert.deepEqual(hexToRgb('#ff0000'), { r: 1, g: 0, b: 0 });
   assert.deepEqual(hexToRgb('#00ff00'), { r: 0, g: 1, b: 0 });
@@ -5180,6 +5198,179 @@ test('UE5 Bridge: coordinate conversion and rotator math', () => {
   assert.equal(defaultOpts.useNanite, true);
   assert.equal(defaultOpts.useLumen, true);
   assert.equal(defaultOpts.scaleFactor, 100.0);
+});
+
+test('ueCoords: SetView -> Unreal basis map flips handedness (determinant -1) and keeps up up', () => {
+  // Build the 3x3 basis matrix from the images of the SetView unit vectors.
+  const ex = svDirectionToUe({ x: 1, y: 0, z: 0 });
+  const ey = svDirectionToUe({ x: 0, y: 1, z: 0 });
+  const ez = svDirectionToUe({ x: 0, y: 0, z: 1 });
+
+  const det =
+    ex.x * (ey.y * ez.z - ey.z * ez.y) -
+    ey.x * (ex.y * ez.z - ex.z * ez.y) +
+    ez.x * (ex.y * ey.z - ex.z * ey.y);
+
+  // A right-handed -> left-handed conversion MUST have determinant -1. A +1
+  // permutation is a pure rotation and silently mirrors the whole scene.
+  assert.equal(det, -1, 'SetView -> Unreal basis map must have determinant -1');
+
+  // Up stays up: SetView +Y is Unreal +Z.
+  assert.deepEqual(ey, { x: 0, y: 0, z: 1 });
+  // SetView +X (right) is Unreal +Y (right); SetView +Z is Unreal -X (backward).
+  assert.deepEqual(ex, { x: 0, y: 1, z: 0 });
+  assert.deepEqual(ez, { x: -1, y: 0, z: 0 });
+
+  // The location map is the same basis map times the metres -> centimetres scale.
+  assert.deepEqual(svToUeLocation({ x: 0, y: 1, z: 0 }, 100), { x: 0, y: 0, z: 100 });
+
+  // The inverse direction map undoes the forward one exactly.
+  for (const v of [
+    { x: 1, y: 0, z: 0 },
+    { x: 0, y: 1, z: 0 },
+    { x: 0, y: 0, z: 1 },
+    { x: -0.6, y: 2.4, z: 7.1 },
+  ]) {
+    const round = ueDirectionToSv(svDirectionToUe(v));
+    assert.ok(Math.abs(round.x - v.x) < 1e-12 && Math.abs(round.y - v.y) < 1e-12 && Math.abs(round.z - v.z) < 1e-12);
+  }
+
+  // Round-trips exactly.
+  const sv = { x: 1.25, y: -2.5, z: 3.75 };
+  const back = ueToSvLocation(svToUeLocation(sv, 100), 100);
+  assert.ok(Math.abs(back.x - sv.x) < 1e-9);
+  assert.ok(Math.abs(back.y - sv.y) < 1e-9);
+  assert.ok(Math.abs(back.z - sv.z) < 1e-9);
+});
+
+test('ueCoords: screen direction survives the Unreal handoff (camera right stays camera right)', () => {
+  // Camera at the origin with an identity quaternion: looks down SetView -Z,
+  // +X is to its right. Actor 5m in front and 1m to the camera's RIGHT.
+  const camPos = { x: 0, y: 0, z: 0 };
+  const camRot = { x: 0, y: 0, z: 0, w: 1 };
+  const actorSv = { x: 1.0, y: 0.0, z: -5.0 };
+
+  const camUe = svToUeLocation(camPos, 100);
+  const actorUe = svToUeLocation(actorSv, 100);
+  const basis = ueRotatorToBasis(svQuatToUeRotator(camRot));
+
+  const rel = { x: actorUe.x - camUe.x, y: actorUe.y - camUe.y, z: actorUe.z - camUe.z };
+  const dot = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) =>
+    a.x * b.x + a.y * b.y + a.z * b.z;
+
+  assert.ok(Math.abs(dot(rel, basis.forward) - 500) < 1e-6, 'actor must stay 5m in FRONT');
+  assert.ok(dot(rel, basis.right) > 0, 'actor must stay to the camera RIGHT, not mirror to the left');
+  assert.ok(Math.abs(dot(rel, basis.right) - 100) < 1e-6);
+  assert.ok(Math.abs(dot(rel, basis.up)) < 1e-6);
+
+  // Same check for a camera that is off-origin, yawed 40 degrees and pitched down.
+  const yawA = 0.7;
+  const pitchA = -0.25;
+  const qYaw = { x: 0, y: Math.sin(yawA / 2), z: 0, w: Math.cos(yawA / 2) };
+  const qPitch = { x: Math.sin(pitchA / 2), y: 0, z: 0, w: Math.cos(pitchA / 2) };
+  // q = qYaw * qPitch (yaw applied in world, pitch in camera local space)
+  const q = {
+    x: qYaw.w * qPitch.x + qYaw.x * qPitch.w + qYaw.y * qPitch.z - qYaw.z * qPitch.y,
+    y: qYaw.w * qPitch.y - qYaw.x * qPitch.z + qYaw.y * qPitch.w + qYaw.z * qPitch.x,
+    z: qYaw.w * qPitch.z + qYaw.x * qPitch.y - qYaw.y * qPitch.x + qYaw.z * qPitch.w,
+    w: qYaw.w * qPitch.w - qYaw.x * qPitch.x - qYaw.y * qPitch.y - qYaw.z * qPitch.z,
+  };
+  const camPos2 = { x: -2.0, y: 1.6, z: 3.0 };
+  const svBasis = svQuatToBasis(q);
+  // Target 4m along the camera forward and 1.5m along the camera right, in SetView.
+  const targetSv = {
+    x: camPos2.x + svBasis.forward.x * 4 + svBasis.right.x * 1.5,
+    y: camPos2.y + svBasis.forward.y * 4 + svBasis.right.y * 1.5,
+    z: camPos2.z + svBasis.forward.z * 4 + svBasis.right.z * 1.5,
+  };
+
+  const camUe2 = svToUeLocation(camPos2, 100);
+  const targetUe2 = svToUeLocation(targetSv, 100);
+  const basis2 = ueRotatorToBasis(svQuatToUeRotator(q));
+  const rel2 = { x: targetUe2.x - camUe2.x, y: targetUe2.y - camUe2.y, z: targetUe2.z - camUe2.z };
+
+  assert.ok(Math.abs(dot(rel2, basis2.forward) - 400) < 1e-6, 'off-axis camera: distance in front preserved');
+  assert.ok(Math.abs(dot(rel2, basis2.right) - 150) < 1e-6, 'off-axis camera: right offset preserved (no mirror)');
+  assert.ok(Math.abs(dot(rel2, basis2.up)) < 1e-6);
+});
+
+test('ueCoords: heading yaw agrees with pushing the SetView facing vector through the position map', () => {
+  for (const deg of [0, 90, 180, 270, 45, -30, 137.5]) {
+    const rotY = (deg * Math.PI) / 180;
+    // SetView facing direction for heading rotationY (0 = +Z).
+    const facingSv = { x: Math.sin(rotY), y: 0, z: Math.cos(rotY) };
+    const facingUe = svDirectionToUe(facingSv);
+
+    const yaw = svHeadingToUeYaw(rotY);
+    const fromYaw = { x: Math.cos((yaw * Math.PI) / 180), y: Math.sin((yaw * Math.PI) / 180), z: 0 };
+
+    assert.ok(Math.abs(fromYaw.x - facingUe.x) < 1e-9, `heading ${deg}: yaw X mismatch`);
+    assert.ok(Math.abs(fromYaw.y - facingUe.y) < 1e-9, `heading ${deg}: yaw Y mismatch`);
+    assert.ok(Math.abs(fromYaw.z - facingUe.z) < 1e-9, `heading ${deg}: yaw Z mismatch`);
+
+    // Inverse helper round-trips the heading.
+    assert.ok(Math.abs(ueYawToSvHeading(yaw) - rotY) < 1e-9);
+  }
+
+  // The documented anchors.
+  assert.equal(svHeadingToUeYaw(0), 180);
+  assert.ok(Math.abs(svHeadingToUeYaw(Math.PI / 2) - 90) < 1e-9);
+  assert.ok(Math.abs(svHeadingToUeYaw(Math.PI) - 0) < 1e-9);
+  assert.ok(Math.abs(svHeadingToUeYaw((3 * Math.PI) / 2) - -90) < 1e-9);
+});
+
+test('ueCoords: roll sign is negated by the handedness flip and rotator round-trips exactly', () => {
+  // A Three.js camera rolled +alpha about its own local +Z (which points BACKWARD)
+  // must come out as Unreal roll -alpha, because the handedness flip reverses roll.
+  for (const alphaDeg of [30, -30, 12.5]) {
+    const a = (alphaDeg * Math.PI) / 180;
+    const q = { x: 0, y: 0, z: Math.sin(a / 2), w: Math.cos(a / 2) };
+    const rot = svQuatToUeRotator(q);
+    assert.ok(Math.abs(rot.pitch) < 1e-9, 'pure roll must not leak into pitch');
+    assert.ok(Math.abs(rot.yaw) < 1e-9, 'pure roll must not leak into yaw');
+    assert.ok(Math.abs(rot.roll - -alphaDeg) < 1e-9, `roll sign wrong for ${alphaDeg} deg`);
+
+    // The rolled camera's up vector must lean the correct way in Unreal:
+    // Unreal roll is positive when up leans toward +Y (the camera's own right).
+    const basis = ueRotatorToBasis(rot);
+    assert.ok(Math.sign(basis.up.y) === Math.sign(-alphaDeg), 'up vector leans the wrong way');
+  }
+
+  // Rotator extraction is an exact inverse of Unreal's own FRotationMatrix for
+  // arbitrary orientations (deterministic pseudo-random quaternions).
+  let seed = 1337;
+  const rnd = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  for (let i = 0; i < 500; i++) {
+    const u1 = rnd();
+    const u2 = rnd();
+    const u3 = rnd();
+    const q = {
+      x: Math.sqrt(1 - u1) * Math.sin(2 * Math.PI * u2),
+      y: Math.sqrt(1 - u1) * Math.cos(2 * Math.PI * u2),
+      z: Math.sqrt(u1) * Math.sin(2 * Math.PI * u3),
+      w: Math.sqrt(u1) * Math.cos(2 * Math.PI * u3),
+    };
+
+    const svBasis = svQuatToBasis(q);
+    const expectF = svDirectionToUe(svBasis.forward);
+    const expectR = svDirectionToUe(svBasis.right);
+    const expectU = svDirectionToUe(svBasis.up);
+
+    const rot = svQuatToUeRotator(q);
+    const basis = ueRotatorToBasis(rot);
+
+    assert.ok(Math.abs(basis.forward.x - expectF.x) < 1e-9 && Math.abs(basis.forward.y - expectF.y) < 1e-9 && Math.abs(basis.forward.z - expectF.z) < 1e-9);
+    assert.ok(Math.abs(basis.right.x - expectR.x) < 1e-9 && Math.abs(basis.right.y - expectR.y) < 1e-9 && Math.abs(basis.right.z - expectR.z) < 1e-9);
+    assert.ok(Math.abs(basis.up.x - expectU.x) < 1e-9 && Math.abs(basis.up.y - expectU.y) < 1e-9 && Math.abs(basis.up.z - expectU.z) < 1e-9);
+
+    // Quaternion round-trip (up to sign, which is the same rotation).
+    const backQ = ueRotatorToSvQuat(rot);
+    const dot = backQ.x * q.x + backQ.y * q.y + backQ.z * q.z + backQ.w * q.w;
+    assert.ok(Math.abs(Math.abs(dot) - 1) < 1e-7, 'quaternion round-trip must recover the same rotation');
+  }
 });
 
 test('generateOpenUsdScene: generates valid USDA ASCII stage with cameras, lights, actors, props, and atmosphere', () => {
@@ -5241,6 +5432,173 @@ test('generateOpenUsdScene: generates valid USDA ASCII stage with cameras, light
 
   assert.ok(usda.includes('def Scope "Atmosphere"'), 'Must define Atmosphere scope');
   assert.ok(usda.includes('custom string preset = "cinematic_fog"'), 'Must preserve preset');
+});
+
+// --- USD rotation axis contract ---------------------------------------------
+
+/** Pulls the `quatf xformOp:orient` written for a named prim out of a USDA stage. */
+function usdOrientOf(usda: string, primName: string): { x: number; y: number; z: number; w: number } {
+  const at = usda.indexOf(`"${primName}"`);
+  assert.ok(at >= 0, `prim "${primName}" not found in stage`);
+  const m = /quatf xformOp:orient = \(([^)]+)\)/.exec(usda.slice(at));
+  assert.ok(m, `prim "${primName}" has no quatf xformOp:orient`);
+  const parts = m![1].split(',').map((v) => Number(v.trim()));
+  assert.equal(parts.length, 4, 'USD quaternion literal must have 4 components');
+  // USD writes quaternion literals real part first: (w, x, y, z).
+  return { w: parts[0], x: parts[1], y: parts[2], z: parts[3] };
+}
+
+/** Standard right-handed quaternion rotation, independent of the exporter's own maths. */
+function rotateByQuat(
+  q: { x: number; y: number; z: number; w: number },
+  v: { x: number; y: number; z: number },
+): { x: number; y: number; z: number } {
+  const cx = q.y * v.z - q.z * v.y;
+  const cy = q.z * v.x - q.x * v.z;
+  const cz = q.x * v.y - q.y * v.x;
+  const dx = q.y * cz - q.z * cy;
+  const dy = q.z * cx - q.x * cz;
+  const dz = q.x * cy - q.y * cx;
+  return {
+    x: v.x + 2 * (q.w * cx + dx),
+    y: v.y + 2 * (q.w * cy + dy),
+    z: v.z + 2 * (q.w * cz + dz),
+  };
+}
+
+test('generateOpenUsdScene: prim rotations decode back to the exact Unreal FRotator (no axis swap)', () => {
+  const scene = createScene('USD Rotation Contract');
+
+  // Case 1: pure heading. rotationY = PI/2 must come back as pure yaw.
+  const heading = Math.PI / 2;
+  const actor = createActor(scene, { x: 1.0, y: 0, z: 2.0 }, heading);
+  actor.name = 'HeadingProbe';
+  actor.stance = 'standing'; // zero bodyRot, so pitch and roll must both be zero
+
+  // Case 2: pitch AND roll AND yaw all distinct and non-zero, so a slot swap or a
+  // sign flip cannot survive by symmetry.
+  const propRotX = 0.2;
+  const propRotY = 0.5;
+  const propRotZ = -0.4;
+  scene.props = [
+    createPropData('directors_chair', 'TiltProbe', { x: -1.5, y: 0, z: 1.0 }, {
+      rotationY: propRotY,
+      rotationX: propRotX,
+      rotationZ: propRotZ,
+    }),
+  ];
+
+  const usda = generateOpenUsdScene(scene, { fps: 24, scaleFactor: 100.0 });
+
+  // The stage is Z-up, so `xformOp:rotateXYZ` would mean rotations about X, then
+  // Y, then Z -- writing an Unreal (pitch, yaw, roll) triple into those slots
+  // tips prims onto their side. Orientation must be order-free.
+  assert.ok(!usda.includes('rotateXYZ'), 'must not emit ambiguous rotateXYZ on a Z-up stage');
+  assert.ok(usda.includes('quatf xformOp:orient'), 'must emit an order-free orientation');
+  assert.ok(
+    usda.includes('uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]'),
+    'xformOpOrder must name the op that is actually authored',
+  );
+
+  // --- Case 1 decode -------------------------------------------------------
+  const qHeading = usdOrientOf(usda, 'HeadingProbe');
+  const decodedHeading = ueBasisToRotator(
+    rotateByQuat(qHeading, { x: 1, y: 0, z: 0 }),
+    rotateByQuat(qHeading, { x: 0, y: 1, z: 0 }),
+    rotateByQuat(qHeading, { x: 0, y: 0, z: 1 }),
+  );
+  const expectYaw = svHeadingToUeYaw(heading);
+  assert.ok(Math.abs(decodedHeading.yaw - expectYaw) < 1e-4, `yaw ${decodedHeading.yaw} != ${expectYaw}`);
+  assert.ok(Math.abs(decodedHeading.pitch) < 1e-4, `heading leaked into pitch: ${decodedHeading.pitch}`);
+  assert.ok(Math.abs(decodedHeading.roll) < 1e-4, `heading leaked into roll: ${decodedHeading.roll}`);
+
+  // The actor must turn about the world up axis, not tip over: forward stays flat
+  // and up stays up. This is the assertion the old rotateXYZ emission failed.
+  const fwd = rotateByQuat(qHeading, { x: 1, y: 0, z: 0 });
+  const up = rotateByQuat(qHeading, { x: 0, y: 0, z: 1 });
+  assert.ok(Math.abs(fwd.z) < 1e-6, 'a pure heading must keep the forward vector horizontal');
+  assert.ok(Math.abs(up.z - 1) < 1e-6, 'a pure heading must keep the up vector pointing up');
+
+  // --- Case 2 decode -------------------------------------------------------
+  const qTilt = usdOrientOf(usda, 'TiltProbe');
+  const decodedTilt = ueBasisToRotator(
+    rotateByQuat(qTilt, { x: 1, y: 0, z: 0 }),
+    rotateByQuat(qTilt, { x: 0, y: 1, z: 0 }),
+    rotateByQuat(qTilt, { x: 0, y: 0, z: 1 }),
+  );
+  const expectTilt = {
+    pitch: (propRotX * 180) / Math.PI,
+    yaw: svHeadingToUeYaw(propRotY),
+    roll: (propRotZ * 180) / Math.PI,
+  };
+  assert.ok(Math.abs(decodedTilt.pitch - expectTilt.pitch) < 1e-4, `pitch ${decodedTilt.pitch} != ${expectTilt.pitch}`);
+  assert.ok(Math.abs(decodedTilt.yaw - expectTilt.yaw) < 1e-4, `yaw ${decodedTilt.yaw} != ${expectTilt.yaw}`);
+  assert.ok(Math.abs(decodedTilt.roll - expectTilt.roll) < 1e-4, `roll ${decodedTilt.roll} != ${expectTilt.roll}`);
+
+  // All three components differ, so the passing decode above cannot be a symmetry.
+  assert.ok(Math.abs(expectTilt.pitch) > 1 && Math.abs(expectTilt.roll) > 1, 'probe must exercise pitch and roll');
+  assert.ok(
+    Math.abs(expectTilt.pitch - expectTilt.roll) > 1 &&
+      Math.abs(expectTilt.pitch - expectTilt.yaw) > 1 &&
+      Math.abs(expectTilt.roll - expectTilt.yaw) > 1,
+    'probe angles must all be distinct',
+  );
+
+  // And the emitted basis matches ueCoords' own FRotator basis element for element.
+  const expectBasis = ueRotatorToBasis(expectTilt);
+  const gotF = rotateByQuat(qTilt, { x: 1, y: 0, z: 0 });
+  assert.ok(Math.abs(gotF.x - expectBasis.forward.x) < 1e-5);
+  assert.ok(Math.abs(gotF.y - expectBasis.forward.y) < 1e-5);
+  assert.ok(Math.abs(gotF.z - expectBasis.forward.z) < 1e-5);
+});
+
+test('generateUe5PythonImportScript: embedded payload is valid JSON and survives hostile scene names', () => {
+  // Every character class that has ever closed a Python literal early, plus the
+  // exact `'''` sequence that defeated the old raw triple-quoted embedding.
+  const hostile = [
+    "Rig's \"A-Cam\"",
+    'back\\slash and \\n literal',
+    'line one\nline two',
+    "triple ''' quote \"\"\" both",
+    'café naïve ñ',
+    '\u{1F3AC} clapper',
+    'tab\tand\rcarriage',
+  ].join(' | ');
+
+  const scene = createScene(hostile);
+  const actor = createActor(scene, { x: 0, y: 0, z: 2.0 }, 0);
+  actor.name = `${hostile} (actor)`;
+  createCameraSetup(scene, { x: 0, y: 1.5, z: -2.0 }, { x: 0, y: 0, z: 0, w: 1 }, 50, '16:9', 2.8, 'fullframe');
+  scene.props = [createPropData('directors_chair', `${hostile} (prop)`, { x: 1, y: 0, z: 0 })];
+
+  const script = generateUe5PythonImportScript(scene, { fps: 24 });
+
+  // The payload must not be hand-escaped into a raw string: raw strings take the
+  // escapes literally, which made every generated script die on json.loads.
+  assert.ok(!script.includes("json.loads(r'''"), 'must not embed escaped JSON in a raw literal');
+  assert.ok(script.includes('import base64'), 'decoder import must be present');
+  assert.ok(script.includes('SCENE_DATA_PAYLOAD = json.loads'), 'Embeds scene JSON payload');
+
+  // Extract exactly what Python would see and decode it the same way Python does.
+  const block = /SCENE_DATA_B64 = \(\n([\s\S]*?)\n\)/.exec(script);
+  assert.ok(block, 'generated script must expose a SCENE_DATA_B64 literal');
+  const b64 = (block![1].match(/"([A-Za-z0-9+/=]*)"/g) ?? []).map((c) => c.slice(1, -1)).join('');
+  assert.ok(b64.length > 0, 'base64 payload must not be empty');
+  assert.ok(!/["'\\\n]/.test(b64), 'base64 payload must contain no literal-terminating characters');
+
+  const json = Buffer.from(b64, 'base64').toString('utf8');
+  const parsed = JSON.parse(json) as SceneData;
+
+  assert.equal(parsed.name, hostile, 'scene name must round-trip byte for byte');
+  assert.equal(parsed.actors[0].name, `${hostile} (actor)`, 'actor name must round-trip byte for byte');
+  assert.equal(parsed.props?.[0]?.name, `${hostile} (prop)`, 'prop name must round-trip byte for byte');
+  assert.equal(parsed.id, scene.id);
+  assert.equal(parsed.cameras.length, 1);
+
+  // The short display strings are escaped, not raw, so they cannot break out either.
+  const docLine = /Generated for: "(.*)"/.exec(script);
+  assert.ok(docLine, 'docstring must name the scene');
+  assert.ok(!docLine![1].includes('\n'), 'escaped display name must stay on one line');
 });
 
 test('generateUe5PythonImportScript: generates self-contained Unreal Engine Python automation script', () => {
@@ -5802,9 +6160,14 @@ test('LiveLink: convertSetViewToUnrealCameraTransform and convertUnrealToSetView
   const svRot = { x: 0, y: 0, z: 0, w: 1 }; // facing -Z, up +Y
 
   const ueTransform = convertSetViewToUnrealCameraTransform(svPos, svRot);
-  assert.equal(Math.round(ueTransform.locationCm.x), -350);
+  assert.equal(Math.round(ueTransform.locationCm.x), 350);
   assert.equal(Math.round(ueTransform.locationCm.y), 150);
   assert.equal(Math.round(ueTransform.locationCm.z), 200);
+
+  // Identity SetView camera quaternion => Unreal rotator (0, 0, 0), facing +X.
+  assert.ok(Math.abs(ueTransform.rotationDeg.pitch) < 1e-6);
+  assert.ok(Math.abs(ueTransform.rotationDeg.yaw) < 1e-6);
+  assert.ok(Math.abs(ueTransform.rotationDeg.roll) < 1e-6);
 
   // Round-trip parity test
   const svReconstructed = convertUnrealToSetViewCameraTransform(ueTransform.locationCm, ueTransform.rotationDeg);
@@ -5823,6 +6186,54 @@ test('LiveLink: convertSetViewToUnrealCameraTransform and convertUnrealToSetView
   const q = ueYawTransform.quaternion;
   const qLen = Math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
   assert.ok(Math.abs(qLen - 1.0) < 1e-4);
+});
+
+test('LiveLink: VCam transforms preserve screen direction and round-trip a rolled camera', () => {
+  // Camera at the origin looking down SetView -Z; subject 5m ahead, 1m to its RIGHT.
+  const camRot: Quat = { x: 0, y: 0, z: 0, w: 1 };
+  const camUe = convertSetViewToUnrealCameraTransform({ x: 0, y: 1.6, z: 0 }, camRot);
+  const subjectUe = convertSetViewToUnrealCameraTransform({ x: 1, y: 1.6, z: -5 }, camRot);
+  const basis = ueRotatorToBasis(camUe.rotationDeg);
+  const rel = {
+    x: subjectUe.locationCm.x - camUe.locationCm.x,
+    y: subjectUe.locationCm.y - camUe.locationCm.y,
+    z: subjectUe.locationCm.z - camUe.locationCm.z,
+  };
+  const dot = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) =>
+    a.x * b.x + a.y * b.y + a.z * b.z;
+  assert.ok(Math.abs(dot(rel, basis.forward) - 500) < 1e-6, 'subject stays 5m in front over LiveLink');
+  assert.ok(Math.abs(dot(rel, basis.right) - 100) < 1e-6, 'subject stays 1m camera-right over LiveLink');
+
+  // A camera with roll AND pitch AND yaw must survive the full round-trip.
+  const half = (a: number) => ({ s: Math.sin(a / 2), c: Math.cos(a / 2) });
+  const ry = half(0.9);
+  const rx = half(-0.4);
+  const rz = half(0.35);
+  const qy: Quat = { x: 0, y: ry.s, z: 0, w: ry.c };
+  const qp: Quat = { x: rx.s, y: 0, z: 0, w: rx.c };
+  const qr: Quat = { x: 0, y: 0, z: rz.s, w: rz.c };
+  const mul = (a: Quat, b: Quat): Quat => ({
+    x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+    y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+    z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+  });
+  const rolled = mul(mul(qy, qp), qr);
+
+  const svPos2 = { x: -1.25, y: 2.4, z: 0.75 };
+  const ue2 = convertSetViewToUnrealCameraTransform(svPos2, rolled);
+  assert.ok(Math.abs(ue2.rotationDeg.roll) > 1.0, 'test case must actually carry roll');
+
+  const back = convertUnrealToSetViewCameraTransform(ue2.locationCm, ue2.rotationDeg);
+  assert.ok(Math.abs(back.positionM.x - svPos2.x) < 1e-9);
+  assert.ok(Math.abs(back.positionM.y - svPos2.y) < 1e-9);
+  assert.ok(Math.abs(back.positionM.z - svPos2.z) < 1e-9);
+  const qDot =
+    back.rotationQuat.x * rolled.x +
+    back.rotationQuat.y * rolled.y +
+    back.rotationQuat.z * rolled.z +
+    back.rotationQuat.w * rolled.w;
+  assert.ok(Math.abs(Math.abs(qDot) - 1) < 1e-7, 'rolled camera orientation must round-trip');
 });
 
 test('LiveLink: applyVcamSmoothing across presets and shortest-arc SLERP', () => {
@@ -7023,9 +7434,12 @@ test('GovernorConfig: creation, validation, and bounds normalization', () => {
   const defaultConfig = createGovernorConfig();
   assert.equal(defaultConfig.targetFps, 72);
   assert.equal(defaultConfig.minRenderScale, 0.6);
-  assert.equal(defaultConfig.maxRenderScale, 1.25);
   assert.equal(defaultConfig.enableDynamicResolution, true);
   assert.equal(defaultConfig.enableFoveatedRendering, true);
+  // No maxRenderScale: DRS caps every climb at native, so a configurable ceiling above 1.0
+  // could not change the outcome at any position. It was removed rather than left as a live
+  // slider wired to nothing.
+  assert.equal('maxRenderScale' in defaultConfig, false);
 
   assert.equal(isGovernorConfig(defaultConfig), true);
   assert.equal(isGovernorConfig(null), false);
@@ -7034,7 +7448,6 @@ test('GovernorConfig: creation, validation, and bounds normalization', () => {
   const clamped = normalizeGovernorConfig({
     targetFps: 85 as any,
     minRenderScale: -0.5,
-    maxRenderScale: 3.5,
     enableDynamicResolution: true,
     enableFoveatedRendering: false,
     enableLODThrottling: true,
@@ -7042,26 +7455,135 @@ test('GovernorConfig: creation, validation, and bounds normalization', () => {
   });
   assert.equal(clamped.targetFps, 72); // Default fallback for invalid FPS
   assert.equal(clamped.minRenderScale, 0.4); // Clamped to min bounds
-  assert.equal(clamped.maxRenderScale, 2.5); // Clamped to max bounds
   assert.equal(clamped.measurementWindowFrames, 10); // Clamped to min window
+
+  // MIGRATION: a config persisted before maxRenderScale was removed must normalize, not
+  // throw and not fail validation. The field is simply dropped.
+  const legacy = normalizeGovernorConfig({
+    targetFps: 90,
+    minRenderScale: 0.7,
+    maxRenderScale: 1.25,
+    enableFoveatedRendering: true,
+    enableDynamicResolution: true,
+    enableLODThrottling: true,
+    measurementWindowFrames: 90,
+  });
+  assert.equal(legacy.targetFps, 90);
+  assert.equal(legacy.minRenderScale, 0.7);
+  assert.equal('maxRenderScale' in legacy, false);
+  assert.equal(isGovernorConfig(legacy), true);
+  // ...and the legacy object itself still reads as a valid config, so nothing that round
+  // trips one rejects it on load.
+  assert.equal(isGovernorConfig({
+    targetFps: 72,
+    minRenderScale: 0.6,
+    maxRenderScale: 1.25,
+    enableFoveatedRendering: true,
+    enableDynamicResolution: true,
+    enableLODThrottling: true,
+    measurementWindowFrames: 90,
+  }), true);
 });
 
-test('calculateAdaptiveRenderScale: dynamic resolution scaling and hysteresis deadband', () => {
-  const targetBudgetMs = 1000 / 72; // 13.88ms
+test('calculateSessionRenderScale: three bands, one step at most, native ceiling', () => {
+  const frames = 600;
+  const minFrames = 144; // two seconds at 72Hz
+  const NONE = DRS_NO_KNOWN_BAD_SCALE;
 
-  // Headroom: frame time 8.0ms (well under budget) -> scale increases
-  const scaledUp = calculateAdaptiveRenderScale(1.0, 8.0, targetBudgetMs, 0.7, 1.2);
-  assert.ok(scaledUp > 1.0, `Expected scale increase, got ${scaledUp}`);
-  assert.ok(scaledUp <= 1.2);
+  // Above 10% of the session missing vsync: one step down, whatever the severity. The old
+  // controller scaled its step with the overload; a once-per-session decision must not,
+  // because it has no chance to correct an overshoot until the next session.
+  assert.equal(calculateSessionRenderScale(1.0, 0.101, frames, minFrames, 0.6, NONE).scale, 0.9);
+  assert.equal(calculateSessionRenderScale(1.0, 0.5, frames, minFrames, 0.6, NONE).scale, 0.9);
+  assert.equal(calculateSessionRenderScale(1.0, 1.0, frames, minFrames, 0.6, NONE).scale, 0.9);
 
-  // Over budget: frame time 18.0ms -> scale decreases
-  const scaledDown = calculateAdaptiveRenderScale(1.0, 18.0, targetBudgetMs, 0.7, 1.2);
-  assert.ok(scaledDown < 1.0, `Expected scale decrease, got ${scaledDown}`);
-  assert.ok(scaledDown >= 0.7);
+  // ...and the scale that just juddered is remembered.
+  assert.equal(calculateSessionRenderScale(1.0, 0.5, frames, minFrames, 0.6, NONE).knownBadScale, 1.0);
+  // Only ever downward: a higher failure than one already recorded teaches nothing new.
+  assert.equal(calculateSessionRenderScale(0.9, 0.5, frames, minFrames, 0.6, 0.8).knownBadScale, 0.8);
+  assert.equal(calculateSessionRenderScale(0.7, 0.5, frames, minFrames, 0.6, 0.8).knownBadScale, 0.7);
 
-  // Deadband: frame time 13.5ms (within deadband of 13.88ms) -> scale holds
-  const scaleHeld = calculateAdaptiveRenderScale(1.0, 13.5, targetBudgetMs, 0.7, 1.2);
-  assert.equal(scaleHeld, 1.0);
+  // Clamped at the floor, never past it.
+  assert.equal(calculateSessionRenderScale(0.65, 1.0, frames, minFrames, 0.6, NONE).scale, 0.6);
+  assert.equal(calculateSessionRenderScale(0.6, 1.0, frames, minFrames, 0.6, NONE).scale, 0.6);
+
+  // The hold band. Its whole point is that it is REACHABLE: the miss ratio is continuous
+  // over [0, 1] even though the frame times underneath it are quantized to hit-or-miss,
+  // so a device that is coping imperfectly can sit here instead of hunting.
+  for (const ratio of [0.02, 0.05, 0.09, 0.1]) {
+    const held = calculateSessionRenderScale(0.8, ratio, frames, minFrames, 0.6, NONE);
+    assert.equal(held.scale, 0.8, `miss ratio ${ratio} should hold`);
+    assert.equal(held.knownBadScale, NONE, `miss ratio ${ratio} is not evidence of a bad scale`);
+  }
+
+  // Below 2%: one step up...
+  assert.equal(calculateSessionRenderScale(0.8, 0.0, frames, minFrames, 0.6, NONE).scale, 0.85);
+  assert.equal(calculateSessionRenderScale(0.8, 0.019, frames, minFrames, 0.6, NONE).scale, 0.85);
+  assert.equal(calculateSessionRenderScale(0.95, 0.0, frames, minFrames, 0.6, NONE).scale, 1.0);
+  // ...never past native, because a 0% miss ratio says nothing missed its deadline; it does
+  // not say there is spare GPU, since a device coping by 1% and one coping by 50% both
+  // report exactly the budget...
+  assert.equal(calculateSessionRenderScale(1.0, 0.0, frames, minFrames, 0.6, NONE).scale, 1.0);
+  // ...and never up TO or ABOVE a scale that already juddered. This is the clause that makes
+  // the whole thing converge: a clean session at 0.9 with 0.95 known bad must NOT step to
+  // 0.95, or it is back on the scale it already failed at.
+  assert.equal(calculateSessionRenderScale(0.9, 0.0, frames, minFrames, 0.6, 0.95).scale, 0.9);
+  assert.equal(calculateSessionRenderScale(0.85, 0.0, frames, minFrames, 0.6, 0.95).scale, 0.9);
+  assert.equal(calculateSessionRenderScale(0.8, 0.0, frames, minFrames, 0.6, 1.0).scale, 0.85);
+  // The ceiling forbids climbing; it never drags a scale down to meet it.
+  assert.equal(calculateSessionRenderScale(0.9, 0.0, frames, minFrames, 0.6, 0.7).scale, 0.9);
+  // Pinned at the floor with the floor itself known bad: a fixed point, not a step below it.
+  assert.equal(calculateSessionRenderScale(0.6, 0.0, frames, minFrames, 0.6, 0.6).scale, 0.6);
+
+  // A clean session never records a bad scale, whatever it was carrying.
+  assert.equal(calculateSessionRenderScale(0.85, 0.0, frames, minFrames, 0.6, 0.95).knownBadScale, 0.95);
+
+  // Too short a session to have measured anything worth acting on: leave it alone, and do
+  // not convict the scale it was running on that little evidence either.
+  assert.equal(calculateSessionRenderScale(1.0, 1.0, minFrames - 1, minFrames, 0.6, NONE).scale, 1.0);
+  assert.equal(calculateSessionRenderScale(1.0, 1.0, minFrames - 1, minFrames, 0.6, NONE).knownBadScale, NONE);
+  assert.equal(calculateSessionRenderScale(0.8, 0.0, 0, minFrames, 0.6, NONE).scale, 0.8);
+
+  // Garbage in, current scale out.
+  assert.equal(calculateSessionRenderScale(0.8, Number.NaN, frames, minFrames, 0.6, NONE).scale, 0.8);
+  assert.equal(calculateSessionRenderScale(Number.NaN, 1.0, frames, minFrames, 0.6, NONE).scale, 0.9);
+  // A NaN ceiling means "no usable evidence", not "everything is forbidden".
+  assert.equal(calculateSessionRenderScale(0.8, 0.0, frames, minFrames, 0.6, Number.NaN).scale, 0.85);
+  assert.equal(calculateSessionRenderScale(0.8, 0.0, frames, minFrames, 0.6, Number.NaN).knownBadScale, NONE);
+  // The ceiling defaults to "none" when the caller omits it entirely.
+  assert.equal(calculateSessionRenderScale(0.8, 0.0, frames, minFrames, 0.6).scale, 0.85);
+});
+
+test('SessionFrameLedger: whole-session vsync tally that resets', () => {
+  const budgetMs = 1000 / 72;
+  const ledger = new SessionFrameLedger();
+  assert.equal(ledger.getFrameCount(), 0);
+  assert.equal(ledger.getMissRatio(), 0);
+
+  for (let i = 0; i < 90; i++) ledger.record(budgetMs, budgetMs);
+  for (let i = 0; i < 10; i++) ledger.record(budgetMs * 2, budgetMs);
+  assert.equal(ledger.getFrameCount(), 100);
+  assert.equal(ledger.getMissCount(), 10);
+  approx(ledger.getMissRatio(), 0.1, 1e-9);
+
+  // Unbounded, unlike the fixed rolling window: the DRS decision is made once at session
+  // end, so it has to see the whole session rather than the last 90 frames of it.
+  for (let i = 0; i < 5000; i++) ledger.record(budgetMs, budgetMs);
+  assert.equal(ledger.getFrameCount(), 5100);
+  assert.equal(ledger.getMissCount(), 10);
+  approx(ledger.getMissRatio(), 10 / 5100, 1e-12);
+
+  // Unusable samples are dropped, never counted as misses.
+  ledger.record(Number.NaN, budgetMs);
+  ledger.record(-5, budgetMs);
+  ledger.record(0, budgetMs);
+  assert.equal(ledger.getFrameCount(), 5100);
+  assert.equal(ledger.getMissCount(), 10);
+
+  ledger.reset();
+  assert.equal(ledger.getFrameCount(), 0);
+  assert.equal(ledger.getMissCount(), 0);
+  assert.equal(ledger.getMissRatio(), 0);
 });
 
 test('calculateAdaptiveLODBudget: splat count and volumetric step throttling', () => {
@@ -7081,6 +7603,660 @@ test('estimateGCPressure: GC pressure classification based on jitter and dropped
   assert.equal(estimateGCPressure(0.5, 11.2, 11.0), 'low');
   assert.equal(estimateGCPressure(3.5, 18.0, 11.0), 'medium');
   assert.equal(estimateGCPressure(7.5, 26.0, 11.0), 'high');
+});
+
+/**
+ * Builds a mock WebGLRenderer exposing only the renderer.xr surface the governor
+ * touches, recording every DRS/FFR call it receives.
+ */
+function mockXrRenderer(state: { presenting: boolean }): {
+  renderer: THREE.WebGLRenderer;
+  foveationCalls: number[];
+  scaleCalls: number[];
+} {
+  const foveationCalls: number[] = [];
+  const scaleCalls: number[] = [];
+  const renderer = {
+    xr: {
+      get isPresenting(): boolean {
+        return state.presenting;
+      },
+      setFoveation(level: number): void {
+        foveationCalls.push(level);
+      },
+      setFramebufferScaleFactor(scale: number): void {
+        scaleCalls.push(scale);
+      },
+    },
+  } as unknown as THREE.WebGLRenderer;
+  return { renderer, foveationCalls, scaleCalls };
+}
+
+test('XRPerformanceGovernor: same-timestamp begin/end still measures the true 50ms cadence', () => {
+  const governor = new XRPerformanceGovernor();
+
+  // Nothing measured yet: report zeroes, never a plausible-looking 72fps.
+  assert.equal(governor.getMetrics().fps, 0);
+  assert.equal(governor.getMetrics().frameTimeMs, 0);
+
+  // Hand beginFrame and endFrame the SAME animation-frame timestamp: the begin->end
+  // delta is then always 0, so it cannot be the source of the frame time.
+  let t = 0;
+  let metrics = governor.getMetrics();
+  for (let i = 0; i < 200; i++) {
+    t += 50;
+    governor.beginFrame(t);
+    metrics = governor.endFrame(undefined, null, null, t);
+  }
+
+  approx(metrics.frameTimeMs, 50, 0.01);
+  approx(metrics.fps, 20, 0.2);
+  assert.notEqual(metrics.frameTimeMs, 13.88); // the fabricated constant
+  assert.equal(metrics.cpuLogicTimeMs, 0); // honest: no CPU span is observable here
+  assert.ok(metrics.droppedFrames > 0, `expected dropped frames at 20fps, got ${metrics.droppedFrames}`);
+  // 200 frames define 199 intervals. The first frame has no predecessor to be measured
+  // against, and the governor no longer invents a nominal-budget sample for it: an
+  // invented first sample is both a measurement nobody took and, once endFrame lands
+  // after beginFrame by the frame's CPU span, a dropped frame that never happened.
+  assert.equal(governor.getMeasuredFrameCount(), 199);
+});
+
+test('XRPerformanceGovernor: the unmeasurable first frame is skipped, not fabricated', () => {
+  const governor = new XRPerformanceGovernor();
+
+  // A realistic first frame: 6ms of CPU between beginFrame and endFrame. The old seeding
+  // measured this as budget + 6ms = 19.9ms, over the 15.97ms drop threshold, and booked a
+  // dropped frame before the app had rendered anything twice.
+  governor.beginFrame(1000);
+  const first = governor.endFrame(undefined, null, null, 1006);
+  assert.equal(governor.getMeasuredFrameCount(), 0);
+  assert.equal(first.droppedFrames, 0);
+  assert.equal(first.frameTimeMs, 0);
+  assert.equal(first.fps, 0);
+
+  // The second frame is the first measurable one.
+  governor.beginFrame(1013.888);
+  const second = governor.endFrame(undefined, null, null, 1019.888);
+  assert.equal(governor.getMeasuredFrameCount(), 1);
+  approx(second.frameTimeMs, 13.888, 0.01);
+  assert.equal(second.droppedFrames, 0);
+});
+
+test('XRPerformanceGovernor: a true 72fps cadence reports ~72fps with zero dropped frames', () => {
+  const governor = new XRPerformanceGovernor();
+  const budgetMs = 1000 / 72;
+
+  let t = 1000;
+  let metrics = governor.getMetrics();
+  for (let i = 0; i < 200; i++) {
+    t += budgetMs;
+    governor.beginFrame(t);
+    metrics = governor.endFrame(undefined, null, null, t);
+  }
+
+  approx(metrics.fps, 72, 0.15);
+  approx(metrics.frameTimeMs, 13.89, 0.02);
+  assert.equal(metrics.droppedFrames, 0);
+});
+
+test('XRPerformanceGovernor: dropped frames counted only when frames overrun the budget', () => {
+  const governor = new XRPerformanceGovernor();
+  const budgetMs = 1000 / 72;
+  let t = 500;
+
+  for (let i = 0; i < 60; i++) {
+    t += budgetMs;
+    governor.beginFrame(t);
+    governor.endFrame(undefined, null, null, t);
+  }
+  assert.equal(governor.getMetrics().droppedFrames, 0);
+
+  // 33ms frames are >15% over the 13.88ms budget: every one of them is a drop.
+  for (let i = 0; i < 10; i++) {
+    t += 33;
+    governor.beginFrame(t);
+    governor.endFrame(undefined, null, null, t);
+  }
+  assert.equal(governor.getMetrics().droppedFrames, 10);
+
+  // A repeated timestamp is an unusable delta: skip the sample, do not invent one.
+  const before = governor.getMeasuredFrameCount();
+  governor.beginFrame(t);
+  const metrics = governor.endFrame(undefined, null, null, t);
+  assert.equal(governor.getMeasuredFrameCount(), before);
+  assert.equal(metrics.frameTimeMs, 33);
+});
+
+test('XRPerformanceGovernor: foveation rests at 1.0 and cannot oscillate under noisy load', () => {
+  // Steady on-budget load: the mandated resting level of 1.0 is never disturbed.
+  const steadyState = { presenting: true };
+  const steady = mockXrRenderer(steadyState);
+  const steadyGovernor = new XRPerformanceGovernor();
+  let st = 100;
+  for (let i = 0; i < 300; i++) {
+    st += 1000 / 72;
+    steadyGovernor.beginFrame(st);
+    steadyGovernor.endFrame(steady.renderer, null, null, st);
+  }
+  assert.equal(steady.foveationCalls.length, 0, 'stable foveation must not be re-pushed every frame');
+  assert.equal(steadyGovernor.getMetrics().foveationLevel, 1.0);
+
+  // Noisy load: 40-frame blocks alternating heavy (25ms) and light (6ms) sweep the
+  // rolling average back and forth across both foveation thresholds ~15 times.
+  const noisyState = { presenting: true };
+  const noisy = mockXrRenderer(noisyState);
+  const governor = new XRPerformanceGovernor({ measurementWindowFrames: 10 });
+  const changeFrames: number[] = [];
+  const changeTimes: number[] = [];
+  const totalFrames = 1200;
+
+  let t = 2000;
+  for (let i = 0; i < totalFrames; i++) {
+    const before = noisy.foveationCalls.length;
+    t += Math.floor(i / 40) % 2 === 0 ? 25 : 6;
+    governor.beginFrame(t);
+    governor.endFrame(noisy.renderer, null, null, t);
+    if (noisy.foveationCalls.length > before) {
+      changeFrames.push(i);
+      changeTimes.push(t);
+    }
+  }
+
+  // Old behaviour was one setFoveation call per frame with no hysteresis at all.
+  assert.ok(
+    noisy.foveationCalls.length * 20 < totalFrames,
+    `foveation thrashed: ${noisy.foveationCalls.length} changes over ${totalFrames} frames`,
+  );
+  for (let i = 1; i < changeFrames.length; i++) {
+    assert.ok(
+      changeFrames[i] - changeFrames[i - 1] >= 60,
+      `foveation changed after only ${changeFrames[i] - changeFrames[i - 1]} frames`,
+    );
+    assert.ok(
+      changeTimes[i] - changeTimes[i - 1] >= 1000,
+      `foveation changed after only ${changeTimes[i] - changeTimes[i - 1]}ms`,
+    );
+  }
+  for (const level of noisy.foveationCalls) {
+    assert.ok(level >= 0 && level <= 1, `foveation level out of range: ${level}`);
+  }
+});
+
+/**
+ * Drives complete XR sessions against one governor: presenting frames, then the
+ * presenting -> not-presenting transition that ends the session. Keeps a monotonic clock
+ * across sessions so consecutive sessions look like consecutive headset uses.
+ *
+ * Reports scale changes seen DURING presenting separately from the total, because
+ * session-scoped DRS promises two distinct things: nothing moves in-session, and at most
+ * one thing moves per session.
+ */
+function makeSessionHarness(): {
+  renderer: THREE.WebGLRenderer;
+  scaleCalls: number[];
+  scaleCallsWhilePresenting: number[];
+  runSession(
+    governor: XRPerformanceGovernor,
+    frameDurationsMs: Iterable<number>,
+  ): { scale: number; changes: number[]; presentingChanges: number[] };
+} {
+  const state = { presenting: false };
+  const scaleCalls: number[] = [];
+  const scaleCallsWhilePresenting: number[] = [];
+  const renderer = {
+    xr: {
+      get isPresenting(): boolean {
+        return state.presenting;
+      },
+      setFoveation(_level: number): void {},
+      setFramebufferScaleFactor(scale: number): void {
+        scaleCalls.push(scale);
+        if (state.presenting) scaleCallsWhilePresenting.push(scale);
+      },
+    },
+  } as unknown as THREE.WebGLRenderer;
+
+  let t = 0;
+
+  function runSession(
+    governor: XRPerformanceGovernor,
+    frameDurationsMs: Iterable<number>,
+  ): { scale: number; changes: number[]; presentingChanges: number[] } {
+    const changes: number[] = [];
+    const presentingChanges: number[] = [];
+    let scale = governor.getMetrics().renderScale;
+
+    state.presenting = true;
+    for (const durationMs of frameDurationsMs) {
+      t += durationMs;
+      governor.beginFrame(t);
+      const metrics = governor.endFrame(renderer, null, null, t);
+      if (metrics.renderScale !== scale) {
+        scale = metrics.renderScale;
+        changes.push(scale);
+        presentingChanges.push(scale);
+      }
+    }
+
+    // Session end. This edge is where DRS decides, and the first non-presenting frame is
+    // the only moment three.js will accept the new framebuffer scale.
+    state.presenting = false;
+    for (let i = 0; i < 3; i++) {
+      t += 1000 / 72;
+      governor.beginFrame(t);
+      const metrics = governor.endFrame(renderer, null, null, t);
+      if (metrics.renderScale !== scale) {
+        scale = metrics.renderScale;
+        changes.push(scale);
+      }
+    }
+
+    return { scale, changes, presentingChanges };
+  }
+
+  return { renderer, scaleCalls, scaleCallsWhilePresenting, runSession };
+}
+
+/**
+ * Frame times of a vsync-locked headset, as a function of scene weight and render scale.
+ *
+ * `capacityMs` is the GPU time the scene needs at scale 1.0. Cost follows pixel count, so it
+ * goes with the SQUARE of the render scale. The result is then QUANTIZED: the frame either
+ * lands on the 13.888ms scanout or slips to the next one at 27.776ms. Nothing in between is
+ * physically producible, which is exactly why frame time carries no headroom information -
+ * a scene needing 6ms and a scene needing 13.5ms both report 13.888ms.
+ *
+ * This is the model that exposes the defect a continuous `t += 18.0 * scale` model cannot.
+ */
+function* quantizedFrames(
+  count: number,
+  capacityMs: number,
+  currentScale: () => number,
+): Generator<number> {
+  const vsyncMs = 1000 / 72;
+  for (let i = 0; i < count; i++) {
+    const scale = currentScale();
+    const costMs = capacityMs * scale * scale;
+    yield costMs <= vsyncMs ? vsyncMs : vsyncMs * 2;
+  }
+}
+
+test('XRPerformanceGovernor: framebuffer scale is never pushed while the session is presenting', () => {
+  // three.js r180 warns "Cannot change framebuffer scale while presenting" and discards
+  // the value (WebXRManager.js), so the only moment a new scale can take effect at all is
+  // between sessions. That is the reason DRS is session-scoped rather than a per-frame
+  // loop: a loop in here would be servoing a number that never reaches the compositor.
+  const governor = new XRPerformanceGovernor();
+  const harness = makeSessionHarness();
+
+  const session = harness.runSession(
+    governor,
+    quantizedFrames(1200, 25, () => governor.getMetrics().renderScale),
+  );
+
+  assert.equal(
+    harness.scaleCallsWhilePresenting.length,
+    0,
+    'must not call setFramebufferScaleFactor while presenting',
+  );
+  assert.equal(
+    session.presentingChanges.length,
+    0,
+    `render scale moved ${session.presentingChanges.length} times mid-session`,
+  );
+
+  // One push, made off-session, carrying the scale the NEXT session will run at.
+  assert.equal(harness.scaleCalls.length, 1);
+  assert.equal(session.scale, 0.9);
+  approx(harness.scaleCalls[0], session.scale, 1e-9);
+  assert.equal(governor.getMetrics().renderScaleApplied, true);
+});
+
+test('XRPerformanceGovernor: the quantized vsync model cannot make DRS hunt', () => {
+  // THE regression. A Quest 3 is vsync-locked at 72Hz, so frame time is not continuous:
+  // a frame either hits 13.888ms or misses and takes ~27.78ms. A controller servoing on
+  // frame time therefore has no gradient and no stable point - it drops, reads the
+  // resulting hit as "healthy" at ratio ~1.0, climbs, misses, and cycles forever, and it
+  // does so precisely when the scene is genuinely too heavy and DRS is supposed to help.
+  //
+  // Measured on the old per-frame controller with exactly this model, 6000 frames:
+  //   capacity  8ms -> 0 changes      capacity 15ms -> 72 changes  *** limit cycle ***
+  //   capacity 12ms -> 0 changes      capacity 18ms -> 73 changes  *** limit cycle ***
+  //   capacity 13.5ms -> 0 changes    capacity 25ms -> 73 changes  *** limit cycle ***
+  // No threshold retune fixes that, because the signal is binary. Session-scoped DRS makes
+  // it structurally impossible: there is no in-session feedback loop for a cycle to live
+  // in, so ONE session yields at most ONE change however heavy the scene.
+  for (const capacityMs of [8, 12, 13.5, 15, 18, 25]) {
+    const governor = new XRPerformanceGovernor();
+    const harness = makeSessionHarness();
+
+    const session = harness.runSession(
+      governor,
+      quantizedFrames(6000, capacityMs, () => governor.getMetrics().renderScale),
+    );
+
+    assert.equal(
+      session.presentingChanges.length,
+      0,
+      `capacity ${capacityMs}ms moved the render scale ${session.presentingChanges.length} times mid-session`,
+    );
+    assert.ok(
+      session.changes.length <= 1,
+      `capacity ${capacityMs}ms produced ${session.changes.length} render-scale changes in one session: ${session.changes.join(', ')}`,
+    );
+    assert.equal(harness.scaleCallsWhilePresenting.length, 0);
+
+    // And the one step it does take must be the right one - the guard must not be
+    // satisfiable by DRS simply doing nothing. Under 13.888ms at native the session never
+    // misses, so it is already as good as it gets and holds at native.
+    const fitsAtNative = capacityMs <= 1000 / 72;
+    assert.equal(
+      session.scale,
+      fitsAtNative ? 1.0 : 0.9,
+      `capacity ${capacityMs}ms settled at ${session.scale}`,
+    );
+  }
+});
+
+/**
+ * Scene weights that span the interesting range, with the render scale each one must
+ * SETTLE at across repeated sessions.
+ *
+ * Everything except the last line settles on a scale whose cost genuinely fits inside the
+ * 13.888ms scanout, which `drsSettlesInsideVsync` re-derives rather than trusting. 40ms is
+ * the pathological case: 40 * 0.6^2 = 14.4ms still misses, so no allowed scale is
+ * affordable and the honest answer is the floor.
+ */
+const DRS_CONVERGENCE_CASES: readonly { capacityMs: number; settlesAt: number }[] = [
+  { capacityMs: 8, settlesAt: 1.0 },
+  { capacityMs: 12, settlesAt: 1.0 },
+  { capacityMs: 13.9, settlesAt: 0.95 },
+  { capacityMs: 14, settlesAt: 0.95 },
+  { capacityMs: 15, settlesAt: 0.95 },
+  { capacityMs: 16, settlesAt: 0.9 },
+  { capacityMs: 18, settlesAt: 0.85 },
+  { capacityMs: 25, settlesAt: 0.7 },
+  { capacityMs: 40, settlesAt: 0.6 },
+];
+
+test('XRPerformanceGovernor: DRS settles across CONSECUTIVE sessions instead of cycling', () => {
+  // THE regression this suite previously could not see. The single-session sweep above
+  // proves only that one session yields at most one step, which a session-scoped decision
+  // satisfies by construction - it cannot observe what happens when that step is fed into
+  // the next session, which is where the limit cycle actually lived:
+  //
+  //   cap 13.9ms -> 0.9, 0.95, 1.0, 0.9, 0.95, 1.0, ...   period-3, forever
+  //   cap 16ms   -> 0.9, 0.95, 0.85, 0.9, 0.95, ...       forever
+  //   cap 25ms   -> 0.9, 0.8, 0.7, 0.75, 0.65, ...        forever
+  //
+  // The mechanism is not a tuning error: a miss ratio near zero cannot tell "barely coping"
+  // from "enormous headroom", so ANY rule that climbs on success climbs until it breaks,
+  // drops, and climbs again. The fix is the congestion-control one - remember the scale
+  // that juddered and never climb back to it - and this test is what pins it down.
+  const SESSIONS = 40;
+  const TAIL = 10;
+
+  for (const { capacityMs, settlesAt } of DRS_CONVERGENCE_CASES) {
+    const governor = new XRPerformanceGovernor();
+    const harness = makeSessionHarness();
+    const trace: number[] = [];
+
+    for (let session = 0; session < SESSIONS; session++) {
+      const run = harness.runSession(
+        governor,
+        quantizedFrames(600, capacityMs, () => governor.getMetrics().renderScale),
+      );
+      assert.equal(
+        run.presentingChanges.length,
+        0,
+        `capacity ${capacityMs}ms moved the scale mid-session ${session}`,
+      );
+      assert.ok(
+        run.changes.length <= 1,
+        `capacity ${capacityMs}ms took ${run.changes.length} steps in session ${session}`,
+      );
+      trace.push(run.scale);
+    }
+
+    const tail = trace.slice(-TAIL);
+    assert.ok(
+      tail.every((scale) => scale === tail[0]),
+      `capacity ${capacityMs}ms never converged - last ${TAIL} sessions: ${tail.join(', ')} (full trace: ${trace.join(', ')})`,
+    );
+    assert.equal(
+      tail[0],
+      settlesAt,
+      `capacity ${capacityMs}ms settled at ${tail[0]}, expected ${settlesAt} (full trace: ${trace.join(', ')})`,
+    );
+  }
+});
+
+test('XRPerformanceGovernor: every settling point that CAN hit vsync does', () => {
+  // Convergence on its own is cheap - parking at the floor forever would converge too. The
+  // settling point also has to be the best scale that actually fits, so this re-derives the
+  // cost at the scale each capacity settled on rather than trusting the table.
+  const vsyncMs = 1000 / 72;
+  for (const { capacityMs, settlesAt } of DRS_CONVERGENCE_CASES) {
+    const costMs = capacityMs * settlesAt * settlesAt;
+    if (capacityMs === 40) {
+      // Unaffordable at every allowed scale: even the floor overruns, so the floor is the
+      // honest answer and there is no scale that hits vsync to settle on.
+      assert.ok(costMs > vsyncMs, `capacity ${capacityMs}ms should be unaffordable, cost ${costMs}ms`);
+      assert.equal(settlesAt, 0.6);
+      continue;
+    }
+    assert.ok(
+      costMs <= vsyncMs,
+      `capacity ${capacityMs}ms settled at ${settlesAt}, which costs ${costMs.toFixed(3)}ms and still misses the ${vsyncMs.toFixed(3)}ms scanout`,
+    );
+  }
+});
+
+test('XRPerformanceGovernor: repeated heavy sessions walk down to the floor and stop', () => {
+  // 60ms at native is a scene the device cannot afford at ANY scale it is allowed: even
+  // the 0.6 floor costs 60 * 0.36 = 21.6ms and misses every vsync. So this converges to
+  // the floor and parks there rather than overshooting past it.
+  const governor = new XRPerformanceGovernor();
+  const harness = makeSessionHarness();
+  const floor = governor.getConfig().minRenderScale;
+  const settled: number[] = [];
+
+  for (let session = 0; session < 8; session++) {
+    const run = harness.runSession(
+      governor,
+      quantizedFrames(600, 60, () => governor.getMetrics().renderScale),
+    );
+    assert.ok(
+      run.changes.length <= 1,
+      `heavy session ${session} moved the scale ${run.changes.length} times`,
+    );
+    assert.equal(run.presentingChanges.length, 0);
+    settled.push(run.scale);
+  }
+
+  // One step per session, monotone down, four sessions to cross the whole range, then flat.
+  assert.deepEqual(settled, [0.9, 0.8, 0.7, floor, floor, floor, floor, floor]);
+  for (const scale of settled) {
+    assert.ok(scale >= floor, `overshot minRenderScale ${floor}: ${scale}`);
+  }
+  // Every one of those decisions was pushed off-session, one per session that changed.
+  assert.equal(harness.scaleCallsWhilePresenting.length, 0);
+  assert.equal(harness.scaleCalls.length, 4);
+});
+
+test('XRPerformanceGovernor: a clean session climbs one step and parks at native', () => {
+  const governor = new XRPerformanceGovernor();
+  const harness = makeSessionHarness();
+
+  // Drive it to the floor first.
+  for (let i = 0; i < 4; i++) {
+    harness.runSession(governor, quantizedFrames(600, 60, () => governor.getMetrics().renderScale));
+  }
+  assert.equal(governor.getMetrics().renderScale, 0.6);
+
+  // The heavy scene is now gone and a 6ms one is loaded in its place, which is exactly when
+  // the known-bad ceiling has to be cleared: it is evidence about the OLD scene's weight,
+  // and left standing it would (correctly, for that scene) forbid climbing back past 0.65.
+  // The dedicated test below pins down both halves of that.
+  governor.clearKnownBadRenderScale();
+
+  // A scene that comfortably hits vsync at every scale: 6ms at native. A vsync-locked
+  // headset reports exactly the budget when it is coping, never less, so recovery has to
+  // trigger on "nothing missed" - which is what the miss ratio says and frame time cannot.
+  const climb: number[] = [];
+  for (let session = 0; session < 12; session++) {
+    const run = harness.runSession(
+      governor,
+      quantizedFrames(600, 6, () => governor.getMetrics().renderScale),
+    );
+    assert.ok(
+      run.changes.length <= 1,
+      `clean session ${session} moved the scale ${run.changes.length} times`,
+    );
+    assert.equal(run.presentingChanges.length, 0);
+    climb.push(run.scale);
+  }
+
+  // One step per session up to native, then flat: a clean session is never grounds to
+  // supersample, because a 0% miss ratio does not measure headroom.
+  assert.deepEqual(climb, [0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0]);
+  for (const scale of climb) {
+    assert.ok(scale <= 1.0, `climbed past native to ${scale}`);
+  }
+  // Nothing juddered on the way up, so nothing was convicted.
+  assert.equal(governor.getKnownBadRenderScale(), DRS_NO_KNOWN_BAD_SCALE);
+});
+
+test('XRPerformanceGovernor: the known-bad ceiling only descends, and clearing it restores the climb', () => {
+  // The ceiling is the entire reason DRS settles rather than cycling, so it has to be
+  // one-way within a scene - and therefore has to be clearable, or a scene that got lighter
+  // could never earn its resolution back. Both halves are load-bearing.
+  const governor = new XRPerformanceGovernor();
+  const harness = makeSessionHarness();
+
+  // 16ms at native: the capacity that used to cycle 0.9, 0.95, 0.85, 0.9, 0.95 forever.
+  const ceilings: number[] = [DRS_NO_KNOWN_BAD_SCALE];
+  for (let session = 0; session < 20; session++) {
+    harness.runSession(governor, quantizedFrames(600, 16, () => governor.getMetrics().renderScale));
+    ceilings.push(governor.getKnownBadRenderScale());
+  }
+
+  // Monotone non-increasing, always, and bounded below by the floor once it is finite.
+  // That plus a climb ceiling strictly under it is the whole termination argument.
+  for (let i = 1; i < ceilings.length; i++) {
+    assert.ok(
+      ceilings[i] <= ceilings[i - 1],
+      `known-bad ceiling rose from ${ceilings[i - 1]} to ${ceilings[i]} at session ${i}`,
+    );
+  }
+  const settledCeiling = ceilings[ceilings.length - 1];
+  assert.equal(settledCeiling, 0.95, `expected 0.95 to be the convicted scale, got ${settledCeiling}`);
+  assert.ok(settledCeiling >= governor.getConfig().minRenderScale);
+  assert.equal(governor.getMetrics().renderScale, 0.9);
+
+  // The ceiling holds the scale down, and it is RIGHT to: 16 * 0.95^2 = 14.44ms misses the
+  // 13.888ms scanout. Even with a spotless session it must not climb back onto that scale.
+  const stuck = harness.runSession(
+    governor,
+    quantizedFrames(600, 6, () => governor.getMetrics().renderScale),
+  );
+  assert.equal(stuck.scale, 0.9, `climbed back onto a scale known to judder: ${stuck.scale}`);
+
+  // Now the scene genuinely changes. Clearing does not jump the scale - it restores the
+  // ability to climb, and the next clean session takes the first step.
+  governor.clearKnownBadRenderScale();
+  assert.equal(governor.getKnownBadRenderScale(), DRS_NO_KNOWN_BAD_SCALE);
+  assert.equal(governor.getMetrics().renderScale, 0.9, 'clearing must not move the scale by itself');
+
+  const recovered: number[] = [];
+  for (let session = 0; session < 4; session++) {
+    recovered.push(harness.runSession(
+      governor,
+      quantizedFrames(600, 6, () => governor.getMetrics().renderScale),
+    ).scale);
+  }
+  assert.deepEqual(recovered, [0.95, 1.0, 1.0, 1.0]);
+
+  // reset() is the other clearing path, and it has to clear too: it puts the scale back at
+  // native, and a stale ceiling would then silently forbid a scale the governor is already
+  // running.
+  harness.runSession(governor, quantizedFrames(600, 60, () => governor.getMetrics().renderScale));
+  assert.equal(governor.getKnownBadRenderScale(), 1.0);
+  governor.reset();
+  assert.equal(governor.getKnownBadRenderScale(), DRS_NO_KNOWN_BAD_SCALE);
+  assert.equal(governor.getMetrics().renderScale, 1.0);
+});
+
+test('XRPerformanceGovernor: one hitch in a clean session cannot move the render scale', () => {
+  // REGRESSION, carried over from the per-frame era and now far stronger. The old
+  // controller decided every frame off a rolling window, so one stall could fire ~90
+  // consecutive reduction steps and walk the scale to its floor off a single event.
+  // A hitch is now one frame in a session's worth of them: it moves the session miss
+  // ratio by ~0.2%, which is inside the hold band and nowhere near the 10% that buys a step.
+  for (const hitchMs of [100, 250, 1000, 3000]) {
+    const governor = new XRPerformanceGovernor();
+    const harness = makeSessionHarness();
+    const budgetMs = 1000 / 72;
+
+    const frames: number[] = [];
+    for (let i = 0; i < 600; i++) frames.push(i === 300 ? hitchMs : budgetMs);
+    const run = harness.runSession(governor, frames);
+
+    assert.equal(
+      run.changes.length,
+      0,
+      `a single ${hitchMs}ms hitch caused ${run.changes.length} scale changes`,
+    );
+    assert.equal(run.scale, 1.0, `a single ${hitchMs}ms hitch left the scale at ${run.scale}`);
+    assert.equal(harness.scaleCalls.length, 0, 'nothing changed, so nothing should be pushed');
+    // The hitch is still counted honestly as a dropped frame; it just does not steer DRS.
+    assert.equal(governor.getMetrics().droppedFrames, 1);
+  }
+});
+
+test('XRPerformanceGovernor: the session ledger resets, so one bad session cannot haunt the next', () => {
+  const governor = new XRPerformanceGovernor();
+  const harness = makeSessionHarness();
+
+  // Session 1 misses every single vsync.
+  harness.runSession(governor, quantizedFrames(600, 60, () => governor.getMetrics().renderScale));
+  approx(governor.getSessionMissRatio(), 1.0, 1e-9);
+  assert.equal(governor.getMetrics().renderScale, 0.9);
+
+  // Session 2 is spotless. Were the ledger carried over, the pooled ratio would still be
+  // ~50% and this session would be charged for session 1's judder with a second step down.
+  const clean = harness.runSession(
+    governor,
+    quantizedFrames(600, 6, () => governor.getMetrics().renderScale),
+  );
+  assert.equal(
+    governor.getSessionMissRatio(),
+    0,
+    `session 2 inherited a miss ratio of ${governor.getSessionMissRatio()}`,
+  );
+  // Exactly its own 600 frames - not session 1's, and not the off-session frames between
+  // them, which belong to no session and are never tallied.
+  assert.equal(governor.getSessionFrameCount(), 600, 'session 2 should count only its own frames');
+  assert.equal(clean.scale, 0.95, `expected one step back up, got ${clean.scale}`);
+});
+
+test('RollingFrameStats: the median ignores a hitch that drags the mean over budget', () => {
+  const stats = new RollingFrameStats(90);
+  for (let i = 0; i < 89; i++) stats.addFrame(13.888);
+  stats.addFrame(3000);
+
+  // One stall puts the mean 2.5x over the 72fps budget for the entire length of the
+  // window, which is why nothing in the governor decides on it.
+  assert.ok(stats.getAverageMs() > 40, `expected the mean to be wrecked, got ${stats.getAverageMs()}`);
+  // The median does not move at all.
+  approx(stats.getMedianMs(), 13.888, 1e-9);
+  // ...and P95 at 90 samples still ignores a lone outlier.
+  approx(stats.getP95Ms(), 13.888, 1e-9);
+
+  // A genuinely overloaded window moves the median, which is the point.
+  const overloaded = new RollingFrameStats(90);
+  for (let i = 0; i < 90; i++) overloaded.addFrame(25);
+  approx(overloaded.getMedianMs(), 25, 1e-9);
 });
 
 test('SpatialInteraction: distanceVec3 and quatFromYaw pure domain conversions', () => {
@@ -8120,6 +9296,31 @@ test('icvfx: generateNDisplayConfigXml export generation', () => {
   for (const wall of config.walls) {
     assert.ok(xml.includes(`id="SCR_${wall.nDisplayNodeId}`));
   }
+});
+
+test('icvfx: nDisplay screen transforms use the shared SetView -> Unreal handedness contract', () => {
+  const config = createLedVolumeConfig('horseshoe_270');
+  config.walls[0].enabled = true;
+  config.walls[0].center = { x: 1.5, y: 2.0, z: -3.5 };
+  config.walls[0].rotationY = Math.PI / 2;
+
+  const xml = generateNDisplayConfigXml(config);
+
+  // Must match svToUeLocation exactly (x_ue = -z_sv * 100), not the old
+  // determinant +1 (x_sv, -z_sv, y_sv) convention that mirrored the volume.
+  const loc = svToUeLocation(config.walls[0].center, 100);
+  assert.equal(loc.x, 350);
+  assert.ok(
+    xml.includes(`<location x="${loc.x.toFixed(1)}" y="${loc.y.toFixed(1)}" z="${loc.z.toFixed(1)}" />`),
+    'wall centre must use the shared determinant -1 location map',
+  );
+
+  // The yaw must be the paired heading conversion, not an ad-hoc sign flip.
+  assert.ok(
+    xml.includes(`yaw="${svHeadingToUeYaw(Math.PI / 2).toFixed(2)}"`),
+    'wall yaw must use svHeadingToUeYaw',
+  );
+  assert.equal(svHeadingToUeYaw(Math.PI / 2).toFixed(2), '90.00');
 });
 
 test('icvfx: generateOpenUsdLedVolume export generation', () => {

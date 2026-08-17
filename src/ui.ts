@@ -4846,9 +4846,13 @@ export class PerformanceHudOverlay {
           <span class="perf-hud-label">LAT</span>
           <span class="perf-hud-val" id="perf-lat-val">13.8 ms</span>
         </div>
-        <div class="perf-hud-pill">
-          <span class="perf-hud-label">DRS</span>
+        <div class="perf-hud-pill" title="Framebuffer scale for this session. Fixed for the whole session: WebXR refuses scale changes while presenting, so DRS decides once, at session end, from the session's vsync-miss ratio.">
+          <span class="perf-hud-label">SCALE</span>
           <span class="perf-hud-val" id="perf-drs-val">100%</span>
+        </div>
+        <div class="perf-hud-pill" title="Share of this session's frames that missed vsync. This is the signal DRS decides on at session end.">
+          <span class="perf-hud-label">MISS</span>
+          <span class="perf-hud-val" id="perf-miss-val">0.0%</span>
         </div>
         <div class="perf-hud-pill">
           <span class="perf-hud-label">FFR</span>
@@ -4879,12 +4883,20 @@ export class PerformanceHudOverlay {
         const fpsEl = this.element.querySelector('#perf-fps-val');
         const latEl = this.element.querySelector('#perf-lat-val');
         const drsEl = this.element.querySelector('#perf-drs-val');
+        const missEl = this.element.querySelector('#perf-miss-val');
         const ffrEl = this.element.querySelector('#perf-ffr-val');
         const gcEl = this.element.querySelector('#perf-gc-val');
 
         if (fpsEl) fpsEl.textContent = m.fps.toFixed(1);
         if (latEl) latEl.textContent = `${m.frameTimeMs.toFixed(1)} ms`;
-        if (drsEl) drsEl.textContent = `${Math.round(m.renderScale * 100)}%`;
+        // Constant for the whole session by design, so it is shown as a plain scale, not
+        // as something being tracked. A "→" marks a scale already decided for the NEXT
+        // session that the renderer has not been able to accept yet.
+        if (drsEl) {
+          const pct = `${Math.round(m.renderScale * 100)}%`;
+          drsEl.textContent = m.renderScaleApplied ? pct : `→ ${pct}`;
+        }
+        if (missEl) missEl.textContent = `${(this.governor.getSessionMissRatio() * 100).toFixed(1)}%`;
         if (ffrEl) ffrEl.textContent = m.foveationLevel.toFixed(1);
         if (gcEl) {
           gcEl.textContent = m.gcPressure.toUpperCase();
@@ -4906,6 +4918,14 @@ export class PerformanceHudOverlay {
       this.element = null;
     }
   }
+}
+
+/**
+ * Renders the DRS known-bad ceiling for the telemetry grid. "none" reads better than the
+ * +Infinity the governor actually holds while no scale has juddered yet.
+ */
+function formatKnownBadRenderScale(knownBadScale: number): string {
+  return Number.isFinite(knownBadScale) ? `${(knownBadScale * 100).toFixed(0)}%` : 'none';
 }
 
 /** Opens the WebXR Performance Governor configuration and real-time telemetry modal. */
@@ -4964,9 +4984,17 @@ export function openPerformanceSettingsModal(
               <span class="perf-stat-label">Jitter (StdDev)</span>
               <span class="perf-stat-val" id="perf-diag-jitter">±${stats.getJitterMs().toFixed(2)} ms</span>
             </div>
-            <div class="perf-stat-card">
-              <span class="perf-stat-label">DRS Scale</span>
+            <div class="perf-stat-card" title="Fixed for the whole session. WebXR refuses framebuffer scale changes while presenting, so DRS decides once, at session end.">
+              <span class="perf-stat-label">Render Scale (this session)</span>
               <span class="perf-stat-val" id="perf-diag-drs">${(metrics.renderScale * 100).toFixed(0)}%</span>
+            </div>
+            <div class="perf-stat-card" title="Share of this session's frames that missed vsync. Above 10% the next session drops a step; below 2% it climbs one, up to native.">
+              <span class="perf-stat-label">Session Vsync Miss</span>
+              <span class="perf-stat-val" id="perf-diag-miss">${(governor.getSessionMissRatio() * 100).toFixed(1)}%</span>
+            </div>
+            <div class="perf-stat-card" title="Lowest render scale this scene has juddered at. DRS never climbs back to it, which is what makes it settle instead of hunting. Clear it below once the scene gets lighter.">
+              <span class="perf-stat-label">DRS Known-Bad Ceiling</span>
+              <span class="perf-stat-val" id="perf-diag-ceiling">${formatKnownBadRenderScale(governor.getKnownBadRenderScale())}</span>
             </div>
             <div class="perf-stat-card">
               <span class="perf-stat-label">FFR Level</span>
@@ -5012,7 +5040,7 @@ export function openPerformanceSettingsModal(
           <div class="perf-checkbox-group" style="margin-top: 12px;">
             <label class="perf-checkbox-label">
               <input type="checkbox" id="perf-drs-toggle" ${config.enableDynamicResolution ? 'checked' : ''} />
-              <span>Enable Dynamic Resolution Scaling (DRS)</span>
+              <span>Enable Dynamic Resolution Scaling (DRS) &mdash; one step per session, applied between sessions</span>
             </label>
             <label class="perf-checkbox-label">
               <input type="checkbox" id="perf-ffr-toggle" ${config.enableFoveatedRendering ? 'checked' : ''} />
@@ -5029,16 +5057,21 @@ export function openPerformanceSettingsModal(
               <label>Min Render Scale (${(config.minRenderScale * 100).toFixed(0)}%)</label>
               <input type="range" id="perf-min-scale" min="0.4" max="1.0" step="0.05" value="${config.minRenderScale}" />
             </div>
-            <div class="perf-field-group">
-              <label>Max Render Scale (${(config.maxRenderScale * 100).toFixed(0)}%)</label>
-              <input type="range" id="perf-max-scale" min="1.0" max="2.0" step="0.05" value="${config.maxRenderScale}" />
-            </div>
+            <!--
+              There is no Max Render Scale control. DRS caps every climb at native, so the
+              slider that used to sit here could not change the outcome at any position -
+              it was a live-looking control wired to nothing. The ceiling that DOES bind is
+              the known-bad one above, and it is cleared from the footer.
+            -->
           </div>
         </div>
       </div>
 
       <div class="perf-modal-footer">
-        <button class="perf-btn-secondary" id="perf-reset-stats-btn">🔄 Reset Statistics</button>
+        <div style="display: flex; gap: 8px;">
+          <button class="perf-btn-secondary" id="perf-reset-stats-btn">🔄 Reset Statistics</button>
+          <button class="perf-btn-secondary" id="perf-clear-drs-ceiling-btn" title="DRS never climbs back to a scale that juddered. Clear that memory once the scene gets lighter so the resolution can be earned back.">↥ Clear DRS Ceiling</button>
+        </div>
         <div style="display: flex; gap: 8px;">
           <button class="perf-btn-secondary" id="perf-cancel-btn">Cancel</button>
           <button class="perf-btn-primary" id="perf-save-btn">Apply Settings</button>
@@ -5051,6 +5084,14 @@ export function openPerformanceSettingsModal(
 
     dialog.querySelector<HTMLButtonElement>('#perf-reset-stats-btn')!.onclick = () => {
       governor.reset();
+      renderContent();
+    };
+
+    dialog.querySelector<HTMLButtonElement>('#perf-clear-drs-ceiling-btn')!.onclick = () => {
+      // The known-bad ceiling only ever descends, so a scene that got lighter cannot earn
+      // its resolution back without this. Deliberately does not touch the current scale:
+      // the next clean session takes the first step up.
+      governor.clearKnownBadRenderScale();
       renderContent();
     };
 
@@ -5084,11 +5125,6 @@ export function openPerformanceSettingsModal(
       config.minRenderScale = parseFloat(minScaleInput.value);
     };
 
-    const maxScaleInput = dialog.querySelector<HTMLInputElement>('#perf-max-scale')!;
-    maxScaleInput.oninput = () => {
-      config.maxRenderScale = parseFloat(maxScaleInput.value);
-    };
-
     const saveBtn = dialog.querySelector<HTMLButtonElement>('#perf-save-btn')!;
     saveBtn.onclick = () => {
       governor.updateConfig(config);
@@ -5109,6 +5145,8 @@ export function openPerformanceSettingsModal(
     const p95El = dialog.querySelector('#perf-diag-p95');
     const jitEl = dialog.querySelector('#perf-diag-jitter');
     const drsEl = dialog.querySelector('#perf-diag-drs');
+    const missEl = dialog.querySelector('#perf-diag-miss');
+    const ceilingEl = dialog.querySelector('#perf-diag-ceiling');
     const ffrEl = dialog.querySelector('#perf-diag-ffr');
     const splatEl = dialog.querySelector('#perf-diag-splat');
     const volEl = dialog.querySelector('#perf-diag-vol');
@@ -5118,7 +5156,12 @@ export function openPerformanceSettingsModal(
     if (avgEl) avgEl.textContent = `${s.getAverageMs().toFixed(2)} ms`;
     if (p95El) p95El.textContent = `${s.getP95Ms().toFixed(2)} ms`;
     if (jitEl) jitEl.textContent = `±${s.getJitterMs().toFixed(2)} ms`;
-    if (drsEl) drsEl.textContent = `${(m.renderScale * 100).toFixed(0)}%`;
+    if (drsEl) {
+      const pct = `${(m.renderScale * 100).toFixed(0)}%`;
+      drsEl.textContent = m.renderScaleApplied ? pct : `${pct} (next session)`;
+    }
+    if (missEl) missEl.textContent = `${(governor.getSessionMissRatio() * 100).toFixed(1)}%`;
+    if (ceilingEl) ceilingEl.textContent = formatKnownBadRenderScale(governor.getKnownBadRenderScale());
     if (ffrEl) ffrEl.textContent = m.foveationLevel.toFixed(1);
     if (splatEl) splatEl.textContent = m.splatBudget.toLocaleString();
     if (volEl) volEl.textContent = `${m.volumetricSteps}`;
@@ -9098,7 +9141,10 @@ export function openWebXRProfilerModal(
             <div style="background:#090e1a; padding:14px; border-radius:8px; border:1px solid #1e293b; display:flex; flex-direction:column; gap:8px;">
               <div><strong>Snapdragon XR2 Gen 2:</strong> Adreno 740 GPU & Hexagon NPU</div>
               <div><strong>Fixed Foveated Rendering:</strong> Level 1.0 (Dynamic Peripheral Falloff)</div>
-              <div><strong>Dynamic Resolution Scaling:</strong> Enabled (0.85x to 1.15x Range)</div>
+              <!-- Deliberately describes the mechanism rather than quoting a scale range:
+                   this panel cannot see the live GovernorConfig, and the range it used to
+                   print (0.85x-1.15x) was a hardcoded guess that matched nothing. -->
+              <div><strong>Dynamic Resolution Scaling:</strong> Session-scoped &mdash; one step per session, decided at session end from that session's vsync-miss ratio (WebXR refuses framebuffer scale changes while presenting), and never climbing back to a scale that already juddered</div>
             </div>
             <div style="background:#090e1a; padding:14px; border-radius:8px; border:1px solid #1e293b; display:flex; flex-direction:column; gap:8px;">
               <div><strong>Display Resolution:</strong> 2064 x 2208 per eye @ ${currentConfig.targetFps}Hz</div>

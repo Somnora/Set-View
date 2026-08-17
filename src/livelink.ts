@@ -10,6 +10,14 @@
 //   - Self-contained Unreal Engine 5 Python receiver companion script generation
 // ---------------------------------------------------------------------------
 
+import {
+  svQuatToUeRotator,
+  svToUeLocation,
+  ueRotatorToSvQuat,
+  ueRotatorToUeQuat,
+  ueToSvLocation,
+} from './ueCoords.ts';
+
 export interface Vec3 {
   x: number;
   y: number;
@@ -365,85 +373,19 @@ export function normalizeLiveLinkConfig(raw: unknown): LiveLinkConfig {
 
 /**
  * Converts SetView Camera Transform (meters, Y-up, right-handed) to Unreal Engine 5 Camera Transform (cm, Z-up, left-handed).
- * SetView: +X right, +Y up, +Z towards viewer / south; camera looks along -Z.
- * Unreal:  +X forward (SetView +Z), +Y right (SetView +X), +Z up (SetView +Y); camera looks along +X.
+ * Uses the shared determinant -1 handedness contract in ./ueCoords.ts:
+ *   x_ue = -z_sv * 100, y_ue = x_sv * 100, z_ue = y_sv * 100.
+ * An identity SetView camera quaternion (looking down -Z) becomes Unreal yaw 0, facing +X.
  */
 export function convertSetViewToUnrealCameraTransform(
   posM: Vec3,
   rotQuat: Quat,
 ): UnrealCameraTransform {
-  const px = isFiniteNum(posM.x) ? posM.x : 0;
-  const py = isFiniteNum(posM.y) ? posM.y : 0;
-  const pz = isFiniteNum(posM.z) ? posM.z : 0;
-
-  const locationCm = {
-    x: pz * 100.0,
-    y: px * 100.0,
-    z: py * 100.0,
-  };
-
-  const q = quatNormalize(rotQuat);
-  const qx = q.x;
-  const qy = q.y;
-  const qz = q.z;
-  const qw = q.w;
-
-  // Camera forward vector in SetView Three.js camera space: R * (0, 0, -1)
-  const fx_sv = -2.0 * (qx * qz + qw * qy);
-  const fy_sv = -2.0 * (qy * qz - qw * qx);
-  const fz_sv = -(1.0 - 2.0 * (qx * qx + qy * qy));
-
-  // Camera up vector in SetView Three.js camera space: R * (0, 1, 0)
-  const ux_sv = 2.0 * (qx * qy - qw * qz);
-  const uy_sv = 1.0 - 2.0 * (qx * qx + qz * qz);
-  const uz_sv = 2.0 * (qy * qz + qw * qx);
-
-  // Camera right vector in SetView Three.js camera space: R * (1, 0, 0)
-  const rx_sv = 1.0 - 2.0 * (qy * qy + qz * qz);
-  const rz_sv = 2.0 * (qx * qz - qw * qy);
-
-  // Remap SetView basis (x=right, y=up, z=back) to Unreal basis (x=fwd, y=right, z=up)
-  const fx_ue = fz_sv;
-  const fy_ue = fx_sv;
-  const fz_ue = fy_sv;
-
-  const ux_ue = uz_sv;
-  const uy_ue = ux_sv;
-  const uz_ue = uy_sv;
-
-  const rx_ue = rz_sv;
-  const ry_ue = rx_sv;
-
-  const yawDeg = (Math.atan2(fy_ue, fx_ue) * 180.0) / Math.PI;
-  const horizDist = Math.sqrt(fx_ue * fx_ue + fy_ue * fy_ue);
-  const pitchDeg = (Math.atan2(fz_ue, horizDist) * 180.0) / Math.PI;
-  const rollDeg = (Math.atan2(ux_ue * ry_ue - uy_ue * rx_ue, uz_ue) * 180.0) / Math.PI;
-
-  const rotationDeg = {
-    pitch: isFiniteNum(pitchDeg) ? pitchDeg : 0,
-    yaw: isFiniteNum(yawDeg) ? yawDeg : 0,
-    roll: isFiniteNum(rollDeg) ? rollDeg : 0,
-  };
+  const locationCm = svToUeLocation(posM, 100.0);
+  const rotationDeg = svQuatToUeRotator(quatNormalize(rotQuat));
 
   // Convert Euler Rotator (Pitch, Yaw, Roll) to Unreal left-handed Quaternion
-  const deg2rad = Math.PI / 180.0;
-  const p = rotationDeg.pitch * deg2rad * 0.5;
-  const y = rotationDeg.yaw * deg2rad * 0.5;
-  const r = rotationDeg.roll * deg2rad * 0.5;
-
-  const sp = Math.sin(p);
-  const cp = Math.cos(p);
-  const sy = Math.sin(y);
-  const cy = Math.cos(y);
-  const sr = Math.sin(r);
-  const cr = Math.cos(r);
-
-  const ueqx = cr * sp * sy - sr * cp * cy;
-  const ueqy = -cr * sp * cy - sr * cp * sy;
-  const ueqz = cr * cp * sy - sr * sp * cy;
-  const ueqw = cr * cp * cy + sr * sp * sy;
-
-  const ueq = quatNormalize({ x: ueqx, y: ueqy, z: ueqz, w: ueqw });
+  const ueq = quatNormalize(ueRotatorToUeQuat(rotationDeg));
 
   return {
     locationCm,
@@ -459,88 +401,8 @@ export function convertUnrealToSetViewCameraTransform(
   locationCm: { x: number; y: number; z: number },
   rotationDeg: { pitch: number; yaw: number; roll: number },
 ): SetViewCameraTransform {
-  const lx = isFiniteNum(locationCm.x) ? locationCm.x : 0;
-  const ly = isFiniteNum(locationCm.y) ? locationCm.y : 0;
-  const lz = isFiniteNum(locationCm.z) ? locationCm.z : 0;
-
-  const positionM: Vec3 = {
-    x: ly / 100.0,
-    y: lz / 100.0,
-    z: lx / 100.0,
-  };
-
-  const deg2rad = Math.PI / 180.0;
-  const p = (isFiniteNum(rotationDeg.pitch) ? rotationDeg.pitch : 0) * deg2rad;
-  const y = (isFiniteNum(rotationDeg.yaw) ? rotationDeg.yaw : 0) * deg2rad;
-  const r = (isFiniteNum(rotationDeg.roll) ? rotationDeg.roll : 0) * deg2rad;
-
-  // UE basis vectors from Euler angles
-  const fx_ue = Math.cos(p) * Math.cos(y);
-  const fy_ue = Math.cos(p) * Math.sin(y);
-  const fz_ue = Math.sin(p);
-
-  const ux_ue = Math.sin(y) * Math.sin(r) + Math.sin(p) * Math.cos(y) * Math.cos(r);
-  const uy_ue = -Math.cos(y) * Math.sin(r) + Math.sin(p) * Math.sin(y) * Math.cos(r);
-  const uz_ue = Math.cos(p) * Math.cos(r);
-
-  // SetView basis vectors (x=ue_y, y=ue_z, z=ue_x)
-  const f_sv: Vec3 = { x: fy_ue, y: fz_ue, z: fx_ue };
-  const u_sv: Vec3 = { x: uy_ue, y: uz_ue, z: ux_ue };
-
-  // In SetView camera space: camera looks down -Z.
-  // Right vector = cross(f_sv, u_sv)
-  const r_sv: Vec3 = {
-    x: f_sv.y * u_sv.z - f_sv.z * u_sv.y,
-    y: f_sv.z * u_sv.x - f_sv.x * u_sv.z,
-    z: f_sv.x * u_sv.y - f_sv.y * u_sv.x,
-  };
-
-  // Rotation Matrix: Col 0 = right (+X), Col 1 = up (+Y), Col 2 = back (+Z = -f_sv)
-  const m00 = r_sv.x;
-  const m01 = u_sv.x;
-  const m02 = -f_sv.x;
-
-  const m10 = r_sv.y;
-  const m11 = u_sv.y;
-  const m12 = -f_sv.y;
-
-  const m20 = r_sv.z;
-  const m21 = u_sv.z;
-  const m22 = -f_sv.z;
-
-  const trace = m00 + m11 + m22;
-  let qx = 0;
-  let qy = 0;
-  let qz = 0;
-  let qw = 1;
-
-  if (trace > 0) {
-    const s = 0.5 / Math.sqrt(trace + 1.0);
-    qw = 0.25 / s;
-    qx = (m21 - m12) * s;
-    qy = (m02 - m20) * s;
-    qz = (m10 - m01) * s;
-  } else if (m00 > m11 && m00 > m22) {
-    const s = 2.0 * Math.sqrt(1.0 + m00 - m11 - m22);
-    qw = (m21 - m12) / s;
-    qx = 0.25 * s;
-    qy = (m01 + m10) / s;
-    qz = (m02 + m20) / s;
-  } else if (m11 > m22) {
-    const s = 2.0 * Math.sqrt(1.0 + m11 - m00 - m22);
-    qw = (m02 - m20) / s;
-    qx = (m01 + m10) / s;
-    qy = 0.25 * s;
-    qz = (m12 + m21) / s;
-  } else {
-    const s = 2.0 * Math.sqrt(1.0 + m22 - m00 - m11);
-    qw = (m10 - m01) / s;
-    qx = (m02 + m20) / s;
-    qy = (m12 + m21) / s;
-    qz = 0.25 * s;
-  }
-
-  const rotationQuat = quatNormalize({ x: qx, y: qy, z: qz, w: qw });
+  const positionM: Vec3 = ueToSvLocation(locationCm, 100.0);
+  const rotationQuat = quatNormalize(ueRotatorToSvQuat(rotationDeg));
 
   return {
     positionM,

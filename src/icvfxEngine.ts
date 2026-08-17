@@ -7,6 +7,8 @@
 // seamlessly in pure Node.js unit tests and headless worker runtimes.
 // ---------------------------------------------------------------------------
 
+import { svHeadingToUeYaw, svToUeLocation } from './ueCoords.ts';
+
 export type LedPanelType =
   | 'curved_perimeter'
   | 'flat_wall'
@@ -828,11 +830,14 @@ export function generateNDisplayConfigXml(
       const pxWidth = Math.round((w.widthM * 1000) / w.pixelPitchMm);
       const pxHeight = Math.round((w.heightM * 1000) / w.pixelPitchMm);
 
+      // Shared SetView -> Unreal handedness contract (determinant -1); see ./ueCoords.ts.
+      const centerCm = svToUeLocation(w.center, 100.0);
+
       return `      <screen id="${screenId}" name="${escapeXml(w.name)}">
         <size width="${(w.widthM * 100).toFixed(1)}" height="${(w.heightM * 100).toFixed(1)}" />
         <resolution width="${pxWidth}" height="${pxHeight}" />
-        <location x="${(w.center.x * 100).toFixed(1)}" y="${(-w.center.z * 100).toFixed(1)}" z="${(w.center.y * 100).toFixed(1)}" />
-        <rotation pitch="0" yaw="${((-w.rotationY * 180) / Math.PI).toFixed(2)}" roll="0" />
+        <location x="${centerCm.x.toFixed(1)}" y="${centerCm.y.toFixed(1)}" z="${centerCm.z.toFixed(1)}" />
+        <rotation pitch="0" yaw="${svHeadingToUeYaw(w.rotationY).toFixed(2)}" roll="0" />
         <geometry type="${isCurved ? 'cylinder' : 'flat'}" radius="${(w.radiusM * 100).toFixed(1)}" arc="${w.arcAngleDeg.toFixed(1)}" pitch_mm="${w.pixelPitchMm.toFixed(2)}" nits="${w.brightnessNits}" />
       </screen>`;
     })

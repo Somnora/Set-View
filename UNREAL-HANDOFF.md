@@ -20,15 +20,37 @@ Once a scene is authored and exported to `.setview.json`, the Unreal Engine impo
 
 ## Coordinate System Contract
 
-SetView and Unreal Engine 5 use different coordinate conventions and length units:
+SetView and Unreal Engine 5 use different coordinate conventions and length units.
+**SetView is right-handed; Unreal is left-handed.** Converting between them requires a
+basis map with **determinant $-1$** — an odd number of axis negations. A determinant $+1$
+permutation such as $(x,y,z) \to (z,x,y)$ is a pure rotation: the export stays internally
+self-consistent but the whole scene comes in **mirrored**, silently reversing every screen
+direction and invalidating 180-degree line / eyeline continuity.
 
 | Dimension | SetView (WebXR / Three.js) | Unreal Engine 5 | Importer Conversion Formula |
 | :--- | :--- | :--- | :--- |
 | **Units** | Meters ($m$) | Centimeters ($cm$) | $1\,m = 100\,cm$ |
 | **Up Axis** | $+Y$ | $+Z$ | $Z_{UE} = Y_{SV} \times 100$ |
 | **Right Axis** | $+X$ | $+Y$ | $Y_{UE} = X_{SV} \times 100$ |
-| **Forward Axis** | $-Z$ ($+Z$ is towards camera) | $+X$ | $X_{UE} = Z_{SV} \times 100$ |
-| **Actor Heading** | $\text{rotationY}$ rad around $+Y$ ($0 = +Z$) | $\text{Yaw}$ deg around $+Z$ ($0 = +X$) | $\text{Yaw}_{UE} = \text{degrees}(\text{rotationY}_{SV})$ |
+| **Forward Axis** | $-Z$ ($+Z$ is towards camera) | $+X$ | $X_{UE} = -Z_{SV} \times 100$ |
+| **Actor Heading** | $\text{rotationY}$ rad around $+Y$ ($0 = +Z$) | $\text{Yaw}$ deg around $+Z$ ($0 = +X$) | $\text{Yaw}_{UE} = 180 - \text{degrees}(\text{rotationY}_{SV})$ |
+
+Basis matrix $\begin{bmatrix}0&0&-1\\1&0&0\\0&1&0\end{bmatrix}$, $\det = -1$.
+
+Consequences of the handedness flip, all of which the importer handles:
+
+- **Heading offset.** SetView heading $0$ faces $+Z_{SV}$, which is $-X_{UE}$, i.e. Yaw $180$.
+  The sweep direction also reverses: $0 \to 180$, $90 \to 90$, $180 \to 0$, $270 \to -90$.
+- **Camera rotators.** An identity SetView camera quaternion (looking down $-Z$) becomes
+  Unreal rotator $(0, 0, 0)$, facing $+X$. Roll changes sign: a Three.js camera rolled
+  $+30°$ about its own local $+Z$ (backward) axis exports as Unreal Roll $-30°$.
+- **Triangle winding.** The determinant $-1$ vertex map flips triangle handedness, so the
+  scan OBJ writer emits reversed winding (`f i0 i2 i1`) or every imported face is inside-out.
+
+The single source of truth is `sv_direction_to_ue()` in `Content/Python/import_setview.py`
+and `src/ueCoords.ts` on the TypeScript side; `src/ue5Bridge.ts`, `src/livelink.ts` and
+`src/icvfxEngine.ts` all route through the latter. Regression coverage lives in
+`test/import-test.py` (`run_coordinate_tests`) and `test/domain.test.ts` (`ueCoords: ...`).
 
 ---
 
