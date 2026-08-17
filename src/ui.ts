@@ -1973,6 +1973,12 @@ export function openAiAnalysisModal(scene: SceneData, overlayRoot?: HTMLElement)
   const storyboard = generateStoryboard(scene, script);
   const container = overlayRoot ?? document.body;
 
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingAiAnalysisModal = document.querySelector('.ai-modal-overlay');
+  if (existingAiAnalysisModal) existingAiAnalysisModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'ai-modal-overlay';
 
@@ -2195,6 +2201,12 @@ export function openAiAnalysisModal(scene: SceneData, overlayRoot?: HTMLElement)
 /** Opens the interactive NLE Timeline and Shot List Exporter modal. */
 export function openNleExportModal(scene: SceneData, overlayRoot?: HTMLElement): void {
   const container = overlayRoot ?? document.body;
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingNleExportModal = document.querySelector('.ai-modal-overlay');
+  if (existingNleExportModal) existingNleExportModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'ai-modal-overlay';
 
@@ -2513,6 +2525,12 @@ export function openCollabModal(
   onDisconnect: () => void,
 ): void {
   const container = document.body;
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingCollabModal = document.querySelector('.collab-modal-overlay');
+  if (existingCollabModal) existingCollabModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'collab-modal-overlay';
 
@@ -2703,6 +2721,12 @@ export function openPropsLibraryModal(
   onDeleteCustomAsset?: (id: string) => Promise<void>,
 ): void {
   const container = document.body;
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingPropsLibraryModal = document.querySelector('.props-modal-overlay');
+  if (existingPropsLibraryModal) existingPropsLibraryModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'props-modal-overlay';
 
@@ -2934,6 +2958,12 @@ export function openLiveLinkModal(
   onSaveConfig?: (config: LiveLinkConfig) => void,
   overlayRoot: HTMLElement = document.body,
 ): void {
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingLiveLinkModal = document.querySelector('.livelink-modal-overlay');
+  if (existingLiveLinkModal) existingLiveLinkModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'livelink-modal-overlay';
 
@@ -3438,6 +3468,12 @@ export function openActorStudioModal(
   onSave: (updated: Partial<ActorData>) => void,
   overlayRoot: HTMLElement = document.body,
 ): void {
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingActorStudioModal = document.querySelector('.actor-studio-overlay');
+  if (existingActorStudioModal) existingActorStudioModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'actor-studio-overlay';
 
@@ -3828,6 +3864,12 @@ export function openCameraGripModal(
   onSave: (updated: { gripRig?: GripRigConfig; lensProfile?: LensOpticalProfile }) => void,
   overlayRoot: HTMLElement = document.body,
 ): void {
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingCameraGripModal = document.querySelector('.grip-studio-overlay');
+  if (existingCameraGripModal) existingCameraGripModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'grip-studio-overlay';
 
@@ -4434,6 +4476,12 @@ export function openGaussianSplatStudioModal(
   overlayRoot: HTMLElement = document.body,
   onCloudModified?: (cloud: GaussianCloudData | null) => void,
 ): void {
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingGaussianSplatStudioModal = document.querySelector('.splat-modal-overlay');
+  if (existingGaussianSplatStudioModal) existingGaussianSplatStudioModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'splat-modal-overlay';
 
@@ -4939,6 +4987,12 @@ export function openPerformanceSettingsModal(
   onSave?: (config: GovernorConfig) => void,
   overlayRoot: HTMLElement = document.body,
 ): void {
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingPerformanceSettingsModal = document.querySelector('.perf-modal-overlay');
+  if (existingPerformanceSettingsModal) existingPerformanceSettingsModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'perf-modal-overlay';
 
@@ -5185,6 +5239,12 @@ export function openDailiesVideoStudioModal(
   ) => Promise<DailiesRenderResult | Blob | void>,
   overlayRoot: HTMLElement = document.body,
 ): void {
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingDailiesVideoStudioModal = document.querySelector('.dailies-modal-overlay');
+  if (existingDailiesVideoStudioModal) existingDailiesVideoStudioModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'dailies-modal-overlay';
 
@@ -5684,6 +5744,12 @@ export function openDmxBridgeStudioModal(
   streamer?: DmxStreamer,
   overlayRoot: HTMLElement = document.body,
 ): void {
+  // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
+  // this can be selected again with one already open. Two stacked full-screen
+  // overlays in a headset leave one behind when the top is closed.
+  const existingDmxBridgeStudioModal = document.querySelector('.dmx-modal-overlay');
+  if (existingDmxBridgeStudioModal) existingDmxBridgeStudioModal.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'dmx-modal-overlay';
 
