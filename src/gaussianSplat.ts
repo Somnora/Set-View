@@ -880,10 +880,13 @@ export function parseCompactSplat(buffer: ArrayBuffer | Uint8Array): GaussianClo
     const b = dataView.getUint8(base + 26) / 255;
     const a = dataView.getUint8(base + 27) / 255;
 
-    const rx = (dataView.getUint8(base + 28) - 128) / 128;
-    const ry = (dataView.getUint8(base + 29) - 128) / 128;
-    const rz = (dataView.getUint8(base + 30) - 128) / 128;
-    const rw = (dataView.getUint8(base + 31) - 128) / 128;
+    // Slots are (w, x, y, z), matching rot_0..rot_3 in the Inria 3DGS PLY that .splat
+    // is transcoded from. See exportCompactSplat for why the old (x, y, z, w) order
+    // round-tripped cleanly here while corrupting every third-party exchange.
+    const rw = (dataView.getUint8(base + 28) - 128) / 128;
+    const rx = (dataView.getUint8(base + 29) - 128) / 128;
+    const ry = (dataView.getUint8(base + 30) - 128) / 128;
+    const rz = (dataView.getUint8(base + 31) - 128) / 128;
 
     const len = Math.hypot(rw, rx, ry, rz);
     const qx = len > 0.0001 ? rx / len : 0;
@@ -944,10 +947,15 @@ export function exportCompactSplat(cloud: GaussianCloudData): Uint8Array {
     dataView.setUint8(base + 26, Math.round(clamp(s.color.b * 255, 0, 255)));
     dataView.setUint8(base + 27, Math.round(clamp(s.opacity * 255, 0, 255)));
 
-    dataView.setUint8(base + 28, Math.round(clamp(s.rotation.x * 128 + 128, 0, 255)));
-    dataView.setUint8(base + 29, Math.round(clamp(s.rotation.y * 128 + 128, 0, 255)));
-    dataView.setUint8(base + 30, Math.round(clamp(s.rotation.z * 128 + 128, 0, 255)));
-    dataView.setUint8(base + 31, Math.round(clamp(s.rotation.w * 128 + 128, 0, 255)));
+    // Quaternion slots are (w, x, y, z), matching rot_0..rot_3 in the Inria 3DGS PLY
+    // that .splat files are transcoded from slot-for-slot. This used to write
+    // (x, y, z, w): SetView's own round-trip stayed self-consistent, so the tests
+    // passed, but every splat exchanged with a third-party tool came back rotated
+    // wrongly, which smears an anisotropic cloud rather than failing loudly.
+    dataView.setUint8(base + 28, Math.round(clamp(s.rotation.w * 128 + 128, 0, 255)));
+    dataView.setUint8(base + 29, Math.round(clamp(s.rotation.x * 128 + 128, 0, 255)));
+    dataView.setUint8(base + 30, Math.round(clamp(s.rotation.y * 128 + 128, 0, 255)));
+    dataView.setUint8(base + 31, Math.round(clamp(s.rotation.z * 128 + 128, 0, 255)));
   }
 
   return out;

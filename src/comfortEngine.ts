@@ -767,12 +767,30 @@ export function auditSceneComfort(
 // Exporters: RFC 4180 CSV & Standalone HTML Safety Deck
 // ---------------------------------------------------------------------------
 
+/**
+ * Provenance of the vestibular samples behind a comfort report.
+ *
+ * `simulated` samples come from a synthetic motion profile, not from a worn headset.
+ * The in-app panel labels this clearly, but the exported artifact used to carry no
+ * marker at all, so a synthetic run left the app looking exactly like a measured
+ * session. A safety report that cannot be told apart from real data is worse than
+ * no report.
+ */
+export type ComfortSampleProvenance = 'measured' | 'simulated';
+
 export function generateComfortReportCsv(
   reportOrSamples: ComfortAuditReport | VestibularStateSample[],
   samples?: VestibularStateSample[],
+  provenance: ComfortSampleProvenance = 'measured',
 ): string {
+  const provenanceLabel =
+    provenance === 'simulated'
+      ? 'SIMULATED (synthetic motion profile, NOT recorded from a headset)'
+      : 'MEASURED (recorded headset motion)';
+
   if (Array.isArray(reportOrSamples)) {
     const lines: string[] = [];
+    lines.push(`DataSource,${provenanceLabel}`);
     lines.push('TimestampMs,PosX,PosY,PosZ,VelX,VelY,VelZ,AccX,AccY,AccZ,JerkX,JerkY,JerkZ,YawDeg,PitchDeg,RollDeg,AngularVelocityDegSec,AngularJerkDegSec3');
     for (const s of reportOrSamples) {
       lines.push(
@@ -786,6 +804,7 @@ export function generateComfortReportCsv(
   const lines: string[] = [];
 
   lines.push('SetView VR Motion Sickness, Ergonomics & Spatial Comfort Audit Report');
+  lines.push(`DataSource,${provenanceLabel}`);
   lines.push(`GeneratedAt,${new Date().toISOString()}`);
   lines.push(`ComfortScore,${report.comfortScore}/100`);
   lines.push(`ComfortGrade,${report.comfortGrade}`);

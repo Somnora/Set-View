@@ -7128,6 +7128,49 @@ test('3DGS: createGaussianSplatCloud and validation functions', () => {
   assert.equal(cloud.transform.scale, 1.0);
 });
 
+test('3DGS: the PLY and .splat codecs agree on quaternion slot order', () => {
+  // Both formats carry the quaternion as four ordinal slots, and a .splat file is
+  // canonically transcoded from an Inria 3DGS PLY slot-for-slot. So slot 0 must mean
+  // the same component in both. It did not: the PLY codec wrote (w,x,y,z) and the
+  // .splat codec wrote (x,y,z,w). SetView's own round-trip stayed self-consistent, so
+  // every existing test passed, while every splat exchanged with a third-party tool
+  // came back rotated wrongly. Gaussians are anisotropic, so that smears a cloud
+  // rather than failing loudly. This asserts the cross-codec invariant, which a
+  // single-codec round-trip test structurally cannot see.
+  const q = { x: 0.1, y: 0.2, z: 0.3, w: 0.9 };
+  const cloud = createGaussianSplatCloud('QuatOrder', [
+    {
+      position: { x: 0, y: 0, z: 0 },
+      scale: { x: 0.1, y: 0.1, z: 0.1 },
+      rotation: q,
+      color: { r: 0.5, g: 0.5, b: 0.5 },
+      opacity: 1.0,
+    },
+  ] as never);
+
+  const ply = exportGaussianPly(cloud, true) as Uint8Array;
+  const headerText = new TextDecoder().decode(ply.slice(0, 1024));
+  const bodyStart = headerText.indexOf('end_header\n') + 'end_header\n'.length;
+  const pv = new DataView(ply.buffer, ply.byteOffset + bodyStart);
+  const plySlots = [40, 44, 48, 52].map((o) => pv.getFloat32(o, true));
+
+  const sp = exportCompactSplat(cloud);
+  const sv = new DataView(sp.buffer, sp.byteOffset);
+  const splatSlots = [28, 29, 30, 31].map((o) => (sv.getUint8(o) - 128) / 128);
+
+  // Inria 3DGS: rot_0 = w, rot_1 = x, rot_2 = y, rot_3 = z.
+  assert.ok(Math.abs(plySlots[0] - q.w) < 1e-4, `PLY slot 0 must be w, got ${plySlots[0]}`);
+  assert.ok(Math.abs(plySlots[1] - q.x) < 1e-4, `PLY slot 1 must be x, got ${plySlots[1]}`);
+
+  // The .splat quantises to a byte, so it needs a looser tolerance than the PLY floats.
+  for (let i = 0; i < 4; i++) {
+    assert.ok(
+      Math.abs(plySlots[i] - splatSlots[i]) < 0.02,
+      `codecs disagree at quaternion slot ${i}: PLY ${plySlots[i]} vs .splat ${splatSlots[i]}`,
+    );
+  }
+});
+
 test('3DGS: normalizeGaussianCloud repairs corrupt/missing fields', () => {
   const corrupt: any = {
     id: 'corrupt-cloud',
@@ -10783,8 +10826,35 @@ test('VR Comfort Engine: RFC 4180 CSV & Standalone HTML Safety Report Export', (
   };
 
   const csv = generateComfortReportCsv([sample]);
-  assert.ok(csv.startsWith('TimestampMs,PosX,PosY,PosZ,VelX,VelY,VelZ,AccX,AccY,AccZ,JerkX,JerkY,JerkZ,YawDeg,PitchDeg,RollDeg,AngularVelocityDegSec,AngularJerkDegSec3'));
+  // Row 1 states provenance, row 2 is the column header. Every exported comfort
+  // artifact has to say whether its samples were measured on a headset or generated
+  // from a synthetic profile: the in-app panel labels the simulator clearly, but the
+  // file used to leave with no marker, so a simulated run was indistinguishable from
+  // a recorded session once it was out of the app.
+  const csvLines = csv.split('\n');
+  assert.ok(csvLines[0].startsWith('DataSource,'), `row 1 must declare provenance, got: ${csvLines[0]}`);
+  assert.ok(csvLines[0].includes('MEASURED'), 'default provenance is measured');
+  assert.equal(
+    csvLines[1],
+    'TimestampMs,PosX,PosY,PosZ,VelX,VelY,VelZ,AccX,AccY,AccZ,JerkX,JerkY,JerkZ,YawDeg,PitchDeg,RollDeg,AngularVelocityDegSec,AngularJerkDegSec3',
+  );
   assert.ok(csv.includes('1500,0.200,1.400,-0.300'));
+
+  // A simulated export must be self-evidently simulated from the file alone.
+  const simCsv = generateComfortReportCsv([sample], undefined, 'simulated');
+  assert.ok(simCsv.split('\n')[0].includes('SIMULATED'), 'simulated samples must be labelled');
+  assert.ok(
+    /NOT recorded/i.test(simCsv.split('\n')[0]),
+    'the simulated label must be unambiguous to a human reading the file',
+  );
+
+  // The full audit report form carries provenance too, not just the raw-sample form.
+  const simReport = generateComfortReportCsv(
+    auditSceneComfort([], config, [sample]),
+    [sample],
+    'simulated',
+  );
+  assert.ok(simReport.includes('DataSource,SIMULATED'), 'audit report form must carry provenance');
 
   const report = auditSceneComfort([], config, [sample]);
   const html = generateComfortReportHtml(report, 'Stage 2 Comfort Studio');

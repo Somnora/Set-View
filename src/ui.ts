@@ -10137,7 +10137,9 @@ export function openVRComfortModal(
       `;
 
       pane.querySelector<HTMLButtonElement>('#btn-export-comfort-csv')!.onclick = () => {
-        const csv = generateComfortReportCsv(latestAudit, simulatedSamples);
+        // These samples come from generateSimulatedVestibularSamples, not a worn
+        // headset, so the exported file has to say so.
+        const csv = generateComfortReportCsv(latestAudit, simulatedSamples, 'simulated');
         triggerDownload(`${(scene.name || 'SetView_VR_Comfort').replace(/\s+/g, '_')}_comfort.csv`, csv, 'text/csv');
         if (onExportCsv) onExportCsv();
       };
