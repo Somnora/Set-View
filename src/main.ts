@@ -986,6 +986,55 @@ class App {
     }
   }
 
+  /**
+   * Pushes a SceneData into every subsystem that renders or streams part of it.
+   *
+   * Shared by loadScene and restoreScene because those two had drifted badly: loadScene
+   * applied thirteen subsystems and restoreScene applied three, so undoing a change to
+   * props, lights, atmosphere, the splat cloud, the floorplan overlay, solar, the LED
+   * volume, acoustics, screenplay or set dressing reverted the scene data and autosaved
+   * it while the 3D view carried on showing the pre-undo state. The user then acted on
+   * what they could see, which no longer matched what was stored.
+   *
+   * Anything that belongs to scene ENTRY rather than to scene CONTENT stays out of here
+   * on purpose: history.reset, persistence.setCurrent, stopRecording and the DRS
+   * known-bad ceiling clear must not run on an undo.
+   */
+  private applySceneToSubsystems(data: SceneData): void {
+    this.actors.setScene(data);
+    this.props.setScene(data);
+    this.keyframes.setScene(data);
+    this.cams.setScene(data);
+    this.contentVersion++;
+    this.pendingScan = null;
+    this.syncLocation();
+
+    const activeCloud = (data.gaussianClouds && data.gaussianClouds.length > 0)
+      ? (data.gaussianClouds.find((c) => c.id === data.activeSplatCloudId) || data.gaussianClouds[0])
+      : null;
+    this.splatRenderer.setCloud(activeCloud);
+    this.splatRenderer.setFloorplanOverlay(data.architecture ?? null);
+
+    this.volumetrics.update(
+      data.atmosphere ?? createAtmosphereConfig('clear'),
+      data.lights ?? [],
+      this.camera,
+    );
+    if (data.livelink) {
+      this.liveLinkStreamer.updateConfig(data.livelink);
+    }
+    if (data.dmxBridge) {
+      this.dmxStreamer.setConfig(data.dmxBridge);
+    }
+    this.icvfxRenderer.setConfig(data.icvfx || createLedVolumeConfig());
+    this.acousticsRenderer.setConfig(data.acoustics || createAcousticsConfig());
+    this.solarRenderer.setConfig(data.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
+    this.screenplayRenderer.setConfig(data.screenplay || createScreenplayConfig());
+    this.profilerRuntime.updateConfig(data.profiler || createVRProfilerConfig());
+    this.comfortRenderer.setConfig(data.comfort || createVRComfortConfig());
+    this.setDressingRenderer.setConfig(data.setDressing || createSetDressingConfig());
+  }
+
   private loadScene(data: SceneData): void {
     const previousSceneId = this.sceneData.id;
     this.sceneData = data;
@@ -1008,41 +1057,8 @@ class App {
     this.cancelActiveManipulation();
     // A take belongs to the scene it was rolling on: finish and save it.
     this.stopRecording(true);
-    this.actors.setScene(data);
-    this.props.setScene(data);
-    this.keyframes.setScene(data);
-    this.cams.setScene(data);
-    this.contentVersion++;
-    this.pendingScan = null;
-    this.syncLocation();
-    const activeCloud = (data.gaussianClouds && data.gaussianClouds.length > 0)
-      ? (data.gaussianClouds.find((c) => c.id === data.activeSplatCloudId) || data.gaussianClouds[0])
-      : null;
-    this.splatRenderer.setCloud(activeCloud);
-    if (data.architecture) {
-      this.splatRenderer.setFloorplanOverlay(data.architecture);
-    } else {
-      this.splatRenderer.setFloorplanOverlay(null);
-    }
+    this.applySceneToSubsystems(data);
     this.history.reset(data);
-    this.volumetrics.update(
-      data.atmosphere ?? createAtmosphereConfig('clear'),
-      data.lights ?? [],
-      this.camera,
-    );
-    if (data.livelink) {
-      this.liveLinkStreamer.updateConfig(data.livelink);
-    }
-    if (data.dmxBridge) {
-      this.dmxStreamer.setConfig(data.dmxBridge);
-    }
-    this.icvfxRenderer.setConfig(data.icvfx || createLedVolumeConfig());
-    this.acousticsRenderer.setConfig(data.acoustics || createAcousticsConfig());
-    this.solarRenderer.setConfig(data.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
-    this.screenplayRenderer.setConfig(data.screenplay || createScreenplayConfig());
-    this.profilerRuntime.updateConfig(data.profiler || createVRProfilerConfig());
-    this.comfortRenderer.setConfig(data.comfort || createVRComfortConfig());
-    this.setDressingRenderer.setConfig(data.setDressing || createSetDressingConfig());
     this.refreshLanding();
 
     this.refreshWristState();
@@ -1092,18 +1108,17 @@ class App {
   private restoreScene(data: SceneData): void {
     this.sceneData = data;
     this.selectedActorId = null;
+    // Cleared for the same reason as selectedActorId: the undone state may not
+    // contain the prop that was selected, leaving a dangling id behind.
+    this.selectedPropId = null;
     this.hover = null;
     this.cancelActiveManipulation();
     // Drop reanchor entries queued for the objects we're about to dispose —
     // otherwise the loop would create (and leak) anchors on detached objects.
     this.pendingReanchorActors.length = 0;
     this.pendingReanchorCams.length = 0;
-    this.actors.setScene(data);
-    this.keyframes.setScene(data);
-    this.cams.setScene(data);
-    this.contentVersion++;
-    this.pendingScan = null;
-    this.syncLocation();
+    // Every subsystem, not just actors/keyframes/cameras. See applySceneToSubsystems.
+    this.applySceneToSubsystems(data);
     this.persistence.saveNow(data);
     if (this.session.session && !this.views.isShifted) {
       for (const obj of this.actors.all()) this.pendingReanchorActors.push(obj);
