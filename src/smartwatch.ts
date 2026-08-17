@@ -104,6 +104,8 @@ export class DirectorSmartwatch {
 
   private lastTouchTime = 0;
   private hoverButtonId: string | null = null;
+  /** Signature of the last painted face; see renderCanvas for why this exists. */
+  private lastRenderSignature = '';
 
   onPress?: (buttonId: string, value?: number) => void;
   onScrub?: (normalizedRatio: number) => void;
@@ -224,6 +226,21 @@ export class DirectorSmartwatch {
 
   private renderCanvas(st: SmartwatchState): void {
     if (typeof document === 'undefined' || !this.ctx || !this.ctx.clearRect) return;
+
+    // Repaint only when the face actually changes. This used to clear and redraw the
+    // whole 512x512 canvas and set texture.needsUpdate on EVERY frame, which forces a
+    // 1 MB RGBA re-upload to the GPU 72 times a second (~75 MB/s) for a watch face
+    // that is usually identical frame to frame. Nothing gates it: the group is mounted
+    // to the wrist permanently and its visibility is never toggled.
+    //
+    // The whole drawn output is a function of `st` plus `hoverButtonId` and nothing
+    // else, so serialising those two is a complete signature. Serialising is used
+    // rather than a hand-picked field list because a missed field would show a stale
+    // face, which is a worse failure than the cost this avoids.
+    const signature = `${this.hoverButtonId}|${JSON.stringify(st)}`;
+    if (signature === this.lastRenderSignature) return;
+    this.lastRenderSignature = signature;
+
     const ctx = this.ctx;
     ctx.clearRect(0, 0, 512, 512);
 

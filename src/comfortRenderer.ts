@@ -224,6 +224,19 @@ export class SpatialComfortRenderer {
     this.updateVisibility();
   }
 
+  /**
+   * Whether the reach shells and out-of-reach markers are showing.
+   *
+   * Exposed so the per-frame caller can skip building the `targetPositions` array
+   * when it would only be discarded: that argument is consumed solely inside the
+   * `isVisible` branch of update(), and arguments are evaluated eagerly, so building
+   * it unconditionally allocated one object per prop, camera and actor every frame
+   * for nothing in the normal hidden case.
+   */
+  public getIsVisible(): boolean {
+    return this.isVisible;
+  }
+
   public setVisible(visible: boolean): void {
     this.isVisible = visible;
     this.updateVisibility();

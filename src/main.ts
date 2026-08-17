@@ -93,7 +93,16 @@ import {
   detectSemanticRegions,
   generateThemeScatter,
   type SettledPropItem,
+  type Vec3,
 } from './model.ts';
+
+/** One reach-envelope target handed to the comfort overlay. See comfortReachTargets(). */
+interface ComfortReachTarget {
+  id: string;
+  name: string;
+  position: Vec3;
+  category: 'prop' | 'camera_grip' | 'actor';
+}
 import { WebXRProfilerRuntime } from './webxrProfiler.ts';
 import { SpatialComfortRenderer } from './comfortRenderer.ts';
 import { SetDressingRenderer } from './setDressingRenderer.ts';
@@ -269,6 +278,8 @@ class App {
   private contentVersion = 0;
   private hiddenCache: THREE.Object3D[] | null = null;
   private hiddenCacheVersion = -1;
+  /** Reused backing store for comfortReachTargets(); never reallocated per frame. */
+  private readonly comfortTargetBuffer: ComfortReachTarget[] = [];
   private hoverTargets: THREE.Object3D[] = [];
   private hoverTargetsVersion = -1;
 
@@ -2397,6 +2408,41 @@ class App {
     return this.hiddenCache;
   }
 
+  /**
+   * Reach-envelope targets for the comfort overlay: every prop, camera and actor.
+   *
+   * Called only while that overlay is visible. Entries are written into a reused
+   * array of reused records rather than rebuilt, so showing the overlay does not
+   * start allocating per frame either. The array is handed straight to
+   * SpatialComfortRenderer.update, which reads it synchronously and keeps no
+   * reference, so reusing the backing objects is safe.
+   */
+  private comfortReachTargets(): ComfortReachTarget[] {
+    const out = this.comfortTargetBuffer;
+    let n = 0;
+
+    const push = (id: string, name: string, position: Vec3, category: ComfortReachTarget['category']) => {
+      let rec = out[n];
+      if (!rec) {
+        rec = { id, name, position, category };
+        out.push(rec);
+      } else {
+        rec.id = id;
+        rec.name = name;
+        rec.position = position;
+        rec.category = category;
+      }
+      n++;
+    };
+
+    for (const p of this.sceneData.props ?? []) push(p.id, p.name, p.position, 'prop');
+    for (const c of this.sceneData.cameras ?? []) push(c.id, c.name, c.position, 'camera_grip');
+    for (const a of this.sceneData.actors ?? []) push(a.id, a.name, a.position, 'actor');
+
+    if (out.length > n) out.length = n;
+    return out;
+  }
+
   // --- per-frame loop ----------------------------------------------------------------
 
   private loop(time: number, frame?: XRFrame): void {
@@ -2914,29 +2960,16 @@ class App {
     );
     this.solarRenderer.update(dt);
     this.screenplayRenderer.update(this.sceneData.actors, this.sceneData.cameras);
+    // Only build the reach-target list when the comfort overlay is actually showing.
+    // update() reads this argument solely inside its isVisible branch, and arguments
+    // evaluate eagerly, so constructing it unconditionally allocated three arrays plus
+    // one object per prop, camera and actor on EVERY frame and then threw them away.
+    // On a dressed set that is thousands of short-lived objects a second against a
+    // 72fps budget, which is exactly the GC micro-stutter this loop is meant to avoid.
     this.comfortRenderer.update(
       this.camera,
       dt,
-      [
-        ...(this.sceneData.props ?? []).map((p) => ({
-          id: p.id,
-          name: p.name,
-          position: p.position,
-          category: 'prop' as const,
-        })),
-        ...(this.sceneData.cameras ?? []).map((c) => ({
-          id: c.id,
-          name: c.name,
-          position: c.position,
-          category: 'camera_grip' as const,
-        })),
-        ...(this.sceneData.actors ?? []).map((a) => ({
-          id: a.id,
-          name: a.name,
-          position: a.position,
-          category: 'actor' as const,
-        })),
-      ],
+      this.comfortRenderer.getIsVisible() ? this.comfortReachTargets() : undefined,
     );
     this.volumetrics.tick(dt, this.sceneData.atmosphere, this.sceneData.lights ?? [], this.camera);
     this.gizmo.update(this.camera);
