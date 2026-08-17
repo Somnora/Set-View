@@ -258,6 +258,16 @@ export class WebXRProfilerRuntime {
     return this.telemetryHistory;
   }
 
+  /**
+   * The per-frame samples a report should be read against: the last benchmark run if
+   * there was one, otherwise the rolling live history. Same selection the two
+   * exportCurrent* helpers below make, exposed so callers that build their own report
+   * cannot end up pairing a real summary with an unrelated sample set.
+   */
+  public getReportSamples(): FrameTelemetrySample[] {
+    return this.benchmarkSamples.length > 0 ? this.benchmarkSamples : this.telemetryHistory;
+  }
+
   public exportCurrentCsv(): string {
     const samples = this.benchmarkSamples.length > 0 ? this.benchmarkSamples : this.telemetryHistory;
     return generatePerformanceReportCsv(samples);

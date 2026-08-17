@@ -2147,7 +2147,12 @@ export function openAiAnalysisModal(scene: SceneData, overlayRoot?: HTMLElement)
     const apiKey = keyInput.value.trim();
     switchTab(tabOutputBtn, tabOutputEl);
     if (!apiKey) {
-      tabOutputEl.textContent = simulateAiContinuityBreakdown(scene);
+      // The three API-failure paths below already announce the fallback. This is the
+      // path users hit most often, since the key is optional, so it has to say the
+      // same thing rather than quietly passing the offline heuristic off as a run.
+      tabOutputEl.textContent =
+        'ℹ️ No Gemini API key set, so no model was called. Showing the offline preview analysis:\n\n' +
+        simulateAiContinuityBreakdown(scene);
       return;
     }
 
@@ -8975,7 +8980,15 @@ if __name__ == "__main__":
 export function openWebXRProfilerModal(
   scene: SceneData,
   onSaveConfig?: (config: VRProfilerConfig) => void,
-  onRunBenchmark?: (scenarioId: string) => Promise<VRBenchmarkReport>,
+  // Returns the report AND the per-frame samples behind it. The samples used to be
+  // omitted, so a real run updated the summary while the modal's sampleTrace kept
+  // whatever was there before: either nothing, or synthetic frames from an earlier
+  // "simulate" click. The Telemetry CSV and the HTML deck both read sampleTrace, so a
+  // real benchmark could be exported with empty or synthetic per-frame data under a
+  // real summary.
+  onRunBenchmark?: (
+    scenarioId: string,
+  ) => Promise<{ report: VRBenchmarkReport; samples: FrameTelemetrySample[] }>,
   onExportCsv?: () => void,
   onExportHtml?: () => void,
   overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
@@ -8999,6 +9012,10 @@ export function openWebXRProfilerModal(
   let benchmarkProgressPct = 0;
   let latestReport: VRBenchmarkReport | null = null;
   let sampleTrace: FrameTelemetrySample[] = [];
+  // Whether sampleTrace/latestReport came from a real profiled run or from the
+  // synthetic scenario generator. Exports state this, so a simulated run cannot leave
+  // the app looking like measured headset telemetry.
+  let benchmarkProvenance: 'measured' | 'simulated' = 'simulated';
 
   const triggerDownload = (filename: string, content: string, mimeType: string) => {
     const blob = new Blob([content], { type: mimeType });
@@ -9250,7 +9267,9 @@ export function openWebXRProfilerModal(
           if (onRunBenchmark) {
             try {
               const res = await onRunBenchmark(selectedScenarioId);
-              latestReport = res;
+              latestReport = res.report;
+              sampleTrace = res.samples;
+              benchmarkProvenance = 'measured';
             } catch (err) {
               console.error(err);
             }
@@ -9259,6 +9278,7 @@ export function openWebXRProfilerModal(
             const synth = generateSyntheticBenchmarkRun(selectedScenarioId);
             sampleTrace = synth.samples;
             latestReport = synth.report;
+            benchmarkProvenance = 'simulated';
           }
 
           isRunningBenchmark = false;
@@ -9365,6 +9385,7 @@ export function openWebXRProfilerModal(
         const synth = generateSyntheticBenchmarkRun(selectedScenarioId);
         sampleTrace = synth.samples;
         latestReport = synth.report;
+        benchmarkProvenance = 'simulated';
       }
 
       const report = latestReport;
@@ -9430,7 +9451,7 @@ export function openWebXRProfilerModal(
       `;
 
       pane.querySelector<HTMLButtonElement>('#btn-export-telemetry-csv')!.onclick = () => {
-        const csv = generatePerformanceReportCsv(sampleTrace);
+        const csv = generatePerformanceReportCsv(sampleTrace, benchmarkProvenance);
         triggerDownload(`${(scene.name || 'SetView_VR_Profiler').replace(/\s+/g, '_')}_telemetry.csv`, csv, 'text/csv');
         if (onExportCsv) onExportCsv();
       };

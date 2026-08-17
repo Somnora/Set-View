@@ -858,7 +858,23 @@ export function calculateBenchmarkSummary(
 // Telemetry Export Generators (CSV and Standalone HTML Deck)
 // ---------------------------------------------------------------------------
 
-export function generatePerformanceReportCsv(samples: FrameTelemetrySample[]): string {
+/**
+ * Provenance of the frame samples behind a performance report.
+ *
+ * `simulated` samples come from the synthetic scenario generator, not from frames a
+ * headset actually rendered. Both feed the same exporters, so without this the two are
+ * indistinguishable once the file leaves the app.
+ */
+export type BenchmarkSampleProvenance = 'measured' | 'simulated';
+
+export function generatePerformanceReportCsv(
+  samples: FrameTelemetrySample[],
+  provenance: BenchmarkSampleProvenance = 'measured',
+): string {
+  const provenanceLabel =
+    provenance === 'simulated'
+      ? 'SIMULATED (synthetic benchmark scenario, NOT frames rendered on a headset)'
+      : 'MEASURED (frames profiled from a real run)';
   const headers = [
     'FrameIndex',
     'TimestampMs',
@@ -875,7 +891,7 @@ export function generatePerformanceReportCsv(samples: FrameTelemetrySample[]): s
     'GCEvent',
   ];
 
-  const lines = [headers.join(',')];
+  const lines = [`DataSource,${provenanceLabel}`, headers.join(',')];
 
   for (let i = 0; i < samples.length; i++) {
     const s = samples[i];

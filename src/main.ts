@@ -3115,7 +3115,10 @@ class App {
         this.markDirty();
       },
       async (scenarioId) => {
-        return await this.profilerRuntime.startBenchmark(scenarioId);
+        const report = await this.profilerRuntime.startBenchmark(scenarioId);
+        // Hand back the frames this report was computed from, so the modal's export
+        // buttons cannot pair it with a stale or synthetic sample trace.
+        return { report, samples: this.profilerRuntime.getReportSamples() };
       },
       () => {
         this.debug.log('Exported WebXR profiler telemetry CSV');

@@ -10527,8 +10527,26 @@ test('WebXR Profiler Engine: RFC 4180 CSV & Standalone HTML Report Generation', 
   };
 
   const csv = generatePerformanceReportCsv([sample]);
-  assert.ok(csv.startsWith('FrameIndex,TimestampMs,FrameTimeMs,InstantFps,CpuLogicTimeMs,GpuRenderTimeMs,DrawCalls,TriangleCount,ProgramSwitches,TextureMemoryBytes,GeometryMemoryBytes,HeapAllocatedBytes,GCEvent'));
+  // Row 1 declares provenance, row 2 is the column header. The synthetic scenario
+  // generator and a real profiled run feed this same exporter, so the file has to say
+  // which one it came from; otherwise simulated frames are indistinguishable from
+  // measured headset telemetry once exported.
+  // This exporter emits RFC 4180 CRLF line endings, so split on either.
+  const csvLines = csv.split(/\r?\n/);
+  assert.ok(csvLines[0].startsWith('DataSource,'), `row 1 must declare provenance, got: ${csvLines[0]}`);
+  assert.ok(csvLines[0].includes('MEASURED'), 'default provenance is measured');
+  assert.equal(
+    csvLines[1],
+    'FrameIndex,TimestampMs,FrameTimeMs,InstantFps,CpuLogicTimeMs,GpuRenderTimeMs,DrawCalls,TriangleCount,ProgramSwitches,TextureMemoryBytes,GeometryMemoryBytes,HeapAllocatedBytes,GCEvent',
+  );
   assert.ok(csv.includes('1,100.50,12.400,80.6,4.100,8.300,48,195000,10,50000000,12000000,0,0'));
+
+  const simCsv = generatePerformanceReportCsv([sample], 'simulated');
+  assert.ok(simCsv.split(/\r?\n/)[0].includes('SIMULATED'), 'synthetic benchmark output must be labelled');
+  assert.ok(
+    /NOT frames rendered/i.test(simCsv.split(/\r?\n/)[0]),
+    'the simulated label must be unambiguous to a human reading the file',
+  );
 
   const thresholds = createDefaultVRThresholds(72);
   const report = calculateBenchmarkSummary([sample], thresholds);
