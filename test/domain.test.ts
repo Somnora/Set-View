@@ -10552,6 +10552,16 @@ test('WebXR Profiler Engine: RFC 4180 CSV & Standalone HTML Report Generation', 
   const report = calculateBenchmarkSummary([sample], thresholds);
   const html = generatePerformanceReportHtml(report, [sample], 'Stage 4 Production');
 
+  // "PASSED PRODUCTION AUDIT" printed over synthetic frames is a claim about hardware
+  // that was never exercised, so a simulated deck has to say so in the document.
+  assert.ok(!html.includes('SIMULATED DATA'), 'a measured deck must not carry the warning');
+  const simHtml = generatePerformanceReportHtml(report, [sample], 'Stage 4 Production', 'simulated');
+  assert.ok(simHtml.includes('SIMULATED DATA'), 'a simulated deck must carry the warning');
+  assert.ok(
+    /not from frames rendered on a headset/i.test(simHtml),
+    'the deck warning must say plainly that no headset rendered these frames',
+  );
+
   assert.ok(html.includes('<!DOCTYPE html>'));
   assert.ok(html.includes('Stage 4 Production'));
   assert.ok(html.includes('WebXR Performance Audit Report'));
@@ -10876,6 +10886,17 @@ test('VR Comfort Engine: RFC 4180 CSV & Standalone HTML Safety Report Export', (
 
   const report = auditSceneComfort([], config, [sample]);
   const html = generateComfortReportHtml(report, 'Stage 2 Comfort Studio');
+
+  // The deck is the artifact most likely to be forwarded to a producer or a safety
+  // reviewer, so simulated input must be called out visibly in the document itself,
+  // not just in the CSV alongside it.
+  assert.ok(!html.includes('SIMULATED DATA'), 'a measured deck must not carry the warning');
+  const simHtml = generateComfortReportHtml(report, 'Stage 2 Comfort Studio', 'simulated');
+  assert.ok(simHtml.includes('SIMULATED DATA'), 'a simulated deck must carry the warning');
+  assert.ok(
+    /not recorded from a headset/i.test(simHtml),
+    'the deck warning must say plainly that no headset was involved',
+  );
 
   assert.ok(html.includes('<!DOCTYPE html>'));
   assert.ok(html.includes('Stage 2 Comfort Studio'));

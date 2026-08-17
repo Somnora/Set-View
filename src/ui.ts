@@ -9457,7 +9457,7 @@ export function openWebXRProfilerModal(
       };
 
       pane.querySelector<HTMLButtonElement>('#btn-export-audit-deck')!.onclick = () => {
-        const html = generatePerformanceReportHtml(report, sampleTrace, scene.name || 'SetView Production Stage');
+        const html = generatePerformanceReportHtml(report, sampleTrace, scene.name || 'SetView Production Stage', benchmarkProvenance);
         triggerDownload(`${(scene.name || 'VR_Performance_Audit').replace(/\s+/g, '_')}_report.html`, html, 'text/html');
         if (onExportHtml) onExportHtml();
       };
@@ -10166,7 +10166,7 @@ export function openVRComfortModal(
       };
 
       pane.querySelector<HTMLButtonElement>('#btn-export-comfort-deck')!.onclick = () => {
-        const html = generateComfortReportHtml(latestAudit, scene.name || 'SetView Production Stage');
+        const html = generateComfortReportHtml(latestAudit, scene.name || 'SetView Production Stage', 'simulated');
         triggerDownload(`${(scene.name || 'VR_Comfort_Safety_Deck').replace(/\s+/g, '_')}_deck.html`, html, 'text/html');
         if (onExportHtml) onExportHtml();
       };

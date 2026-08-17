@@ -920,7 +920,17 @@ export function generatePerformanceReportHtml(
   report: VRBenchmarkReport,
   samples: FrameTelemetrySample[],
   sceneName: string = 'SetView Production Stage',
+  provenance: BenchmarkSampleProvenance = 'measured',
 ): string {
+  // "PASSED PRODUCTION AUDIT" on synthetic frames is a claim about hardware that was
+  // never exercised, so the banner sits next to the badge rather than in a footnote.
+  const provenanceBanner =
+    provenance === 'simulated'
+      ? '<div style="background:#7c2d12;color:#fed7aa;padding:12px 16px;border-radius:8px;' +
+        'margin:0 0 20px;font-weight:600;border:1px solid #ea580c;">' +
+        'SIMULATED DATA. Generated from a synthetic benchmark scenario, not from frames ' +
+        'rendered on a headset. Not valid as a hardware performance result.</div>'
+      : '';
   const statusColor = report.passedTest ? '#10b981' : '#ef4444';
   const statusBadge = report.passedTest ? 'PASSED PRODUCTION AUDIT' : 'FAILED PERFORMANCE BUDGET';
   const sampleCount = samples.length;
@@ -1165,6 +1175,7 @@ export function generatePerformanceReportHtml(
       </div>
       <div class="status-badge">${statusBadge}</div>
     </div>
+    ${provenanceBanner}
 
     <div class="metrics-grid">
       <div class="metric-card">

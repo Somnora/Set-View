@@ -865,8 +865,19 @@ export function generateComfortReportCsv(
 export function generateComfortReportHtml(
   report: ComfortAuditReport,
   sceneName?: string,
+  provenance: ComfortSampleProvenance = 'measured',
 ): string {
   const name = sceneName || 'Untitled SetView Scene';
+  // A deck is more likely than a CSV to be forwarded to a producer or a safety
+  // reviewer, so the banner is visible rather than a footnote. See
+  // ComfortSampleProvenance.
+  const provenanceBanner =
+    provenance === 'simulated'
+      ? '<div style="background:#7c2d12;color:#fed7aa;padding:12px 16px;border-radius:8px;' +
+        'margin:0 0 20px;font-weight:600;border:1px solid #ea580c;">' +
+        'SIMULATED DATA. Generated from a synthetic motion profile, not recorded from a ' +
+        'headset. Not valid as a safety assessment of a real session.</div>'
+      : '';
   const gradeColor =
     report.comfortGrade === 'A'
       ? '#22c55e'
@@ -1002,6 +1013,7 @@ export function generateComfortReportHtml(
       </div>
       <div class="grade-badge">${report.comfortGrade}</div>
     </header>
+    ${provenanceBanner}
 
     <div class="grid">
       <div class="card">
