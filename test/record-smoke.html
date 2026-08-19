@@ -45,7 +45,12 @@
         const rec = new MonitorRecorder();
         const done = new Promise((resolve) => (rec.onStopped = resolve));
         const t0 = performance.now();
-        const name = rec.start(renderer, rt.width, rt.height, 'record-smoke', t0);
+        // start() is async (it may await a microphone permission before the
+        // canvas resize); the resize/blit assertions below are only valid
+        // after it resolves. ?noaudio skips the mic request for automation
+        // environments whose blocked permission prompt never settles.
+        const audio = !new URLSearchParams(location.search).has('noaudio');
+        const name = await rec.start(renderer, rt.width, rt.height, 'record-smoke', t0, audio);
         if (!name) throw new Error('start() returned null (captureStream/MediaRecorder unavailable)');
         if (renderer.domElement.width !== rt.width) throw new Error('canvas not resized to feed');
         const px = new Uint8Array(4);

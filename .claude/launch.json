@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "setview-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 5173,
+      "url": "https://localhost:5173"
+    },
+    {
+      "name": "setview-http",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--config", "vite.http.config.ts"],
+      "port": 5174,
+      "url": "http://localhost:5174"
+    }
+  ]
+}
