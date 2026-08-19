@@ -164,8 +164,16 @@ def run_coordinate_tests():
         assert all(abs(g - w) < 1e-6 for g, w in zip(got, want)), (
             f"OBJ vertex map diverged from sv_to_ue_location: {got} vs {want}"
         )
-    assert faces[0] == "f 1 3 2", f"OBJ winding must be reversed for the det -1 map, got '{faces[0]}'"
-    print("  [ok] scan OBJ writer uses the shared map and reverses triangle winding")
+    # Each corner may carry a /uv reference (Unreal's Interchange OBJ translator
+    # fires a per-corner ensure on faces with no texture coordinate at all);
+    # the vertex winding itself must still be reversed for the det -1 map.
+    face_verts = [corner.split("/")[0] for corner in faces[0].split()[1:]]
+    assert face_verts == ["1", "3", "2"], (
+        f"OBJ winding must be reversed for the det -1 map, got '{faces[0]}'"
+    )
+    uv_lines = [ln for ln in lines if ln.startswith("vt ")]
+    assert uv_lines, "OBJ must declare at least one vt: faces without UVs trip Interchange"
+    print("  [ok] scan OBJ writer uses the shared map, reverses winding, and declares UVs")
 
     # --- Actor stance orientation ------------------------------------------
     # The stance table used to carry hand-baked Unreal degrees with the wrong sign on

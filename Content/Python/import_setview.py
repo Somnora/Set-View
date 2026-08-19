@@ -12,8 +12,8 @@ Features:
   - Cine Light actors (Spot/Point/Rect lights) matching SetView light definitions.
   - Location scan static mesh import (from embedded base64 scanData) with furniture placement offsets.
 
-Usage in Unreal Engine:
-    import Content.Python.import_setview as import_setview
+Usage in Unreal Engine (Content/Python is on sys.path inside the editor):
+    import import_setview
     import_setview.import_scene("/path/to/scene.setview.json")
 
 Usage via Command Line / Standalone Verification:
@@ -41,6 +41,12 @@ except ImportError:
 # --- Constants & Specs -------------------------------------------------------
 
 WALK_SPEED_DEFAULT = 1.4  # m/s
+ACTOR_HEIGHT_M_DEFAULT = 1.7
+ACTOR_WIDTH_SCALE = 0.35
+CYLINDER_ASSET = '/Engine/BasicShapes/Cylinder.Cylinder'
+SEQUENCE_FPS = 30
+MIN_SEGMENT_S = 0.4   # matches src/timeline.ts minimum per-segment duration
+CAMERA_MOVE_SPEED = 1.0  # m/s previz dolly pace between camera keyframes
 
 SENSOR_FORMATS: Dict[str, Dict[str, Any]] = {
     'super35': {'name': 'Super 35', 'gateWidthMm': 24.89, 'cocMm': 0.025, 'squeeze': 1.0},
@@ -266,6 +272,59 @@ def hex_to_rgb(hex_str: str) -> Tuple[float, float, float]:
     return (1.0, 1.0, 1.0)
 
 
+def sanitize_asset_name(name: str, fallback: str = 'SetViewScene') -> str:
+    """Unreal object paths reject spaces and most punctuation in asset names."""
+    cleaned = ''.join(ch if ch.isalnum() else '_' for ch in str(name).strip())
+    while '__' in cleaned:
+        cleaned = cleaned.replace('__', '_')
+    return cleaned.strip('_') or fallback
+
+
+def unwrap_deg(prev: float, cur: float) -> float:
+    """Nearest equivalent angle so linear yaw keys take the shortest arc."""
+    while cur - prev > 180.0:
+        cur -= 360.0
+    while cur - prev < -180.0:
+        cur += 360.0
+    return cur
+
+
+def ue_up_vector(pitch_deg: float, yaw_deg: float, roll_deg: float) -> Tuple[float, float, float]:
+    """Up row of Unreal's FRotationMatrix for a rotator (see ue_basis_to_rotator)."""
+    sp, cp = math.sin(math.radians(pitch_deg)), math.cos(math.radians(pitch_deg))
+    sy, cy = math.sin(math.radians(yaw_deg)), math.cos(math.radians(yaw_deg))
+    sr, cr = math.sin(math.radians(roll_deg)), math.cos(math.radians(roll_deg))
+    return (-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp)
+
+
+def actor_placeholder_transform(
+    position: Dict[str, float],
+    rotation_y_rad: float,
+    stance: str,
+    height_m: float = ACTOR_HEIGHT_M_DEFAULT,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Feet-origin SetView mark -> center-pivot placeholder cylinder (loc cm, rotator deg).
+
+    The engine cylinder's pivot is its center, so the center sits half the body
+    height along the body's LOCAL up axis from the feet: upright stances rise
+    +Z by half the height, lying stances shift horizontally so the feet stay
+    on the mark. bodyLift (seated stances) applies along world up.
+    """
+    info = STANCES.get(stance, STANCES['standing'])
+    rot = sv_actor_rotator(rotation_y_rad, stance)
+    up = ue_up_vector(*rot)
+    half_cm = float(height_m) * SCALE_M_TO_CM / 2.0
+    base = sv_to_ue_location(position)
+    lift_cm = info['bodyLift'] * SCALE_M_TO_CM
+    loc = (
+        base[0] + up[0] * half_cm,
+        base[1] + up[1] * half_cm,
+        base[2] + lift_cm + up[2] * half_cm,
+    )
+    return loc, rot
+
+
 # --- Binary Scan Mesh Decoder ------------------------------------------------
 
 def decode_scan_data(b64_data: str) -> Optional[List[Dict[str, Any]]]:
@@ -332,6 +391,10 @@ def export_scan_to_obj(meshes: List[Dict[str, Any]], obj_path: str) -> bool:
         os.makedirs(os.path.dirname(os.path.abspath(obj_path)), exist_ok=True)
         with open(obj_path, 'w', encoding='utf-8') as f:
             f.write("# SetView Location Scan Export\n")
+            # One dummy UV shared by every face corner: Unreal's Interchange OBJ
+            # translator fires a per-corner "UVs.IsValidIndex" ensure on faces
+            # that reference no texture coordinate at all.
+            f.write("vt 0.0 0.0\n")
             v_offset = 1
             for m_idx, mesh in enumerate(meshes):
                 f.write(f"o ScanMesh_{m_idx}_{mesh['label'].replace(' ', '_')}\n")
@@ -353,7 +416,7 @@ def export_scan_to_obj(meshes: List[Dict[str, Any]], obj_path: str) -> bool:
                     i2 = indices[i+2] + v_offset
                     # The det -1 vertex map flips triangle handedness, so the winding
                     # must be reversed or every imported scan face renders inside-out.
-                    f.write(f"f {i0} {i2} {i1}\n")
+                    f.write(f"f {i0}/1 {i2}/1 {i1}/1\n")
 
                 v_offset += len(positions) // 3
         return True
@@ -384,11 +447,24 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
     print(f"[SetView] Starting import for '{scene_name}' (walk speed: {walk_speed} m/s)...")
 
     # 1. Editor World / Subsystem Setup
-    editor_actor_subsystem = unreal.EditorActorSubsystem()
+    editor_actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    level_subsystem = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 
-    # Create root folder under /Game/SetView/{SceneName}
-    package_path = f"/Game/SetView/{scene_name.replace(' ', '_')}"
+    # Asset names reject spaces and most punctuation; scene names are free text.
+    safe_name = sanitize_asset_name(scene_name)
+    package_path = f"/Game/SetView/{safe_name}"
+    outliner_folder = f"SetView/{safe_name}"
+
+    # A dedicated level per scene: an in-editor import never dirties the map
+    # the user has open, and a headless import has a real asset to save.
+    level_path = f"{package_path}/Maps/SV_{safe_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(level_path):
+        level_subsystem.load_level(level_path)
+    else:
+        if not level_subsystem.new_level(level_path):
+            print(f"[SetView] Error: could not create level {level_path}")
+            return False
 
     # 2. Import Location Scan Static Mesh (if present)
     scan_actor = None
@@ -396,23 +472,26 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         meshes = decode_scan_data(scan_b64)
         if meshes:
             temp_dir = unreal.Paths.project_saved_dir() + "SetViewTemp/"
-            obj_file = temp_dir + f"{scene_name}_scan.obj"
+            obj_file = temp_dir + f"{safe_name}_scan.obj"
             if export_scan_to_obj(meshes, obj_file):
                 print(f"[SetView] Exported scan OBJ to {obj_file}, importing into Unreal...")
+                scan_asset_name = f"SM_{safe_name}_Scan"
                 task = unreal.AssetImportTask()
                 task.filename = obj_file
                 task.destination_path = package_path + "/Scans"
-                task.destination_name = f"SM_{scene_name}_Scan"
+                task.destination_name = scan_asset_name
                 task.automated = True
+                task.replace_existing = True
                 task.save = True
                 asset_tools.import_asset_tasks([task])
 
-                imported_mesh = unreal.EditorAssetLibrary.load_asset(f"{package_path}/Scans/SM_{scene_name}_Scan")
+                imported_mesh = unreal.EditorAssetLibrary.load_asset(f"{package_path}/Scans/{scan_asset_name}")
                 if imported_mesh:
                     scan_actor = editor_actor_subsystem.spawn_actor_from_class(
-                        unreal.StaticMeshActor, unreal.Vector(0, 0, 0), unreal.Rotator(0, 0, 0)
+                        unreal.StaticMeshActor, unreal.Vector(0, 0, 0), unreal.Rotator()
                     )
-                    scan_actor.set_actor_label(f"Scan_{scene_name}")
+                    scan_actor.set_actor_label(f"Scan_{safe_name}")
+                    scan_actor.set_folder_path(outliner_folder)
                     scan_actor.static_mesh_component.set_static_mesh(imported_mesh)
                     print("[SetView] Spawned location scan static mesh actor.")
 
@@ -423,12 +502,15 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         pos_ue = sv_to_ue_location(c_data.get('position', {}))
         rot_ue = sv_quat_to_ue_rotator(c_data.get('rotation', {}))
 
+        # unreal.Rotator's positional order is (roll, pitch, yaw); our tuples are
+        # (pitch, yaw, roll) from ue_basis_to_rotator. Always use keywords.
         cam_actor = editor_actor_subsystem.spawn_actor_from_class(
             unreal.CineCameraActor,
             unreal.Vector(*pos_ue),
-            unreal.Rotator(*rot_ue)
+            unreal.Rotator(roll=rot_ue[2], pitch=rot_ue[0], yaw=rot_ue[1])
         )
         cam_actor.set_actor_label(cam_name)
+        cam_actor.set_folder_path(outliner_folder)
 
         cine_comp = cam_actor.get_cine_camera_component()
 
@@ -463,32 +545,41 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         if verbose:
             print(f"[SetView] Created CineCamera '{cam_name}' ({focal_length}mm, T{t_stop}, {fmt_info['name']})")
 
-    # 4. Create Actors (MetaHuman / Placeholder)
+    # 4. Create Actors (visible placeholder cylinders, stance-aware)
+    cylinder_mesh = unreal.EditorAssetLibrary.load_asset(CYLINDER_ASSET)
     spawned_actors: Dict[str, Any] = {}
     for a_data in actors_data:
         actor_name = a_data.get('name', 'Actor')
-        pos_ue = sv_to_ue_location(a_data.get('position', {}))
         rotation_y = a_data.get('rotationY', 0.0)
         stance = a_data.get('stance', 'standing')
-        stance_info = STANCES.get(stance, STANCES['standing'])
+        height_m = float(a_data.get('heightM') or ACTOR_HEIGHT_M_DEFAULT)
 
-        # Apply bodyLift (meters -> cm)
-        lift_cm = stance_info['bodyLift'] * 100.0
-        pos_ue = (pos_ue[0], pos_ue[1], pos_ue[2] + lift_cm)
+        loc, rot = actor_placeholder_transform(
+            a_data.get('position', {}), rotation_y, stance, height_m)
 
-        rot_ue = sv_actor_rotator(rotation_y, stance)
-
-        # Try spawning skeletal mesh actor or placeholder
         act = editor_actor_subsystem.spawn_actor_from_class(
-            unreal.SkeletalMeshActor,
-            unreal.Vector(*pos_ue),
-            unreal.Rotator(*rot_ue)
+            unreal.StaticMeshActor,
+            unreal.Vector(*loc),
+            unreal.Rotator(roll=rot[2], pitch=rot[0], yaw=rot[1])
         )
         act.set_actor_label(actor_name)
+        act.set_folder_path(outliner_folder)
+        if cylinder_mesh:
+            act.static_mesh_component.set_static_mesh(cylinder_mesh)
+        # The engine cylinder is 100 cm tall; sequences can only move MOVABLE actors.
+        act.set_actor_scale3d(unreal.Vector(
+            ACTOR_WIDTH_SCALE, ACTOR_WIDTH_SCALE, height_m * SCALE_M_TO_CM / 100.0))
+        act.static_mesh_component.set_mobility(unreal.ComponentMobility.MOVABLE)
+        mid = act.static_mesh_component.create_dynamic_material_instance(0)
+        if mid:
+            r, g, b = hex_to_rgb(a_data.get('color', '#888888'))
+            # crude sRGB -> linear for a previz tint
+            mid.set_vector_parameter_value(
+                'Color', unreal.LinearColor(r ** 2.2, g ** 2.2, b ** 2.2, 1.0))
 
         spawned_actors[a_data['id']] = (act, a_data)
         if verbose:
-            print(f"[SetView] Placed Actor '{actor_name}' at {pos_ue} stance={stance}")
+            print(f"[SetView] Placed Actor '{actor_name}' at {loc} stance={stance}")
 
     # 5. Create Cine Light Actors
     for idx, l_data in enumerate(lights_data):
@@ -506,9 +597,10 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         l_actor = editor_actor_subsystem.spawn_actor_from_class(
             light_class,
             unreal.Vector(*pos_ue),
-            unreal.Rotator(*rot_ue)
+            unreal.Rotator(roll=rot_ue[2], pitch=rot_ue[0], yaw=rot_ue[1])
         )
         l_actor.set_actor_label(l_name)
+        l_actor.set_folder_path(outliner_folder)
 
         if verbose:
             print(f"[SetView] Created {l_type.capitalize()} Light '{l_name}'")
@@ -522,13 +614,30 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
         spatial = bool(cue_data.get('spatial', True))
         max_dist_m = float(cue_data.get('maxDistanceM', 20.0))
 
-        # Position (world or relative to actor)
+        # Position (attached to an actor at head level, or free-standing in the world).
+        # Editor Python cannot construct-and-register a bare AudioComponent on an
+        # existing actor (it never registers with the world), so attached cues are
+        # AmbientSound actors attached to the placeholder with KEEP_WORLD rules.
         attached_act_id = cue_data.get('attachedActorId')
         if attached_act_id and attached_act_id in spawned_actors:
-            act_actor, _ = spawned_actors[attached_act_id]
-            audio_comp = unreal.AudioComponent(act_actor)
-            audio_comp.set_relative_location(unreal.Vector(0, 0, 150)) # head level
-            audio_comp.volume_multiplier = vol
+            act_actor, act_data = spawned_actors[attached_act_id]
+            base = sv_to_ue_location(act_data.get('position', {}))
+            audio_actor = editor_actor_subsystem.spawn_actor_from_class(
+                unreal.AmbientSound,
+                unreal.Vector(base[0], base[1], base[2] + 150.0),  # head level
+                unreal.Rotator()
+            )
+            audio_actor.set_actor_label(cue_name)
+            audio_actor.set_folder_path(outliner_folder)
+            audio_actor.attach_to_actor(
+                act_actor, '',
+                unreal.AttachmentRule.KEEP_WORLD,
+                unreal.AttachmentRule.KEEP_WORLD,
+                unreal.AttachmentRule.KEEP_WORLD,
+                False)
+            audio_comp = audio_actor.get_component_by_class(unreal.AudioComponent)
+            if audio_comp:
+                audio_comp.set_editor_property('volume_multiplier', vol)
             if verbose:
                 print(f"[SetView] Attached Audio Cue '{cue_name}' ({cue_type}) to actor '{act_actor.get_actor_label()}'")
         else:
@@ -536,92 +645,194 @@ def import_scene_to_unreal(scene_data: Dict[str, Any], verbose: bool = True) -> 
             audio_actor = editor_actor_subsystem.spawn_actor_from_class(
                 unreal.AmbientSound,
                 unreal.Vector(*pos_ue),
-                unreal.Rotator(0, 0, 0)
+                unreal.Rotator()
             )
             audio_actor.set_actor_label(cue_name)
+            audio_actor.set_folder_path(outliner_folder)
+            audio_comp = audio_actor.get_component_by_class(unreal.AudioComponent)
+            if audio_comp:
+                audio_comp.set_editor_property('volume_multiplier', vol)
             if verbose:
                 print(f"[SetView] Placed Spatial AmbientSound '{cue_name}' at {pos_ue}")
 
     # 7. Create LevelSequence Driving Timeline
-    seq_name = f"LS_{scene_name.replace(' ', '_')}"
+    def _dist_m(a: Dict[str, float], b: Dict[str, float]) -> float:
+        return math.sqrt(
+            (float(b.get('x', 0.0)) - float(a.get('x', 0.0))) ** 2
+            + (float(b.get('y', 0.0)) - float(a.get('y', 0.0))) ** 2
+            + (float(b.get('z', 0.0)) - float(a.get('z', 0.0))) ** 2)
+
+    def _actor_samples(a_data: Dict[str, Any]) -> List[Tuple[float, Tuple, Tuple]]:
+        """(time_s, loc_cm, rotator_deg) per keyframe, SetView playback timing:
+        distance / walkSpeed with the same minimum segment as src/timeline.ts."""
+        keyframes = a_data.get('keyframes', [])
+        if len(keyframes) < 2:
+            return []
+        stance0 = a_data.get('stance', 'standing')
+        height_m = float(a_data.get('heightM') or ACTOR_HEIGHT_M_DEFAULT)
+        speed = walk_speed if walk_speed > 0 else WALK_SPEED_DEFAULT
+        samples: List[Tuple[float, Tuple, Tuple]] = []
+        t = 0.0
+        prev = None
+        for kf in keyframes:
+            pos = kf.get('position', a_data.get('position', {}))
+            if prev is not None:
+                t += max(_dist_m(prev, pos) / speed, MIN_SEGMENT_S)
+            loc, rot = actor_placeholder_transform(
+                pos, kf.get('rotationY', a_data.get('rotationY', 0.0)),
+                kf.get('stance', stance0), height_m)
+            samples.append((t, loc, rot))
+            hold = float(kf.get('holdDurationS', 0.0))
+            if hold > 0.0:
+                t += hold
+                samples.append((t, loc, rot))
+            prev = pos
+        return samples
+
+    def _camera_samples(c_data: Dict[str, Any]) -> List[Tuple[float, Tuple, Tuple]]:
+        cam_kfs = c_data.get('keyframes', [])
+        if len(cam_kfs) < 2:
+            return []
+        samples: List[Tuple[float, Tuple, Tuple]] = []
+        t = 0.0
+        prev = None
+        for kf in cam_kfs:
+            pos = kf.get('position', c_data.get('position', {'x': 0, 'y': 1.6, 'z': 0}))
+            if prev is not None:
+                t += max(_dist_m(prev, pos) / CAMERA_MOVE_SPEED, MIN_SEGMENT_S)
+            rot = sv_quat_to_ue_rotator(kf.get('rotation', c_data.get('rotation', {})))
+            samples.append((t, sv_to_ue_location(pos), rot))
+            hold = float(kf.get('holdDurationS', 0.0))
+            if hold > 0.0:
+                t += hold
+                samples.append((t, sv_to_ue_location(pos), rot))
+            prev = pos
+        return samples
+
+    def _write_transform_keys(section: Any, samples: List[Tuple[float, Tuple, Tuple]]) -> int:
+        """Channel order on a 3D transform section: Loc XYZ 0-2,
+        Rot XYZ = (roll, pitch, yaw) 3-5, Scale XYZ 6-8."""
+        channels = section.get_all_channels()
+        linear = unreal.MovieSceneKeyInterpolation.LINEAR
+        keys = 0
+        prev_yaw = None
+        for t, loc, rot in samples:
+            frame = unreal.FrameNumber(round(t * SEQUENCE_FPS))
+            channels[0].add_key(frame, loc[0], interpolation=linear)
+            channels[1].add_key(frame, loc[1], interpolation=linear)
+            channels[2].add_key(frame, loc[2], interpolation=linear)
+            keys += 3
+            if rot is not None:
+                pitch, yaw, roll = rot
+                if prev_yaw is not None:
+                    yaw = unwrap_deg(prev_yaw, yaw)
+                prev_yaw = yaw
+                channels[3].add_key(frame, roll, interpolation=linear)
+                channels[4].add_key(frame, pitch, interpolation=linear)
+                channels[5].add_key(frame, yaw, interpolation=linear)
+                keys += 3
+        return keys
+
+    seq_name = f"LS_{safe_name}"
+    seq_path = f"{package_path}/Sequences/{seq_name}"
+    # The sequence is generated data derived from the JSON: a re-import replaces
+    # it wholesale instead of appending duplicate bindings to the old asset.
+    if unreal.EditorAssetLibrary.does_asset_exist(seq_path):
+        unreal.EditorAssetLibrary.delete_asset(seq_path)
     sequence = asset_tools.create_asset(
         seq_name, package_path + "/Sequences", unreal.LevelSequence, unreal.LevelSequenceFactoryNew()
     )
 
+    sequence_key_counts: Dict[str, int] = {}
+    end_frame = 0
     if sequence:
-        sequence.set_display_rate(unreal.FrameRate(30, 1))
+        sequence.set_display_rate(unreal.FrameRate(SEQUENCE_FPS, 1))
 
-        # Add Camera Cut Track
-        camera_cut_track = sequence.add_master_track(unreal.MovieSceneCameraCutTrack)
-
-        # Add Camera possessables and Keyframe Motion Tracks
-        for cam_id, (cam_actor, cine_comp) in spawned_cameras.items():
-            cam_possessable = sequence.add_possessable(cam_actor)
+        binding_plan: List[Tuple[str, Any, List]] = []
+        for cam_id, (cam_actor, _cine_comp) in spawned_cameras.items():
             c_data = next((c for c in cameras_data if c.get('id') == cam_id), None)
-            if not c_data:
+            binding_plan.append((
+                cam_actor.get_actor_label(), cam_actor,
+                _camera_samples(c_data) if c_data else []))
+        for _act_id, (act_actor, a_data) in spawned_actors.items():
+            binding_plan.append((act_actor.get_actor_label(), act_actor, _actor_samples(a_data)))
+
+        end_seconds = max((s[-1][0] for _, _, s in binding_plan if s), default=0.0)
+        end_frame = max(int(round(end_seconds * SEQUENCE_FPS)), SEQUENCE_FPS)
+        sequence.set_playback_start(0)
+        sequence.set_playback_end(end_frame + 1)
+
+        first_cam_binding = None
+        for label, actor, samples in binding_plan:
+            possessable = sequence.add_possessable(actor)
+            if first_cam_binding is None and isinstance(actor, unreal.CineCameraActor):
+                first_cam_binding = possessable
+            if not samples:
+                sequence_key_counts[label] = 0
                 continue
+            track = possessable.add_track(unreal.MovieScene3DTransformTrack)
+            section = track.add_section()
+            section.set_range(0, end_frame + 1)
+            sequence_key_counts[label] = _write_transform_keys(section, samples)
 
-            cam_kfs = c_data.get('keyframes', [])
-            look_target_id = c_data.get('lookAtTargetActorId')
+        # Camera cut: bind the full range to the hero (first) camera so opening
+        # the sequence looks through it. Per-cut data would come from the dailies
+        # timeline, which the scene JSON does not carry today.
+        if first_cam_binding is not None:
+            cut_track = sequence.add_track(unreal.MovieSceneCameraCutTrack)
+            cut_section = cut_track.add_section()
+            cut_section.set_range(0, end_frame + 1)
+            if hasattr(sequence, 'make_binding_id'):
+                binding_id = sequence.make_binding_id(
+                    first_cam_binding, unreal.MovieSceneObjectBindingSpace.LOCAL)
+            else:
+                binding_id = sequence.get_binding_id(first_cam_binding)
+            cut_section.set_camera_binding_id(binding_id)
 
-            # If camera has keyframes, animate its transform and optics across the sequence
-            if len(cam_kfs) > 1:
-                cam_transform_track = cam_possessable.add_track(unreal.MovieSceneTransformTrack)
-                cam_transform_sec = cam_transform_track.add_section()
-                cam_transform_sec.set_start_frame_bounded(True)
+        unreal.EditorAssetLibrary.save_loaded_asset(sequence)
+        print(f"[SetView] Created LevelSequence '{seq_name}' ({end_frame} frames @ {SEQUENCE_FPS}fps).")
 
-                current_time_sec = 0.0
-                last_pos = c_data.get('position', {'x': 0, 'y': 1.6, 'z': 0})
-                for k_idx, kf in enumerate(cam_kfs):
-                    kf_pos = kf.get('position', last_pos)
-                    dx = kf_pos['x'] - last_pos['x']
-                    dy = kf_pos['y'] - last_pos['y']
-                    dz = kf_pos['z'] - last_pos['z']
-                    dist_m = math.sqrt(dx * dx + dy * dy + dz * dz)
-                    move_dur = dist_m / 1.0 if dist_m > 0.001 else 0.5
-                    hold_dur = float(kf.get('holdDurationS', 0.0))
+    # 8. Persist the level and write ground truth for headless verification
+    level_subsystem.save_current_level()
 
-                    if k_idx > 0:
-                        current_time_sec += move_dur
+    spawned_report = []
+    for _sid, (sp_actor, _d) in list(spawned_cameras.items()) + list(spawned_actors.items()):
+        loc = sp_actor.get_actor_location()
+        rot = sp_actor.get_actor_rotation()
+        spawned_report.append({
+            'label': str(sp_actor.get_actor_label()),
+            'class': sp_actor.get_class().get_name(),
+            'loc': [loc.x, loc.y, loc.z],
+            'rot': {'pitch': rot.pitch, 'yaw': rot.yaw, 'roll': rot.roll},
+        })
 
-                    # Sample camera position & rotator in Unreal coordinates
-                    kf_pos_ue = sv_to_ue_location(kf_pos)
-                    kf_rot_ue = sv_quat_to_ue_rotator(kf.get('rotation', c_data.get('rotation', {})))
+    report = {
+        'scene': scene_name,
+        'safeName': safe_name,
+        'levelPath': level_path,
+        'sequencePath': seq_path if sequence else None,
+        'endFrame': end_frame,
+        'counts': {
+            'cameras': len(spawned_cameras),
+            'actors': len(spawned_actors),
+            'lights': len(lights_data),
+            'audioCues': len(audio_cues_data),
+            'scanImported': scan_actor is not None,
+        },
+        'sequenceKeyCounts': sequence_key_counts,
+        'spawned': spawned_report,
+    }
+    report_path = os.path.join(unreal.Paths.project_saved_dir(), 'SetViewTemp', 'import_report.json')
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2)
 
-                    current_time_sec += hold_dur
-                    last_pos = kf_pos
-
-        # Add Actor possessables and Keyframe Motion
-        for act_id, (act_actor, a_data) in spawned_actors.items():
-            act_possessable = sequence.add_possessable(act_actor)
-            transform_track = act_possessable.add_track(unreal.MovieSceneTransformTrack)
-            transform_section = transform_track.add_section()
-            transform_section.set_start_frame_bounded(True)
-
-            keyframes = a_data.get('keyframes', [])
-            current_time_sec = 0.0
-            last_pos = a_data.get('position', {'x':0, 'y':0, 'z':0})
-
-            # Base keyframe at t = 0
-            base_pos_ue = sv_to_ue_location(last_pos)
-            base_yaw = sv_heading_to_ue_yaw(a_data.get('rotationY', 0.0))
-
-            for kf in keyframes:
-                kf_pos = kf.get('position', last_pos)
-                dx = kf_pos['x'] - last_pos['x']
-                dy = kf_pos['y'] - last_pos['y']
-                dz = kf_pos['z'] - last_pos['z']
-                dist_m = math.sqrt(dx*dx + dy*dy + dz*dz)
-
-                duration_sec = dist_m / walk_speed if walk_speed > 0 else 1.0
-                current_time_sec += max(duration_sec, 0.5)
-
-                kf_pos_ue = sv_to_ue_location(kf_pos)
-                kf_yaw = sv_heading_to_ue_yaw(kf.get('rotationY', 0.0))
-                last_pos = kf_pos
-
-        print(f"[SetView] Created LevelSequence '{seq_name}' successfully.")
-
+    # log_warning so the summary surfaces in -stdout headless runs, where
+    # Display-severity Python prints are filtered out.
+    unreal.log_warning(
+        f"[SetView] Imported '{scene_name}': {len(spawned_actors)} actors, "
+        f"{len(spawned_cameras)} cameras, {len(lights_data)} lights, "
+        f"level {level_path}, report {report_path}")
     print(f"[SetView] Import complete for '{scene_name}'!")
     return True
 
@@ -768,6 +979,18 @@ def verify_scene_json(file_path: str, verbose: bool = True) -> bool:
     print("Verification completed successfully — JSON is valid for SetView Unreal Handoff.")
     print("=" * 70)
     return True
+
+
+def import_scene_to_unreal_from_file(json_path: str, verbose: bool = True) -> bool:
+    """File-path entry point documented in UNREAL-HANDOFF.md."""
+    with open(json_path, 'r', encoding='utf-8') as f:
+        scene_data = json.load(f)
+    return import_scene_to_unreal(scene_data, verbose=verbose)
+
+
+def import_scene(json_path: str, verbose: bool = True) -> bool:
+    """Backward-compatible entry point documented in SETVIEW_IMPORT.md."""
+    return import_scene_to_unreal_from_file(json_path, verbose=verbose)
 
 
 def main():
