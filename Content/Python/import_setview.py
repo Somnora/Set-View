@@ -1000,7 +1000,11 @@ def main():
     args = parser.parse_args()
 
     if not args.json_path:
-        print("Usage: python3 import_setview.py /path/to/scene.setview.json")
+        # SETVIEW_IMPORT.md's documented headless invocation passes the scene
+        # via this env var instead of an argument; keep that contract working.
+        args.json_path = os.environ.get("SETVIEW_JSON")
+    if not args.json_path:
+        print("Usage: python3 import_setview.py /path/to/scene.setview.json (or set SETVIEW_JSON)")
         sys.exit(1)
 
     success = verify_scene_json(args.json_path, verbose=args.verbose)
