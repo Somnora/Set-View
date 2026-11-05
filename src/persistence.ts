@@ -167,6 +167,9 @@ export class Persistence {
   readonly scans = new ScanStore();
 
   private saveTimer: number | null = null;
+  /** The scene the pending debounced save is for. A save of another scene writes it
+   *  first instead of dropping it along with the timer. */
+  private pendingScene: SceneData | null = null;
   private errorHandler: ((msg: string) => void) | null = null;
   /** Errors raised before a handler was attached, delivered when one is. */
   private pendingErrors: string[] = [];
@@ -284,10 +287,15 @@ export class Persistence {
 
   /** Debounced autosave — call on every mutation. */
   markDirty(scene: SceneData): void {
-    if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+    // A pending save of another scene (the one open before a switch) is written
+    // now, not dropped with its timer.
+    const other = this.takePendingSave();
+    if (other && other.id !== scene.id) this.write(other);
+    this.pendingScene = scene;
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
-      this.saveNow(scene);
+      this.pendingScene = null;
+      this.write(scene);
     }, 800);
   }
 
@@ -295,13 +303,26 @@ export class Persistence {
    *  onError so the caller can warn the user — silent loss on a headset with no
    *  console is otherwise unrecoverable. */
   saveNow(scene: SceneData): boolean {
-    // Cancel any pending debounced save: this write is authoritative, and a
-    // stale timer could otherwise overwrite it with an older scene object
-    // (e.g. an undo landing inside the 800ms window after a mutation).
-    if (this.saveTimer !== null) {
-      window.clearTimeout(this.saveTimer);
-      this.saveTimer = null;
-    }
+    // Cancel a pending debounced save of this scene: this write is authoritative,
+    // and a stale timer could otherwise overwrite it with an older scene object
+    // (e.g. an undo landing inside the 800ms window after a mutation). A pending
+    // save of another scene (the live one, while a landing card or a studio saves
+    // a different scene) is written first: cancelling it lost that edit.
+    const other = this.takePendingSave();
+    if (other && other.id !== scene.id) this.write(other);
+    return this.write(scene);
+  }
+
+  /** Stops the debounced save and returns the scene it was for, if any. */
+  private takePendingSave(): SceneData | null {
+    const scene = this.pendingScene;
+    if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+    this.pendingScene = null;
+    return scene;
+  }
+
+  private write(scene: SceneData): boolean {
     scene.updatedAt = Date.now();
     try {
       localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
@@ -332,6 +353,8 @@ export class Persistence {
   }
 
   deleteScene(id: string): void {
+    // Its pending autosave would write it back into storage and the index.
+    if (this.pendingScene?.id === id) this.takePendingSave();
     this.unsaved.delete(id);
     const scene = this.loadScene(id);
     if (scene?.scan) void this.scans.deleteScan(scene.scan.id);

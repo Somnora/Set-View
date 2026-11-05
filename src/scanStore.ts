@@ -33,8 +33,9 @@ export class ScanStore {
   private dbPromise: Promise<IDBDatabase | null> | null = null;
   /** Fallback when IndexedDB is unavailable (session lifetime only). */
   private memory = new Map<string, LocationScan>();
-  /** Sizes already measured by getTotalStorageBytes. A blob never changes under its
-   *  id (every capture, import and duplicate gets a fresh one), so a size stays valid. */
+  /** Sizes already measured by putScan or getTotalStorageBytes. A blob never changes
+   *  under its id (every capture, import and duplicate gets a fresh one), so a size
+   *  stays valid. */
   private sizeCache = new Map<string, number>();
 
   private open(): Promise<IDBDatabase | null> {
@@ -75,6 +76,11 @@ export class ScanStore {
 
   /** Stores a scan under its id. Resolves false (and fires onError) on failure. */
   async putScan(scan: LocationScan): Promise<boolean> {
+    // Measured now, while the scan is in hand, so getTotalStorageBytes never reads
+    // a blob this page wrote back from IndexedDB just to size it (in AR that is a
+    // full read and decode of a fresh capture). Valid on every path below: the
+    // blob lands in IndexedDB or in the memory fallback under this same id.
+    this.sizeCache.set(scan.id, estimateScanSizeBytes(scan));
     const db = await this.open();
     if (!db) {
       this.memory.set(scan.id, scan);
@@ -157,8 +163,8 @@ export class ScanStore {
     return scan ? estimateScanSizeBytes(scan) : 0;
   }
 
-  /** Returns total approximate byte size of all scans in storage. Each blob is read
-   *  once per page to measure it; later calls only list the ids. */
+  /** Returns total approximate byte size of all scans in storage. A blob this page
+   *  did not write is read once to measure it; later calls only list the ids. */
   async getTotalStorageBytes(): Promise<number> {
     const ids = await this.listScanIds();
     let total = 0;

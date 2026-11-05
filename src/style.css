@@ -125,6 +125,24 @@ body {
   color: var(--text-secondary);
 }
 
+/* Save, storage and import banners. Fixed on the body, outside #landing, so they
+   stay in view over the desktop preview: above its bar (z-index 100) and below
+   the studio modals (z-index 1000 and up). */
+.banners {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(720px, calc(100vw - 32px));
+  z-index: 200;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.banners > div {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
 /* Action Buttons */
 #landing button.enter {
   width: 100%;
@@ -162,7 +180,8 @@ body {
   flex-wrap: wrap;
 }
 
-#landing button.small {
+#landing button.small,
+.banners button.small {
   padding: 8px 14px;
   font-size: 13px;
   font-weight: 600;
@@ -175,7 +194,8 @@ body {
   backdrop-filter: blur(8px);
 }
 
-#landing button.small:hover {
+#landing button.small:hover,
+.banners button.small:hover {
   background: var(--bg-card-hover);
   border-color: var(--border-accent);
   color: #ffffff;
