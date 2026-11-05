@@ -11348,9 +11348,14 @@ function probeSessionFixture(): xrProbe.SessionRecord {
     optionalFeatures: ['anchors', 'plane-detection', 'mesh-detection'],
   });
   s.enabledFeatures = ['hit-test', 'local-floor', 'anchors', 'plane-detection'];
+  s.spaceSetup = 'yes';
   s.domOverlayState = 'null';
   s.referenceSpace = 'local-floor';
   s.hitTest = { source: 'ok', framesTested: 100, framesWithHit: 80, firstHitAt: 250 };
+  s.detection.planes.setTicks = 2;
+  s.detection.planes.firstSetAt = 0;
+  s.detection.meshes.setTicks = 2;
+  s.detection.meshes.firstSetAt = 0;
   s.geometry.push({
     t: 0,
     planes: xrProbe.summarizePlanes([
@@ -11544,8 +11549,8 @@ test('P0 probe: summary answers the spike questions from a session', () => {
   assert.equal(answer('plane-detection'), 'yes');
   assert.equal(answer('mesh-detection'), 'no');
   assert.equal(answer('dom-overlay'), 'null');
-  assert.equal(answer('plane-labels'), 'wall x2, floor x1');
-  assert.equal(answer('mesh-labels'), 'global mesh x1');
+  assert.equal(answer('plane-labels'), 'wall x2, floor x1; first set after 0.0 s, first non-empty after 0.0 s');
+  assert.equal(answer('mesh-labels'), 'global mesh x1; first set after 0.0 s, first non-empty after 0.0 s');
   assert.equal(answer('global-mesh'), '300 vertices, 1200 indices (400 triangles)');
   assert.deepEqual(xrProbe.largestGlobalMesh(s.geometry), [300, 1200]);
   assert.match(answer('hit-test'), /^80\/100 frames had a hit; first hit after 0\.3 s$/);
@@ -11567,7 +11572,7 @@ test('P0 probe: summary answers the spike questions from a session', () => {
   assert.match(xrProbe.summarizeReport(r).find((row) => row.id === 'session')?.answer ?? '', /^requestSession failed/);
 });
 
-test('P0 probe: panel buttons hit-test and the status text fits the panel', () => {
+test('P0 probe: panel buttons hit-test', () => {
   for (const b of xrProbe.PANEL_BUTTONS) {
     assert.ok(b.x >= 0 && b.y >= 0 && b.x + b.w <= xrProbe.PANEL_W && b.y + b.h <= xrProbe.PANEL_H, `${b.id} inside panel`);
     const u = (b.x + b.w / 2) / xrProbe.PANEL_W;
@@ -11578,13 +11583,209 @@ test('P0 probe: panel buttons hit-test and the status text fits the panel', () =
   const [cx, cy] = xrProbe.uvToPanelPx(0.5, 0.5);
   assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, cx, cy), null, 'the text area is not a button');
   assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, 260, 580), null, 'the gap between buttons is not a button');
-  const s = probeSessionFixture();
-  s.events.push({ t: 1, type: 'a', detail: '' }, { t: 2, type: 'b', detail: '' }, { t: 3, type: 'c', detail: '' });
-  const lines = xrProbe.panelLines(s, 12_000);
-  assert.ok(lines.length <= 16, `panel shows at most 16 lines, got ${lines.length}`);
-  assert.match(lines[1], /^enabledFeatures: hit-test, local-floor, anchors, plane-detection$/);
   assert.equal(xrProbe.describeRoomCapture(null), 'not run');
   assert.equal(xrProbe.describeKeyboard(null), 'not run');
+});
+
+test('P0 probe: panel text wraps by columns and splits words longer than a row', () => {
+  assert.deepEqual(xrProbe.wrapColumns('short line', 20), ['short line']);
+  assert.deepEqual(xrProbe.wrapColumns('aaaa bbbb cccc dddd', 10), ['aaaa bbbb', '  cccc', '  dddd']);
+  const long = xrProbe.wrapColumns(`x: ${'a,'.repeat(20)}`, 12);
+  for (const row of long) assert.ok(row.length <= 12, `"${row}" is longer than 12`);
+  assert.equal(long.map((r, i) => (i ? r.slice(2) : r)).join(''), `x: ${'a,'.repeat(20)}`, 'a split word loses no characters');
+  assert.equal(long[0].length, 12, 'a word longer than a row starts on the current row');
+  // 2 lines into 3 rows: both get a first row, the spare row goes to the top line, the cut line ends in '...'.
+  const rows = xrProbe.layoutPanelText(['aaaa bbbb cccc dddd', 'eeee ffff gggg'], 10, 3);
+  assert.deepEqual(rows, ['aaaa bbbb', '  cccc...', 'eeee ff...']);
+  assert.deepEqual(xrProbe.layoutPanelText(['a', 'b', 'c'], 10, 2), ['a', 'b'], 'more lines than rows: the last lines go');
+});
+
+test('P0 probe: realistic Quest status text keeps every line on the panel', () => {
+  assert.ok(
+    xrProbe.PANEL_TEXT_TOP + xrProbe.PANEL_TEXT_ROWS * xrProbe.PANEL_ROW_PX <= xrProbe.PANEL_FLASH_Y,
+    'status rows stop above the flash line',
+  );
+  assert.ok(xrProbe.PANEL_FLASH_Y + 30 <= Math.min(...xrProbe.PANEL_BUTTONS.map((b) => b.y)), 'the flash line clears the buttons');
+  const s = probeSessionFixture();
+  s.enabledFeatures = ['viewer', 'local', 'local-floor', 'hit-test', 'anchors', 'hand-tracking', 'mesh-detection', 'plane-detection', 'dom-overlay'];
+  const profiles = '[oculus-touch-v3,oculus-touch-v2,oculus-touch,generic-trigger-squeeze-thumbstick]';
+  s.inputSources = [`left tracked-pointer gamepad ${profiles}`, `right tracked-pointer gamepad ${profiles}`];
+  s.keyboard = {
+    at: 4000,
+    focusError: null,
+    activeIsInput: true,
+    visibility: ['visible-blurred', 'visible'],
+    inputEvents: 3,
+    typed: 'ok',
+    endedBy: 'enter',
+  };
+  s.roomCapture = {
+    calledAt: 9000,
+    outcome: 'resolved',
+    message: null,
+    settledAt: 21400,
+    anchorBefore: { tracked: true, pos: [0, 0, 0] },
+    anchorAfter: { tracked: false, pos: null },
+    anchorLater: { tracked: false, pos: null },
+    anchorMovedM: null,
+    maxFrameGapMs: 12345,
+    resetsDuring: 1,
+    visibilityDuring: ['hidden', 'visible-blurred', 'visible'],
+    planesBefore: 12,
+    planesAfter: 14,
+    meshesBefore: 9,
+    meshesAfter: 11,
+  };
+  const labels = ['wall', 'wall', 'wall', 'wall', 'floor', 'ceiling', 'door frame', 'window frame', 'table', 'couch', 'wall art', 'other'];
+  s.geometry.push({
+    t: 12000,
+    planes: xrProbe.summarizePlanes(labels.map((l) => ({ semanticLabel: l, orientation: 'vertical', polygon: { length: 4 } }))),
+    meshes: xrProbe.summarizeMeshes(
+      ['global mesh', 'table', 'table', 'couch', 'storage', 'bed', 'screen', 'lamp', 'plant'].map((l) => ({
+        semanticLabel: l,
+        vertices: new Float32Array(l === 'global mesh' ? 3 * 41234 : 24),
+        indices: new Uint32Array(l === 'global mesh' ? 3 * 80123 : 36),
+      })),
+    ),
+  });
+  s.ticks.push({ t: 12000, fps: 72, gapMaxMs: 19, planes: 12, meshes: 9, hit: [-0.123, 0.001, -1.456], head: [0, 1.6, 0], anchor: 0, vis: 'visible', saveMs: 1.2 });
+  s.events.push(
+    { t: 9000, type: 'room-capture', detail: 'calling initiateRoomCapture()' },
+    { t: 21400, type: 'room-capture', detail: 'resolved' },
+    { t: 24500, type: 'room-capture', detail: 'follow-up: anchor NOT tracked' },
+  );
+  const lines = xrProbe.panelLines(s, 25_000);
+  const cols = xrProbe.PANEL_TEXT_COLS;
+  const unbudgeted = lines.reduce((n, l) => n + Math.min(xrProbe.PANEL_ROWS_PER_LINE, xrProbe.wrapColumns(l, cols).length), 0);
+  assert.ok(unbudgeted > xrProbe.PANEL_TEXT_ROWS, `the fixture needs more rows (${unbudgeted}) than the panel has without a budget`);
+  const rows = xrProbe.layoutPanelText(lines, cols, xrProbe.PANEL_TEXT_ROWS);
+  assert.ok(rows.length <= xrProbe.PANEL_TEXT_ROWS, `${rows.length} rows`);
+  for (const row of rows) assert.ok(row.length <= cols, `"${row}" is wider than ${cols} columns`);
+  const prefixes = ['t ', 'planes:', 'meshes:', 'global mesh:', 'viewer hit-test:', 'sentinel anchor:', 'keyboard:', 'room capture:', 'enabledFeatures:', 'domOverlayState:', 'inputs:'];
+  for (const p of prefixes) assert.equal(rows.filter((r) => r.startsWith(p)).length, 1, `"${p}" line is on the panel`);
+  assert.equal(rows.filter((r) => r.startsWith('event: ')).length, 3, 'the three recent events are on the panel');
+  const rc = rows.findIndex((r) => r.startsWith('room capture:'));
+  let rcEnd = rc + 1;
+  while (rcEnd < rows.length && rows[rcEnd].startsWith('  ')) rcEnd++;
+  const rcText = rows
+    .slice(rc, rcEnd)
+    .map((r) => r.trim())
+    .join(' ');
+  assert.match(rcText, /^room capture: resolved; settled after 12\.4 s; anchor before tracked, after NOT tracked/);
+  assert.ok(rcText.includes('3 s later NOT'), `room capture keeps its anchor follow-up: ${rcText}`);
+  assert.match(rows.find((r) => r.startsWith('inputs:')) ?? '', /^inputs: left tracked-pointer gamepad \| right tracked-pointer gamepad$/);
+});
+
+test('P0 probe: detected-geometry reads keep polling after undefined, null and throws', () => {
+  const stat = xrProbe.createDetectionStat();
+  const planes = new Set([{ semanticLabel: 'floor' }]);
+  const attr = 'frame.detectedPlanes';
+  const notReady = () => {
+    throw new DOMException('not ready', 'InvalidStateError');
+  };
+  assert.deepEqual(xrProbe.readDetection(stat, 1000, () => undefined, attr), { set: null, event: null }, 'a first undefined read only means "not yet"');
+  assert.equal(xrProbe.readDetection(stat, 2000, () => null, attr).set, null);
+  assert.deepEqual(xrProbe.readDetection(stat, 3000, notReady, attr), {
+    set: null,
+    event: 'frame.detectedPlanes threw InvalidStateError: not ready; still polling',
+  });
+  assert.equal(xrProbe.readDetection(stat, 3500, notReady, attr).event, null, 'a repeated throw is counted, not logged again');
+  assert.deepEqual(xrProbe.readDetection(stat, 4000, () => planes, attr), {
+    set: planes,
+    event: 'frame.detectedPlanes first returned a set after 4 tick(s) without one',
+  });
+  assert.deepEqual(xrProbe.readDetection(stat, 5000, () => planes, attr), { set: planes, event: null });
+  assert.equal(xrProbe.readDetection(stat, 6000, () => undefined, attr).event, 'frame.detectedPlanes was undefined again after returning a set');
+  assert.equal(xrProbe.readDetection(stat, 7000, () => undefined, attr).event, null);
+  assert.deepEqual(stat, {
+    skipped: null,
+    setTicks: 2,
+    missingTicks: 4,
+    throwTicks: 2,
+    dropoutTicks: 2,
+    firstSetAt: 4000,
+    error: 'InvalidStateError: not ready',
+  });
+
+  const off = xrProbe.createDetectionStat();
+  off.skipped = 'mesh-detection not in enabledFeatures';
+  let called = false;
+  const r = xrProbe.readDetection(off, 1000, () => ((called = true), planes), 'frame.detectedMeshes');
+  assert.deepEqual(r, { set: null, event: null });
+  assert.equal(called, false, 'a feature known to be off is not read');
+
+  assert.equal(xrProbe.detectionSkipReason(null, 'plane-detection', true), null, 'enabledFeatures not exposed: keep polling');
+  assert.equal(xrProbe.detectionSkipReason(['hit-test', 'plane-detection'], 'plane-detection', true), null);
+  assert.equal(xrProbe.detectionSkipReason(['hit-test'], 'plane-detection', true), 'plane-detection not in enabledFeatures');
+  assert.equal(xrProbe.detectionSkipReason(['hit-test'], 'mesh-detection', false), 'mesh-detection not in enabledFeatures (not requested)');
+});
+
+test('P0 probe: summary reports late or missing geometry instead of a false platform answer', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/test/xr-probe.html');
+  const s = probeSessionFixture();
+  const wall = { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } };
+  s.geometry = [
+    { t: 2000, planes: xrProbe.summarizePlanes([]), meshes: null },
+    { t: 3000, planes: xrProbe.summarizePlanes([wall]), meshes: null },
+  ];
+  s.detection.planes = { skipped: null, setTicks: 9, missingTicks: 1, throwTicks: 0, dropoutTicks: 0, firstSetAt: 2000, error: null };
+  s.detection.meshes = { ...xrProbe.createDetectionStat(), missingTicks: 5 };
+  r.sessions.push(s);
+  const answer = (id: string) => xrProbe.summarizeReport(r).find((row) => row.id === id)?.answer ?? '<missing>';
+  assert.equal(answer('plane-labels'), 'wall x1; first set after 2.0 s, first non-empty after 3.0 s; undefined or null on 1 tick(s)');
+  assert.equal(answer('mesh-labels'), 'frame.detectedMeshes never returned a set: undefined or null on 5 tick(s)');
+  assert.equal(answer('global-mesh'), 'not seen');
+  const lines = xrProbe.panelLines(s, 12_000);
+  assert.ok(lines.includes('planes: 1  wall x1'));
+  assert.ok(lines.includes('meshes: no set yet (5 missing, 0 threw)'));
+
+  s.detection.meshes = { ...xrProbe.createDetectionStat(), throwTicks: 3, error: 'NotSupportedError: x' };
+  assert.equal(answer('mesh-labels'), 'frame.detectedMeshes never returned a set: threw on 3 tick(s), first NotSupportedError: x');
+  s.detection.meshes = { ...xrProbe.createDetectionStat(), skipped: 'mesh-detection not in enabledFeatures' };
+  assert.equal(answer('mesh-labels'), 'not polled: mesh-detection not in enabledFeatures');
+  assert.ok(xrProbe.panelLines(s, 1).includes('meshes: not polled (mesh-detection not in enabledFeatures)'));
+  s.detection.meshes = xrProbe.createDetectionStat();
+  assert.equal(answer('mesh-labels'), 'not sampled');
+  s.detection.planes.dropoutTicks = 1;
+  assert.match(answer('plane-labels'), /; 1 of those after the first set$/);
+});
+
+test('P0 probe: hit-test is S5 only for a Quest session with Space Setup cleared; S7 and S11 are partial', () => {
+  const quest = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/test/xr-probe.html');
+  let rows = xrProbe.summarizeReport(quest);
+  const row = (id: string) => rows.find((x) => x.id === id);
+  assert.match(row('hit-test-no-space-setup')?.answer ?? '', /^no session marked "Space Setup: no" yet/, 'S5 row shows even with no session');
+  assert.equal(row('storage')?.spike, 'S7 (partial)');
+  assert.match(row('storage')?.question ?? '', /IndexedDB is not probed/);
+  assert.equal(row('persistent-anchors')?.spike, 'S11 (partial)');
+  assert.match(row('persistent-anchors')?.question ?? '', /API presence only/);
+
+  quest.sessions.push(probeSessionFixture()); // Space Setup done
+  rows = xrProbe.summarizeReport(quest);
+  assert.equal(row('space-setup-before')?.answer, 'yes');
+  assert.equal(row('hit-test')?.spike, '', 'a Quest session with Space Setup done does not answer S5');
+  assert.match(row('hit-test')?.question ?? '', /Space Setup before this session: yes/);
+  assert.ok(!rows.some((x) => x.spike === 'S7' || x.spike === 'S11' || x.spike.includes('S5/') || x.spike.includes('/S5')));
+
+  const cleared = probeSessionFixture();
+  cleared.spaceSetup = 'no';
+  cleared.startedAt = '2026-11-05T09:00:00.000Z';
+  cleared.hitTest = { source: 'ok', framesTested: 50, framesWithHit: 10, firstHitAt: 1200 };
+  quest.sessions.unshift(cleared); // the S5 run first, the main run last
+  rows = xrProbe.summarizeReport(quest);
+  assert.equal(row('hit-test')?.spike, '', 'the summary still describes the latest session');
+  assert.equal(row('hit-test-no-space-setup')?.answer, '10/50 frames had a hit; first hit after 1.2 s (session started 2026-11-05T09:00:00.000Z)');
+  const lastCleared = probeSessionFixture();
+  lastCleared.spaceSetup = 'no';
+  quest.sessions.push(lastCleared);
+  rows = xrProbe.summarizeReport(quest);
+  assert.equal(row('hit-test')?.spike, 'S5');
+
+  const android = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_ANDROID_UA, 'https://x/test/xr-probe.html');
+  android.sessions.push(probeSessionFixture());
+  rows = xrProbe.summarizeReport(android);
+  assert.equal(row('hit-test')?.spike, 'S2');
+  assert.equal(row('hit-test-no-space-setup')?.answer, 'n/a (S5 is a Quest 3 question)');
 });
 
 test('P0 probe: copy has no em dashes and the probe stays out of src', () => {

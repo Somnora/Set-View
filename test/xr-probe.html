@@ -111,16 +111,35 @@
     </section>
 
     <section>
-      <h2>2. Storage and API presence (S7, S11)</h2>
+      <h2>2. Storage and API presence (S7 and S11, partial)</h2>
       <p class="hint">Estimate and API checks run on load. Press the button once to record what <code>navigator.storage.persist()</code> returns.</p>
+      <p class="hint">
+        Partial answers only: the 100 to 300 MB LAN fetch into IndexedDB (rest of S7) and creating or restoring a
+        persistent anchor (rest of S11) are not probed here.
+      </p>
       <button id="persist">Request persistent storage</button>
       <pre id="env"></pre>
     </section>
 
     <section>
-      <h2>3. AR session (S1, S2, S3, S5, S6)</h2>
+      <h2>3. AR session (S1, S2, S3, S6; S5 on Quest)</h2>
       <label><input id="opt-planes" type="checkbox" checked /> request plane-detection</label>
       <label><input id="opt-meshes" type="checkbox" checked /> request mesh-detection</label>
+      <p>
+        <label
+          >Space Setup done for this room before Enter AR (Quest)
+          <select id="space-setup">
+            <option value="">not recorded</option>
+            <option value="yes">yes</option>
+            <option value="no">no (cleared, for S5)</option>
+            <option value="unsure">unsure</option>
+          </select>
+        </label>
+      </p>
+      <p class="hint">
+        Set this before each Enter AR; it is stored with that session. S1 needs a Quest session with Space Setup done;
+        S5 needs a separate Quest session with Space Setup cleared and this set to <code>no</code>.
+      </p>
       <p>
         <button id="enter" class="primary">Enter AR probe</button>
         <span id="ar-status"></span>

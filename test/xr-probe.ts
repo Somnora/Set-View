@@ -2,10 +2,11 @@
 // SetView XR capability probe (roadmap P0.0): page logic for test/xr-probe.html.
 //
 // Test-only. Nothing in src/ imports this file and it imports nothing from
-// src/. The AR session setup deliberately copies SessionManager.start
-// (src/session.ts): hit-test required; anchors, hand-tracking, dom-overlay,
-// local-floor, mesh-detection and plane-detection optional; local-floor with a
-// local fallback. That way the probe sees what the app would see.
+// src/. The AR session setup copies SessionManager.start (src/session.ts):
+// hit-test required; anchors, hand-tracking, dom-overlay, local-floor and
+// mesh-detection optional; local-floor with a local fallback. It also asks for
+// plane-detection, which the app does not request yet (roadmap P0.4 adds it),
+// so the probe sees what the app will see once P0.4 lands.
 //
 // 2D part: file reads via File.arrayBuffer(), storage estimate/persist, API
 // presence. AR part: granted features, detected planes and meshes (raw
@@ -27,7 +28,13 @@ import {
   OBSERVATIONS,
   OBSERVATION_ANSWERS,
   PANEL_BUTTONS,
+  PANEL_FLASH_Y,
+  PANEL_FONT_PX,
   PANEL_H,
+  PANEL_ROW_PX,
+  PANEL_TEXT_COLS,
+  PANEL_TEXT_ROWS,
+  PANEL_TEXT_TOP,
   PANEL_W,
   PROBE_STORAGE_KEY,
   asciiHead,
@@ -35,14 +42,17 @@ import {
   classifyRejection,
   createReport,
   createSessionRecord,
+  detectionSkipReason,
   distance3,
   errorText,
   fmtBytes,
   geometrySignature,
   hexHead,
+  layoutPanelText,
   panelLines,
   parseStoredReport,
   pushCapped,
+  readDetection,
   reportFileName,
   round3,
   slugify,
@@ -51,12 +61,12 @@ import {
   summarizeReport,
   uvToPanelPx,
   type AnchorState,
+  type DetectionStat,
   type FileProbe,
   type KeyboardRecord,
   type ProbeReport,
   type RoomCaptureRecord,
   type SessionRecord,
-  type Vec3T,
 } from './xr-probe-core.ts';
 
 /** Panel width in meters and its distance from the head when placed. */
@@ -71,6 +81,8 @@ const KEYBOARD_OPEN_MS = 60_000;
 const KEYBOARD_AFTER_MS = 5000;
 /** Delay before the sentinel anchor is created, so tracking has settled. */
 const ANCHOR_DELAY_MS = 1500;
+/** While in AR the report is saved on this timer, outside the XR frame callback (events still save at once). */
+const AR_AUTOSAVE_MS = 5000;
 /** endedAt marker for a session whose page died before its 'end' event (see device-reports/README.md). */
 const UNCLEAN_END = 'not recorded (page closed or killed during AR)';
 
@@ -88,6 +100,7 @@ const persistBtn = el<HTMLButtonElement>('persist');
 const envOut = el<HTMLElement>('env');
 const optPlanes = el<HTMLInputElement>('opt-planes');
 const optMeshes = el<HTMLInputElement>('opt-meshes');
+const spaceSetupSel = el<HTMLSelectElement>('space-setup');
 const enterBtn = el<HTMLButtonElement>('enter');
 const arStatus = el<HTMLElement>('ar-status');
 const obsHost = el<HTMLElement>('observations');
@@ -118,8 +131,11 @@ function loadReport(): ProbeReport {
 
 let report: ProbeReport = loadReport();
 let saveFailed = false;
+/** Time spent in save() since the last AR tick; each tick records and resets it. */
+let saveMsSinceTick = 0;
 
 function save(): void {
+  const t0 = performance.now();
   report.updatedAt = new Date().toISOString();
   try {
     localStorage.setItem(PROBE_STORAGE_KEY, JSON.stringify(report));
@@ -130,6 +146,7 @@ function save(): void {
       log(`localStorage save failed (${errorText(e)}); use Download JSON before closing the page`);
     }
   }
+  saveMsSinceTick += performance.now() - t0;
 }
 
 let logRenderQueued = false;
@@ -363,12 +380,18 @@ interface ArRuntime {
   lastFrameAt: number;
   frames: number;
   gapMax: number;
+  /** 0 until the first frame; the first tick (and first geometry read) comes 1 s after it. */
   nextTickAt: number;
-  ticksSinceSave: number;
+  /** setInterval id of the AR autosave, 0 when none. */
+  saveTimer: number;
   lastSig: string;
   lastPlanes: number | null;
   lastMeshes: number | null;
-  hitThisSecond: Vec3T | null;
+  /** Latest viewer hit this second, kept as numbers so hit frames allocate nothing. */
+  hitSeen: boolean;
+  hitX: number;
+  hitY: number;
+  hitZ: number;
   hasHead: boolean;
   panelPlaced: boolean;
   roomArmedUntil: number;
@@ -451,28 +474,6 @@ function fitText(ctx: CanvasRenderingContext2D, text: string, maxW: number): str
   return `${text.slice(0, lo)}...`;
 }
 
-/** Word-wraps a status line into at most `maxRows` rows; continuation rows are indented. */
-function wrapText(ctx: CanvasRenderingContext2D, text: string, maxW: number, maxRows: number): string[] {
-  if (ctx.measureText(text).width <= maxW) return [text];
-  const rows: string[] = [];
-  let cur = '';
-  for (const word of text.split(' ')) {
-    const next = cur ? `${cur} ${word}` : word;
-    if (!cur || ctx.measureText(next).width <= maxW) {
-      cur = next;
-    } else {
-      rows.push(cur);
-      cur = `  ${word}`;
-    }
-  }
-  if (cur) rows.push(cur);
-  if (rows.length > maxRows) {
-    rows.length = maxRows;
-    rows[maxRows - 1] += ' ...';
-  }
-  return rows.map((r) => fitText(ctx, r, maxW));
-}
-
 function drawPanel(a: ArRuntime): void {
   if (!rig) return;
   const { ctx, texture } = rig;
@@ -488,19 +489,19 @@ function drawPanel(a: ArRuntime): void {
   ctx.font = 'bold 30px system-ui, sans-serif';
   ctx.fillText(fitText(ctx, `SetView XR probe   ${report.device}`, PANEL_W - 40), 20, 14);
   ctx.fillStyle = '#e6e9ef';
-  ctx.font = '20px ui-monospace, Menlo, monospace';
-  let y = 56;
-  for (const line of panelLines(a.rec, now - a.t0)) {
-    for (const row of wrapText(ctx, line, PANEL_W - 40, 3)) {
-      if (y > 470) break;
-      ctx.fillText(row, 20, y);
-      y += 26;
-    }
+  ctx.font = `${PANEL_FONT_PX}px ui-monospace, Menlo, monospace`;
+  // Columns from the real glyph width; fitText still guards each row in pixels.
+  const glyph = ctx.measureText('0123456789').width / 10;
+  const cols = glyph > 0 ? Math.floor((PANEL_W - 40) / glyph) : PANEL_TEXT_COLS;
+  let y = PANEL_TEXT_TOP;
+  for (const row of layoutPanelText(panelLines(a.rec, now - a.t0), cols, PANEL_TEXT_ROWS)) {
+    ctx.fillText(fitText(ctx, row, PANEL_W - 40), 20, y);
+    y += PANEL_ROW_PX;
   }
   if (a.flash && now < a.flashUntil) {
     ctx.fillStyle = '#ffd166';
     ctx.font = 'bold 22px system-ui, sans-serif';
-    ctx.fillText(fitText(ctx, a.flash, PANEL_W - 40), 20, 504);
+    ctx.fillText(fitText(ctx, a.flash, PANEL_W - 40), 20, PANEL_FLASH_Y);
   }
   const armed = now < a.roomArmedUntil;
   ctx.textAlign = 'center';
@@ -545,30 +546,16 @@ function anchorState(a: ArRuntime, frame: XRFrame, ref: XRReferenceSpace): Ancho
   }
 }
 
-function readPlanes(rec: SessionRecord, frame: XRFrame): Iterable<XRPlane> | null {
-  if (rec.planesError) return null;
-  try {
-    const set = frame.detectedPlanes;
-    if (set) return set;
-    rec.planesError = 'frame.detectedPlanes is undefined';
-  } catch (e) {
-    rec.planesError = `frame.detectedPlanes threw ${errorText(e)}`;
-  }
-  addEvent('planes', rec.planesError);
-  return null;
-}
-
-function readMeshes(rec: SessionRecord, frame: XRFrame): Iterable<XRMesh> | null {
-  if (rec.meshesError) return null;
-  try {
-    const set = frame.detectedMeshes;
-    if (set) return set;
-    rec.meshesError = 'frame.detectedMeshes is undefined';
-  } catch (e) {
-    rec.meshesError = `frame.detectedMeshes threw ${errorText(e)}`;
-  }
-  addEvent('meshes', rec.meshesError);
-  return null;
+/**
+ * One tick's read of a detected-geometry attribute. undefined/null and throws
+ * are counted in `stat` (see readDetection) and polling carries on next tick:
+ * platform data is often not ready on the first frames, and three.js treats the
+ * attribute as possibly undefined on any frame.
+ */
+function readDetected<T>(stat: DetectionStat, kind: string, t: number, read: () => T | null | undefined, attr: string): T | null {
+  const r = readDetection(stat, t, read, attr);
+  if (r.event) addEvent(kind, r.event);
+  return r.set;
 }
 
 function hasFeature(rec: SessionRecord, f: string): boolean {
@@ -613,7 +600,10 @@ function onFrame(a: ArRuntime, frame: XRFrame): void {
       rec.hitTest.framesWithHit++;
       if (rec.hitTest.firstHitAt === null) rec.hitTest.firstHitAt = Math.round(t);
       const q = hp.transform.position;
-      a.hitThisSecond = [round3(q.x), round3(q.y), round3(q.z)];
+      a.hitSeen = true;
+      a.hitX = q.x;
+      a.hitY = q.y;
+      a.hitZ = q.z;
     }
   }
 
@@ -663,11 +653,13 @@ function onFrame(a: ArRuntime, frame: XRFrame): void {
     }
   }
 
+  // Once per second: geometry, tick, panel redraw. The first tick is 1 s after
+  // the first frame, so it counts a full second and geometry is not read on frame 0.
+  if (a.nextTickAt === 0) a.nextTickAt = now + 1000;
   if (now < a.nextTickAt) return;
-  // Once per second: geometry, tick, panel redraw.
   a.nextTickAt = now + 1000;
-  const planeSet = readPlanes(rec, frame);
-  const meshSet = readMeshes(rec, frame);
+  const planeSet = readDetected(rec.detection.planes, 'planes', t, () => frame.detectedPlanes, 'frame.detectedPlanes');
+  const meshSet = readDetected(rec.detection.meshes, 'meshes', t, () => frame.detectedMeshes, 'frame.detectedMeshes');
   const planes = planeSet ? summarizePlanes(planeSet) : null;
   const meshes = meshSet ? summarizeMeshes(meshSet) : null;
   const sig = geometrySignature(planes, meshes);
@@ -686,21 +678,20 @@ function onFrame(a: ArRuntime, frame: XRFrame): void {
       gapMaxMs: Math.round(a.gapMax),
       planes: a.lastPlanes,
       meshes: a.lastMeshes,
-      hit: a.hitThisSecond,
+      hit: a.hitSeen ? [round3(a.hitX), round3(a.hitY), round3(a.hitZ)] : null,
       head: a.hasHead ? [round3(headPos.x), round3(headPos.y), round3(headPos.z)] : null,
       anchor: a.lastAnchor.tracked === null ? null : a.lastAnchor.tracked ? 1 : 0,
       vis: a.session.visibilityState,
+      saveMs: Math.round(saveMsSinceTick * 10) / 10,
     },
     MAX_TICKS,
   );
   a.frames = 0;
   a.gapMax = 0;
-  a.hitThisSecond = null;
+  a.hitSeen = false;
+  saveMsSinceTick = 0;
   drawPanel(a);
-  if (++a.ticksSinceSave >= 2) {
-    a.ticksSinceSave = 0;
-    save();
-  }
+  // No save here: the AR autosave timer (setupSession) runs outside the frame callback.
 }
 
 function runKeyboardTest(a: ArRuntime): void {
@@ -841,6 +832,10 @@ function noteInputs(rec: SessionRecord, list: Iterable<XRInputSource>): void {
 function onEnd(a: ArRuntime): void {
   addEvent('end', `after ${((performance.now() - a.t0) / 1000).toFixed(1)} s`);
   a.rec.endedAt = new Date().toISOString();
+  if (a.saveTimer) {
+    clearInterval(a.saveTimer);
+    a.saveTimer = 0;
+  }
   if (rig) {
     rig.renderer.setAnimationLoop(null);
     rig.panel.visible = false;
@@ -857,6 +852,17 @@ function onEnd(a: ArRuntime): void {
 async function setupSession(a: ArRuntime, r: ThreeRig): Promise<void> {
   const { session, rec } = a;
   rec.enabledFeatures = session.enabledFeatures ? Array.from(session.enabledFeatures) : null;
+  // Stop polling detected geometry only when the feature is known to be off.
+  rec.detection.planes.skipped = detectionSkipReason(
+    rec.enabledFeatures,
+    'plane-detection',
+    rec.init.optionalFeatures.includes('plane-detection'),
+  );
+  rec.detection.meshes.skipped = detectionSkipReason(
+    rec.enabledFeatures,
+    'mesh-detection',
+    rec.init.optionalFeatures.includes('mesh-detection'),
+  );
   const dos = session.domOverlayState;
   rec.domOverlayState = dos === undefined ? 'attribute-missing' : dos === null ? 'null' : String(dos.type);
   rec.environmentBlendMode = session.environmentBlendMode ?? null;
@@ -936,6 +942,9 @@ async function setupSession(a: ArRuntime, r: ThreeRig): Promise<void> {
     }
     r.renderer.render(r.scene, r.camera);
   });
+  a.saveTimer = window.setInterval(() => {
+    if (ar === a) save();
+  }, AR_AUTOSAVE_MS);
   addEvent(
     'start',
     `ref=${rec.referenceSpace} features=${rec.enabledFeatures ? rec.enabledFeatures.join(',') : 'not exposed'}` +
@@ -954,7 +963,7 @@ async function enterAr(): Promise<void> {
   if (optMeshes.checked) optionalFeatures.push('mesh-detection');
   if (optPlanes.checked) optionalFeatures.push('plane-detection');
   const requiredFeatures = ['hit-test'];
-  const rec = createSessionRecord(new Date().toISOString(), { requiredFeatures, optionalFeatures });
+  const rec = createSessionRecord(new Date().toISOString(), { requiredFeatures, optionalFeatures }, spaceSetupSel.value);
   pushCapped(report.sessions, rec, MAX_SESSIONS, 1);
   enterBtn.disabled = true;
   overlayStatus.textContent = 'SetView XR probe: DOM overlay is active';
@@ -986,11 +995,14 @@ async function enterAr(): Promise<void> {
     frames: 0,
     gapMax: 0,
     nextTickAt: 0,
-    ticksSinceSave: 0,
+    saveTimer: 0,
     lastSig: '',
     lastPlanes: null,
     lastMeshes: null,
-    hitThisSecond: null,
+    hitSeen: false,
+    hitX: 0,
+    hitY: 0,
+    hitZ: 0,
     hasHead: false,
     panelPlaced: false,
     roomArmedUntil: 0,
@@ -1000,6 +1012,7 @@ async function enterAr(): Promise<void> {
     lastFrameError: '',
   };
   ar = a;
+  saveMsSinceTick = 0; // the first tick counts only saves made during this session
   arStatus.textContent = 'AR session running.';
   try {
     await setupSession(a, ensureRig());

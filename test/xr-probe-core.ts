@@ -10,8 +10,8 @@
 // ---------------------------------------------------------------------------
 
 export const PROBE_ID = 'setview-xr-probe';
-export const PROBE_VERSION = 1;
-export const PROBE_STORAGE_KEY = 'setview.xrProbe.report.v1';
+export const PROBE_VERSION = 2;
+export const PROBE_STORAGE_KEY = 'setview.xrProbe.report.v2';
 
 export const MAX_FILES = 100;
 export const MAX_SESSIONS = 20;
@@ -84,6 +84,30 @@ export interface Tick {
   /** 1 tracked, 0 not tracked, null no sentinel anchor. */
   anchor: 0 | 1 | null;
   vis: string;
+  /** Milliseconds spent saving the report to localStorage during the last second, so frame gaps can be attributed to it. */
+  saveMs: number;
+}
+
+/**
+ * How reads of frame.detectedPlanes or frame.detectedMeshes went over a
+ * session, one read per 1 Hz tick. undefined or null means "not yet" and a
+ * throw is counted; neither stops the polling.
+ */
+export interface DetectionStat {
+  /** Why the attribute is not polled at all in this session (the feature is known to be off), or null. */
+  skipped: string | null;
+  /** Ticks on which the attribute returned a set (possibly empty). */
+  setTicks: number;
+  /** Ticks on which it was undefined or null. */
+  missingTicks: number;
+  /** Ticks on which reading it threw. */
+  throwTicks: number;
+  /** Missing or throwing ticks after the first set arrived. */
+  dropoutTicks: number;
+  /** Milliseconds since the session started at the first tick that returned a set. */
+  firstSetAt: number | null;
+  /** The first error thrown, "Name: message". */
+  error: string | null;
 }
 
 export interface ProbeEvent {
@@ -133,6 +157,8 @@ export interface SessionRecord {
   startedAt: string;
   endedAt: string | null;
   init: { requiredFeatures: string[]; optionalFeatures: string[] };
+  /** Owner's answer, picked on the 2D page before Enter AR: was Space Setup done for this room? '' | 'yes' | 'no' | 'unsure'. */
+  spaceSetup: string;
   requestError: string | null;
   /** null when the browser does not expose session.enabledFeatures. */
   enabledFeatures: string[] | null;
@@ -147,8 +173,7 @@ export interface SessionRecord {
   persistentAnchors: { count: number; blank: number } | null;
   inputSources: string[];
   hitTest: { source: string; framesTested: number; framesWithHit: number; firstHitAt: number | null };
-  planesError: string | null;
-  meshesError: string | null;
+  detection: { planes: DetectionStat; meshes: DetectionStat };
   anchor: { created: boolean; error: string | null; createdAt: number | null };
   geometry: GeometrySample[];
   ticks: Tick[];
@@ -359,6 +384,60 @@ export function geometrySignature(planes: PlaneSummary | null, meshes: MeshSumma
   ]);
 }
 
+// --- detected-geometry reads ----------------------------------------------------
+
+export function createDetectionStat(): DetectionStat {
+  return { skipped: null, setTicks: 0, missingTicks: 0, throwTicks: 0, dropoutTicks: 0, firstSetAt: null, error: null };
+}
+
+/**
+ * Polling is skipped only when the feature is known to be off: the browser
+ * exposes enabledFeatures and it lacks `feature`. In every other case the
+ * attribute is read each tick, because undefined may only mean "not yet".
+ */
+export function detectionSkipReason(enabledFeatures: string[] | null, feature: string, requested: boolean): string | null {
+  if (!enabledFeatures || enabledFeatures.includes(feature)) return null;
+  return `${feature} not in enabledFeatures${requested ? '' : ' (not requested)'}`;
+}
+
+/**
+ * One tick's read of frame.detectedPlanes or frame.detectedMeshes (`attr` names
+ * it in the event text). Updates `stat` and never stops polling on its own.
+ * Returns the set, or null when it was missing or threw, plus an event worth
+ * logging (the first set, the first throw, the first drop-out after a set).
+ */
+export function readDetection<T>(
+  stat: DetectionStat,
+  t: number,
+  read: () => T | null | undefined,
+  attr: string,
+): { set: T | null; event: string | null } {
+  if (stat.skipped) return { set: null, event: null };
+  let v: T | null | undefined;
+  try {
+    v = read();
+  } catch (e) {
+    stat.throwTicks++;
+    if (stat.firstSetAt !== null) stat.dropoutTicks++;
+    if (stat.error === null) {
+      stat.error = errorText(e);
+      return { set: null, event: `${attr} threw ${stat.error}; still polling` };
+    }
+    return { set: null, event: stat.dropoutTicks === 1 ? `${attr} threw again after returning a set` : null };
+  }
+  if (v === undefined || v === null) {
+    stat.missingTicks++;
+    if (stat.firstSetAt === null) return { set: null, event: null };
+    stat.dropoutTicks++;
+    return { set: null, event: stat.dropoutTicks === 1 ? `${attr} was ${String(v)} again after returning a set` : null };
+  }
+  stat.setTicks++;
+  if (stat.firstSetAt !== null) return { set: v, event: null };
+  stat.firstSetAt = Math.round(t);
+  const before = stat.missingTicks + stat.throwTicks;
+  return { set: v, event: `${attr} first returned a set${before ? ` after ${before} tick(s) without one` : ''}` };
+}
+
 // --- user agent and file naming ----------------------------------------------
 
 export interface UaInfo {
@@ -472,11 +551,13 @@ export function createReport(nowIso: string, userAgent: string, url: string): Pr
 export function createSessionRecord(
   nowIso: string,
   init: { requiredFeatures: string[]; optionalFeatures: string[] },
+  spaceSetup = '',
 ): SessionRecord {
   return {
     startedAt: nowIso,
     endedAt: null,
     init: { requiredFeatures: init.requiredFeatures.slice(), optionalFeatures: init.optionalFeatures.slice() },
+    spaceSetup,
     requestError: null,
     enabledFeatures: null,
     domOverlayState: 'attribute-missing',
@@ -488,8 +569,7 @@ export function createSessionRecord(
     persistentAnchors: null,
     inputSources: [],
     hitTest: { source: 'not requested', framesTested: 0, framesWithHit: 0, firstHitAt: null },
-    planesError: null,
-    meshesError: null,
+    detection: { planes: createDetectionStat(), meshes: createDetectionStat() },
     anchor: { created: false, error: null, createdAt: null },
     geometry: [],
     ticks: [],
@@ -582,6 +662,48 @@ export function largestGlobalMesh(samples: GeometrySample[]): [number, number] |
   return best;
 }
 
+/** Time of the first stored sample in which at least one plane (or mesh) was detected, or null. */
+export function firstNonEmptyAt(samples: GeometrySample[], kind: 'planes' | 'meshes'): number | null {
+  for (const g of samples) {
+    const s = kind === 'planes' ? g.planes : g.meshes;
+    if (s && s.count > 0) return g.t;
+  }
+  return null;
+}
+
+/**
+ * Summary answer for a detected-geometry attribute: the label counts once any
+ * set arrived, with how long it took and how often it was missing or threw;
+ * otherwise why there is nothing.
+ */
+export function describeDetection(
+  stat: DetectionStat,
+  attr: string,
+  labels: Record<string, number>,
+  firstNonEmpty: number | null,
+): string {
+  if (stat.skipped) return `not polled: ${stat.skipped}`;
+  const misses: string[] = [];
+  if (stat.missingTicks) misses.push(`undefined or null on ${stat.missingTicks} tick(s)`);
+  if (stat.throwTicks) misses.push(`threw on ${stat.throwTicks} tick(s), first ${stat.error ?? 'n/a'}`);
+  if (stat.setTicks === 0) {
+    return misses.length ? `${attr} never returned a set: ${misses.join('; ')}` : 'not sampled';
+  }
+  const parts = [
+    formatCounts(labels),
+    `first set after ${secs(stat.firstSetAt)}, first non-empty after ${firstNonEmpty === null ? 'never' : secs(firstNonEmpty)}`,
+    ...misses,
+  ];
+  if (stat.dropoutTicks) parts.push(`${stat.dropoutTicks} of those after the first set`);
+  return parts.join('; ');
+}
+
+export function describeHitTest(h: SessionRecord['hitTest']): string {
+  return h.source !== 'ok'
+    ? `source ${h.source}`
+    : `${h.framesWithHit}/${h.framesTested} frames had a hit; first hit after ${secs(h.firstHitAt)}`;
+}
+
 function anchorWord(a: AnchorState | null): string {
   if (!a) return 'n/a';
   return a.tracked === null ? 'no anchor' : a.tracked ? 'tracked' : 'NOT tracked';
@@ -639,28 +761,52 @@ export function summarizeReport(report: ProbeReport): SummaryRow[] {
   );
   add(
     'storage',
-    'S7',
-    'navigator.storage estimate / persisted / persist()',
+    'S7 (partial)',
+    'navigator.storage estimate / persisted / persist() (the 100 to 300 MB LAN fetch into IndexedDB is not probed)',
     env.storageError
       ? env.storageError
       : `quota ${fmtBytes(env.storage?.quota ?? null)}, usage ${fmtBytes(env.storage?.usage ?? null)}, persisted ${yn(env.persisted)}, persist() ${
           env.persistRequest === null ? 'not asked' : String(env.persistRequest)
         }`,
   );
-  add('persistent-anchors', 'S11', 'typeof XRAnchor.prototype.requestPersistentHandle', env.requestPersistentHandle);
+  add(
+    'persistent-anchors',
+    'S11 (partial)',
+    'typeof XRAnchor.prototype.requestPersistentHandle (API presence only: no handle is created or restored)',
+    env.requestPersistentHandle,
+  );
   add('speech', '', "'webkitSpeechRecognition' in window", yn(env.webkitSpeechRecognition));
+
+  // S5 needs its own Quest session with Space Setup cleared, so it is answered
+  // from the latest session marked that way, whichever session the rest describes.
+  const finish = (): SummaryRow[] => {
+    let cleared: SessionRecord | null = null;
+    for (const x of report.sessions) if (!x.requestError && x.spaceSetup === 'no') cleared = x;
+    add(
+      'hit-test-no-space-setup',
+      'S5',
+      'Viewer hit-test in a session marked "Space Setup: no"',
+      ua.browser !== 'quest-browser'
+        ? 'n/a (S5 is a Quest 3 question)'
+        : cleared
+          ? `${describeHitTest(cleared.hitTest)} (session started ${cleared.startedAt})`
+          : 'no session marked "Space Setup: no" yet (see the S5 step in test/device-reports/README.md)',
+    );
+    return rows;
+  };
 
   const s = latestSession(report);
   if (!s) {
     add('session', '', 'AR session', 'no AR session yet');
-    return rows;
+    return finish();
   }
   if (s.requestError) {
     add('session', '', 'AR session', `requestSession failed: ${s.requestError}`);
-    return rows;
+    return finish();
   }
   const enabled = s.enabledFeatures;
   const has = (f: string) => (enabled ? yn(enabled.includes(f)) : 'unknown (enabledFeatures not exposed)');
+  add('space-setup-before', '', 'Space Setup done for this room before this session (picked on the 2D page)', s.spaceSetup || 'not recorded');
   add('features', 'S1/S2', 'session.enabledFeatures', enabled ? enabled.join(', ') || '(empty)' : 'not exposed');
   add('plane-detection', 'S1/S2', 'plane-detection granted', has('plane-detection'));
   add('mesh-detection', 'S1', 'mesh-detection granted', has('mesh-detection'));
@@ -671,25 +817,20 @@ export function summarizeReport(report: ProbeReport): SummaryRow[] {
     'plane-labels',
     'S1/S2',
     'Plane semanticLabel strings (max count seen)',
-    s.planesError ? s.planesError : formatCounts(maxLabelCounts(s.geometry, 'planes')),
+    describeDetection(s.detection.planes, 'frame.detectedPlanes', maxLabelCounts(s.geometry, 'planes'), firstNonEmptyAt(s.geometry, 'planes')),
   );
   add(
     'mesh-labels',
     'S1',
     'Mesh semanticLabel strings (max count seen)',
-    s.meshesError ? s.meshesError : formatCounts(maxLabelCounts(s.geometry, 'meshes')),
+    describeDetection(s.detection.meshes, 'frame.detectedMeshes', maxLabelCounts(s.geometry, 'meshes'), firstNonEmptyAt(s.geometry, 'meshes')),
   );
   const gm = largestGlobalMesh(s.geometry);
   add('global-mesh', 'S1', "'global mesh' size", gm ? `${gm[0]} vertices, ${gm[1]} indices (${Math.floor(gm[1] / 3)} triangles)` : 'not seen');
-  const h = s.hitTest;
-  add(
-    'hit-test',
-    'S2/S5',
-    'Viewer hit-test results',
-    h.source !== 'ok'
-      ? `source ${h.source}`
-      : `${h.framesWithHit}/${h.framesTested} frames had a hit; first hit after ${secs(h.firstHitAt)}`,
-  );
+  // Floor hit-test is an S2 question on Galaxy XR. On Quest it answers S5 only
+  // when Space Setup was cleared; with Space Setup done it is context.
+  const hitSpike = ua.browser === 'quest-browser' ? (s.spaceSetup === 'no' ? 'S5' : '') : ua.browser === 'chrome' ? 'S2' : '';
+  add('hit-test', hitSpike, `Viewer hit-test results (Space Setup before this session: ${s.spaceSetup || 'not recorded'})`, describeHitTest(s.hitTest));
   add('keyboard', 'S3', 'Focus a hidden <input> in AR', describeKeyboard(s.keyboard));
   add('keyboard-seen', 'S3', 'System keyboard appeared (observed)', observed(report, 'keyboardShown'));
   add('room-capture', 'S6', 'initiateRoomCapture()', describeRoomCapture(s.roomCapture));
@@ -704,13 +845,106 @@ export function summarizeReport(report: ProbeReport): SummaryRow[] {
   add('visibility', 'S3', 'Session visibility states seen', vis.length ? vis.join(', ') : 'visible only');
   add('resets', '', "Reference space 'reset' events", String(resets));
   add('inputs', '', 'Input sources', s.inputSources.length ? s.inputSources.join(' | ') : 'none recorded');
-  return rows;
+  return finish();
 }
 
 // --- AR panel layout -------------------------------------------------------------
 
 export const PANEL_W = 1024;
 export const PANEL_H = 640;
+
+/** Status text: monospace font size, row pitch, first row's top, and the flash line that the rows stop above. */
+export const PANEL_FONT_PX = 18;
+export const PANEL_ROW_PX = 24;
+export const PANEL_TEXT_TOP = 56;
+export const PANEL_FLASH_Y = 504;
+/** Rows that fit between PANEL_TEXT_TOP and the flash line (18). */
+export const PANEL_TEXT_ROWS = Math.floor((PANEL_FLASH_Y - PANEL_TEXT_TOP) / PANEL_ROW_PX);
+/** Characters per row at about 0.6 em per monospace glyph over PANEL_W - 40 px (91). drawPanel measures the real glyph width. */
+export const PANEL_TEXT_COLS = Math.floor((PANEL_W - 40) / (PANEL_FONT_PX * 0.6));
+/** A single status line wraps onto at most this many rows. */
+export const PANEL_ROWS_PER_LINE = 3;
+
+/**
+ * Word-wraps one line into rows of at most `cols` characters. Continuation
+ * rows are indented by two spaces; a word longer than a row is split.
+ */
+export function wrapColumns(text: string, cols: number): string[] {
+  const width = Math.max(8, Math.floor(cols));
+  if (text.length <= width) return [text];
+  const rows: string[] = [];
+  let cur = '';
+  for (const word of text.split(' ')) {
+    const sep = cur.trim() ? ' ' : '';
+    if (cur.length + sep.length + word.length <= width) {
+      cur += sep + word;
+      continue;
+    }
+    if (word.length <= width - 2) {
+      // Fits on a fresh continuation row (cur has content, or the first branch would have taken it).
+      rows.push(cur);
+      cur = `  ${word}`;
+      continue;
+    }
+    // Longer than any row: split it, starting on the current row.
+    let w = word;
+    if (cur.length + sep.length < width) {
+      cur += sep;
+    } else {
+      rows.push(cur);
+      cur = '  ';
+    }
+    while (w.length > width - cur.length) {
+      const n = width - cur.length;
+      rows.push(cur + w.slice(0, n));
+      w = w.slice(n);
+      cur = '  ';
+    }
+    cur += w;
+  }
+  if (cur.trim()) rows.push(cur);
+  return rows;
+}
+
+/**
+ * Fits status lines into `maxRows` rows of `cols` characters. Every line gets
+ * its first row before any line gets a second, so a long line high up can no
+ * longer push later lines off the panel; spare rows then go round-robin, top
+ * line first, up to `rowsPerLine` each. A cut line ends in '...'. Lines are
+ * dropped (from the end) only when there are more lines than rows.
+ */
+export function layoutPanelText(lines: readonly string[], cols: number, maxRows: number, rowsPerLine = PANEL_ROWS_PER_LINE): string[] {
+  const width = Math.max(8, Math.floor(cols));
+  const shown = Math.max(0, Math.min(lines.length, maxRows));
+  const wrapped = lines.slice(0, shown).map((l) => wrapColumns(l, width));
+  const take = wrapped.map(() => 1);
+  let spare = maxRows - shown;
+  for (let pass = 1; spare > 0 && pass < rowsPerLine; pass++) {
+    for (let i = 0; i < shown && spare > 0; i++) {
+      if (wrapped[i].length > take[i]) {
+        take[i]++;
+        spare--;
+      }
+    }
+  }
+  const out: string[] = [];
+  for (let i = 0; i < shown; i++) {
+    const rows = wrapped[i].slice(0, take[i]);
+    if (take[i] < wrapped[i].length) {
+      const lastRow = rows[rows.length - 1];
+      rows[rows.length - 1] = lastRow.length > width - 3 ? `${lastRow.slice(0, width - 3)}...` : `${lastRow}...`;
+    }
+    out.push(...rows);
+  }
+  return out;
+}
+
+function panelDetection(stat: DetectionStat, latest: string | null): string {
+  if (stat.skipped) return `not polled (${stat.skipped})`;
+  if (latest !== null) return latest;
+  if (stat.setTicks === 0) return `no set yet (${stat.missingTicks} missing, ${stat.throwTicks} threw)`;
+  return `missing on the last read (${stat.dropoutTicks} drop-outs so far)`;
+}
 
 export interface PanelButton {
   id: 'keyboard' | 'room' | 'recenter' | 'exit';
@@ -739,21 +973,24 @@ export function uvToPanelPx(u: number, v: number): [number, number] {
   return [u * PANEL_W, (1 - v) * PANEL_H];
 }
 
-/** Text lines for the in-AR status panel. `t` is ms since the session started. */
+/**
+ * Text lines for the in-AR status panel. `t` is ms since the session started.
+ * Live readouts come first because layoutPanelText hands spare rows out top
+ * first; static session facts and the input list follow, recent events last.
+ * Input profile lists are left to the JSON report.
+ */
 export function panelLines(s: SessionRecord, t: number): string[] {
   const last = s.ticks.length ? s.ticks[s.ticks.length - 1] : null;
   const g = s.geometry.length ? s.geometry[s.geometry.length - 1] : null;
   const lines: string[] = [];
   lines.push(`t ${(t / 1000).toFixed(0)} s   fps ${last ? last.fps : '-'}   ref ${s.referenceSpace ?? '-'}   vis ${last ? last.vis : '-'}`);
-  lines.push(`enabledFeatures: ${s.enabledFeatures ? s.enabledFeatures.join(', ') || '(empty)' : 'not exposed'}`);
-  lines.push(`domOverlayState: ${s.domOverlayState}   blend: ${s.environmentBlendMode ?? '-'}   rate: ${s.frameRate ?? '-'}`);
-  if (s.planesError) lines.push(`planes: ${s.planesError}`);
-  else lines.push(`planes: ${g && g.planes ? `${g.planes.count}  ${formatCounts(g.planes.labels)}` : 'none yet'}`);
-  if (s.meshesError) lines.push(`meshes: ${s.meshesError}`);
-  else
-    lines.push(
-      `meshes: ${g && g.meshes ? `${g.meshes.count}  ${formatCounts(g.meshes.labels)}  v ${g.meshes.totalVertices} i ${g.meshes.totalIndices}` : 'none yet'}`,
-    );
+  lines.push(`planes: ${panelDetection(s.detection.planes, g && g.planes ? `${g.planes.count}  ${formatCounts(g.planes.labels)}` : null)}`);
+  lines.push(
+    `meshes: ${panelDetection(
+      s.detection.meshes,
+      g && g.meshes ? `${g.meshes.count}  ${formatCounts(g.meshes.labels)}  v ${g.meshes.totalVertices} i ${g.meshes.totalIndices}` : null,
+    )}`,
+  );
   const gm = largestGlobalMesh(s.geometry);
   lines.push(`global mesh: ${gm ? `${gm[0]} vertices, ${gm[1]} indices` : 'not seen'}`);
   const h = s.hitTest;
@@ -765,7 +1002,9 @@ export function panelLines(s: SessionRecord, t: number): string[] {
   );
   lines.push(`keyboard: ${describeKeyboard(s.keyboard)}`);
   lines.push(`room capture: ${describeRoomCapture(s.roomCapture)}`);
-  lines.push(`inputs: ${s.inputSources.length ? s.inputSources.join(' | ') : 'none'}`);
+  lines.push(`enabledFeatures: ${s.enabledFeatures ? s.enabledFeatures.join(', ') || '(empty)' : 'not exposed'}`);
+  lines.push(`domOverlayState: ${s.domOverlayState}   blend: ${s.environmentBlendMode ?? '-'}   rate: ${s.frameRate ?? '-'}`);
+  lines.push(`inputs: ${s.inputSources.length ? s.inputSources.map((d) => d.replace(/ \[[^\]]*\]$/, '')).join(' | ') : 'none'}`);
   const recent = s.events.slice(-3).map((e) => `${(e.t / 1000).toFixed(1)}s ${e.type} ${e.detail}`);
   for (const r of recent) lines.push(`event: ${r}`);
   return lines;

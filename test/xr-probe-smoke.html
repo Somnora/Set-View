@@ -2,10 +2,12 @@
 <!-- Desktop smoke for the XR capability probe (test/xr-probe.html, roadmap P0.0).
      Loads the real probe markup and script against a scripted fake WebXR
      runtime (and stubbed navigator.storage) and drives it end to end: env
-     checks, persist(), two file reads, Enter AR, per-second sampling, the
-     sentinel anchor, Keyboard test, the two-press room capture (with a reset,
-     a visibility flip and a lost anchor), Exit AR and Download JSON. It checks
-     the saved report after each step and prints XR-PROBE-SMOKE PASS or FAIL.
+     checks, persist(), two file reads, Enter AR, per-second sampling (with
+     detected planes undefined and detected meshes throwing for the first
+     2.5 s, which must not stop the polling), the sentinel anchor, Keyboard
+     test, the two-press room capture (with a reset, a visibility flip and a
+     lost anchor), Exit AR and Download JSON. It checks the saved report after
+     each step and prints XR-PROBE-SMOKE PASS or FAIL.
 
        npx vite --config vite.http.config.ts
        chrome --headless=new --disable-gpu --enable-unsafe-swiftshader \
@@ -25,7 +27,7 @@
     <pre id="smoke-out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6;background:#000">running...</pre>
     <script type="module">
       const out = document.getElementById('smoke-out');
-      const KEY = 'setview.xrProbe.report.v1';
+      const KEY = 'setview.xrProbe.report.v2';
       const errors = [];
       window.addEventListener('error', (e) => errors.push(`error: ${e.message}`));
       window.addEventListener('unhandledrejection', (e) => errors.push(`rejection: ${e.reason && e.reason.message}`));
@@ -104,12 +106,23 @@
           { semanticLabel: 'global mesh', vertices: new Float32Array(3000), indices: new Uint32Array(6000), meshSpace: new FakeSpace(), lastChangedTime: 0 },
           { semanticLabel: 'table', vertices: new Float32Array(72), indices: new Uint32Array(36), meshSpace: new FakeSpace(), lastChangedTime: 0 },
         ]);
+        // Detected geometry is not ready until GEOMETRY_READY_MS after requestSession:
+        // planes read as undefined (three.js also reads that attribute every frame,
+        // so it must not throw) and meshes throw. The probe must keep polling.
+        const GEOMETRY_READY_MS = 2500;
+        let geometryReadyAt = Infinity;
+        const geometryReady = () => performance.now() >= geometryReadyAt;
         const frame = {
           getViewerPose: () => viewerPose,
           getPose: (space) => (space === targetRaySpace ? pose(aim) : space === anchorSpace ? pose(anchorPos) : null),
           getHitTestResults: () => [{ getPose: () => pose(translate(0, 0, -1.5)) }],
-          detectedPlanes: planes,
-          detectedMeshes: meshes,
+          get detectedPlanes() {
+            return geometryReady() ? planes : undefined;
+          },
+          get detectedMeshes() {
+            if (!geometryReady()) throw new DOMException('meshes not ready', 'InvalidStateError');
+            return meshes;
+          },
           trackedAnchors: tracked,
           createAnchor: () => {
             tracked.add(anchor);
@@ -196,6 +209,7 @@
             isSessionSupported: async (mode) => mode === 'immersive-ar',
             requestSession: async (_mode, init) => {
               lastInit = init;
+              geometryReadyAt = performance.now() + GEOMETRY_READY_MS;
               session = new FakeSession();
               return session;
             },
@@ -270,8 +284,16 @@
         check(noext.byteLength === 2 && noext.ascii === 'NG', 'extensionless read');
 
         // --- Enter AR and let it sample ---
+        $('space-setup').value = 'yes';
         $('enter').click();
-        await until(() => last().ticks.length >= 3 && last().anchor.created, 'AR sampling');
+        await until(
+          () =>
+            last().ticks.length >= 3 &&
+            last().anchor.created &&
+            last().detection.planes.setTicks >= 1 &&
+            last().detection.meshes.setTicks >= 1,
+          'AR sampling',
+        );
         check(lastInit && lastInit.requiredFeatures.join() === 'hit-test', 'hit-test must be the only required feature');
         for (const feat of ['anchors', 'hand-tracking', 'dom-overlay', 'local-floor', 'mesh-detection', 'plane-detection']) {
           check(lastInit.optionalFeatures.includes(feat), `optional feature ${feat} not requested`);
@@ -281,10 +303,28 @@
         check(s.referenceSpace === 'local-floor', `ref space ${s.referenceSpace}`);
         check(s.domOverlayState === 'null', `domOverlayState ${s.domOverlayState}`);
         check(s.persistentAnchors && s.persistentAnchors.count === 2 && s.persistentAnchors.blank === 1, 'persistentAnchors not read');
+        check(s.spaceSetup === 'yes', `spaceSetup ${s.spaceSetup}`);
         check(s.ticks.length >= 2, `only ${s.ticks.length} ticks`);
         check(s.ticks.at(-1).fps > 0, 'no frames counted');
-        check(s.geometry.length >= 1, 'no geometry sample');
-        const g = s.geometry[0];
+        check(s.ticks[0].t >= 1000, `first tick (and first geometry read) at ${s.ticks[0].t} ms, before 1 s`);
+        check(s.ticks.every((tk) => typeof tk.saveMs === 'number'), 'ticks lack saveMs');
+        const dp = s.detection.planes;
+        const dm = s.detection.meshes;
+        check(
+          dp.skipped === null && dp.missingTicks >= 1 && dp.throwTicks === 0 && dp.setTicks >= 1 && dp.firstSetAt >= GEOMETRY_READY_MS - 500,
+          `planes stopped polling after an undefined read: ${JSON.stringify(dp)}`,
+        );
+        check(
+          dm.skipped === null && dm.throwTicks >= 1 && /^InvalidStateError: meshes not ready$/.test(dm.error) && dm.setTicks >= 1,
+          `meshes stopped polling after a throw: ${JSON.stringify(dm)}`,
+        );
+        check(s.ticks[0].planes === null && s.ticks.at(-1).planes === 3, 'per-second plane counts did not recover');
+        check(
+          s.events.filter((e) => e.type === 'meshes' && /threw/.test(e.detail)).length === 1,
+          'a repeated mesh throw must be logged once',
+        );
+        const g = s.geometry.find((x) => x.planes && x.meshes);
+        check(g, 'no geometry sample with planes and meshes');
         check(g.planes.count === 3 && g.planes.labels.wall === 1 && g.planes.labels['(none)'] === 1, 'plane labels wrong');
         check(g.meshes.perMesh[0][0] === 'global mesh' && g.meshes.perMesh[0][1] === 1000, 'global mesh size wrong');
         check(s.anchor.created && s.ticks.at(-1).anchor === 1, 'sentinel anchor not created and tracked');
