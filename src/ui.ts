@@ -4481,7 +4481,7 @@ export function openGaussianSplatStudioModal(
   scene: SceneData,
   onSave: (scene: SceneData) => void,
   overlayRoot: HTMLElement = document.body,
-  onCloudModified?: (cloud: GaussianCloudData | null) => void,
+  onCloudPreview?: (cloud: GaussianCloudData | null) => void,
 ): void {
   // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
   // this can be selected again with one already open. Two stacked full-screen
@@ -4503,8 +4503,26 @@ export function openGaussianSplatStudioModal(
   let alignmentStatusMsg = '';
   let alignmentConfidence = 0;
 
+  // Nothing touches the scene until Save. Edits push a live preview to the
+  // renderer, and Extract Walls stages its result here; closing without Save
+  // puts the renderer back on the cloud the scene had when the studio opened.
+  const openedCloud =
+    scene.gaussianClouds?.find((c) => c.id === scene.activeSplatCloudId) ?? scene.gaussianClouds?.[0] ?? null;
+  let stagedArchitecture: SceneData['architecture'] | null = null;
+  let previewed = false;
+  const onCloudModified = onCloudPreview
+    ? (cloud: GaussianCloudData | null) => {
+        previewed = true;
+        onCloudPreview(cloud);
+      }
+    : undefined;
+
   const close = () => {
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+  };
+  const cancel = () => {
+    if (previewed) onCloudPreview?.(openedCloud);
+    close();
   };
 
   const getActiveCloud = (): GaussianCloudData | null => {
@@ -4664,8 +4682,8 @@ export function openGaussianSplatStudioModal(
     `;
 
     // Wire up events
-    dialog.querySelector('#splat-close-btn')!.addEventListener('click', close);
-    dialog.querySelector('#splat-cancel-btn')!.addEventListener('click', close);
+    dialog.querySelector('#splat-close-btn')!.addEventListener('click', cancel);
+    dialog.querySelector('#splat-cancel-btn')!.addEventListener('click', cancel);
 
     const cloudSelect = dialog.querySelector<HTMLSelectElement>('#splat-cloud-select');
     if (cloudSelect) {
@@ -4767,7 +4785,7 @@ export function openGaussianSplatStudioModal(
     const autoAlignBtn = dialog.querySelector<HTMLButtonElement>('#splat-autoalign-btn');
     if (autoAlignBtn && cloud) {
       autoAlignBtn.onclick = () => {
-        const result = alignSplatCloudToFloorplan(cloud, scene.architecture);
+        const result = alignSplatCloudToFloorplan(cloud, stagedArchitecture ?? scene.architecture);
         cloud.transform = result.alignedTransform;
         cloud.floorAlignment = {
           floorHeightY: result.floorHeightY,
@@ -4786,11 +4804,15 @@ export function openGaussianSplatStudioModal(
     if (extractWallsBtn && cloud) {
       extractWallsBtn.onclick = () => {
         const arch = fitArchitecturalPlanesFromSplats(cloud, 8);
-        if (!scene.architecture) {
-          scene.architecture = arch;
+        // Staged, not written to the scene: Save commits it with the clouds as
+        // one undo step, and Cancel leaves scene.architecture untouched.
+        const base = stagedArchitecture ?? scene.architecture;
+        if (!base) {
+          stagedArchitecture = arch;
         } else {
-          scene.architecture.walls = arch.walls;
-          scene.architecture.ceilingHeightM = arch.ceilingHeightM;
+          stagedArchitecture = JSON.parse(JSON.stringify(base)) as NonNullable<SceneData['architecture']>;
+          stagedArchitecture.walls = arch.walls;
+          stagedArchitecture.ceilingHeightM = arch.ceilingHeightM;
         }
         const ceilStr = arch.ceilingHeightM !== undefined ? `${arch.ceilingHeightM.toFixed(2)}m` : 'N/A';
         alignmentStatusMsg = `Extracted ${arch.walls.length} architectural perimeter walls and ceiling at ${ceilStr}.`;
@@ -4863,6 +4885,7 @@ export function openGaussianSplatStudioModal(
     saveBtn.onclick = () => {
       scene.gaussianClouds = localClouds.map((c) => normalizeGaussianCloud(c));
       scene.activeSplatCloudId = activeCloudId || (scene.gaussianClouds.length > 0 ? scene.gaussianClouds[0].id : undefined);
+      if (stagedArchitecture) scene.architecture = stagedArchitecture;
       onSave(scene);
       close();
     };

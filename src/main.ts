@@ -3102,6 +3102,13 @@ class App {
     }
   }
 
+  /** Points the splat renderer at the scene's active cloud and floorplan. */
+  private applySplatState(data: SceneData): void {
+    const clouds = data.gaussianClouds ?? [];
+    this.splatRenderer.setCloud(clouds.find((c) => c.id === data.activeSplatCloudId) ?? clouds[0] ?? null);
+    this.splatRenderer.setFloorplanOverlay(data.architecture ?? null);
+  }
+
   private openSplatStudioDialog(sceneToUse?: SceneData): void {
     const host = this.studioHost('3DGS Studio');
     if (!host) return;
@@ -3109,17 +3116,21 @@ class App {
     openGaussianSplatStudioModal(
       sc,
       (updated) => {
-        if (sc.id === this.sceneData.id) {
-          this.sceneData = updated;
-          this.loadScene(this.sceneData);
-          this.persistence.saveNow(this.sceneData);
-          this.markDirty();
-        } else {
-          this.persistence.saveNow(updated);
-        }
-        this.refreshLanding();
+        // A normal undo step. This used to run loadScene, whose history.reset
+        // wiped the whole undo stack on every save. Only the splat renderer
+        // reads these fields, so actors, cameras and their anchors stay put.
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.gaussianClouds = updated.gaussianClouds;
+            t.activeSplatCloudId = updated.activeSplatCloudId;
+            t.architecture = updated.architecture;
+          },
+          () => this.applySplatState(this.sceneData),
+        );
       },
       host,
+      // Live preview while editing; Cancel sends the opening cloud back here.
       (cloud) => {
         if (sc.id === this.sceneData.id) this.splatRenderer.setCloud(cloud);
       },

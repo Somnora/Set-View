@@ -11503,6 +11503,23 @@ test('P0.15 Set Dressing: an applied AI scatter survives the modal Save (no stal
   assert.equal(staged.settledItems.length, aiItems.length);
 });
 
+test('P0.13 Splat studio save as one undo step: History restores the previous cloud count', () => {
+  // main.ts now commits the studio with markDirty (history.record) instead of
+  // loadScene (history.reset). This pins the contract that path relies on.
+  const scene = normalizeScene(createScene('splat undo'));
+  const h = new History();
+  h.reset(scene);
+  createActor(scene, { x: 1, y: 0, z: 0 }, 0); // an earlier edit (adds itself to the scene)
+  h.record(scene);
+  scene.gaussianClouds = [generateSyntheticScoutSplatCloud('scout', 200)];
+  scene.activeSplatCloudId = scene.gaussianClouds[0].id;
+  h.record(scene);
+  const undone = h.undo()!;
+  assert.equal(undone.gaussianClouds?.length ?? 0, 0, 'undo removes the imported cloud');
+  assert.equal(undone.actors.length, 1, 'the edit before the import is still there');
+  assert.ok(h.canUndo, 'earlier history survives the studio save');
+});
+
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(
 
   () => {

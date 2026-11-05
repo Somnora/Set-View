@@ -1,0 +1,310 @@
+<!doctype html>
+<!-- Studio modal smoke (Phase 0: P0.1, P0.13, P0.15). Boots the real app and
+     drives the studio modals through the actual DOM:
+
+       P0.1  3DGS, ICVFX, Set Dressing and Prop Library open from the landing
+             page and the desktop preview toolbar, mount on document.body (not
+             the hidden #overlay), have a non-zero rect, and elementFromPoint at
+             their visible centre lands inside the dialog. A studio opened for a
+             scene that is NOT current saves that scene, not the current one.
+       P0.13 3DGS Studio Cancel after Extract Walls leaves scene.architecture
+             untouched; Save stores the synthetic cloud.
+       P0.15 A Gemini key embedded in a stored scene is moved to the device
+             setting at boot; a key typed in Set Dressing is stored per device
+             and never in the scene; offline NLP "add a desk" adds a prop; an AI
+             scatter survives a later Save.
+
+     It also checks the in-AR CSS contract (#overlay stays click-through, each
+     studio root inside it takes pointer events back). The AR routing itself
+     (mount in #overlay with dom-overlay, refuse on the wheel without it) needs
+     a real session: on-headset only.
+
+     Undo after a 3DGS save is not reachable from the DOM (it lives on the 3D
+     wheel and wrist), so that half of P0.13 is a domain test plus on-headset.
+
+     WARNING: clears localStorage for the origin it runs on (like the marks
+     smoke). Use the HTTP config's localhost:5174 origin, not the one you keep
+     scenes in.
+
+     Run with the HTTP config (automation browsers reject basic-ssl's cert):
+       npx vite --config vite.http.config.ts
+       open http://localhost:5174/test/studio-modal-smoke.html
+     Headless (IndexedDB may never open headlessly on this Mac, in which case
+     the Prop Library checks report SKIP after the store's 4 s watchdog):
+       chrome --headless=new --disable-gpu --enable-unsafe-swiftshader \
+         --user-data-dir=<fresh dir> --window-size=1280,900 \
+         --virtual-time-budget=40000 --dump-dom \
+         http://localhost:5174/test/studio-modal-smoke.html > out.html
+       grep -o "STUDIO-SMOKE [A-Z]*" out.html
+-->
+<html>
+  <head><meta charset="utf-8" /><title>studio modal smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:100000;color:#9f6;background:#000c;max-width:60vw;white-space:pre-wrap;font-size:11px">running…</pre>
+    <script type="module">
+      import { createScene } from '../src/model.ts';
+
+      const out = document.getElementById('out');
+      const lines = [];
+      let failed = false;
+      let skipped = 0;
+      const check = (cond, msg) => {
+        lines.push(`${cond ? 'ok  ' : 'FAIL'} ${msg}`);
+        if (!cond) failed = true;
+      };
+      const skip = (msg) => {
+        lines.push(`SKIP ${msg}`);
+        skipped++;
+      };
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const stored = (id) => JSON.parse(localStorage.getItem('setview.scene.' + id));
+      const buttonByText = (root, text) =>
+        Array.from(root.querySelectorAll('button')).find((b) => b.textContent.trim() === text);
+      const waitFor = async (fn, ms = 2000) => {
+        const end = performance.now() + ms;
+        for (;;) {
+          const v = fn();
+          if (v || performance.now() > end) return v;
+          await sleep(50);
+        }
+      };
+
+      // Mounted on body, visible, and the topmost element at its visible centre.
+      const assertUsable = (rootSel, dialogSel, label) => {
+        const root = document.querySelector(rootSel);
+        if (!root) {
+          check(false, `${label}: ${rootSel} not mounted`);
+          return null;
+        }
+        check(root.parentElement === document.body, `${label}: mounted on body (parent ${root.parentElement?.id || root.parentElement?.tagName})`);
+        const dlg = root.querySelector(dialogSel) ?? root;
+        const r = dlg.getBoundingClientRect();
+        check(r.width > 0 && r.height > 0, `${label}: rect ${Math.round(r.width)}x${Math.round(r.height)}`);
+        const top = Math.max(r.top, 0);
+        const bottom = Math.min(r.bottom, innerHeight);
+        const hit = document.elementFromPoint(r.left + r.width / 2, (top + bottom) / 2);
+        check(!!hit && dlg.contains(hit), `${label}: centre hit inside dialog (${hit ? hit.tagName + '.' + hit.className : 'null'})`);
+        return root;
+      };
+
+      try {
+        // --- seed: current scene A (with an old-style embedded key) + scene B ---
+        localStorage.clear();
+        const a = JSON.parse(JSON.stringify(createScene('smoke A')));
+        a.setDressing.aiConfig.apiKey = 'AIzaSy-SEEDED';
+        const b = createScene('smoke B');
+        const t0 = Date.now() - 60_000;
+        a.updatedAt = t0;
+        b.updatedAt = t0 - 1000;
+        localStorage.setItem('setview.scene.' + a.id, JSON.stringify(a));
+        localStorage.setItem('setview.scene.' + b.id, JSON.stringify(b));
+        localStorage.setItem('setview.currentScene', a.id);
+        localStorage.setItem(
+          'setview.sceneIndex',
+          JSON.stringify([
+            { id: a.id, name: a.name, updatedAt: a.updatedAt, actors: 0, cameras: 0 },
+            { id: b.id, name: b.name, updatedAt: b.updatedAt, actors: 0, cameras: 0 },
+          ]),
+        );
+
+        await import('../src/main.ts');
+        await sleep(400);
+
+        // --- P0.15 migration ran at boot, before any save ---
+        check(localStorage.getItem('setview.geminiApiKey') === 'AIzaSy-SEEDED', 'P0.15 embedded key moved to the device setting at boot');
+        check(localStorage.getItem('setview.geminiApiKeyMigrated') === '1', 'P0.15 migration flag set');
+
+        const landing = document.getElementById('landing');
+        const rowFor = (name) =>
+          Array.from(landing.querySelectorAll('.scene')).find((r) => r.querySelector('.load b')?.textContent === name);
+        const prepButton = (name, text) => {
+          const row = rowFor(name);
+          const det = row?.querySelector('details.prep');
+          if (det) det.open = true;
+          return det ? buttonByText(det, text) : undefined;
+        };
+
+        // --- P0.1 landing: toolbar 3DGS + Prop Library, scene-card ICVFX + Set Dressing ---
+        buttonByText(landing, '✨ 3DGS Studio')?.click();
+        await sleep(100);
+        assertUsable('.splat-modal-overlay', '.splat-modal-dialog', 'landing 3DGS');
+        document.querySelector('#splat-close-btn')?.click();
+
+        prepButton('smoke A', '🎬 ICVFX Volume')?.click();
+        await sleep(100);
+        assertUsable('.icvfx-modal-overlay', '.icvfx-modal-dialog', 'landing ICVFX');
+        document.querySelector('.icvfx-modal-overlay')?.remove();
+
+        prepButton('smoke A', '🎲 Set Dressing')?.click();
+        await sleep(100);
+        assertUsable('.dressing-modal-overlay', '.dressing-modal-dialog', 'landing Set Dressing');
+        document.querySelector('.dressing-modal-overlay')?.remove();
+
+        buttonByText(landing, '📦 Prop Library')?.click();
+        const props = await waitFor(() => document.querySelector('.props-modal-overlay'), 6000);
+        if (props) {
+          assertUsable('.props-modal-overlay', '.props-modal-dialog', 'landing Prop Library');
+          props.remove();
+        } else {
+          skip('landing Prop Library: IndexedDB listAssets never settled in this browser');
+        }
+
+        // --- P0.1 wrong-scene: ICVFX opened for scene B saves B, not A ---
+        const aBefore = stored(a.id).updatedAt;
+        const bBefore = stored(b.id).updatedAt;
+        prepButton('smoke B', '🎬 ICVFX Volume')?.click();
+        await sleep(100);
+        const icvfxB = document.querySelector('.icvfx-modal-overlay');
+        check(!!icvfxB, 'ICVFX for scene B opened');
+        document.querySelector('#icvfx-save-btn')?.click();
+        await sleep(100);
+        check(stored(b.id).updatedAt > bBefore, 'non-current ICVFX save wrote scene B');
+        check(stored(a.id).updatedAt === aBefore, 'non-current ICVFX save left current scene A untouched');
+
+        // --- P0.13: Extract Walls then Cancel leaves architecture alone; Save stores the cloud ---
+        const wallsOf = (sc) => JSON.stringify({ walls: sc.architecture?.walls ?? [], ceiling: sc.architecture?.ceilingHeightM ?? null });
+        const wallsBefore = wallsOf(stored(a.id));
+        prepButton('smoke A', '✨ 3DGS Scout Studio')?.click();
+        await sleep(100);
+        document.querySelector('#splat-synthetic-btn')?.click();
+        await sleep(100);
+        const extract = document.querySelector('#splat-extract-walls-btn');
+        check(!!extract, 'Extract Walls available after adding the synthetic cloud');
+        extract?.click();
+        await sleep(100);
+        document.querySelector('#splat-cancel-btn')?.click();
+        await sleep(50);
+        check(!document.querySelector('.splat-modal-overlay'), '3DGS Cancel closes the studio');
+        // Force a save of the live scene so any in-memory architecture change would land on disk.
+        prepButton('smoke A', '🎬 ICVFX Volume')?.click();
+        await sleep(100);
+        document.querySelector('#icvfx-save-btn')?.click();
+        await sleep(100);
+        check(wallsOf(stored(a.id)) === wallsBefore, 'P0.13 Cancel left scene.architecture unchanged');
+        check((stored(a.id).gaussianClouds ?? []).length === 0, 'P0.13 Cancel stored no cloud');
+
+        prepButton('smoke A', '✨ 3DGS Scout Studio')?.click();
+        await sleep(100);
+        document.querySelector('#splat-synthetic-btn')?.click();
+        await sleep(100);
+        document.querySelector('#splat-save-btn')?.click();
+        await sleep(100);
+        const afterSave = stored(a.id);
+        check((afterSave.gaussianClouds ?? []).length === 1, 'P0.13 Save stored the synthetic cloud');
+        check(afterSave.activeSplatCloudId === afterSave.gaussianClouds?.[0]?.id, 'P0.13 Save set the active cloud');
+        check(!!rowFor('smoke A'), 'landing still lists the scene after the 3DGS save');
+
+        // --- P0.15 Set Dressing: device key, offline AI add, AI scatter survives Save ---
+        prepButton('smoke A', '🎲 Set Dressing')?.click();
+        await sleep(100);
+        const keyInput = document.querySelector('#input-gemini-key');
+        check(keyInput?.value === 'AIzaSy-SEEDED', 'key input shows the migrated device key');
+        check(!keyInput?.outerHTML.includes('AIzaSy-SEEDED'), 'key is not interpolated into the markup');
+        keyInput.value = '  AIzaSy-TYPED  ';
+        keyInput.dispatchEvent(new Event('change'));
+        check(localStorage.getItem('setview.geminiApiKey') === 'AIzaSy-TYPED', 'typed key stored per device (trimmed)');
+        // Clear it again so Run AI Director takes the offline path (no network in a smoke).
+        keyInput.value = '';
+        keyInput.dispatchEvent(new Event('change'));
+        check(localStorage.getItem('setview.geminiApiKey') === null, 'clearing the input removes the device key');
+
+        const runAi = async (prompt) => {
+          document.querySelector('#nl-director-prompt').value = prompt;
+          document.querySelector('#btn-run-ai-director').click();
+          await waitFor(() => {
+            const btn = document.querySelector('#btn-apply-mutations');
+            return btn && !btn.disabled ? btn : null;
+          });
+          document.querySelector('#btn-apply-mutations')?.click();
+          await sleep(100);
+        };
+        // Scatter FIRST in this freshly opened modal: its staged config is still a
+        // separate copy, which is exactly when the old Apply overwrote the scatter.
+        await runAi('scatter cyberpunk alley props');
+        const scattered = stored(a.id).setDressing;
+        check(scattered.activeTheme === 'cyberpunk_alley' && scattered.settledItems.length > 0, `P0.15 AI scatter kept after Apply (${scattered.settledItems.length} items)`);
+        const exportTab = Array.from(document.querySelectorAll('.dressing-tab-btn')).find((t) => t.textContent.includes('Manifest'));
+        exportTab?.click();
+        await sleep(50);
+        document.querySelector('#btn-save-dressing-config')?.click();
+        await sleep(100);
+        const saved = stored(a.id).setDressing;
+        check(
+          saved.activeTheme === 'cyberpunk_alley' && saved.settledItems.length === scattered.settledItems.length,
+          'P0.15 AI scatter survived Save (no stale overwrite)',
+        );
+
+        // Save closed the modal; reopen for the offline prop add.
+        prepButton('smoke A', '🎲 Set Dressing')?.click();
+        await sleep(100);
+        const propsBefore = (stored(a.id).props ?? []).length;
+        await runAi('add a desk');
+        check((stored(a.id).props ?? []).length === propsBefore + 1, 'P0.15 offline "add a desk" saved one new prop');
+        document.querySelector('.dressing-modal-overlay')?.remove();
+        const allStored = Object.keys(localStorage)
+          .filter((k) => k.startsWith('setview.scene.'))
+          .map((k) => localStorage.getItem(k))
+          .join('');
+        check(!stored(a.id).setDressing.aiConfig.apiKey && !JSON.stringify(stored(a.id)).includes('apiKey'), 'P0.15 saved scene carries no apiKey');
+        check(!allStored.includes('AIzaSy-TYPED'), 'typed key never reached stored scenes');
+
+        // --- P0.1 desktop preview toolbar ---
+        buttonByText(rowFor('smoke A'), 'Preview')?.click();
+        await sleep(300);
+        const bar = document.querySelector('.preview-bar');
+        check(!!bar, 'preview toolbar shown');
+        if (bar) {
+          buttonByText(bar, '🎬 ICVFX')?.click();
+          await sleep(100);
+          assertUsable('.icvfx-modal-overlay', '.icvfx-modal-dialog', 'preview ICVFX');
+          document.querySelector('.icvfx-modal-overlay')?.remove();
+
+          buttonByText(bar, '🎲 Dressing')?.click();
+          await sleep(100);
+          assertUsable('.dressing-modal-overlay', '.dressing-modal-dialog', 'preview Set Dressing');
+          document.querySelector('.dressing-modal-overlay')?.remove();
+
+          buttonByText(bar, '📦 Props')?.click();
+          const p2 = await waitFor(() => document.querySelector('.props-modal-overlay'), 6000);
+          if (p2) {
+            assertUsable('.props-modal-overlay', '.props-modal-dialog', 'preview Prop Library');
+            p2.remove();
+          } else {
+            skip('preview Prop Library: IndexedDB listAssets never settled in this browser');
+          }
+          buttonByText(bar, '✕ Close')?.click();
+        }
+
+        // --- P0.1 in-AR CSS contract: #overlay stays click-through, each studio
+        // root mounted inside it takes pointer events back (no XR session here,
+        // so this checks the computed style only).
+        const overlayRoot = document.getElementById('overlay');
+        check(getComputedStyle(overlayRoot).pointerEvents === 'none', '#overlay itself stays pointer-events:none');
+        const roots = [
+          'ai-modal-overlay', 'props-modal-overlay', 'livelink-modal-overlay', 'actor-studio-overlay',
+          'grip-studio-overlay', 'splat-modal-overlay', 'perf-modal-overlay', 'dailies-modal-overlay',
+          'dmx-modal-overlay', 'icvfx-modal-overlay', 'acoustics-modal-overlay', 'solar-modal-overlay',
+          'screenplay-modal-overlay', 'profiler-modal-overlay', 'comfort-modal-overlay', 'dressing-modal-overlay',
+        ];
+        const blocked = roots.filter((cls) => {
+          const d = document.createElement('div');
+          d.className = cls;
+          overlayRoot.appendChild(d);
+          const pe = getComputedStyle(d).pointerEvents;
+          d.remove();
+          return pe !== 'auto';
+        });
+        check(blocked.length === 0, `studio roots under #overlay take pointer events${blocked.length ? ` (not: ${blocked.join(', ')})` : ''}`);
+
+        const verdict = failed ? 'FAIL' : 'PASS';
+        out.textContent = `STUDIO-SMOKE ${verdict}${skipped ? ` (${skipped} skipped)` : ''}\n${lines.join('\n')}`;
+        if (failed) out.style.color = '#f66';
+      } catch (e) {
+        out.textContent = `STUDIO-SMOKE ERROR ${e.message}\n${lines.join('\n')}`;
+        out.style.color = '#f66';
+      }
+    </script>
+  </body>
+</html>
