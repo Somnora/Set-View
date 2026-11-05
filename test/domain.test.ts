@@ -557,6 +557,23 @@ import {
 } from '../src/setDressingEngine.ts';
 import * as xrProbe from './xr-probe-core.ts';
 import * as probeFs from 'node:fs';
+import {
+  buildSceneFile,
+  decodeSceneFileBytes,
+  formatBytes,
+  formatStorageLine,
+  parseSceneFile,
+  Persistence,
+} from '../src/persistence.ts';
+import {
+  COMPRESSED_PLY_MESSAGE,
+  MAX_INLINE_SPLATS,
+  SPLAT_HEADER_SNIFF_BYTES,
+  sniffSplatFile,
+  splatImportRefusal,
+} from '../src/gaussianSplat.ts';
+import { SPLAT_BUDGET_STEP, stepSplatBudget } from '../src/performanceGovernor.ts';
+import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
 
 
 let passed = 0;
@@ -9474,7 +9491,7 @@ test('icvfx: generateOpenUsdLedVolume export generation', () => {
 test('icvfx: multi-user collaboration patch sync', () => {
   const scene = createScene('ICVFX Stage Test');
   assert.ok(scene.icvfx);
-  assert.equal(scene.icvfx.enabled, true);
+  assert.equal(scene.icvfx.enabled, false); // P0.10: new scenes start without the LED volume
 
   // Collab patch: icvfx_update
   const newConfig = createLedVolumeConfig('commercial_180');
@@ -12315,16 +12332,524 @@ test('P0.7 locationMode: removing the scan drops the mode, so the next scan star
   assert.equal(normalizeScene(reloaded).locationMode, 'ghost');
 });
 
-void Promise.all([scanStoreFallback(), propStoreFallback()]).then(
+// --- P0 data ---
+
+/** Minimal synchronous Storage for exercising Persistence in Node. */
+class P0MemoryStorage {
+  private map = new Map<string, string>();
+  failWrites = false;
+  get length(): number {
+    return this.map.size;
+  }
+  key(i: number): string | null {
+    return [...this.map.keys()][i] ?? null;
+  }
+  getItem(k: string): string | null {
+    return this.map.get(k) ?? null;
+  }
+  setItem(k: string, v: string): void {
+    if (this.failWrites) throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    this.map.set(k, String(v));
+  }
+  removeItem(k: string): void {
+    this.map.delete(k);
+  }
+  clear(): void {
+    this.map.clear();
+  }
+}
+
+/** Installs the shim for the duration of fn only (synchronous, so no other test sees it). */
+function withP0MemoryStorage(fn: (storage: P0MemoryStorage) => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const storage = new P0MemoryStorage();
+  Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true, writable: true });
+  try {
+    fn(storage);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+}
+
+/** A scene carrying the synthetic room scan with two moved pieces and one stale placement. */
+function p0SceneWithMovedFurniture(): { scene: SceneData; scan: LocationScan } {
+  const scan = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+  const scene = createScene('Furniture Round Trip');
+  scene.scan = summarizeScan(scan);
+  const last = scan.meshes.length - 1;
+  scene.scan.furniture = [
+    { meshIndex: last, dx: 0.75, dz: -0.5, rotY: 0.4 },
+    { meshIndex: last - 1, dx: -1.25, dz: 0.3, rotY: -1.1 },
+    { meshIndex: scan.meshes.length + 3, dx: 1, dz: 1, rotY: 0 }, // points past the mesh list
+  ];
+  return { scene, scan };
+}
+
+test('P0.8: furniture placements survive export then import, and mesh order is stable', () => {
+  const { scene, scan } = p0SceneWithMovedFurniture();
+  const text = JSON.stringify(buildSceneFile(scene, scan), null, 2);
+  const parsed = parseSceneFile(text);
+  assert.ok(parsed, 'an exported scene must parse back');
+  const imported = parsed.scene;
+  assert.notEqual(imported.id, scene.id); // a fresh id never clobbers the source scene
+  assert.ok(imported.name.endsWith('(imported)'));
+  assert.equal(parsed.scanDropped, false);
+  assert.ok(parsed.scan && imported.scan);
+  assert.equal(imported.scan.id, parsed.scan.id);
+  assert.notEqual(parsed.scan.id, scan.id); // fresh blob id
+  // The two in-range placements come back unchanged; the stale one is dropped.
+  assert.deepEqual(imported.scan.furniture, scene.scan!.furniture!.slice(0, 2));
+  // Placements index meshes, so the codec must keep mesh order and contents.
+  assert.equal(parsed.scan.meshes.length, scan.meshes.length);
+  for (let i = 0; i < scan.meshes.length; i++) {
+    assert.equal(parsed.scan.meshes[i].label, scan.meshes[i].label);
+    assert.deepEqual(Array.from(parsed.scan.meshes[i].positions), Array.from(scan.meshes[i].positions));
+    assert.deepEqual(Array.from(parsed.scan.meshes[i].indices), Array.from(scan.meshes[i].indices));
+  }
+  // The base64 never rides along into the scene that gets saved.
+  assert.equal('scanData' in imported, false);
+
+  // ...and the placements persist through a save and reload (in-memory Storage shim).
+  withP0MemoryStorage(() => {
+    const p = new Persistence();
+    assert.equal(p.saveNow(imported), true);
+    const reloaded = p.loadScene(imported.id);
+    assert.ok(reloaded?.scan);
+    assert.deepEqual(reloaded.scan.furniture, imported.scan!.furniture);
+  });
+});
+
+test('P0.8: an import with a summary but no geometry drops the scan instead of dangling', () => {
+  const { scene } = p0SceneWithMovedFurniture();
+  const parsed = parseSceneFile(JSON.stringify(buildSceneFile(scene, null)));
+  assert.ok(parsed);
+  assert.equal(parsed.scan, null);
+  assert.equal(parsed.scene.scan, null);
+  assert.equal(parsed.scanDropped, true);
+  assert.equal(parseSceneFile('{"name":"not a scene"}'), null);
+  assert.equal(parseSceneFile('not json at all'), null);
+});
+
+test('P0.8: a null or empty file read is "blocked", not "corrupt"', () => {
+  assert.equal(decodeSceneFileBytes(null), null);
+  assert.equal(decodeSceneFileBytes(undefined), null);
+  assert.equal(decodeSceneFileBytes(new ArrayBuffer(0)), null);
+  const bytes = new TextEncoder().encode('{"a":"é"}');
+  assert.equal(decodeSceneFileBytes(bytes.buffer as ArrayBuffer), '{"a":"é"}');
+});
+
+// Async: run from the final Promise.all, so its result is part of the reported total
+// (test() does not await, so it would print a check mark before any assertion ran).
+async function p0ImportReadsTest(): Promise<void> {
+  const p = new Persistence();
+  const blocked = {
+    name: 'scene.setview.json',
+    size: 2048,
+    arrayBuffer: () => Promise.reject(new Error('NotReadableError')),
+  } as unknown as File;
+  const r1 = await p.importScene(blocked);
+  assert.equal(r1.ok, false);
+  if (!r1.ok) {
+    assert.equal(r1.reason, 'blocked');
+    assert.ok(r1.message.includes('blocked'));
+  }
+  const empty = { name: 'empty.json', size: 0, arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) } as unknown as File;
+  const r2 = await p.importScene(empty);
+  assert.equal(r2.ok === false && r2.reason, 'blocked');
+  const notScene = {
+    name: 'other.json',
+    size: 16,
+    arrayBuffer: () => Promise.resolve(new TextEncoder().encode('{"hello":1}').buffer),
+  } as unknown as File;
+  const r3 = await p.importScene(notScene);
+  assert.equal(r3.ok === false && r3.reason, 'invalid');
+  // P0.9: Node has no navigator.storage, and the request is made once per page.
+  assert.equal(await p.requestPersistentStorage(), 'unsupported');
+  assert.equal(await p.requestPersistentStorage(), 'already-asked');
+}
+
+/** Async: Add Test Room looks up the live scene after the scan blob is written. */
+async function p0SyntheticScanLiveTest(): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: new P0MemoryStorage(), configurable: true, writable: true });
+  try {
+    const p = new Persistence();
+    p.onError = () => {}; // the Node scan store is memory-only and says so
+    const before = createScene('Test Room');
+    assert.equal(p.saveNow(before), true);
+    let live: SceneData = before;
+    const pending = p.attachSyntheticScan(before.id, () => live);
+    // An undo or restore replaces the live object while the blob write is pending.
+    const restored = normalizeScene(JSON.parse(JSON.stringify(before)) as SceneData);
+    live = restored;
+    const res = await pending;
+    assert.ok(res);
+    assert.equal(res.scene, restored, 'the scan goes onto the scene that is live now');
+    assert.equal(before.scan, null, 'the replaced object is not written');
+    assert.equal(restored.scan?.id, res.scan.id);
+    assert.equal(p.loadScene(before.id)?.scan?.id, res.scan.id);
+    // A scene that is not live gets the stored copy.
+    const other = createScene('Other');
+    assert.equal(p.saveNow(other), true);
+    const res2 = await p.attachSyntheticScan(other.id, () => live);
+    assert.ok(res2 && res2.scene !== live);
+    assert.equal(p.loadScene(other.id)?.scan?.id, res2.scan.id);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+}
+
+test('P0.8: after a failed save, Export hands out the in-memory scene, not the stale stored copy', () => {
+  withP0MemoryStorage((storage) => {
+    const p = new Persistence();
+    const errors: string[] = [];
+    p.onError = (m) => errors.push(m);
+    const scene = createScene('Quota Victim');
+    assert.equal(p.saveNow(scene), true);
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim');
+
+    scene.name = 'Quota Victim (edited)';
+    storage.failWrites = true;
+    assert.equal(p.saveNow(scene), false);
+    assert.equal(errors.length, 1);
+    const storedCopy = JSON.parse(storage.getItem(`setview.scene.${scene.id}`) ?? '{}') as { name?: string };
+    assert.equal(storedCopy.name, 'Quota Victim'); // storage holds the old copy
+    assert.equal(p.loadScene(scene.id)?.name, 'Quota Victim (edited)'); // reopening gets the newer one
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
+
+    // A scene that never saved at all (e.g. a failed import) can still be exported.
+    const neverSaved = createScene('Never Saved');
+    assert.equal(p.saveNow(neverSaved), false);
+    assert.equal(storage.getItem(`setview.scene.${neverSaved.id}`), null);
+    assert.equal(p.sceneForExport(neverSaved.id), neverSaved);
+
+    // The live scene always wins for its own id; other ids fall through.
+    const live = createScene('Live');
+    assert.equal(p.sceneForExport(live.id, live), live);
+    assert.equal(p.sceneForExport(scene.id, live)?.name, 'Quota Victim (edited)');
+
+    // Once a save succeeds again, export reads storage as before.
+    storage.failWrites = false;
+    assert.equal(p.saveNow(scene), true);
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
+    assert.notEqual(p.sceneForExport(scene.id), scene); // a fresh load, not the cached object
+  });
+});
+
+test('P0.8: a scene whose save failed gets a landing row (with Export), and reopening it keeps the edits', () => {
+  withP0MemoryStorage((storage) => {
+    const p = new Persistence();
+    p.onError = () => {};
+    const stored = createScene('Stored');
+    assert.equal(p.saveNow(stored), true);
+    assert.deepEqual(
+      p.listScenesForLanding(stored).map((e) => [e.name, !!e.unsaved]),
+      [['Stored', false]],
+    );
+
+    // An import (or New, or Dup) that does not fit never reaches the index...
+    storage.failWrites = true;
+    const imported = createScene('Big Import (imported)');
+    assert.equal(p.saveNow(imported), false);
+    assert.equal(p.listScenes().some((e) => e.id === imported.id), false);
+    // ...but the landing still lists it, flagged, so its Export button exists.
+    const rows = p.listScenesForLanding(imported);
+    const row = rows.find((e) => e.id === imported.id);
+    assert.ok(row, 'the failed import has a landing row');
+    assert.equal(row.unsaved, true);
+    assert.equal(row.name, 'Big Import (imported)');
+    assert.equal(rows.find((e) => e.id === stored.id)?.unsaved, undefined);
+    assert.equal(p.sceneForExport(imported.id), imported);
+
+    // A stored scene whose later save failed: the row shows the in-memory name.
+    stored.name = 'Stored (edited)';
+    assert.equal(p.saveNow(stored), false);
+    const storedRow = p.listScenesForLanding(imported).find((e) => e.id === stored.id);
+    assert.equal(storedRow?.name, 'Stored (edited)');
+    assert.equal(storedRow?.unsaved, true);
+
+    // Re-opening it after switching away gets the edits, not the stale stored copy,
+    // as a clone the caller may edit; Export then hands out that reopened copy.
+    const reopened = p.loadScene(stored.id);
+    assert.equal(reopened?.name, 'Stored (edited)');
+    assert.notEqual(reopened, stored);
+    reopened!.name = 'Stored (edited again)';
+    assert.equal(stored.name, 'Stored (edited)', 'editing the reopened copy does not touch the cache');
+    assert.equal(p.sceneForExport(stored.id, reopened)?.name, 'Stored (edited again)');
+    // Landing edits on a non-current scene go through loadScene too.
+    assert.equal(p.renameScene(imported.id, 'Renamed Import'), false);
+    assert.equal(p.listScenesForLanding(stored).find((e) => e.id === imported.id)?.name, 'Renamed Import');
+
+    // The live scene is listed even when the index lacks it and no save was tried.
+    const orphanLive = createScene('Live Only');
+    assert.equal(p.listScenesForLanding(orphanLive).find((e) => e.id === orphanLive.id)?.unsaved, true);
+
+    // Once saves work again the flag clears; deleting drops the in-memory copy.
+    storage.failWrites = false;
+    assert.equal(p.saveNow(reopened!), true);
+    assert.equal(p.listScenesForLanding(reopened).find((e) => e.id === stored.id)?.unsaved, undefined);
+    assert.equal(p.loadScene(stored.id)?.name, 'Stored (edited again)');
+    p.deleteScene(imported.id);
+    assert.equal(p.listScenesForLanding(reopened).some((e) => e.id === imported.id), false);
+    assert.equal(p.loadScene(imported.id), null);
+  });
+});
+
+test('P0.9: a save failure before onError is wired (first-run scene) is held, then delivered', () => {
+  withP0MemoryStorage((storage) => {
+    storage.failWrites = true;
+    const p = new Persistence();
+    const first = p.loadCurrentOrCreate(); // main.ts runs this before wiring onError
+    assert.equal(p.listScenesForLanding(first)[0]?.unsaved, true);
+    const got: string[] = [];
+    p.onError = (m) => got.push(m);
+    assert.equal(got.length, 1);
+    assert.ok(got[0].includes('storage full'));
+    // Later failures go straight to the handler; nothing is delivered twice.
+    p.saveNow(first);
+    assert.equal(got.length, 2);
+    p.onError = (m) => got.push(`second: ${m}`);
+    assert.equal(got.length, 2);
+  });
+});
+
+test('P0.9: storage line formatting', () => {
+  const MB = 1024 * 1024;
+  assert.equal(formatBytes(512), '512 B');
+  assert.equal(formatBytes(1536), '1.5 KB');
+  assert.equal(formatBytes(5 * MB), '5.0 MB');
+  assert.equal(formatBytes(2 * 1024 * MB), '2.00 GB');
+  assert.equal(formatBytes(Number.NaN), '?');
+  const full = formatStorageLine({
+    usageBytes: 12 * MB,
+    quotaBytes: 2 * 1024 * MB,
+    persisted: false,
+    sceneBytes: 1.5 * MB,
+    scanBytes: 3 * MB,
+  });
+  assert.ok(full.startsWith('Storage: scenes 1.5 MB, scans 3.0 MB'));
+  assert.ok(full.includes('browser total 12.0 MB of 2.00 GB'));
+  assert.ok(full.includes('not persistent'));
+  const bare = formatStorageLine({ usageBytes: null, quotaBytes: null, persisted: null, sceneBytes: 0, scanBytes: 0 });
+  assert.equal(bare, 'Storage: scenes 0 B, scans 0 B');
+  assert.ok(!/[\u2014\u2013]/.test(full), 'no em or en dashes in UI copy');
+});
+
+test('P0.10: new scenes start without the LED volume; saved scenes keep their own flag', () => {
+  const fresh = createScene('Empty Stage');
+  assert.equal(fresh.icvfx?.enabled, false);
+  assert.ok((fresh.icvfx?.walls.length ?? 0) > 0, 'the preset is still there to switch on');
+
+  const legacy = createScene('Pre-ICVFX Scene');
+  delete legacy.icvfx;
+  assert.equal(normalizeScene(legacy).icvfx?.enabled, false);
+
+  const saved = createScene('Saved With LED');
+  saved.icvfx!.enabled = true;
+  const reloaded = normalizeScene(JSON.parse(JSON.stringify(saved)) as SceneData);
+  assert.equal(reloaded.icvfx?.enabled, true);
+});
+
+/** Builds a binary little-endian PLY from a header body and per-vertex writer. */
+function p0BinaryPly(
+  props: string[],
+  count: number,
+  stride: number,
+  write: (view: DataView, base: number, i: number) => void,
+): Uint8Array {
+  const header =
+    'ply\nformat binary_little_endian 1.0\n' +
+    `element vertex ${count}\n` +
+    props.map((p) => `property ${p}\n`).join('') +
+    'end_header\n';
+  const head = new TextEncoder().encode(header);
+  const out = new Uint8Array(head.length + count * stride);
+  out.set(head, 0);
+  const view = new DataView(out.buffer, head.length);
+  for (let i = 0; i < count; i++) write(view, i * stride, i);
+  return out;
+}
+
+test('P0.14: a ushort PLY property has a 2-byte stride', () => {
+  // x y z float, ushort flags, float opacity: 18 bytes per vertex. The old 4-byte
+  // ushort stride read 20, misplaced every field after it and dropped a vertex.
+  const ply = p0BinaryPly(['float x', 'float y', 'float z', 'ushort flags', 'float opacity'], 2, 18, (v, b, i) => {
+    v.setFloat32(b, 1 + i * 3, true);
+    v.setFloat32(b + 4, 2 + i * 3, true);
+    v.setFloat32(b + 8, 3 + i * 3, true);
+    v.setUint16(b + 12, 7 + i, true);
+    v.setFloat32(b + 14, i === 0 ? 0.25 : 0.75, true);
+  });
+  const cloud = parseGaussianPly(ply);
+  assert.equal(cloud.splatCount, 2);
+  assert.deepEqual(cloud.splats[1].position, { x: 4, y: 5, z: 6 });
+  approx(cloud.splats[0].opacity, 0.25, 1e-6); // no 3DGS layout: linear opacity stays linear
+  approx(cloud.splats[1].opacity, 0.75, 1e-6);
+});
+
+test('P0.14: 3DGS-layout opacity is always a logit (0.5 reads 0.622)', () => {
+  const props = ['x', 'y', 'z', 'f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3'];
+  const ascii =
+    'ply\nformat ascii 1.0\nelement vertex 1\n' +
+    props.map((p) => `property float ${p}\n`).join('') +
+    'end_header\n' +
+    '0 0 0 0 0 0 0.5 -3 -3 -3 1 0 0 0\n';
+  approx(parseGaussianPly(ascii).splats[0].opacity, 1 / (1 + Math.exp(-0.5)), 1e-4);
+  approx(parseGaussianPly(ascii).splats[0].opacity, 0.6225, 1e-3);
+  const bin = p0BinaryPly(props.map((p) => `float ${p}`), 1, 56, (v, b) => {
+    const vals = [0, 0, 0, 0, 0, 0, 0.5, -3, -3, -3, 1, 0, 0, 0];
+    vals.forEach((x, k) => v.setFloat32(b + k * 4, x, true));
+  });
+  approx(parseGaussianPly(bin).splats[0].opacity, 0.6225, 1e-3);
+});
+
+test('P0.14: compressed and pre-vertex PLY layouts are refused with a message', () => {
+  const compressedHeader =
+    'ply\nformat binary_little_endian 1.0\n' +
+    'element chunk 1\nproperty float min_x\nproperty float max_x\n' +
+    'element vertex 256\nproperty uint packed_position\nproperty uint packed_rotation\n' +
+    'property uint packed_scale\nproperty uint packed_color\nend_header\n';
+  const bytes = new Uint8Array(compressedHeader.length + 8 + 256 * 16);
+  bytes.set(new TextEncoder().encode(compressedHeader), 0);
+  const sniff = sniffSplatFile('room.compressed.ply', bytes.length, bytes);
+  assert.equal(sniff.ok, false);
+  if (!sniff.ok) assert.equal(sniff.message, COMPRESSED_PLY_MESSAGE);
+  assert.throws(() => parseGaussianPly(bytes), /compressed PLY/);
+
+  const preVertex =
+    'ply\nformat ascii 1.0\nelement camera 1\nproperty float fx\n' +
+    'element vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n500\n1 2 3\n';
+  assert.throws(() => parseGaussianPly(preVertex), /element "camera" comes before the vertex data/);
+});
+
+test('P0.14: the header sniff returns the splat count without the body', () => {
+  // Header only: the body of a 1.2M-splat capture is never read or parsed.
+  const header =
+    'ply\nformat binary_little_endian 1.0\nelement vertex 1200000\n' +
+    ['x', 'y', 'z', 'opacity', 'scale_0', 'rot_0'].map((p) => `property float ${p}\n`).join('') +
+    'end_header\n';
+  const head = new TextEncoder().encode(header);
+  const sniff = sniffSplatFile('capture.ply', head.length + 1200000 * 24, head);
+  assert.deepEqual(sniff, { ok: true, format: 'ply', splatCount: 1200000 });
+  assert.ok(SPLAT_HEADER_SNIFF_BYTES >= head.length);
+
+  assert.deepEqual(sniffSplatFile('cloud.splat', 32 * 20000, null), { ok: true, format: 'splat', splatCount: 20000 });
+  assert.equal(sniffSplatFile('cloud.splat', 33, null).ok, false);
+  assert.equal(sniffSplatFile('notes.ply', 10, new TextEncoder().encode('hello there')).ok, false);
+  assert.equal(sniffSplatFile('broken.ply', 0, null).ok, false);
+
+  // Size guard: the cap applies to the scene's total.
+  assert.equal(splatImportRefusal(MAX_INLINE_SPLATS), null);
+  assert.equal(splatImportRefusal(4000, 8000), null);
+  const refusal = splatImportRefusal(1200000);
+  assert.ok(refusal && refusal.startsWith('Too large for now'));
+  assert.ok(refusal.includes('mesh export') && refusal.includes('splat locations'));
+  assert.ok(splatImportRefusal(10000, 6000)?.includes('already in this scene'));
+  assert.ok(!/[\u2014\u2013]/.test(refusal), 'no em or en dashes in UI copy');
+});
+
+test('P0.14: voxel downsampling keeps splats 12.8 m apart separate', () => {
+  const splat = (z: number): GaussianSplat => ({
+    position: { x: 0.01, y: 0.01, z },
+    scale: { x: 0.01, y: 0.01, z: 0.01 },
+    rotation: { x: 0, y: 0, z: 0, w: 1 },
+    color: { r: 0.5, g: 0.5, b: 0.5 },
+    opacity: 1,
+  });
+  const out = voxelDownsampleSplats([splat(0.01), splat(12.81)], 0.05);
+  assert.equal(out.length, 2);
+  const zs = out.map((s) => s.position.z).sort((a, b) => a - b);
+  approx(zs[0], 0.01, 1e-9);
+  approx(zs[1], 12.81, 1e-9);
+  // Far apart on every axis and on both sides of the origin.
+  assert.equal(voxelDownsampleSplats([splat(-300.01), splat(300.01), splat(-300.02)], 0.05).length, 2);
+});
+
+test('P0.14: the splat budget only moves past a full step and snaps to it', () => {
+  assert.equal(stepSplatBudget(100000, 102000), 100000);
+  assert.equal(stepSplatBudget(100000, 105000), 100000); // exactly one step: hold
+  assert.equal(stepSplatBudget(100000, 94999), 95000);
+  assert.equal(stepSplatBudget(100000, 72400), 70000);
+  assert.equal(stepSplatBudget(100000, Number.NaN), 100000);
+  // Jitter around a value or a step boundary never flips the budget.
+  let b = 100000;
+  for (let i = 0; i < 100; i++) b = stepSplatBudget(b, i % 2 ? 97400 : 97600);
+  assert.equal(b, 100000);
+  assert.equal(stepSplatBudget(100000, 77777) % SPLAT_BUDGET_STEP, 0);
+});
+
+test('P0.14: the governor only pushes a splat budget change, not one per frame', () => {
+  let budget = 100000;
+  const pushes: number[] = [];
+  const fakeSplats = {
+    getSplatBudget: () => budget,
+    setSplatBudget: (n: number) => {
+      pushes.push(n);
+      budget = n;
+    },
+  } as unknown as GaussianSplatRenderer;
+  const governor = new XRPerformanceGovernor();
+  let t = 0;
+  for (let i = 0; i < 400; i++) {
+    t += i % 2 ? 16 : 17.5; // over a 72 fps budget, with jitter
+    governor.beginFrame(t);
+    governor.endFrame(undefined, fakeSplats, null, t);
+  }
+  assert.ok(pushes.length >= 1, 'an overloaded frame rate lowers the budget');
+  assert.ok(pushes.length <= 4, `expected a handful of budget changes, got ${pushes.length}`);
+  assert.ok(budget < 100000);
+  assert.ok(pushes.every((n) => n % SPLAT_BUDGET_STEP === 0));
+});
+
+test('P0.14: the splat renderer rebuilds only when the drawn count changes, and frees the old material', () => {
+  const renderer = new GaussianSplatRenderer();
+  renderer.setCloud(generateSyntheticScoutSplatCloud('Budget', 300));
+  const meshOf = () => renderer.group.children.find((c) => (c as THREE.InstancedMesh).isInstancedMesh) as THREE.InstancedMesh;
+  const first = meshOf();
+  assert.ok(first);
+  let disposed = false;
+  (first.material as THREE.Material).addEventListener('dispose', () => {
+    disposed = true;
+  });
+  // three frees an InstancedMesh's instanceMatrix GPU buffer only on its 'dispose' event.
+  let meshDisposed = false;
+  first.addEventListener('dispose', () => {
+    meshDisposed = true;
+  });
+  // Budgets above the cloud size draw the same 300 splats: no rebuild.
+  renderer.setSplatBudget(5000);
+  renderer.setSplatBudget(250000);
+  assert.equal(meshOf(), first);
+  assert.equal(disposed, false);
+  // Below the cloud size the drawn count changes: rebuild, and the old material is released.
+  renderer.setSplatBudget(150);
+  const second = meshOf();
+  assert.notEqual(second, first);
+  assert.equal(second.count, 150);
+  assert.equal(disposed, true);
+  assert.equal(meshDisposed, true, 'the old InstancedMesh is disposed on rebuild');
+  let lastDisposed = false;
+  second.addEventListener('dispose', () => {
+    lastDisposed = true;
+  });
+  renderer.dispose();
+  assert.equal(lastDisposed, true, 'dispose() releases the current InstancedMesh');
+});
+
+void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
 
   () => {
-    passed += 2;
+    passed += 4;
     console.log('  ✓ ScanStore: memory fallback contract (put/get/list/prune/delete + warning)');
     console.log('  ✓ PropStore: memory fallback contract (save/get/list/delete + warning)');
+    console.log('  ✓ P0.8: importScene tells a blocked read apart from a file that is not a scene');
+    console.log('  ✓ P0.8: Add Test Room attaches to the scene that is live after the scan write');
     console.log(`\n${passed} tests passed`);
   },
   (e) => {
-    console.error('  ✗ Stores: memory fallback contract');
+    console.error('  ✗ async tests (store fallbacks, P0.8 import read, P0.8 test room)');
     throw e;
   },
 );

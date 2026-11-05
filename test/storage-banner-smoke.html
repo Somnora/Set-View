@@ -1,0 +1,139 @@
+<!doctype html>
+<!-- Storage banner smoke (P0.8 / P0.9 / P0.10): boots the real app and drives the
+     landing "Import JSON" input twice with a scene file built in-page (a new scene;
+     with ?scan, plus the synthetic room scan and one moved furniture piece):
+       1. with every localStorage write throwing QuotaExceededError: the failed save
+          must show as a visible landing banner (it used to reach only the console
+          and the 3D wrist), the scene must get a "Not saved" row, and both that
+          row's Export button and the banner's Export button must download it
+          (the download is intercepted and its JSON read back);
+       2. with storage working: the scene must import and appear in the scene list
+          as a saved row.
+     Also checks the Scene & Environment card's storage line and LED volume row.
+     (test/sample_scene.setview.json is not used: it fails isSceneData even at
+     cd82a8e, its lights use an old schema, and test/import-test.py depends on it.)
+
+       npx vite --config vite.http.config.ts      (port 5174)
+       chrome --headless=new --disable-gpu --enable-unsafe-swiftshader \
+         --window-size=1100,900 --virtual-time-budget=20000 --dump-dom \
+         http://localhost:5174/test/storage-banner-smoke.html
+
+     ?scan embeds a scan, which the import stores in IndexedDB. Headless Chrome on
+     this Mac can hang IndexedDB transactions (no watchdog covers them), so run ?scan
+     headed only; the default run has no scan and needs no IndexedDB writes. Checks
+     poll for up to 12 s each.
+     PASS = banner visible with the save failure, failed import listed as not saved
+     and exportable from its row and the banner, second import listed as saved,
+     storage line measured, LED row present. -->
+<html>
+  <head><meta charset="utf-8" /><title>storage banner smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;bottom:4px;right:8px;z-index:99;color:#9f6">running...</pre>
+    <script type="module">
+      const out = document.getElementById('out');
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const until = async (fn, ms) => {
+        for (let t = 0; t < ms; t += 200) {
+          const v = fn();
+          if (v) return v;
+          await wait(200);
+        }
+        return fn();
+      };
+      const infoLines = () =>
+        [...document.querySelectorAll('#landing .scan-info')].map((e) => e.textContent ?? '');
+      const bannerTexts = () =>
+        [...document.querySelectorAll('#landing .banners .banner-text')].map((e) => e.textContent ?? '');
+      const sceneRows = (n) =>
+        [...document.querySelectorAll('#landing .scene')].filter((r) => r.querySelector('.load b')?.textContent === n);
+      // Intercept the export download (an anchor click on a blob URL) and keep its URL.
+      const downloads = [];
+      HTMLAnchorElement.prototype.click = function () {
+        if (this.download) downloads.push({ name: this.download, href: this.href });
+      };
+      const exportedName = async (fromIndex) => {
+        const d = await until(() => downloads[fromIndex], 12000);
+        if (!d) return null;
+        const file = await (await fetch(d.href)).json();
+        return file?.name ?? null;
+      };
+      try {
+        await import('../src/main.ts');
+        const { createScene } = await import('../src/model.ts');
+        const { summarizeScan } = await import('../src/scan.ts');
+        const { createSyntheticLocationScan } = await import('../src/scanExporters.ts');
+        const { buildSceneFile } = await import('../src/persistence.ts');
+        await wait(400);
+
+        const withScan = new URLSearchParams(location.search).has('scan');
+        const scan = withScan ? createSyntheticLocationScan() : null;
+        const name = `Banner Smoke ${Date.now()}`;
+        const scene = createScene(name);
+        if (scan) {
+          scene.scan = summarizeScan(scan);
+          scene.scan.furniture = [{ meshIndex: scan.meshes.length - 1, dx: 0.5, dz: 0, rotY: 0.2 }];
+        }
+        const json = JSON.stringify(buildSceneFile(scene, scan));
+        const importFile = (fileName) => {
+          const input = document.querySelector('#landing .bar input[type=file]');
+          if (!input) throw new Error('Import JSON input missing');
+          const dt = new DataTransfer();
+          dt.items.add(new File([json], fileName, { type: 'application/json' }));
+          input.files = dt.files;
+          input.dispatchEvent(new Event('change'));
+        };
+
+        // 1. Storage full: the failure must reach a visible landing banner.
+        const realSetItem = Storage.prototype.setItem;
+        Storage.prototype.setItem = function () {
+          throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+        };
+        importFile('banner-smoke-full.setview.json');
+        const saveBanner = await until(() => bannerTexts().find((t) => t.includes('could not be saved')), 12000);
+        Storage.prototype.setItem = realSetItem;
+        const box = document.querySelector('#landing .banners')?.getBoundingClientRect();
+        const visible = !!box && box.height > 0;
+
+        // The failed import has a "Not saved" row whose Export downloads it, and the
+        // banner's Export does the same (the scene is in memory only).
+        const unsavedRow = await until(
+          () => sceneRows(`${name} (imported)`).find((r) => r.dataset.unsaved === 'true'),
+          12000,
+        );
+        const rowExport = unsavedRow
+          ? [...unsavedRow.querySelectorAll('.scene-head button.small')].find((b) => b.textContent === 'Export')
+          : null;
+        rowExport?.click();
+        const rowExported = rowExport ? await exportedName(0) : null;
+        const bannerExport = [...document.querySelectorAll('#landing .banners .banner-action')].find(
+          (b) => b.textContent === 'Export',
+        );
+        bannerExport?.click();
+        const bannerExported = bannerExport ? await exportedName(rowExport ? 1 : 0) : null;
+        const exportOk = rowExported === `${name} (imported)` && bannerExported === `${name} (imported)`;
+
+        // 2. Storage working: the same file imports and is listed as saved.
+        importFile('banner-smoke-ok.setview.json');
+        const listed = await until(
+          () => sceneRows(`${name} (imported)`).find((r) => r.dataset.unsaved !== 'true'),
+          12000,
+        );
+
+        const storageLine = await until(
+          () => infoLines().find((t) => t.startsWith('Storage:') && !t.includes('measuring')),
+          12000,
+        );
+        const ledRow = infoLines().find((t) => t.startsWith('LED volume:'));
+        const pass = !!saveBanner && visible && !!unsavedRow && exportOk && !!listed && !!storageLine && !!ledRow;
+        out.textContent =
+          `STORAGE-SMOKE ${pass ? 'PASS' : 'FAIL'} | visible=${visible} | unsavedRow=${!!unsavedRow}` +
+          ` | rowExport=${rowExported ?? 'none'} | bannerExport=${bannerExported ?? 'none'} | listed=${!!listed}` +
+          ` | banners=${JSON.stringify(bannerTexts())} | storage=${storageLine ?? 'none'} | led=${ledRow ?? 'none'}`;
+      } catch (e) {
+        out.textContent = `STORAGE-SMOKE ERROR ${e.message}`;
+      }
+    </script>
+  </body>
+</html>

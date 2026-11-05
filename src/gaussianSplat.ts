@@ -385,6 +385,146 @@ interface PlyProperty {
   byteOffset: number;
 }
 
+/** One element declared in a PLY header, in declaration order. */
+interface PlyHeaderElement {
+  name: string;
+  count: number;
+  properties: string[];
+}
+
+/**
+ * Shown when a PlayCanvas / SuperSplat compressed PLY is picked. Its vertex data
+ * is bit-packed and comes after a 'chunk' element, so reading it as a plain 3DGS
+ * PLY used to yield a cloud of splats all sitting at the origin.
+ */
+export const COMPRESSED_PLY_MESSAGE =
+  'This is a compressed PLY (PlayCanvas / SuperSplat format), which SetView cannot read yet. ' +
+  'Export an uncompressed 3DGS .ply or a .splat file instead.';
+
+/** Element list of a PLY header (text up to and including end_header). */
+function describePlyHeader(headerText: string): { format: string; elements: PlyHeaderElement[] } {
+  let format = 'ascii';
+  const elements: PlyHeaderElement[] = [];
+  for (const line of headerText.split(/\r?\n/)) {
+    const tokens = line.trim().split(/\s+/);
+    if (tokens[0] === 'format') {
+      format = tokens[1] ?? format;
+    } else if (tokens[0] === 'element') {
+      elements.push({ name: tokens[1] ?? '', count: parseInt(tokens[2], 10) || 0, properties: [] });
+    } else if (tokens[0] === 'property' && elements.length > 0) {
+      // 'property list <count type> <item type> <name>' keeps the name last.
+      elements[elements.length - 1].properties.push(tokens[tokens.length - 1]);
+    }
+  }
+  return { format, elements };
+}
+
+/** PlayCanvas compressed layout: a 'chunk' element and bit-packed vertex fields. */
+function isCompressedPlyLayout(elements: PlyHeaderElement[]): boolean {
+  return elements.some(
+    (e) => e.name === 'chunk' || (e.name === 'vertex' && e.properties.includes('packed_position')),
+  );
+}
+
+/**
+ * Throws a readable error for PLY layouts the parser below cannot read. It reads
+ * the vertex element straight after end_header, so any non-empty element declared
+ * before 'vertex' would shift every splat onto garbage bytes.
+ */
+function assertSupportedPlyLayout(elements: PlyHeaderElement[]): void {
+  if (isCompressedPlyLayout(elements)) throw new Error(COMPRESSED_PLY_MESSAGE);
+  for (const e of elements) {
+    if (e.name === 'vertex') return;
+    if (e.count > 0) {
+      throw new Error(`Unsupported PLY layout: element "${e.name}" comes before the vertex data`);
+    }
+  }
+}
+
+/** Index just past the end_header line in the first `limit` bytes, or -1. */
+function findPlyHeaderEnd(bytes: Uint8Array, limit: number): number {
+  // 'end_header' as bytes; the line may end in \n or \r\n.
+  const token = [101, 110, 100, 95, 104, 101, 97, 100, 101, 114];
+  const max = Math.min(bytes.length, limit);
+  outer: for (let i = 0; i + token.length <= max; i++) {
+    for (let k = 0; k < token.length; k++) {
+      if (bytes[i + k] !== token[k]) continue outer;
+    }
+    let j = i + token.length;
+    if (j < max && bytes[j] === 13) j++;
+    if (j < max && bytes[j] === 10) return j + 1;
+  }
+  return -1;
+}
+
+/** Bytes read from the front of a .ply to find its header. Real 3DGS headers are well under 4 KB. */
+export const SPLAT_HEADER_SNIFF_BYTES = 65536;
+
+/**
+ * Splats a scene can hold inline for now. Clouds are stored as JSON inside the scene,
+ * which autosaves to localStorage at roughly 300 bytes per splat, so beyond about
+ * 15k splats the scene silently stops saving (measured against the per-origin quota).
+ */
+export const MAX_INLINE_SPLATS = 15000;
+
+export type SplatFileSniff =
+  | { ok: true; format: 'ply' | 'splat'; splatCount: number }
+  | { ok: false; message: string };
+
+/**
+ * Finds how many splats a file holds without parsing its body: from the byte length
+ * for a .splat (32 bytes each), from the PLY header's vertex count otherwise. `head`
+ * is the first bytes of the file (SPLAT_HEADER_SNIFF_BYTES is plenty); it is not
+ * needed for a .splat. Lets the importer refuse an oversized cloud before reading
+ * hundreds of megabytes and building millions of objects on the main thread.
+ */
+export function sniffSplatFile(fileName: string, fileSize: number, head: Uint8Array | null): SplatFileSniff {
+  if (fileName.toLowerCase().endsWith('.splat')) {
+    if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize % 32 !== 0) {
+      return {
+        ok: false,
+        message: `Not a valid .splat file: its size (${fileSize} bytes) is not a multiple of 32 bytes.`,
+      };
+    }
+    return { ok: true, format: 'splat', splatCount: fileSize / 32 };
+  }
+  if (!head || head.length === 0) {
+    return { ok: false, message: 'Could not read the file (the browser returned no data).' };
+  }
+  const end = findPlyHeaderEnd(head, head.length);
+  if (end < 0) {
+    return { ok: false, message: 'Not a PLY file: no end_header found at the start of the file.' };
+  }
+  let headerText = '';
+  for (let i = 0; i < end; i++) headerText += String.fromCharCode(head[i]);
+  if (headerText.split(/\r?\n/)[0].trim() !== 'ply') {
+    return { ok: false, message: 'Not a PLY file: missing the "ply" signature.' };
+  }
+  const { elements } = describePlyHeader(headerText);
+  if (isCompressedPlyLayout(elements)) return { ok: false, message: COMPRESSED_PLY_MESSAGE };
+  const vertex = elements.find((e) => e.name === 'vertex');
+  if (!vertex) return { ok: false, message: 'This PLY has no vertex element, so it holds no splats.' };
+  return { ok: true, format: 'ply', splatCount: vertex.count };
+}
+
+/**
+ * Null when a cloud of `incoming` splats fits beside the `alreadyInScene` splats the
+ * scene holds, otherwise the message to show instead of importing it.
+ */
+export function splatImportRefusal(
+  incoming: number,
+  alreadyInScene = 0,
+  cap: number = MAX_INLINE_SPLATS,
+): string | null {
+  if (incoming + alreadyInScene <= cap) return null;
+  const held = alreadyInScene > 0 ? ` beside the ${alreadyInScene.toLocaleString()} already in this scene` : '';
+  return (
+    `Too large for now: this cloud has ${incoming.toLocaleString()} splats${held}, and a scene can only ` +
+    `hold about ${cap.toLocaleString()} before it stops saving. Use a mesh export of the capture instead, ` +
+    'or wait for splat locations.'
+  );
+}
+
 /**
  * Parses binary or ASCII Gaussian Splat PLY file buffer or text into a GaussianCloudData object.
  */
@@ -431,6 +571,7 @@ export function parseGaussianPly(buffer: ArrayBuffer | Uint8Array | string): Gau
   if (lines.length === 0 || lines[0].trim() !== 'ply') {
     throw new Error('Invalid PLY: Missing initial "ply" signature');
   }
+  assertSupportedPlyLayout(describePlyHeader(headerText).elements);
 
   let format = 'ascii';
   let vertexCount = 0;
@@ -468,7 +609,7 @@ export function parseGaussianPly(buffer: ArrayBuffer | Uint8Array | string): Gau
         typeSize = 8;
       } else if (propType === 'uchar' || propType === 'uint8' || propType === 'char' || propType === 'int8') {
         typeSize = 1;
-      } else if (propType === 'short' || propType === 'uint16' || propType === 'int16') {
+      } else if (propType === 'short' || propType === 'ushort' || propType === 'uint16' || propType === 'int16') {
         typeSize = 2;
       }
       currentOffset += typeSize;
@@ -482,6 +623,10 @@ export function parseGaussianPly(buffer: ArrayBuffer | Uint8Array | string): Gau
   }
 
   const splats: GaussianSplat[] = [];
+  // A PLY carrying the 3DGS training layout (log scales + quaternions) stores opacity
+  // as an unactivated logit, so it always goes through the sigmoid. The old range
+  // heuristic read a logit inside [0, 1] as linear: 0.5 came out 0.5, not 0.622.
+  const isInria3dgsLayout = propMap.has('scale_0') && propMap.has('rot_0');
 
   if (format === 'binary_little_endian' || format === 'binary_big_endian') {
     const littleEndian = format === 'binary_little_endian';
@@ -568,7 +713,7 @@ export function parseGaussianPly(buffer: ArrayBuffer | Uint8Array | string): Gau
         const rawOp = readVal(base + opacityProp.byteOffset, opacityProp.type);
         if (opacityProp.type === 'uchar' || opacityProp.type === 'uint8') {
           opacity = rawOp / 255;
-        } else if (rawOp < 0 || rawOp > 1.0) {
+        } else if (isInria3dgsLayout || rawOp < 0 || rawOp > 1.0) {
           // Inria 3DGS stores unactivated logits: sigmoid(rawOp)
           opacity = 1 / (1 + Math.exp(-rawOp));
         } else {
@@ -674,7 +819,7 @@ export function parseGaussianPly(buffer: ArrayBuffer | Uint8Array | string): Gau
       let opacity = 1.0;
       if (opIdx >= 0) {
         const rawOp = parseFloat(tokens[opIdx]) || 0;
-        if (rawOp < 0 || rawOp > 1.0) {
+        if (isInria3dgsLayout || rawOp < 0 || rawOp > 1.0) {
           opacity = 1 / (1 + Math.exp(-rawOp));
         } else {
           opacity = rawOp;
@@ -992,12 +1137,20 @@ export function voxelDownsampleSplats(splats: GaussianSplat[], voxelSizeM: numbe
 
   const grid = new Map<number, VoxelAccumulator>();
 
+  // 17 bits of cell index per axis packed into one exact integer (51 bits, below
+  // 2^53). The old 32-bit key gave Z only 8 bits, so at 5 cm splats 12.8 m apart
+  // landed in the same voxel and were averaged into one; now an axis wraps only
+  // every 131072 cells (6.5 km at 5 cm).
+  const AXIS_CELLS = 131072;
+  const HALF_CELLS = 65536;
+  const wrapCell = (c: number) => ((c % AXIS_CELLS) + AXIS_CELLS) % AXIS_CELLS;
+
   for (let i = 0; i < splats.length; i++) {
     const s = splats[i];
-    const vx = (Math.floor(s.position.x * invVoxel) + 2048) & 0xfff;
-    const vy = (Math.floor(s.position.y * invVoxel) + 2048) & 0xfff;
-    const vz = (Math.floor(s.position.z * invVoxel) + 128) & 0xff;
-    const key = vx | (vy << 12) | (vz << 24);
+    const vx = wrapCell(Math.floor(s.position.x * invVoxel) + HALF_CELLS);
+    const vy = wrapCell(Math.floor(s.position.y * invVoxel) + HALF_CELLS);
+    const vz = wrapCell(Math.floor(s.position.z * invVoxel) + HALF_CELLS);
+    const key = vx + vy * AXIS_CELLS + vz * AXIS_CELLS * AXIS_CELLS;
 
     let cell = grid.get(key);
     if (!cell) {
