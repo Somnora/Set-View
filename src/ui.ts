@@ -2724,8 +2724,10 @@ export function openPropsLibraryModal(
   customAssets: CustomPropAsset[] = [],
   onUploadCustomAsset?: (file: File) => Promise<void>,
   onDeleteCustomAsset?: (id: string) => Promise<void>,
+  // document.body on the 2D page; the dom-overlay root (#overlay) in AR, since
+  // only that subtree is displayed inside an immersive session.
+  container: HTMLElement = document.body,
 ): void {
-  const container = document.body;
   // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
   // this can be selected again with one already open. Two stacked full-screen
   // overlays in a headset leave one behind when the top is closed.
@@ -7848,9 +7850,9 @@ export function openSolarStudioModal(
   onSaveConfig?: (config: SolarEnvironmentConfig) => void,
   onExportCsv?: () => void,
   onExportHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.solar-modal-overlay');
+  const existingModal = document.querySelector('.solar-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -8521,9 +8523,9 @@ export function openScreenplayBreakdownModal(
   onApplyCoverageCameras?: (coverage: ShotCoverageRecommendation[]) => void,
   onExportCsv?: () => void,
   onExportDirectorDeckHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.screenplay-modal-overlay');
+  const existingModal = document.querySelector('.screenplay-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -9062,9 +9064,9 @@ export function openWebXRProfilerModal(
   ) => Promise<{ report: VRBenchmarkReport; samples: FrameTelemetrySample[] }>,
   onExportCsv?: () => void,
   onExportHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.profiler-modal-overlay');
+  const existingModal = document.querySelector('.profiler-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -9574,9 +9576,9 @@ export function openVRComfortModal(
   _onRunAudit?: () => Promise<ComfortAuditReport> | ComfortAuditReport,
   onExportCsv?: () => void,
   onExportHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.comfort-modal-overlay');
+  const existingModal = document.querySelector('.comfort-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -10290,9 +10292,10 @@ export function openSetDressingStudioModal(
   onSaveConfig?: (config: SetDressingConfig) => void,
   onApplyScatter?: (theme: ScatterTheme, density: ScatterDensity, enablePhysics: boolean) => void,
   onAiMutate?: (mutations: GeminiAiSceneMutation[]) => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.dressing-modal-overlay');
+  // Document-wide: callers mount on document.body (2D page) or #overlay (AR).
+  const existingModal = document.querySelector('.dressing-modal-overlay');
   if (existingModal) existingModal.remove();
 
   // The Gemini key is a per-device setting, never part of the scene. When the
