@@ -544,6 +544,8 @@ import {
   parseGeminiAiResponse,
   simulatePhysicsImpulseSettling,
 } from '../src/setDressingEngine.ts';
+import * as xrProbe from './xr-probe-core.ts';
+import * as probeFs from 'node:fs';
 
 
 let passed = 0;
@@ -11329,6 +11331,283 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
   const setDressingActions = generateEntityContextActions('set_dressing', 'dressing_root');
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_open_studio'));
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_quick_scatter'));
+});
+
+// --- P0 probe ---
+// Pure half of the XR capability probe (test/xr-probe-core.ts). The page itself
+// (test/xr-probe.html + xr-probe.ts) only runs on a headset.
+
+const PROBE_QUEST_UA =
+  'Mozilla/5.0 (X11; Linux x86_64; Quest 3) AppleWebKit/537.36 (KHTML, like Gecko) OculusBrowser/154.1.0.18.52 SamsungBrowser/4.0 Chrome/140.0.0.0 VR Safari/537.36';
+const PROBE_ANDROID_UA =
+  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36';
+
+function probeSessionFixture(): xrProbe.SessionRecord {
+  const s = xrProbe.createSessionRecord('2026-11-05T10:00:00.000Z', {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['anchors', 'plane-detection', 'mesh-detection'],
+  });
+  s.enabledFeatures = ['hit-test', 'local-floor', 'anchors', 'plane-detection'];
+  s.domOverlayState = 'null';
+  s.referenceSpace = 'local-floor';
+  s.hitTest = { source: 'ok', framesTested: 100, framesWithHit: 80, firstHitAt: 250 };
+  s.geometry.push({
+    t: 0,
+    planes: xrProbe.summarizePlanes([
+      { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+      { semanticLabel: 'floor', orientation: 'horizontal', polygon: { length: 6 } },
+    ]),
+    meshes: xrProbe.summarizeMeshes([{ semanticLabel: 'global mesh', vertices: new Float32Array(300), indices: new Uint32Array(600) }]),
+  });
+  s.geometry.push({
+    t: 1000,
+    planes: xrProbe.summarizePlanes([
+      { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+      { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+    ]),
+    meshes: xrProbe.summarizeMeshes([{ semanticLabel: 'global mesh', vertices: new Float32Array(900), indices: new Uint32Array(1200) }]),
+  });
+  s.events.push({ t: 500, type: 'visibility', detail: 'visible-blurred' }, { t: 900, type: 'reset', detail: '' });
+  return s;
+}
+
+test('P0 probe: byte heads, labels and counts are reported raw', () => {
+  const glb = [0x67, 0x6c, 0x54, 0x46, 0x02, 0x00, 0x00, 0x00, 0xff, 0xff];
+  assert.equal(xrProbe.hexHead(glb), '67 6c 54 46 02 00 00 00');
+  assert.equal(xrProbe.asciiHead(glb), 'glTF....');
+  assert.equal(xrProbe.hexHead([1, 2, 3]), '01 02 03');
+  assert.equal(xrProbe.hexHead([]), '');
+  assert.equal(xrProbe.asciiHead(new Uint8Array([0x50, 0x4c, 0x59, 0x0a])), 'PLY.');
+  assert.equal(xrProbe.labelKey(null), '(none)');
+  assert.equal(xrProbe.labelKey(undefined), '(none)');
+  assert.equal(xrProbe.labelKey(''), '(empty)');
+  assert.equal(xrProbe.labelKey(' wall '), ' wall ', 'raw strings are kept exactly, never trimmed');
+  assert.equal(xrProbe.labelKey(7), '(number)');
+  assert.equal(xrProbe.formatCounts({ floor: 1, wall: 4, ceiling: 1 }), 'wall x4, ceiling x1, floor x1');
+  assert.equal(xrProbe.formatCounts({}), 'none');
+  assert.equal(xrProbe.fmtBytes(512), '512 B');
+  assert.equal(xrProbe.fmtBytes(2048), '2.0 KB');
+  assert.equal(xrProbe.fmtBytes(null), 'unknown');
+  approx(xrProbe.distance3([0, 0, 0], [3, 4, 0]) ?? -1, 5);
+  assert.equal(xrProbe.distance3(null, [1, 1, 1]), null);
+});
+
+test('P0 probe: pushCapped keeps the earliest entries and the newest', () => {
+  const list: number[] = [];
+  for (let i = 1; i <= 8; i++) xrProbe.pushCapped(list, i, 5, 2);
+  assert.deepEqual(list, [1, 2, 6, 7, 8]);
+  const one: number[] = [];
+  for (let i = 1; i <= 4; i++) xrProbe.pushCapped(one, i, 3, 10);
+  assert.deepEqual(one, [1, 2, 4], 'keepHead larger than max still leaves room for the newest');
+  const none: number[] = [];
+  xrProbe.pushCapped(none, 1, 0);
+  assert.deepEqual(none, []);
+});
+
+test('P0 probe: plane and mesh summaries count raw labels and sizes', () => {
+  const planes = xrProbe.summarizePlanes([
+    { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+    { semanticLabel: null, orientation: 'horizontal', polygon: { length: 7 } },
+    { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 5 } },
+    { semanticLabel: 'floor', orientation: 'horizontal', polygon: null },
+  ]);
+  assert.equal(planes.count, 4);
+  assert.deepEqual(planes.labels, { wall: 2, '(none)': 1, floor: 1 });
+  assert.deepEqual(planes.orientations, { vertical: 2, horizontal: 2 });
+  assert.deepEqual(planes.perPlane, [
+    ['(none)', 'horizontal', 7],
+    ['floor', 'horizontal', -1],
+    ['wall', 'vertical', 5],
+    ['wall', 'vertical', 4],
+  ]);
+  const many = xrProbe.summarizePlanes(Array.from({ length: 70 }, () => ({ semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } })));
+  assert.equal(many.count, 70);
+  assert.equal(many.perPlane.length, xrProbe.MAX_PER_ITEM);
+
+  const meshes = xrProbe.summarizeMeshes([
+    { semanticLabel: 'table', vertices: new Float32Array(24 * 3), indices: new Uint32Array(36) },
+    { semanticLabel: 'global mesh', vertices: new Float32Array(1000 * 3), indices: new Uint32Array(5400) },
+    { semanticLabel: undefined, vertices: null, indices: null },
+  ]);
+  assert.equal(meshes.count, 3);
+  assert.equal(meshes.totalVertices, 1024);
+  assert.equal(meshes.totalIndices, 5436);
+  assert.deepEqual(meshes.labels, { table: 1, 'global mesh': 1, '(none)': 1 });
+  assert.deepEqual(meshes.perMesh[0], ['global mesh', 1000, 5400], 'largest mesh first');
+  assert.deepEqual(meshes.perMesh[2], ['(none)', 0, 0]);
+});
+
+test('P0 probe: geometry signature ignores set order and catches changes', () => {
+  const a = { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } };
+  const b = { semanticLabel: 'floor', orientation: 'horizontal', polygon: { length: 6 } };
+  const m = { semanticLabel: 'global mesh', vertices: new Float32Array(9), indices: new Uint32Array(3) };
+  const s1 = xrProbe.geometrySignature(xrProbe.summarizePlanes([a, b]), xrProbe.summarizeMeshes([m]));
+  const s2 = xrProbe.geometrySignature(xrProbe.summarizePlanes([b, a]), xrProbe.summarizeMeshes([m]));
+  assert.equal(s1, s2);
+  const grown = { ...b, polygon: { length: 9 } };
+  assert.notEqual(xrProbe.geometrySignature(xrProbe.summarizePlanes([a, grown]), xrProbe.summarizeMeshes([m])), s1);
+  assert.notEqual(
+    xrProbe.geometrySignature(null, xrProbe.summarizeMeshes([m])),
+    xrProbe.geometrySignature(xrProbe.summarizePlanes([]), xrProbe.summarizeMeshes([m])),
+    'feature missing and nothing detected are different answers',
+  );
+});
+
+test('P0 probe: room-capture rejections are classified by DOMException name', () => {
+  assert.equal(xrProbe.classifyRejection(new DOMException('no planes', 'NotSupportedError')), 'NotSupportedError');
+  assert.equal(xrProbe.classifyRejection(new DOMException('twice', 'InvalidStateError')), 'InvalidStateError');
+  assert.equal(xrProbe.classifyRejection(new DOMException('failed', 'OperationError')), 'OperationError');
+  assert.equal(xrProbe.classifyRejection(new TypeError('x')), 'other:TypeError');
+  assert.equal(xrProbe.classifyRejection('boom'), 'other:Error');
+  assert.equal(xrProbe.errorText(new DOMException('twice', 'InvalidStateError')), 'InvalidStateError: twice');
+  assert.equal(xrProbe.errorText(undefined), 'Error: undefined');
+});
+
+test('P0 probe: user agent parsing, device slug and report file name', () => {
+  const quest = xrProbe.parseUserAgent(PROBE_QUEST_UA);
+  assert.equal(quest.browser, 'quest-browser');
+  assert.equal(quest.major, 154);
+  assert.equal(quest.model, 'Quest 3');
+  assert.equal(xrProbe.suggestDeviceSlug(PROBE_QUEST_UA), 'quest-3-browser-154');
+  assert.equal(xrProbe.parseUserAgent(PROBE_QUEST_UA.replace('Quest 3', 'Quest 3S')).model, 'Quest 3S');
+  const android = xrProbe.parseUserAgent(PROBE_ANDROID_UA);
+  assert.equal(android.browser, 'chrome');
+  assert.equal(android.major, 147);
+  assert.equal(android.android, true);
+  assert.equal(android.model, null);
+  assert.equal(xrProbe.suggestDeviceSlug(PROBE_ANDROID_UA), 'android-chrome-147');
+  assert.equal(xrProbe.suggestDeviceSlug('Mozilla/5.0 (Macintosh) Gecko/20100101 Firefox/140.0'), 'unknown-browser');
+  assert.equal(xrProbe.slugify('  Quest 3 / Browser 154!! '), 'quest-3-browser-154');
+  assert.equal(xrProbe.slugify('***'), 'device');
+  const long = xrProbe.slugify(`${'a'.repeat(47)} b`);
+  assert.ok(long.length <= 48 && !long.endsWith('-'));
+  assert.equal(xrProbe.reportFileName('Quest 3 browser 154', new Date(2026, 10, 5)), '2026-11-05-quest-3-browser-154.json');
+});
+
+test('P0 probe: stored report round-trips and rejects anything else', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://192.168.1.2:5173/test/xr-probe.html');
+  assert.equal(r.device, 'quest-3-browser-154');
+  assert.deepEqual(Object.keys(r.observations).sort(), xrProbe.OBSERVATIONS.map((o) => o.id).sort());
+  r.sessions.push(probeSessionFixture());
+  r.observations.permissionPrompt = 'no';
+  const back = xrProbe.parseStoredReport(JSON.stringify(r));
+  assert.deepEqual(back, r);
+  assert.equal(xrProbe.parseStoredReport(null), null);
+  assert.equal(xrProbe.parseStoredReport('{not json'), null);
+  assert.equal(xrProbe.parseStoredReport(JSON.stringify({ ...r, version: xrProbe.PROBE_VERSION + 1 })), null);
+  assert.equal(xrProbe.parseStoredReport(JSON.stringify({ ...r, probe: 'something-else' })), null);
+  assert.equal(xrProbe.parseStoredReport(JSON.stringify({ ...r, sessions: 'x' })), null);
+  const partial = JSON.parse(JSON.stringify(r)) as Record<string, unknown>;
+  delete partial.notes;
+  delete partial.observations;
+  const filled = xrProbe.parseStoredReport(JSON.stringify(partial));
+  assert.ok(filled);
+  assert.equal(filled.notes, '');
+  assert.equal(filled.observations.keyboardShown, '');
+});
+
+test('P0 probe: summary answers the spike questions from a session', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/test/xr-probe.html');
+  const none = xrProbe.summarizeReport(r);
+  assert.equal(none.find((row) => row.id === 'session')?.answer, 'no AR session yet');
+  assert.equal(none.find((row) => row.id === 'files')?.answer, 'no files picked');
+
+  const failed = xrProbe.createSessionRecord('2026-11-05T10:05:00.000Z', { requiredFeatures: ['hit-test'], optionalFeatures: [] });
+  failed.requestError = 'NotSupportedError: nope';
+  const s = probeSessionFixture();
+  s.roomCapture = {
+    calledAt: 2000,
+    outcome: 'InvalidStateError',
+    message: 'InvalidStateError: already captured',
+    settledAt: 2100,
+    anchorBefore: { tracked: true, pos: [0, 0, 0] },
+    anchorAfter: { tracked: true, pos: [0, 0, 0] },
+    anchorLater: { tracked: false, pos: null },
+    anchorMovedM: null,
+    maxFrameGapMs: 14,
+    resetsDuring: 0,
+    visibilityDuring: [],
+    planesBefore: 2,
+    planesAfter: 2,
+    meshesBefore: 1,
+    meshesAfter: 1,
+  };
+  r.sessions.push(s, failed); // the later failed request must not hide the real session
+  r.files.push(
+    { name: 'room.glb', type: '', size: 10, lastModified: 0, byteLength: 10, head: '67 6c 54 46', ascii: 'glTF', ms: 1, error: null },
+    { name: 'scan.spz', type: '', size: 99, lastModified: 0, byteLength: null, head: null, ascii: null, ms: 1, error: 'NotReadableError: denied' },
+  );
+  r.observations.spaceSetupLaunched = 'yes';
+  assert.equal(xrProbe.latestSession(r), s);
+  const rows = xrProbe.summarizeReport(r);
+  const answer = (id: string) => rows.find((row) => row.id === id)?.answer ?? '<missing>';
+  assert.equal(answer('plane-detection'), 'yes');
+  assert.equal(answer('mesh-detection'), 'no');
+  assert.equal(answer('dom-overlay'), 'null');
+  assert.equal(answer('plane-labels'), 'wall x2, floor x1');
+  assert.equal(answer('mesh-labels'), 'global mesh x1');
+  assert.equal(answer('global-mesh'), '300 vertices, 1200 indices (400 triangles)');
+  assert.deepEqual(xrProbe.largestGlobalMesh(s.geometry), [300, 1200]);
+  assert.match(answer('hit-test'), /^80\/100 frames had a hit; first hit after 0\.3 s$/);
+  assert.match(answer('room-capture'), /^InvalidStateError/);
+  assert.match(answer('room-capture'), /3 s later NOT tracked/);
+  assert.equal(answer('space-setup'), 'yes');
+  assert.equal(answer('keyboard'), 'not run');
+  assert.equal(answer('keyboard-seen'), 'not recorded');
+  assert.equal(answer('visibility'), 'visible-blurred');
+  assert.equal(answer('resets'), '1');
+  assert.match(answer('files'), /^1\/2 read OK; failed: scan\.spz \(NotReadableError: denied\)/);
+
+  s.enabledFeatures = null;
+  assert.equal(
+    xrProbe.summarizeReport(r).find((row) => row.id === 'plane-detection')?.answer,
+    'unknown (enabledFeatures not exposed)',
+  );
+  r.sessions = [failed];
+  assert.match(xrProbe.summarizeReport(r).find((row) => row.id === 'session')?.answer ?? '', /^requestSession failed/);
+});
+
+test('P0 probe: panel buttons hit-test and the status text fits the panel', () => {
+  for (const b of xrProbe.PANEL_BUTTONS) {
+    assert.ok(b.x >= 0 && b.y >= 0 && b.x + b.w <= xrProbe.PANEL_W && b.y + b.h <= xrProbe.PANEL_H, `${b.id} inside panel`);
+    const u = (b.x + b.w / 2) / xrProbe.PANEL_W;
+    const v = 1 - (b.y + b.h / 2) / xrProbe.PANEL_H;
+    const [px, py] = xrProbe.uvToPanelPx(u, v);
+    assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, px, py)?.id, b.id);
+  }
+  const [cx, cy] = xrProbe.uvToPanelPx(0.5, 0.5);
+  assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, cx, cy), null, 'the text area is not a button');
+  assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, 260, 580), null, 'the gap between buttons is not a button');
+  const s = probeSessionFixture();
+  s.events.push({ t: 1, type: 'a', detail: '' }, { t: 2, type: 'b', detail: '' }, { t: 3, type: 'c', detail: '' });
+  const lines = xrProbe.panelLines(s, 12_000);
+  assert.ok(lines.length <= 16, `panel shows at most 16 lines, got ${lines.length}`);
+  assert.match(lines[1], /^enabledFeatures: hit-test, local-floor, anchors, plane-detection$/);
+  assert.equal(xrProbe.describeRoomCapture(null), 'not run');
+  assert.equal(xrProbe.describeKeyboard(null), 'not run');
+});
+
+test('P0 probe: copy has no em dashes and the probe stays out of src', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/');
+  r.sessions.push(probeSessionFixture());
+  const copy = [
+    ...xrProbe.OBSERVATIONS.map((o) => o.question),
+    ...xrProbe.PANEL_BUTTONS.map((b) => b.label),
+    ...xrProbe.summarizeReport(r).flatMap((row) => [row.question, row.answer]),
+    ...xrProbe.panelLines(r.sessions[0], 1000),
+  ];
+  for (const text of copy) assert.ok(!text.includes('—'), `em dash in "${text}"`);
+  const srcDir = new URL('../src/', import.meta.url);
+  for (const name of probeFs.readdirSync(srcDir)) {
+    if (!name.endsWith('.ts')) continue;
+    const text = probeFs.readFileSync(new URL(name, srcDir), 'utf8');
+    assert.ok(!text.includes('xr-probe'), `src/${name} must not reference the probe`);
+  }
+  const core = probeFs.readFileSync(new URL('./xr-probe-core.ts', import.meta.url), 'utf8');
+  assert.ok(!/^\s*import\s/m.test(core), 'xr-probe-core.ts imports nothing');
+  const page = probeFs.readFileSync(new URL('./xr-probe.ts', import.meta.url), 'utf8');
+  const specifiers = Array.from(page.matchAll(/^\s*import[^'"]*['"]([^'"]+)['"]/gm), (m) => m[1]);
+  assert.deepEqual(specifiers, ['three', './xr-probe-core.ts'], 'xr-probe.ts imports only three and its core');
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(
