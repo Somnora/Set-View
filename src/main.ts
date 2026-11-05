@@ -29,7 +29,7 @@ import { classifyCameraMove } from './timeline.ts';
 import { History } from './history.ts';
 import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
-import { summarizeScan } from './scan.ts';
+import { summarizeScan, type ScanSource } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
 import { LocationRenderer } from './location.ts';
 import { checkSupport, SessionManager } from './session.ts';
@@ -51,7 +51,7 @@ import {
   type WheelPath,
 } from './wheel.ts';
 import { WheelPanel } from './wheelView.ts';
-import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
+import { floorCorrection, floorSettled, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
 import {
   buildWristPanel,
@@ -172,6 +172,8 @@ const SNAP_TURN_RAD = Math.PI / 6; // 30°
 const SCAN_TIMEOUT_MS = 30_000;
 /** If nothing is tracked after this long, ask the OS to run room capture. */
 const SCAN_ROOM_CAPTURE_AFTER_MS = 2_000;
+/** Longest a scan waits for the floor estimate to settle before capturing anyway. */
+const SCAN_FLOOR_WAIT_MS = 5_000;
 
 /** What the pointer ray is over ('furniture' id = scan mesh index as string). */
 type Hover = { kind: 'actor' | 'camera' | 'furniture' | 'prop'; id: string } | null;
@@ -258,8 +260,16 @@ class App {
   private notesVisible = true;
   private pendingReanchorActors: ActorObject[] = [];
   private pendingReanchorCams: CamObject[] = [];
-  /** Non-null while waiting for the platform's Scene Mesh to capture. */
-  private pendingScan: { startedAt: number; roomCaptureRequested: boolean } | null = null;
+  /** Non-null while waiting for the platform's room data to capture. */
+  private pendingScan: {
+    /** Clock start (loop time), or -1 to (re)start it on the next frame. */
+    startedAt: number;
+    /** Scan Room re-aligned first; capture waits until that fade has applied. */
+    awaitingRealign: boolean;
+    sources: ScanSource[];
+    floorHinted: boolean;
+    roomCaptureRequested: boolean;
+  } | null = null;
   /** Blob id currently loaded into the location renderer. */
   private displayedScanId: string | null = null;
   /** Invalidates stale async scan-blob loads (scene switches, undo). */
@@ -910,7 +920,7 @@ class App {
     this.refreshLanding();
   }
 
-  /** Wrist "Scan Room": starts (or cancels) waiting for the platform mesh. */
+  /** Wrist "Scan Room": starts (or cancels) waiting for the platform's room data. */
   private toggleScan(): void {
     if (this.pendingScan) {
       this.pendingScan = null;
@@ -919,29 +929,61 @@ class App {
       return;
     }
     if (!this.session.session) return;
-    if (!this.session.features.meshDetection) {
-      this.debug.log('mesh detection unavailable — needs a Quest 3/3S-class device with Space Setup done');
+    // Meshes (Quest Scene Mesh) or planes (Android XR); unknown when the
+    // browser does not report enabledFeatures, in which case both are tried.
+    const cap = this.session.scanCapability();
+    if (!cap.canScan) {
+      this.debug.log(`scan unavailable: ${cap.reason}`);
       return;
     }
-    if (this.views.mode !== 'full' || this.views.isShifted) {
-      this.debug.log('scan needs Full view at true alignment — press Re-align first');
+    if (this.views.mode !== 'full') {
+      this.debug.log('scan needs Full view: switch to Full first');
       return;
     }
-    this.pendingScan = { startedAt: performance.now(), roomCaptureRequested: false };
-    this.debug.log('scanning — reading the room mesh…');
+    // Capture bakes the content transform into the geometry, so it must run at
+    // true registration. Re-align here instead of refusing. realign() applies
+    // behind a fade, so isShifted stays true for about half the fade; the scan
+    // waits for it in updatePendingScan rather than cancelling itself.
+    const awaitingRealign = this.views.isShifted;
+    if (awaitingRealign) this.views.realign();
+    this.pendingScan = {
+      startedAt: -1,
+      awaitingRealign,
+      sources: cap.sources,
+      floorHinted: false,
+      roomCaptureRequested: false,
+    };
+    this.debug.log(awaitingRealign ? 'scan: re-aligning first…' : `scanning: reading ${cap.sources.join(' + ')}…`);
     this.refreshWristState();
   }
 
-  /** Per-frame while a scan is pending: snapshot the Scene Mesh when tracked. */
+  /** Per-frame while a scan is pending: snapshot the room data when tracked. */
   private updatePendingScan(frame: XRFrame, time: number): void {
     const pending = this.pendingScan;
     if (!pending) return;
+    if (pending.awaitingRealign) {
+      if (this.views.fading) return; // realign queued behind the fade, not applied yet
+      pending.awaitingRealign = false;
+      pending.startedAt = -1;
+    }
     // Teleporting or leaving Full view mid-scan would bake that transform into
-    // the captured geometry — cancel instead of misregistering the room.
+    // the captured geometry: cancel instead of misregistering the room.
     if (this.views.mode !== 'full' || this.views.isShifted) {
       this.pendingScan = null;
-      this.debug.log('scan cancelled — view changed during capture (Re-align and rescan)');
+      this.debug.log('scan cancelled: view moved (Re-align, then rescan)');
       this.refreshWristState();
+      return;
+    }
+    if (pending.startedAt < 0) pending.startedAt = time;
+    const waited = time - pending.startedAt;
+    // Capture in a scene space the floor re-base (floor.ts) is about to move
+    // would leave the scan at the wrong height, so give the estimate its
+    // settle window first. Capped: without hit-test results it never settles.
+    if (!floorSettled(this.floorEst, this.lastViewerPos.y, time) && waited < SCAN_FLOOR_WAIT_MS) {
+      if (!pending.floorHinted) {
+        pending.floorHinted = true;
+        this.debug.log('scan: settling floor height, look at the floor');
+      }
       return;
     }
     const refSpace = this.renderer.xr.getReferenceSpace();
@@ -951,6 +993,9 @@ class App {
     const scan = captureScanFromFrame(frame, refSpace, _worldToScene);
     if (scan) {
       this.pendingScan = null;
+      // Freeze the floor estimate for the rest of the session: a later re-base
+      // would shift contentRoot under geometry captured in this scene space.
+      this.floorEst.committed = true;
       const summary = summarizeScan(scan);
       void this.persistence.scans.putScan(scan); // fire-and-forget; onError warns
       this.sceneData.scan = summary; // old blob (if any) stays until next-launch prune
@@ -969,7 +1014,6 @@ class App {
       );
       return;
     }
-    const waited = time - pending.startedAt;
     if (!pending.roomCaptureRequested && waited > SCAN_ROOM_CAPTURE_AFTER_MS) {
       pending.roomCaptureRequested = true;
       this.debug.log('no room mesh yet — asking the system to run room capture…');

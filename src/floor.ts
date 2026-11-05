@@ -61,3 +61,18 @@ export function floorCorrection(e: FloorEstimate, headY: number, timeMs: number)
   if (correctedEye < FLOOR_MIN_EYE_M || correctedEye > FLOOR_MAX_EYE_M) return null;
   return e.minHitY;
 }
+
+/**
+ * True once the estimate has had its chance to re-base content: a correction
+ * was committed, or the settle window has passed with enough hits and
+ * floorCorrection declines to correct. Scan capture waits for this, because
+ * geometry captured before a re-base would end up at the wrong height once
+ * contentRoot moves. Not a guarantee: a much lower hit seen later could still
+ * trigger a correction, so the caller freezes the estimate at capture (sets
+ * committed) to keep a fresh scan registered to the real room.
+ */
+export function floorSettled(e: FloorEstimate, headY: number, timeMs: number): boolean {
+  if (e.committed) return true;
+  if (e.hits < FLOOR_MIN_HITS || timeMs - e.firstHitAt < FLOOR_SETTLE_MS) return false;
+  return floorCorrection(e, headY, timeMs) === null;
+}

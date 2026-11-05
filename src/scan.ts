@@ -125,6 +125,42 @@ export function isMovableScanMesh(label: string): boolean {
   return MOVABLE_SCAN_LABELS.has(normalizeSemanticLabel(label));
 }
 
+// --- capture capability -------------------------------------------------------
+
+/** Where Scan Room can read room geometry from. */
+export type ScanSource = 'meshes' | 'planes';
+
+export interface ScanCapability {
+  canScan: boolean;
+  /** Sources capture may read, preferred first. */
+  sources: ScanSource[];
+  /** Short user-facing line: why scanning is refused, or what it will read. */
+  reason: string;
+}
+
+/**
+ * Whether Scan Room can run in this session. `enabledFeatures` is
+ * XRSession.enabledFeatures; `reported` is false when the browser did not
+ * expose that list. Unreported features are unknown, not absent, so both
+ * sources are tried instead of refusing (capture simply finds nothing and
+ * times out if neither exists). Meshes are preferred: Quest Scene Mesh is
+ * denser than its planes; planes are the Android XR path.
+ */
+export function scanCapability(input: { enabledFeatures: readonly string[]; reported: boolean }): ScanCapability {
+  if (!input.reported) {
+    return { canScan: true, sources: ['meshes', 'planes'], reason: 'features not reported, trying meshes and planes' };
+  }
+  const sources: ScanSource[] = [];
+  if (input.enabledFeatures.includes('mesh-detection')) sources.push('meshes');
+  if (input.enabledFeatures.includes('plane-detection')) sources.push('planes');
+  if (sources.length === 0) {
+    return { canScan: false, sources, reason: 'browser has no mesh or plane detection' };
+  }
+  const reason =
+    sources.length === 2 ? 'room mesh, planes as fallback' : sources[0] === 'meshes' ? 'room mesh' : 'detected planes';
+  return { canScan: true, sources, reason };
+}
+
 /**
  * XZ bounds center of a mesh's vertex positions — the pivot furniture yaws
  * about (y stays 0: furniture slides on the floor plane).

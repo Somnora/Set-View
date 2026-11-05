@@ -7,6 +7,7 @@
 import * as THREE from 'three';
 import { makeLabel, type Label } from './ui.ts';
 import type { PlaceArm } from './wheel.ts';
+import { scanCapability, type ScanCapability } from './scan.ts';
 
 export interface SupportReport {
   secureContext: boolean;
@@ -39,6 +40,8 @@ export interface XRFeatureFlags {
   handTracking: boolean;
   domOverlay: boolean;
   meshDetection: boolean;
+  /** WebXR plane-detection granted (the Android XR scan path). */
+  planeDetection: boolean;
   referenceSpace: 'local-floor' | 'local';
 }
 
@@ -59,8 +62,13 @@ export class SessionManager {
     handTracking: false,
     domOverlay: false,
     meshDetection: false,
+    planeDetection: false,
     referenceSpace: 'local',
   };
+  /** XRSession.enabledFeatures as the browser reported it ([] when it didn't). */
+  enabledFeatures: readonly string[] = [];
+  /** False when the browser omitted enabledFeatures: optional features are then unknown, not absent. */
+  featuresReported = false;
 
   /** Reticle object lives in true world space (scene root, not contentRoot). */
   readonly reticle: THREE.Group;
@@ -88,7 +96,15 @@ export class SessionManager {
   async start(overlayRoot: HTMLElement, onEnd: () => void): Promise<void> {
     const init: XRSessionInit = {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['anchors', 'hand-tracking', 'dom-overlay', 'local-floor', 'mesh-detection'],
+      optionalFeatures: [
+        'anchors',
+        'hand-tracking',
+        'dom-overlay',
+        'local-floor',
+        'mesh-detection',
+        // Android XR exposes planes but not meshes; Scan Room falls back to them.
+        'plane-detection',
+      ],
       domOverlay: { root: overlayRoot },
     };
     const session = await navigator.xr!.requestSession('immersive-ar', init);
@@ -102,12 +118,16 @@ export class SessionManager {
 
     const enabled: string[] = (session as unknown as { enabledFeatures?: string[] }).enabledFeatures ?? [];
     const has = (f: string) => enabled.includes(f);
+    this.enabledFeatures = enabled;
+    // hit-test is required, so a real report is never empty.
+    this.featuresReported = enabled.length > 0;
     this.features = {
       hitTest: enabled.length ? has('hit-test') : true, // required, so present if session started
       anchors: enabled.length ? has('anchors') : true, // optimistic; first failure flips anchorsBroken
       handTracking: has('hand-tracking'),
       domOverlay: enabled.length ? has('dom-overlay') : !!session.domOverlayState,
       meshDetection: has('mesh-detection'),
+      planeDetection: has('plane-detection'),
       referenceSpace: 'local',
     };
 
@@ -157,11 +177,18 @@ export class SessionManager {
       onEnd();
     });
 
+    // '?' = the browser did not report enabledFeatures, so the flag is unknown.
+    const flag = (on: boolean) => (!this.featuresReported ? '?' : on ? 'yes' : 'no');
     this.log(
       `session started · ref=${this.features.referenceSpace}` +
         ` · anchors=${this.features.anchors ? 'yes' : 'no'} · overlay=${this.features.domOverlay ? 'yes' : 'no'}` +
-        ` · mesh=${this.features.meshDetection ? 'yes' : 'no'}`,
+        ` · mesh=${flag(this.features.meshDetection)} · planes=${flag(this.features.planeDetection)}`,
     );
+  }
+
+  /** Whether Scan Room can run in this session, and from which sources. */
+  scanCapability(): ScanCapability {
+    return scanCapability({ enabledFeatures: this.enabledFeatures, reported: this.featuresReported });
   }
 
   /**

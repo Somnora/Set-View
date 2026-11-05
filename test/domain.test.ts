@@ -196,6 +196,9 @@ import {
 } from '../src/scan.ts';
 import { MOVABLE_SCAN_LABELS, normalizeSemanticLabel, UNLABELED_SCAN_LABEL } from '../src/scan.ts';
 import { LocationRenderer } from '../src/location.ts';
+import { scanCapability } from '../src/scan.ts';
+import { floorSettled, FLOOR_MIN_HITS, FLOOR_SETTLE_MS } from '../src/floor.ts';
+import { ViewManager } from '../src/views.ts';
 import { estimateScanSizeBytes, ScanStore } from '../src/scanStore.ts';
 import {
   calculateMeshAABB,
@@ -11397,6 +11400,67 @@ test('P0.6 LocationRenderer: the synthetic room shell is never a grab target', (
   const grabbed = loc.furnitureTargets().map((o) => room.meshes[o.userData.scanMeshIndex as number].label);
   assert.deepEqual([...grabbed].sort(), ['couch', 'desk', 'table']);
   for (const label of ['floor', 'ceiling', 'walls', 'door', 'window']) assert.ok(!grabbed.includes(label), label);
+});
+
+test('P0.4 scanCapability: meshes, planes, both, neither, or unreported', () => {
+  const questLike = ['hit-test', 'local-floor', 'anchors', 'hand-tracking', 'dom-overlay', 'mesh-detection', 'plane-detection'];
+  assert.deepEqual(scanCapability({ enabledFeatures: questLike, reported: true }).sources, ['meshes', 'planes']);
+  const questMeshOnly = questLike.filter((f) => f !== 'plane-detection');
+  const q = scanCapability({ enabledFeatures: questMeshOnly, reported: true });
+  assert.equal(q.canScan, true);
+  assert.deepEqual(q.sources, ['meshes']);
+  // Android XR Chrome: planes but no Scene Mesh. Used to dead-end with 'needs a Quest 3'.
+  const androidXrLike = ['hit-test', 'local-floor', 'anchors', 'plane-detection'];
+  const a = scanCapability({ enabledFeatures: androidXrLike, reported: true });
+  assert.equal(a.canScan, true);
+  assert.deepEqual(a.sources, ['planes']);
+  const neither = scanCapability({ enabledFeatures: ['hit-test', 'local-floor'], reported: true });
+  assert.equal(neither.canScan, false);
+  assert.deepEqual(neither.sources, []);
+  assert.ok(neither.reason.length > 0);
+  // Browser omitted enabledFeatures: unknown, so try both instead of refusing.
+  const unknown = scanCapability({ enabledFeatures: [], reported: false });
+  assert.equal(unknown.canScan, true);
+  assert.deepEqual(unknown.sources, ['meshes', 'planes']);
+});
+
+test('P0.4 floorSettled: scan capture waits for the floor estimate', () => {
+  const e = newFloorEstimate();
+  assert.equal(floorSettled(e, 1.6, 0), false, 'no evidence yet');
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(e, 0.02, 1000 + i);
+  assert.equal(floorSettled(e, 1.6, 1000 + FLOOR_SETTLE_MS - 1), false, 'inside the settle window');
+  assert.equal(floorSettled(e, 1.6, 1000 + FLOOR_SETTLE_MS), true, 'plausible floor, nothing to correct');
+
+  const low = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(low, -0.4, 1000 + i);
+  const t = 1000 + FLOOR_SETTLE_MS;
+  assert.notEqual(floorCorrection(low, 1.3, t), null);
+  assert.equal(floorSettled(low, 1.3, t), false, 'a re-base is about to happen');
+  low.committed = true; // what the loop does when it applies the correction
+  assert.equal(floorSettled(low, 1.3, t), true);
+
+  // A correction the estimator declines (implausible eye height) counts as settled.
+  const odd = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(odd, -0.4, 1000 + i);
+  assert.equal(floorCorrection(odd, 3.5, t), null);
+  assert.equal(floorSettled(odd, 3.5, t), true);
+});
+
+test('P0.4 ViewManager.fading: realign stays shifted until the fade applies it', () => {
+  const root = new THREE.Group();
+  const views = new ViewManager(root, new THREE.PerspectiveCamera());
+  views.glide(0.5, -0.25);
+  assert.equal(views.isShifted, true);
+  assert.equal(views.fading, false);
+  views.realign();
+  // This window is what used to cancel an auto-realigned scan on the next frame.
+  assert.equal(views.fading, true);
+  assert.equal(views.isShifted, true);
+  views.update(performance.now() + 1000);
+  assert.equal(views.fading, false);
+  assert.equal(views.isShifted, false);
+  assert.equal(root.position.x, 0);
+  assert.equal(root.position.z, 0);
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(
