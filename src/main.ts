@@ -106,6 +106,7 @@ interface ComfortReachTarget {
 import { WebXRProfilerRuntime } from './webxrProfiler.ts';
 import { SpatialComfortRenderer } from './comfortRenderer.ts';
 import { SetDressingRenderer } from './setDressingRenderer.ts';
+import { migrateEmbeddedGeminiKey } from './setDressingEngine.ts';
 import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
 
 import { ViewfinderRig } from './viewfinder.ts';
@@ -326,6 +327,7 @@ class App {
     this.scene3.add(this.camera); // so head-attached children render
     this.scene3.add(this.contentRoot);
 
+    this.migrateGeminiKeyOnce();
     this.sceneData = this.persistence.loadCurrentOrCreate();
     // Sprite raycasting (name labels, note cards) requires raycaster.camera.
     this.raycaster.camera = this.camera;
@@ -2993,6 +2995,33 @@ class App {
     // is real CPU time rather than a zero delta against the frame-start timestamp.
     this.performanceGovernor.endFrame(this.renderer, this.splatRenderer, this.volumetrics);
     this.profilerRuntime.endFrame(this.renderer, time);
+  }
+
+  /**
+   * Older builds kept the Gemini API key inside each scene's set-dressing
+   * config, so it was autosaved, exported and sent to collab peers. It is now a
+   * per-device setting and normalizeScene drops it from scenes. Runs before the
+   * first scene loads (and is re-saved without the key): moves the key from the
+   * most recently edited scene that has one into the device setting, once.
+   */
+  private migrateGeminiKeyOnce(): void {
+    let store: Storage | null = null;
+    try {
+      store = window.localStorage;
+    } catch {
+      return; // storage blocked: nothing stored to move, nowhere to put it
+    }
+    const s: Storage = store;
+    // Mirrors SCENE_PREFIX in persistence.ts. If that ever changes this finds
+    // nothing and the user re-enters the key once (the Set Dressing modal says so).
+    const prefix = 'setview.scene.';
+    const entries = this.persistence.listScenes(); // most recently updated first
+    function* rawScenes(): Generator<string | null> {
+      for (const e of entries) yield s.getItem(prefix + e.id);
+    }
+    if (migrateEmbeddedGeminiKey(s, rawScenes())) {
+      this.debug.log('Gemini API key moved from scene data to a per-device setting');
+    }
   }
 
   private openPerformanceSettings(): void {

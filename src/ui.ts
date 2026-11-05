@@ -234,6 +234,11 @@ import {
   parseDeterministicNlCommand,
   parseGeminiAiResponse,
 } from './setDressingEngine.ts';
+import {
+  carryAiScatterIntoConfig,
+  readDeviceGeminiKey,
+  writeDeviceGeminiKey,
+} from './setDressingEngine.ts';
 
 
 
@@ -10290,6 +10295,18 @@ export function openSetDressingStudioModal(
   const existingModal = overlayRoot.querySelector('.dressing-modal-overlay');
   if (existingModal) existingModal.remove();
 
+  // The Gemini key is a per-device setting, never part of the scene. When the
+  // browser refuses storage, a key typed here still works until the modal closes.
+  const deviceStore = (): Storage | null => {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  };
+  let sessionGeminiKey = '';
+  const currentGeminiKey = (): string => readDeviceGeminiKey(deviceStore()) || sessionGeminiKey;
+
   const overlay = document.createElement('div');
   overlay.className = 'dressing-modal-overlay';
 
@@ -10379,8 +10396,13 @@ export function openSetDressingStudioModal(
               <div style="display:flex; flex-direction:column; gap:8px;">
                 <label style="font-size:11px; color:#cbd5e1;">Google AI API Key</label>
                 <div style="display:flex; gap:6px;">
-                  <input type="password" id="input-gemini-key" value="${currentConfig.aiConfig.apiKey || ''}" placeholder="AIzaSy..." style="flex:1; background:#040711; border:1px solid #1e293b; color:#f8fafc; border-radius:6px; padding:6px 10px; font-size:12px;" />
+                  <input type="password" id="input-gemini-key" autocomplete="off" placeholder="AIzaSy..." style="flex:1; background:#040711; border:1px solid #1e293b; color:#f8fafc; border-radius:6px; padding:6px 10px; font-size:12px;" />
                   <button class="dressing-btn-secondary" id="btn-toggle-key-vis">👁️</button>
+                </div>
+                <div id="gemini-key-note" style="font-size:11px; color:#94a3b8; line-height:1.4;">
+                  Saved on this device only. It is never stored in the scene, exports or collab sessions.
+                  Keys from older scenes were moved here once; if this is empty, enter yours again.
+                  If you shared a scene file that contained your key, rotate the key.
                 </div>
                 <div style="display:flex; gap:8px; align-items:center;">
                   <label style="font-size:11px; color:#cbd5e1;">Model:</label>
@@ -10429,11 +10451,21 @@ export function openSetDressingStudioModal(
 
       // Wire up Key visibility toggle
       const keyInput = pane.querySelector<HTMLInputElement>('#input-gemini-key')!;
+      // Set as a property, not interpolated into the markup above.
+      keyInput.value = currentGeminiKey();
       pane.querySelector<HTMLButtonElement>('#btn-toggle-key-vis')!.onclick = () => {
         keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
       };
       keyInput.onchange = () => {
-        currentConfig.aiConfig.apiKey = keyInput.value.trim();
+        sessionGeminiKey = keyInput.value.trim();
+        if (!writeDeviceGeminiKey(deviceStore(), sessionGeminiKey)) {
+          const note = pane.querySelector<HTMLElement>('#gemini-key-note');
+          if (note) {
+            note.textContent =
+              'This browser blocked local storage, so the key was not saved. It is used only until this window closes.';
+            note.style.color = '#f87171';
+          }
+        }
       };
 
       const modelSelect = pane.querySelector<HTMLSelectElement>('#select-gemini-model')!;
@@ -10461,9 +10493,10 @@ export function openSetDressingStudioModal(
         renderModal();
 
         try {
-          if (currentConfig.aiConfig.apiKey) {
+          const apiKey = currentGeminiKey();
+          if (apiKey) {
             // Live Gemini API Call
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentConfig.aiConfig.model}:generateContent?key=${currentConfig.aiConfig.apiKey}`;
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentConfig.aiConfig.model}:generateContent?key=${encodeURIComponent(apiKey)}`;
             const sysPrompt = buildGeminiAiSystemPrompt(scene);
             const body = {
               contents: [
@@ -10516,6 +10549,12 @@ export function openSetDressingStudioModal(
       applyBtn.onclick = () => {
         if (pendingMutations.length > 0) {
           applyAiMutationsToScene(scene, pendingMutations);
+          // An AI scatter rewrites scene.setDressing. Carry what it changed into
+          // the staged copy, or onSaveConfig below (and any later Save) would put
+          // the pre-AI items back. Other staged edits in this modal are kept.
+          if (scene.setDressing && pendingMutations.some((m) => m.action === 'scatter_theme')) {
+            carryAiScatterIntoConfig(currentConfig, scene.setDressing);
+          }
           if (onAiMutate) onAiMutate(pendingMutations);
           if (onSaveConfig) onSaveConfig(currentConfig);
           aiStatusText = `Successfully applied ${pendingMutations.length} mutation(s) to the live scene.`;

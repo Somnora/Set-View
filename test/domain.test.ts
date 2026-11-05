@@ -525,6 +525,17 @@ import {
   normalizeVRComfortConfig,
 } from '../src/comfortEngine.ts';
 import {
+  carryAiScatterIntoConfig,
+  createDefaultAiConfig,
+  embeddedGeminiKey,
+  GEMINI_KEY_MIGRATED_FLAG,
+  GEMINI_KEY_STORAGE_KEY,
+  migrateEmbeddedGeminiKey,
+  readDeviceGeminiKey,
+  writeDeviceGeminiKey,
+  type KeyValueStore,
+} from '../src/setDressingEngine.ts';
+import {
   type GeminiAiSceneMutation,
   type ScatterTheme,
   type SetDressingManifest,
@@ -11329,6 +11340,167 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
   const setDressingActions = generateEntityContextActions('set_dressing', 'dressing_root');
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_open_studio'));
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_quick_scatter'));
+});
+
+// --- P0 studios ---
+
+/** In-memory Web Storage stand-in for the per-device key helpers. */
+function p0MemStore(init: Record<string, string> = {}): KeyValueStore & { map: Map<string, string> } {
+  const map = new Map(Object.entries(init));
+  return {
+    map,
+    getItem: (k) => map.get(k) ?? null,
+    setItem: (k, v) => {
+      map.set(k, String(v));
+    },
+    removeItem: (k) => {
+      map.delete(k);
+    },
+  };
+}
+
+/** A stored scene as an older build wrote it: Gemini key inside setDressing.aiConfig. */
+function p0SceneJsonWithKey(name: string, key: string): string {
+  const raw = JSON.parse(JSON.stringify(createScene(name)));
+  raw.setDressing.aiConfig.apiKey = key;
+  return JSON.stringify(raw);
+}
+
+test('P0.15 Gemini key: normalizeScene drops an embedded apiKey, so the export JSON never carries it', () => {
+  const stored = JSON.parse(p0SceneJsonWithKey('keyed', 'AIzaSy-LEAK-1'));
+  stored.setDressing.aiConfig.model = 'gemini-2.5-pro';
+  assert.ok(isSceneData(stored), 'a scene with an embedded key still loads');
+  // persistence.loadScene/exportScene path: normalizeScene, then JSON.stringify.
+  const exported = JSON.stringify(normalizeScene(stored), null, 2);
+  assert.ok(!exported.includes('apiKey'));
+  assert.ok(!exported.includes('AIzaSy-LEAK-1'));
+  // The rest of the AI config survives.
+  assert.equal(JSON.parse(exported).setDressing.aiConfig.model, 'gemini-2.5-pro');
+  // New scenes and default configs have no key field at all.
+  assert.ok(!JSON.stringify(createScene('fresh')).includes('apiKey'));
+  assert.ok(!('apiKey' in createDefaultAiConfig({ apiKey: 'x' } as unknown as Parameters<typeof createDefaultAiConfig>[0])));
+});
+
+test('P0.15 Gemini key: set_dressing_update patches carry no key, sent or received', () => {
+  const leaky = JSON.parse(p0SceneJsonWithKey('patch', 'AIzaSy-LEAK-2')).setDressing;
+  // Sender: main.ts broadcasts normalizeSetDressingConfig(config).
+  const sent = { type: 'set_dressing_update' as const, config: normalizeSetDressingConfig(leaky) };
+  assert.ok(!JSON.stringify(sent).includes('apiKey'));
+  // Receiver: even a patch from an older peer that still embeds a key is stripped.
+  const scene = createScene('receiver');
+  assert.equal(applyScenePatch(scene, { type: 'set_dressing_update', config: leaky }), true);
+  assert.ok(!JSON.stringify(scene).includes('apiKey'));
+  assert.ok(!JSON.stringify(scene).includes('AIzaSy-LEAK-2'));
+});
+
+test('P0.15 Gemini key: per-device read/write trims, clears on empty, and survives refusing storage', () => {
+  const store = p0MemStore();
+  assert.equal(readDeviceGeminiKey(store), '');
+  assert.equal(writeDeviceGeminiKey(store, '  AIzaSy-DEVICE  '), true);
+  assert.equal(store.map.get(GEMINI_KEY_STORAGE_KEY), 'AIzaSy-DEVICE');
+  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-DEVICE');
+  assert.equal(writeDeviceGeminiKey(store, '   '), true);
+  assert.equal(store.map.has(GEMINI_KEY_STORAGE_KEY), false);
+  // No storage at all (blocked accessor) and storage that throws on every call.
+  assert.equal(readDeviceGeminiKey(null), '');
+  assert.equal(writeDeviceGeminiKey(null, 'k'), false);
+  const throwing: KeyValueStore = {
+    getItem: () => {
+      throw new Error('SecurityError');
+    },
+    setItem: () => {
+      throw new Error('QuotaExceededError');
+    },
+    removeItem: () => {
+      throw new Error('SecurityError');
+    },
+  };
+  assert.equal(readDeviceGeminiKey(throwing), '');
+  assert.equal(writeDeviceGeminiKey(throwing, 'k'), false);
+});
+
+test('P0.15 Gemini key: embeddedGeminiKey reads only a real string key from raw scene JSON', () => {
+  assert.equal(embeddedGeminiKey(p0SceneJsonWithKey('a', ' AIzaSy-RAW ')), 'AIzaSy-RAW');
+  assert.equal(embeddedGeminiKey(JSON.stringify(createScene('none'))), '');
+  assert.equal(embeddedGeminiKey('{"setDressing":{"aiConfig":{"apiKey":42}}}'), '');
+  assert.equal(embeddedGeminiKey('{not json'), '');
+  assert.equal(embeddedGeminiKey('null'), '');
+  assert.equal(embeddedGeminiKey(null), '');
+});
+
+test('P0.15 Gemini key: migration moves the first embedded key once and never overwrites', () => {
+  // Takes the first scene (most recent) that has a key, and stops parsing there.
+  const store = p0MemStore();
+  let parsed = 0;
+  function* scenes(): Generator<string | null> {
+    parsed++;
+    yield JSON.stringify(createScene('no key'));
+    parsed++;
+    yield p0SceneJsonWithKey('newest keyed', 'AIzaSy-FIRST');
+    parsed++;
+    yield p0SceneJsonWithKey('older keyed', 'AIzaSy-SECOND');
+  }
+  assert.equal(migrateEmbeddedGeminiKey(store, scenes()), true);
+  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-FIRST');
+  assert.equal(parsed, 2, 'stops at the first key found');
+  assert.equal(store.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
+
+  // Once per device: a second run does nothing, even with new keyed scenes.
+  writeDeviceGeminiKey(store, '');
+  assert.equal(migrateEmbeddedGeminiKey(store, [p0SceneJsonWithKey('later', 'AIzaSy-LATER')]), false);
+  assert.equal(readDeviceGeminiKey(store), '');
+
+  // A key the device already has is never replaced; the flag is still set.
+  const existing = p0MemStore({ [GEMINI_KEY_STORAGE_KEY]: 'AIzaSy-MINE' });
+  assert.equal(migrateEmbeddedGeminiKey(existing, [p0SceneJsonWithKey('x', 'AIzaSy-OTHER')]), false);
+  assert.equal(readDeviceGeminiKey(existing), 'AIzaSy-MINE');
+  assert.equal(existing.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
+
+  // Nothing to move: flag set, no key written. No storage: no throw.
+  const empty = p0MemStore();
+  assert.equal(migrateEmbeddedGeminiKey(empty, [null, '{bad', JSON.stringify(createScene('k'))]), false);
+  assert.equal(empty.map.has(GEMINI_KEY_STORAGE_KEY), false);
+  assert.equal(empty.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
+  assert.equal(migrateEmbeddedGeminiKey(null, [p0SceneJsonWithKey('y', 'k')]), false);
+  const reader: KeyValueStore = {
+    getItem: () => {
+      throw new Error('SecurityError');
+    },
+    setItem: () => {},
+    removeItem: () => {},
+  };
+  assert.equal(migrateEmbeddedGeminiKey(reader, [p0SceneJsonWithKey('z', 'k')]), false);
+});
+
+test('P0.15 Set Dressing: an applied AI scatter survives the modal Save (no stale overwrite)', () => {
+  const scene = normalizeScene(createScene('ai scatter'));
+  // The modal's staged working copy, with one unsaved tweak made before the AI ran.
+  const staged = normalizeSetDressingConfig(scene.setDressing);
+  staged.scatterConfig.seed = 987654;
+  staged.aiConfig.model = 'gemini-2.5-pro';
+  assert.equal(staged.settledItems.length, 0);
+
+  const mutations = parseDeterministicNlCommand('scatter cyberpunk alley props', scene);
+  assert.ok(mutations.some((m) => m.action === 'scatter_theme'));
+  applyAiMutationsToScene(scene, mutations);
+  const aiItems = scene.setDressing!.settledItems;
+  assert.ok(aiItems.length > 0, 'AI scatter placed items');
+
+  carryAiScatterIntoConfig(staged, scene.setDressing!);
+  // Save writes the staged copy over the scene, as onSaveConfig does.
+  scene.setDressing = staged;
+  assert.equal(scene.setDressing.activeTheme, 'cyberpunk_alley');
+  assert.deepEqual(
+    scene.setDressing.settledItems.map((i) => i.id),
+    aiItems.map((i) => i.id),
+  );
+  // Staged edits unrelated to the scatter are kept.
+  assert.equal(scene.setDressing.scatterConfig.seed, 987654);
+  assert.equal(scene.setDressing.aiConfig.model, 'gemini-2.5-pro');
+  // The copy is independent of the scene's arrays, and carrying onto itself is a no-op.
+  assert.notEqual(staged.settledItems, aiItems);
+  carryAiScatterIntoConfig(staged, staged);
+  assert.equal(staged.settledItems.length, aiItems.length);
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(

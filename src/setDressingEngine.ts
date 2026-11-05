@@ -93,9 +93,14 @@ export interface GeminiAiSceneMutation {
   explanation: string;
 }
 
-/** Gemini AI Omni Set Director configuration and model settings. */
+/**
+ * Gemini AI Omni Set Director configuration and model settings. Deliberately
+ * holds NO API key: this config lives in SceneData, which is autosaved,
+ * exported and sent to collab peers. The key is a per-device setting (see
+ * readDeviceGeminiKey below), and normalizing a config drops any key an older
+ * build embedded.
+ */
 export interface GeminiAiConfig {
-  apiKey?: string;
   model: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-lite';
   systemInstruction?: string;
   temperature: number;
@@ -1759,8 +1764,10 @@ export function createDefaultScatterConfig(
 export function createDefaultAiConfig(
   partial?: Partial<GeminiAiConfig>,
 ): GeminiAiConfig {
+  // Builds a fresh object from the known fields only, so an `apiKey` that an
+  // older build stored in the scene is dropped here (and therefore by
+  // normalizeSetDressingConfig and normalizeScene).
   return {
-    apiKey: partial?.apiKey ?? '',
     model: partial?.model ?? 'gemini-2.5-flash',
     systemInstruction: partial?.systemInstruction ?? 'You are the Virtual Set Director for SetView.',
     temperature: partial?.temperature ?? 0.4,
@@ -1797,4 +1804,115 @@ export function normalizeSetDressingConfig(val: unknown): SetDressingConfig {
   if (!val || typeof val !== 'object') return createSetDressingConfig();
   const raw = val as Partial<SetDressingConfig>;
   return createSetDressingConfig(raw);
+}
+
+/**
+ * Copies what an applied AI 'scatter_theme' mutation changed in the scene's
+ * config (theme, density, regions, settled items) into a staged copy, such as
+ * the Set Dressing modal's working config. Without it the modal's next save
+ * writes the pre-AI scatter back over the AI result. Everything else in the
+ * staged copy (seed, spacing, physics, model choice) is left as staged.
+ */
+export function carryAiScatterIntoConfig(staged: SetDressingConfig, applied: SetDressingConfig): void {
+  if (staged === applied) return;
+  staged.activeTheme = applied.activeTheme;
+  staged.scatterConfig.theme = applied.scatterConfig.theme;
+  staged.scatterConfig.density = applied.scatterConfig.density;
+  staged.regions = [...applied.regions];
+  staged.settledItems = [...applied.settledItems];
+}
+
+// ---------------------------------------------------------------------------
+// Per-device Gemini API key (never part of scene data)
+// ---------------------------------------------------------------------------
+
+/** localStorage key holding this device's Gemini API key. */
+export const GEMINI_KEY_STORAGE_KEY = 'setview.geminiApiKey';
+/** Set once the one-time move of a scene-embedded key has run on this device. */
+export const GEMINI_KEY_MIGRATED_FLAG = 'setview.geminiApiKeyMigrated';
+
+/**
+ * The slice of the Web Storage API the key helpers need. Passing it in keeps
+ * this module DOM-free; callers hand over window.localStorage, or null when
+ * the browser refuses storage access.
+ */
+export interface KeyValueStore {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/** This device's Gemini API key, or '' when none is set or storage is unavailable. */
+export function readDeviceGeminiKey(store: KeyValueStore | null | undefined): string {
+  if (!store) return '';
+  try {
+    return (store.getItem(GEMINI_KEY_STORAGE_KEY) ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Stores (or, for an empty value, clears) this device's Gemini API key.
+ * Returns false when storage refused the write (private mode, quota, policy).
+ */
+export function writeDeviceGeminiKey(store: KeyValueStore | null | undefined, key: string): boolean {
+  if (!store) return false;
+  const k = key.trim();
+  try {
+    if (k) store.setItem(GEMINI_KEY_STORAGE_KEY, k);
+    else store.removeItem(GEMINI_KEY_STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The Gemini key an older build embedded in a stored scene
+ * (setDressing.aiConfig.apiKey), read from the raw scene JSON before
+ * normalizeScene drops it. '' when absent or the JSON is malformed.
+ */
+export function embeddedGeminiKey(rawSceneJson: string | null | undefined): string {
+  if (!rawSceneJson) return '';
+  try {
+    const parsed = JSON.parse(rawSceneJson) as {
+      setDressing?: { aiConfig?: { apiKey?: unknown } };
+    } | null;
+    const key = parsed?.setDressing?.aiConfig?.apiKey;
+    return typeof key === 'string' ? key.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * One-time move of a scene-embedded Gemini key into the per-device setting.
+ * Runs at most once per device (a flag records that it ran) and never
+ * overwrites a key the device already has. `rawScenes` is iterated lazily, so
+ * pass the most recently edited scene first: the first embedded key found
+ * wins and the rest are not parsed. Returns true when a key was moved.
+ */
+export function migrateEmbeddedGeminiKey(
+  store: KeyValueStore | null | undefined,
+  rawScenes: Iterable<string | null>,
+): boolean {
+  if (!store) return false;
+  try {
+    if (store.getItem(GEMINI_KEY_MIGRATED_FLAG) === '1') return false;
+    let moved = false;
+    if (!readDeviceGeminiKey(store)) {
+      for (const raw of rawScenes) {
+        const key = embeddedGeminiKey(raw);
+        if (key) {
+          moved = writeDeviceGeminiKey(store, key);
+          break;
+        }
+      }
+    }
+    store.setItem(GEMINI_KEY_MIGRATED_FLAG, '1');
+    return moved;
+  } catch {
+    return false;
+  }
 }
