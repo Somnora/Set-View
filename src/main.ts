@@ -53,6 +53,7 @@ import {
 import { WheelPanel } from './wheelView.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
 import { Persistence } from './persistence.ts';
+import { formatStorageLine } from './persistence.ts';
 import {
   buildWristPanel,
   DebugLog,
@@ -510,11 +511,26 @@ class App {
         if (this.sceneData.id === id) this.newScene('Scene 1');
         this.refreshLanding();
       },
-      onExport: (id) => void this.persistence.exportScene(id),
+      // The live scene is passed so Export hands out what is in memory, not an older
+      // localStorage copy (or nothing) after a failed save.
+      onExport: (id) =>
+        void this.persistence.exportScene(id, this.sceneData).then((ok) => {
+          if (!ok) this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
+        }),
       onImport: (file) => {
-        void this.persistence.importScene(file).then((data) => {
-          if (data) this.loadScene(data);
-          else this.debug.log('import failed: not a SetView scene JSON');
+        void this.persistence.importScene(file).then((res) => {
+          if (!res.ok) {
+            this.reportDataIssue(`import failed: ${res.message}`, 'import');
+            return;
+          }
+          this.loadScene(res.scene);
+          if (!res.saved) {
+            this.reportDataIssue(
+              `"${res.scene.name}" is open but could not be saved (storage full), so it will be gone after a reload. Export it now, or delete scenes you no longer need.`,
+              'import',
+            );
+          }
+          if (res.heavy) this.requestPersistentStorage();
         });
       },
       onRename: (id, name) => {
@@ -546,14 +562,20 @@ class App {
       onExportScanGeoJson: (id) => void this.persistence.exportScanGeoJson(id),
       onExportScanPackage: (id) => void this.persistence.exportScanPackage(id),
       onAddSyntheticScan: (id) => {
-        void this.persistence.attachSyntheticScan(id).then((scan) => {
-          if (scan && id === this.sceneData.id) {
-            this.sceneData = this.persistence.loadScene(id) ?? this.sceneData;
+        const live = id === this.sceneData.id ? this.sceneData : null;
+        void this.persistence.attachSyntheticScan(id, live).then((scan) => {
+          // The scan was attached to the live scene object itself. Replacing
+          // this.sceneData with a reloaded copy (as before) left actors, props and
+          // cameras editing the old object while autosave wrote the new one.
+          // Mirrors removeScan: show it and make it undoable.
+          if (scan && live && live === this.sceneData) {
             this.syncLocation();
+            this.history.record(live);
           }
           this.refreshLanding();
         });
       },
+      getStorageSummary: () => this.persistence.storageReport().then(formatStorageLine),
       onSetLedVolumeEnabled: (sceneId, enabled) => this.setLedVolumeEnabled(sceneId, enabled),
       onPreview: (id) => this.openPreview(id),
       getScene: (id) =>
@@ -674,10 +696,10 @@ class App {
       setTimeout(() => this.openCollabDialog(), 300);
     }
 
-    this.persistence.onError = (m) => {
-      this.debug.log(m);
-      this.wrist.setStatus(m);
-    };
+    // Save, storage and prop-library failures reach the debug log, the 3D wrist and
+    // a banner on the 2D landing page (the wrist is invisible there).
+    this.persistence.onError = (m) => this.reportDataIssue(m);
+    globalPropStore.onError = (m) => this.reportDataIssue(m);
 
     // Fires whichever way a take ends (wrist toggle, camera deleted, session
     // end, MAX_RECORD_S cap, encoder error) — the file is already downloading.
@@ -1170,6 +1192,39 @@ class App {
 
   private refreshLanding(): void {
     this.landing.refreshScenes(this.persistence.listScenes(), this.sceneData.id);
+  }
+
+  /**
+   * Surfaces a save, storage or import problem wherever the user is looking: the
+   * debug log (console and drift board), the 3D wrist status, and a landing banner
+   * on the 2D page. Banners sharing a key replace each other (default: the text).
+   */
+  private reportDataIssue(message: string, key?: string): void {
+    this.debug.log(message);
+    this.wrist.setStatus(message);
+    this.landing.showBanner(message, 'error', key);
+  }
+
+  /** On the first heavy import, asks once for persistent storage and says what the browser decided. */
+  private requestPersistentStorage(): void {
+    void this.persistence.requestPersistentStorage().then((outcome) => {
+      if (outcome === 'granted') {
+        this.debug.log('storage: persistent');
+        this.landing.showBanner(
+          'Browser storage is now persistent: SetView scenes, scans and props will not be cleared to free space.',
+          'info',
+          'persist',
+        );
+      } else if (outcome === 'denied') {
+        const m =
+          'The browser did not make storage persistent, so it may clear SetView data when space runs low. Export scenes you need to keep.';
+        this.debug.log(m);
+        this.landing.showBanner(m, 'warn', 'persist');
+      } else if (outcome === 'unsupported') {
+        this.debug.log('storage: persistence request unavailable in this browser');
+      }
+      if (outcome !== 'already-asked') this.refreshLanding();
+    });
   }
 
   /** Records an undo snapshot and schedules a debounced save. Call after every

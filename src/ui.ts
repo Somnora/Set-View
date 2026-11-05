@@ -775,6 +775,8 @@ export interface LandingCallbacks {
   onExportScanGeoJson?: (id: string) => void;
   onExportScanPackage?: (id: string) => void;
   onAddSyntheticScan?: (id: string) => void;
+  /** One-line storage usage for the Scene & Environment card (may be cached). */
+  getStorageSummary?: () => Promise<string>;
   /** Turns a scene's ICVFX LED volume on or off without opening ICVFX Studio. */
   onSetLedVolumeEnabled?: (sceneId: string, enabled: boolean) => void;
   /** Opens the desktop 3D preview (orbit + playback) for a scene. */
@@ -829,6 +831,7 @@ export class Landing {
   private cb: LandingCallbacks;
   private enterBtn!: HTMLButtonElement;
   private diagEl!: HTMLElement;
+  private bannerEl!: HTMLElement;
   private listEl!: HTMLElement;
   private lastSelectedSceneId = '';
 
@@ -854,6 +857,11 @@ export class Landing {
     el('h1', '', titleBox, 'AR Shot Blocking & 3D Desktop Prep');
     el('p', 'sub', wrap, 'Professional spatial previsualization: block actor keyframes, configure optical camera physics, rig lighting, and preview in 3D & WebXR.');
     this.diagEl = el('div', 'diag', wrap);
+    // Sticky so a storage or import problem stays in view while scrolled down a
+    // scene's prep panel. Hidden while empty so it adds no gap to the layout.
+    this.bannerEl = el('div', 'banners', wrap);
+    this.bannerEl.style.cssText =
+      'display: none; position: sticky; top: 8px; z-index: 20; flex-direction: column; gap: 8px;';
     this.enterBtn = el('button', 'enter', wrap, 'Enter WebXR / AR Mode') as HTMLButtonElement;
     this.enterBtn.disabled = true;
     this.enterBtn.onclick = () => this.cb.onEnter();
@@ -934,6 +942,55 @@ export class Landing {
     p.className = 'bad';
     p.textContent = `Enter AR failed: ${message}`;
     this.diagEl.appendChild(p);
+  }
+
+  /**
+   * Shows a dismissible message at the top of the landing page. Save, storage and
+   * import problems used to reach only the console and the 3D wrist panel, which are
+   * invisible on the 2D page. A banner with the same key is updated in place, so a
+   * failure that repeats on every autosave stays one banner.
+   */
+  showBanner(message: string, kind: 'error' | 'warn' | 'info' = 'error', key: string = message): void {
+    const palette = {
+      error: ['rgba(127, 29, 29, 0.94)', '#f87171', '#fee2e2'],
+      warn: ['rgba(120, 53, 15, 0.94)', '#fbbf24', '#fef3c7'],
+      info: ['rgba(12, 74, 110, 0.94)', '#38bdf8', '#e0f2fe'],
+    }[kind];
+    let banner: HTMLElement | null = null;
+    for (const child of Array.from(this.bannerEl.children)) {
+      if ((child as HTMLElement).dataset.key === key) banner = child as HTMLElement;
+    }
+    if (!banner) {
+      const b = document.createElement('div');
+      b.dataset.key = key;
+      b.style.cssText =
+        'display: flex; align-items: center; justify-content: space-between; gap: 12px; ' +
+        'padding: 10px 14px; border-radius: 8px; border: 1px solid; font-size: 14px; line-height: 1.4;';
+      const text = document.createElement('span');
+      text.className = 'banner-text';
+      b.appendChild(text);
+      const dismiss = document.createElement('button');
+      dismiss.className = 'small';
+      dismiss.textContent = '✕';
+      dismiss.title = 'Dismiss';
+      dismiss.setAttribute('aria-label', 'Dismiss');
+      dismiss.onclick = () => {
+        b.remove();
+        if (this.bannerEl.children.length === 0) this.bannerEl.style.display = 'none';
+      };
+      b.appendChild(dismiss);
+      this.bannerEl.appendChild(b);
+      // Keep the newest few; older ones are still in the debug log.
+      while (this.bannerEl.children.length > 4) this.bannerEl.firstElementChild?.remove();
+      banner = b;
+    }
+    banner.style.background = palette[0];
+    banner.style.borderColor = palette[1];
+    banner.style.color = palette[2];
+    banner.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    const text = banner.querySelector('.banner-text');
+    if (text) text.textContent = message;
+    this.bannerEl.style.display = 'flex';
   }
 
   setDiagnostics(report: SupportReport): void {
@@ -1198,6 +1255,24 @@ export class Landing {
       ledBtn.onclick = () => this.cb.onSetLedVolumeEnabled!(sceneId, !ledOn);
       ledRow.appendChild(ledBtn);
       envCard.appendChild(ledRow);
+    }
+
+    if (this.cb.getStorageSummary) {
+      const storageRow = document.createElement('div');
+      storageRow.className = 'cam-edit';
+      const info = document.createElement('span');
+      info.className = 'scan-info';
+      info.textContent = 'Storage: measuring...';
+      storageRow.appendChild(info);
+      envCard.appendChild(storageRow);
+      void this.cb.getStorageSummary().then(
+        (line) => {
+          info.textContent = line;
+        },
+        () => {
+          info.textContent = 'Storage: unavailable';
+        },
+      );
     }
     grid.appendChild(envCard);
 

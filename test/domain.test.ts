@@ -545,6 +545,14 @@ import {
   simulatePhysicsImpulseSettling,
 } from '../src/setDressingEngine.ts';
 import {
+  buildSceneFile,
+  decodeSceneFileBytes,
+  formatBytes,
+  formatStorageLine,
+  parseSceneFile,
+  Persistence,
+} from '../src/persistence.ts';
+import {
   COMPRESSED_PLY_MESSAGE,
   MAX_INLINE_SPLATS,
   SPLAT_HEADER_SNIFF_BYTES,
@@ -11341,6 +11349,196 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
 });
 
 // --- P0 data ---
+
+/** Minimal synchronous Storage for exercising Persistence in Node. */
+class P0MemoryStorage {
+  private map = new Map<string, string>();
+  failWrites = false;
+  get length(): number {
+    return this.map.size;
+  }
+  key(i: number): string | null {
+    return [...this.map.keys()][i] ?? null;
+  }
+  getItem(k: string): string | null {
+    return this.map.get(k) ?? null;
+  }
+  setItem(k: string, v: string): void {
+    if (this.failWrites) throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    this.map.set(k, String(v));
+  }
+  removeItem(k: string): void {
+    this.map.delete(k);
+  }
+  clear(): void {
+    this.map.clear();
+  }
+}
+
+/** Installs the shim for the duration of fn only (synchronous, so no other test sees it). */
+function withP0MemoryStorage(fn: (storage: P0MemoryStorage) => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const storage = new P0MemoryStorage();
+  Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true, writable: true });
+  try {
+    fn(storage);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+}
+
+/** A scene carrying the synthetic room scan with two moved pieces and one stale placement. */
+function p0SceneWithMovedFurniture(): { scene: SceneData; scan: LocationScan } {
+  const scan = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+  const scene = createScene('Furniture Round Trip');
+  scene.scan = summarizeScan(scan);
+  const last = scan.meshes.length - 1;
+  scene.scan.furniture = [
+    { meshIndex: last, dx: 0.75, dz: -0.5, rotY: 0.4 },
+    { meshIndex: last - 1, dx: -1.25, dz: 0.3, rotY: -1.1 },
+    { meshIndex: scan.meshes.length + 3, dx: 1, dz: 1, rotY: 0 }, // points past the mesh list
+  ];
+  return { scene, scan };
+}
+
+test('P0.8: furniture placements survive export then import, and mesh order is stable', () => {
+  const { scene, scan } = p0SceneWithMovedFurniture();
+  const text = JSON.stringify(buildSceneFile(scene, scan), null, 2);
+  const parsed = parseSceneFile(text);
+  assert.ok(parsed, 'an exported scene must parse back');
+  const imported = parsed.scene;
+  assert.notEqual(imported.id, scene.id); // a fresh id never clobbers the source scene
+  assert.ok(imported.name.endsWith('(imported)'));
+  assert.equal(parsed.scanDropped, false);
+  assert.ok(parsed.scan && imported.scan);
+  assert.equal(imported.scan.id, parsed.scan.id);
+  assert.notEqual(parsed.scan.id, scan.id); // fresh blob id
+  // The two in-range placements come back unchanged; the stale one is dropped.
+  assert.deepEqual(imported.scan.furniture, scene.scan!.furniture!.slice(0, 2));
+  // Placements index meshes, so the codec must keep mesh order and contents.
+  assert.equal(parsed.scan.meshes.length, scan.meshes.length);
+  for (let i = 0; i < scan.meshes.length; i++) {
+    assert.equal(parsed.scan.meshes[i].label, scan.meshes[i].label);
+    assert.deepEqual(Array.from(parsed.scan.meshes[i].positions), Array.from(scan.meshes[i].positions));
+    assert.deepEqual(Array.from(parsed.scan.meshes[i].indices), Array.from(scan.meshes[i].indices));
+  }
+  // The base64 never rides along into the scene that gets saved.
+  assert.equal('scanData' in imported, false);
+
+  // ...and the placements persist through a save and reload (in-memory Storage shim).
+  withP0MemoryStorage(() => {
+    const p = new Persistence();
+    assert.equal(p.saveNow(imported), true);
+    const reloaded = p.loadScene(imported.id);
+    assert.ok(reloaded?.scan);
+    assert.deepEqual(reloaded.scan.furniture, imported.scan!.furniture);
+  });
+});
+
+test('P0.8: an import with a summary but no geometry drops the scan instead of dangling', () => {
+  const { scene } = p0SceneWithMovedFurniture();
+  const parsed = parseSceneFile(JSON.stringify(buildSceneFile(scene, null)));
+  assert.ok(parsed);
+  assert.equal(parsed.scan, null);
+  assert.equal(parsed.scene.scan, null);
+  assert.equal(parsed.scanDropped, true);
+  assert.equal(parseSceneFile('{"name":"not a scene"}'), null);
+  assert.equal(parseSceneFile('not json at all'), null);
+});
+
+test('P0.8: a null or empty file read is "blocked", not "corrupt"', () => {
+  assert.equal(decodeSceneFileBytes(null), null);
+  assert.equal(decodeSceneFileBytes(undefined), null);
+  assert.equal(decodeSceneFileBytes(new ArrayBuffer(0)), null);
+  const bytes = new TextEncoder().encode('{"a":"é"}');
+  assert.equal(decodeSceneFileBytes(bytes.buffer as ArrayBuffer), '{"a":"é"}');
+});
+
+test('P0.8: importScene tells a blocked read apart from a file that is not a scene', async () => {
+  const p = new Persistence();
+  const blocked = {
+    name: 'scene.setview.json',
+    size: 2048,
+    arrayBuffer: () => Promise.reject(new Error('NotReadableError')),
+  } as unknown as File;
+  const r1 = await p.importScene(blocked);
+  assert.equal(r1.ok, false);
+  if (!r1.ok) {
+    assert.equal(r1.reason, 'blocked');
+    assert.ok(r1.message.includes('blocked'));
+  }
+  const empty = { name: 'empty.json', size: 0, arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) } as unknown as File;
+  const r2 = await p.importScene(empty);
+  assert.equal(r2.ok === false && r2.reason, 'blocked');
+  const notScene = {
+    name: 'other.json',
+    size: 16,
+    arrayBuffer: () => Promise.resolve(new TextEncoder().encode('{"hello":1}').buffer),
+  } as unknown as File;
+  const r3 = await p.importScene(notScene);
+  assert.equal(r3.ok === false && r3.reason, 'invalid');
+  // P0.9: Node has no navigator.storage, and the request is made once per page.
+  assert.equal(await p.requestPersistentStorage(), 'unsupported');
+  assert.equal(await p.requestPersistentStorage(), 'already-asked');
+});
+
+test('P0.8: after a failed save, Export hands out the in-memory scene, not the stale stored copy', () => {
+  withP0MemoryStorage((storage) => {
+    const p = new Persistence();
+    const errors: string[] = [];
+    p.onError = (m) => errors.push(m);
+    const scene = createScene('Quota Victim');
+    assert.equal(p.saveNow(scene), true);
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim');
+
+    scene.name = 'Quota Victim (edited)';
+    storage.failWrites = true;
+    assert.equal(p.saveNow(scene), false);
+    assert.equal(errors.length, 1);
+    assert.equal(p.loadScene(scene.id)?.name, 'Quota Victim'); // storage holds the old copy
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
+
+    // A scene that never saved at all (e.g. a failed import) can still be exported.
+    const neverSaved = createScene('Never Saved');
+    assert.equal(p.saveNow(neverSaved), false);
+    assert.equal(p.loadScene(neverSaved.id), null);
+    assert.equal(p.sceneForExport(neverSaved.id), neverSaved);
+
+    // The live scene always wins for its own id; other ids fall through.
+    const live = createScene('Live');
+    assert.equal(p.sceneForExport(live.id, live), live);
+    assert.equal(p.sceneForExport(scene.id, live)?.name, 'Quota Victim (edited)');
+
+    // Once a save succeeds again, export reads storage as before.
+    storage.failWrites = false;
+    assert.equal(p.saveNow(scene), true);
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
+    assert.notEqual(p.sceneForExport(scene.id), scene); // a fresh load, not the cached object
+  });
+});
+
+test('P0.9: storage line formatting', () => {
+  const MB = 1024 * 1024;
+  assert.equal(formatBytes(512), '512 B');
+  assert.equal(formatBytes(1536), '1.5 KB');
+  assert.equal(formatBytes(5 * MB), '5.0 MB');
+  assert.equal(formatBytes(2 * 1024 * MB), '2.00 GB');
+  assert.equal(formatBytes(Number.NaN), '?');
+  const full = formatStorageLine({
+    usageBytes: 12 * MB,
+    quotaBytes: 2 * 1024 * MB,
+    persisted: false,
+    sceneBytes: 1.5 * MB,
+    scanBytes: 3 * MB,
+  });
+  assert.ok(full.startsWith('Storage: scenes 1.5 MB, scans 3.0 MB'));
+  assert.ok(full.includes('browser total 12.0 MB of 2.00 GB'));
+  assert.ok(full.includes('not persistent'));
+  const bare = formatStorageLine({ usageBytes: null, quotaBytes: null, persisted: null, sceneBytes: 0, scanBytes: 0 });
+  assert.equal(bare, 'Storage: scenes 0 B, scans 0 B');
+  assert.ok(!/[\u2014\u2013]/.test(full), 'no em or en dashes in UI copy');
+});
 
 test('P0.10: new scenes start without the LED volume; saved scenes keep their own flag', () => {
   const fresh = createScene('Empty Stage');

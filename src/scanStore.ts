@@ -33,6 +33,9 @@ export class ScanStore {
   private dbPromise: Promise<IDBDatabase | null> | null = null;
   /** Fallback when IndexedDB is unavailable (session lifetime only). */
   private memory = new Map<string, LocationScan>();
+  /** Sizes already measured by getTotalStorageBytes. A blob never changes under its
+   *  id (every capture, import and duplicate gets a fresh one), so a size stays valid. */
+  private sizeCache = new Map<string, number>();
 
   private open(): Promise<IDBDatabase | null> {
     if (this.dbPromise) return this.dbPromise;
@@ -154,12 +157,18 @@ export class ScanStore {
     return scan ? estimateScanSizeBytes(scan) : 0;
   }
 
-  /** Returns total approximate byte size of all scans in storage. */
+  /** Returns total approximate byte size of all scans in storage. Each blob is read
+   *  once per page to measure it; later calls only list the ids. */
   async getTotalStorageBytes(): Promise<number> {
     const ids = await this.listScanIds();
     let total = 0;
     for (const id of ids) {
-      total += await this.getScanSizeBytes(id);
+      let size = this.sizeCache.get(id);
+      if (size === undefined) {
+        size = await this.getScanSizeBytes(id);
+        if (size > 0) this.sizeCache.set(id, size);
+      }
+      total += size;
     }
     return total;
   }
