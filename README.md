@@ -84,16 +84,16 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 
 **The tool wheel (your menu for everything):** a ring of tools that **always rides your left hand** — raise your hand and it's right there, drop your hand and it falls out of frame. **Controllers also have a hard menu button: press Y (left) to pop the wheel head-locked in front of your face** (press Y again to tuck it away). **To operate it: point your right hand/controller at a sector and pull the trigger (or pinch)**.
 
-Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit, Light, Scale) and the hub becomes **◂ Back**. The wheel switches between **Block** (plan the shot), **Dress** (adjust physical room furniture), and **Light** (place & tune set lights).
+Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit, Stance, Props) and the hub becomes **◂ Back**. The wheel switches between **Block** (plan the shot) and **Dress** (scan the room, move scanned furniture and props). Lights from an imported scene render and export; placing and tuning lights in AR is not wired yet (roadmap P4.5).
 
 ### Quick Control Matrix
 
 | Input | Action |
 |---|---|
 | **Y** | Toggle tool wheel head-locked in front of face |
-| **X** | Cycle Place tool mode: Off → Actor → Camera → Light → Off |
-| **Point + Trigger / Pinch** | Select actor / camera / light or press wheel sector |
-| **Right Grip (hold)** | Grab & move selected actor, camera, scanned furniture, or light |
+| **X** | Cycle Place tool mode: Off → Actor → Camera → Prop → Off |
+| **Point + Trigger / Pinch** | Select actor / camera / prop or press wheel sector |
+| **Right Grip (hold)** | Grab & move an actor, camera or prop (Block), or scanned furniture and props (Dress, Full view) |
 | **Right stick ← → (holding)** | Rotate facing / yaw of held object |
 | **Wrist HUD Toggle** | Pin/unpin the concise VR wrist HUD readout |
 | **Wrist Frame Lines** | Eyes-as-camera mode with focal-correct letterboxing & specs |
