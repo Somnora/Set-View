@@ -480,6 +480,30 @@ body {
   pointer-events: none;
 }
 
+/* Studio modals mount inside #overlay during an AR session with dom-overlay
+   (on the 2D page they mount on body). #overlay stays click-through so the
+   AR view keeps its input; each full-screen modal root takes input back.
+   Keep this list in sync with STUDIO_MODAL_ROOT_CLASSES in ui.ts. */
+#overlay > .ai-modal-overlay,
+#overlay > .collab-modal-overlay,
+#overlay > .props-modal-overlay,
+#overlay > .livelink-modal-overlay,
+#overlay > .actor-studio-overlay,
+#overlay > .grip-studio-overlay,
+#overlay > .splat-modal-overlay,
+#overlay > .perf-modal-overlay,
+#overlay > .dailies-modal-overlay,
+#overlay > .dmx-modal-overlay,
+#overlay > .icvfx-modal-overlay,
+#overlay > .acoustics-modal-overlay,
+#overlay > .solar-modal-overlay,
+#overlay > .screenplay-modal-overlay,
+#overlay > .profiler-modal-overlay,
+#overlay > .comfort-modal-overlay,
+#overlay > .dressing-modal-overlay {
+  pointer-events: auto;
+}
+
 #overlay .note-dialog {
   pointer-events: auto;
   position: absolute;

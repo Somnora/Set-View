@@ -113,6 +113,12 @@ interface ComfortReachTarget {
 import { WebXRProfilerRuntime } from './webxrProfiler.ts';
 import { SpatialComfortRenderer } from './comfortRenderer.ts';
 import { SetDressingRenderer } from './setDressingRenderer.ts';
+import {
+  applyAiMutationsToScene,
+  migrateEmbeddedGeminiKey,
+  normalizeSetDressingConfig,
+} from './setDressingEngine.ts';
+import { STUDIO_MODAL_ROOT_CLASSES } from './ui.ts';
 import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
 
 import { ViewfinderRig } from './viewfinder.ts';
@@ -305,6 +311,9 @@ class App {
   private fpsFrames = 0;
   private fpsLast = 0;
   private wristRefreshLast = 0;
+  /** Wrist status shown instead of the selection line until wristNoticeUntil (studioHost). */
+  private wristNotice = '';
+  private wristNoticeUntil = 0;
 
   // Bumped on any add/remove of an actor or camera; caches below key off it so
   // per-frame hover/hidden lists rebuild only when the scene structure changes.
@@ -359,6 +368,7 @@ class App {
     this.scene3.add(this.camera); // so head-attached children render
     this.scene3.add(this.contentRoot);
 
+    this.migrateGeminiKeyOnce();
     this.sceneData = this.persistence.loadCurrentOrCreate();
     // Sprite raycasting (name labels, note cards) requires raycaster.camera.
     this.raycaster.camera = this.camera;
@@ -516,6 +526,12 @@ class App {
     this.performanceHud = new PerformanceHudOverlay(this.performanceGovernor, () => this.openPerformanceSettings());
 
     const overlayRoot = document.getElementById('overlay')!;
+    // A trigger or pinch on a DOM overlay control (a studio modal, the note
+    // editor, a HUD) should only click it. Without this the same press also
+    // fires an XR select, which places or selects in the world behind the
+    // dialog (WebXR DOM Overlays 'beforexrselect'). #overlay itself is
+    // pointer-events:none, so presses that hit no control still reach the world.
+    overlayRoot.addEventListener('beforexrselect', (e) => e.preventDefault());
     this.noteEditor = new NoteEditor(overlayRoot);
 
     this.wrist = buildWristPanel();
@@ -580,20 +596,21 @@ class App {
       },
       onExportFloorplan: (id) => this.persistence.exportFloorplan(id),
       onExportShotList: (id) => this.persistence.exportShotList(id),
+      // Landing entries only run outside a session, where modalHost() is body.
       onExportNleTimeline: (id) =>
         openNleExportModal(
           id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
-          document.getElementById('overlay')!,
+          this.modalHost() ?? document.body,
         ),
       onExportUe5Bridge: (id) =>
         openUe5ExportModal(
           id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
-          document.getElementById('overlay')!,
+          this.modalHost() ?? document.body,
         ),
       onAiShotAnalysis: (id) =>
         openAiAnalysisModal(
           id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
-          document.getElementById('overlay')!,
+          this.modalHost() ?? document.body,
         ),
       onRemoveScan: (id) => this.removeScan(id),
       onExportScanObj: (id) => void this.persistence.exportScanObj(id),
@@ -631,32 +648,15 @@ class App {
       onOpenLiveLink: () => this.openLiveLinkDialog(),
       onGaussianSplatStudio: (sceneId) => {
         const sc = sceneId === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(sceneId) ?? this.sceneData);
-        openGaussianSplatStudioModal(
-          sc,
-          (updated) => {
-            if (sc.id === this.sceneData.id) {
-              this.sceneData = updated;
-              this.loadScene(this.sceneData);
-              this.persistence.saveNow(this.sceneData);
-              this.markDirty();
-            } else {
-              this.persistence.saveNow(updated);
-            }
-            this.refreshLanding();
-          },
-          document.getElementById('overlay')!,
-          (cloud) => {
-            if (sc.id === this.sceneData.id) {
-              this.splatRenderer.setCloud(cloud);
-            }
-          },
-        );
+        this.openSplatStudioDialog(sc);
       },
       onOpenDailiesStudio: (sceneId) => {
         const sc =
           sceneId === this.sceneData.id
             ? this.sceneData
             : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        const host = this.studioHost('Dailies Studio');
+        if (!host) return;
         openDailiesVideoStudioModal(
           sc,
           async (options, onProgress) => {
@@ -670,7 +670,7 @@ class App {
               sc.id === this.sceneData.id ? this.contentRoot : undefined,
             );
           },
-          document.getElementById('overlay') ?? document.body,
+          host,
         );
       },
       onOpenDmxBridge: (sceneId) => {
@@ -758,6 +758,7 @@ class App {
 
     this.wireSubsystems();
     this.loadScene(this.sceneData);
+    if (import.meta.env.DEV) this.installDevTestHooks();
     // ?preview auto-opens the desktop viewer on the current scene (also the
     // hook for the headless render smoke — see test notes in TESTING.md).
     if (new URLSearchParams(location.search).has('preview')) this.openPreview(this.sceneData.id);
@@ -874,7 +875,8 @@ class App {
       } else if (id === 'wheel') {
         this.toggleMenuInFront();
       } else if (id === 'ai') {
-        openAiAnalysisModal(this.sceneData);
+        const host = this.studioHost('AI Shot Analysis');
+        if (host) openAiAnalysisModal(this.sceneData, host);
       } else if (id === 'props') {
         void this.openPropsLibrary();
       }
@@ -1690,12 +1692,22 @@ class App {
           (this.selectedActorId ? this.sceneData.actors.find((a) => a.id === this.selectedActorId) : undefined) ??
           this.sceneData.actors[0];
         if (actor) {
-          openActorStudioModal(actor, this.sceneData, (updated) => {
-            Object.assign(actor, updated);
-            this.actors.rebuildVisual(actor.id);
-            this.persistence.saveNow(this.sceneData);
-            this.markDirty();
-          });
+          const host = this.studioHost('Actor Rig Studio');
+          if (!host) break;
+          openActorStudioModal(
+            actor,
+            this.sceneData,
+            (updated) => {
+              // Re-resolve: an undo while the studio was open replaces the scene's objects.
+              const live = this.sceneData.actors.find((a) => a.id === actor.id);
+              if (!live) return;
+              Object.assign(live, updated);
+              this.actors.rebuildVisual(live.id);
+              this.persistence.saveNow(this.sceneData);
+              this.markDirty();
+            },
+            host,
+          );
         } else {
           this.debug.log('No actor in scene: place an actor first');
         }
@@ -1704,34 +1716,34 @@ class App {
       case 'grip-rig': {
         const cam = this.cams.active?.data ?? this.sceneData.cameras[0];
         if (cam) {
-          openCameraGripModal(cam, this.sceneData, (updated) => {
-            Object.assign(cam, updated);
-            this.cams.refreshCamera(cam.id);
-            this.persistence.saveNow(this.sceneData);
-            this.markDirty();
-          });
+          const host = this.studioHost('Camera Grip Studio');
+          if (!host) break;
+          openCameraGripModal(
+            cam,
+            this.sceneData,
+            (updated) => {
+              // Re-resolve: an undo while the studio was open replaces the scene's objects.
+              const live = this.sceneData.cameras.find((c) => c.id === cam.id);
+              if (!live) return;
+              Object.assign(live, updated);
+              this.cams.refreshCamera(live.id);
+              this.persistence.saveNow(this.sceneData);
+              this.markDirty();
+            },
+            host,
+          );
         } else {
           this.debug.log('No camera in scene: place a camera first');
         }
         break;
       }
       case 'splat-studio': {
-        openGaussianSplatStudioModal(
-          this.sceneData,
-          (updated) => {
-            this.sceneData = updated;
-            this.loadScene(this.sceneData);
-            this.persistence.saveNow(this.sceneData);
-            this.markDirty();
-          },
-          document.getElementById('overlay')!,
-          (cloud) => {
-            this.splatRenderer.setCloud(cloud);
-          },
-        );
+        this.openSplatStudioDialog();
         break;
       }
       case 'dailies-studio': {
+        const host = this.studioHost('Dailies Studio');
+        if (!host) break;
         openDailiesVideoStudioModal(
           this.sceneData,
           async (options, onProgress) => {
@@ -1745,7 +1757,7 @@ class App {
               this.contentRoot,
             );
           },
-          document.getElementById('overlay') ?? document.body,
+          host,
         );
         break;
       }
@@ -1840,9 +1852,11 @@ class App {
       case 'record':
         this.toggleRecording();
         break;
-      case 'aianalysis':
-        openAiAnalysisModal(this.sceneData, document.getElementById('overlay')!);
+      case 'aianalysis': {
+        const host = this.studioHost('AI Shot Analysis');
+        if (host) openAiAnalysisModal(this.sceneData, host);
         break;
+      }
       case 'help':
         this.guideSticky = !this.guideSticky;
         this.guideAutoUntil = 0;
@@ -1996,6 +2010,7 @@ class App {
     this.pendingScan = null;
     this.noteEditor.close();
     this.persistence.saveNow(this.sceneData);
+    this.moveStudiosToPage();
     document.getElementById('overlay')!.hidden = true;
     this.landing.show(true);
     this.refreshLanding();
@@ -2764,7 +2779,8 @@ class App {
     this.wrist.setLabel('stance', selObj ? `Stance ▸ ${poseFor(selObj.data.stance).short}` : 'Stance ▸');
     const sel = selObj?.data.name ?? '—';
     const cam = this.cams.active;
-    this.wrist.setStatus(`${sel}${cam ? ` · ${cam.data.name} ${Math.round(cam.data.lensFocalLength)}mm` : ''}`);
+    const notice = performance.now() < this.wristNoticeUntil ? this.wristNotice : '';
+    this.wrist.setStatus(notice || `${sel}${cam ? ` · ${cam.data.name} ${Math.round(cam.data.lensFocalLength)}mm` : ''}`);
   }
 
   /** Everything that must not appear in the virtual camera's frame. Cached and
@@ -3371,54 +3387,250 @@ class App {
     this.profilerRuntime.endFrame(this.renderer, time);
   }
 
+  // --- studio modals -----------------------------------------------------------------
+
+  /**
+   * Dev server only (the constructor calls this under import.meta.env.DEV,
+   * which vite build compiles to false, so production never installs it): a
+   * handle for the headed smokes such as test/studio-modal-smoke.html.
+   * Undo lives on the 3D wheel and wrist and rendered props live in the 3D
+   * scene, so a DOM-driven smoke cannot reach either without it.
+   */
+  private installDevTestHooks(): void {
+    const sent: string[] = [];
+    const collab = this.collabSession;
+    const broadcast = collab.broadcastPatch.bind(collab);
+    collab.broadcastPatch = (patch) => {
+      sent.push(JSON.stringify(patch));
+      broadcast(patch);
+    };
+    const splat = this.splatRenderer as unknown as { cloud?: { id: string } | null };
+    (window as unknown as { __setviewTest?: unknown }).__setviewTest = {
+      undo: () => this.undo(),
+      canUndo: () => this.history.canUndo,
+      renderedPropCount: () => this.props.all().length,
+      splatCloudId: () => splat.cloud?.id ?? null,
+      liveDmxEnabled: () => this.dmxStreamer.getConfig().enabled,
+      sentPatches: () => sent.slice(),
+    };
+  }
+
+  /**
+   * Where a DOM modal (studio, library, exporter) mounts. Outside an XR session
+   * (landing page, desktop preview, the Quest 2D page) that is document.body:
+   * #overlay is hidden there. Inside a session only the dom-overlay root is
+   * displayed, so it is #overlay when the session granted dom-overlay, and null
+   * otherwise, meaning the modal would be invisible and the caller must refuse.
+   */
+  private modalHost(): HTMLElement | null {
+    if (!this.session.session) return document.body;
+    if (!this.session.features.domOverlay) return null;
+    return document.getElementById('overlay');
+  }
+
+  /**
+   * modalHost() for a studio the user just asked for. In AR without dom-overlay
+   * it returns null after saying so where the user is looking (wheel hub, wrist
+   * status, debug log, haptic buzz) instead of opening an invisible modal: the
+   * same refusal openNoteEditor makes, made visible.
+   */
+  private studioHost(name: string): HTMLElement | null {
+    const host = this.modalHost();
+    if (host) return host;
+    const NOTICE_MS = 3000;
+    this.debug.log(`${name} needs dom-overlay, which this session lacks: open it on the 2D page`);
+    this.wheel.showHubNotice('2D page', 'open it there', NOTICE_MS);
+    this.wristNotice = `${name}: open this on the 2D page`;
+    this.wristNoticeUntil = performance.now() + NOTICE_MS;
+    this.refreshWristState();
+    // Every press refreshes the wrist; this puts the normal status back afterwards.
+    window.setTimeout(() => this.refreshWristState(), NOTICE_MS + 50);
+    globalSpatialFeedback.triggerHaptic('both', 'error');
+    globalSpatialFeedback.playSpatialSound('error');
+    return null;
+  }
+
+  /**
+   * A studio still open when the session ends sits in #overlay, which the 2D
+   * page hides. Move it to body so it stays visible and usable there, and its
+   * unsaved edits are neither lost nor brought back on the next AR entry. Its
+   * Save and Cancel still work: the callbacks do not depend on where it mounts.
+   */
+  private moveStudiosToPage(): void {
+    const overlayRoot = document.getElementById('overlay');
+    if (!overlayRoot) return;
+    for (const el of Array.from(overlayRoot.children)) {
+      if (STUDIO_MODAL_ROOT_CLASSES.some((cls) => el.classList.contains(cls))) document.body.appendChild(el);
+    }
+  }
+
+  /**
+   * Commits an edit made in a studio modal. Studios opened from the landing page
+   * can target a scene other than the live one: that scene is only saved, since
+   * the live renderers, collab peers and undo history belong to the current
+   * scene. For the current scene the edit is applied to this.sceneData itself
+   * (the modal may hold a stale object if an undo replaced the scene while it was
+   * open), pushed to the running subsystems by `applyLive`, saved, broadcast and
+   * recorded as one undo step.
+   */
+  private commitStudioEdit(
+    sc: SceneData,
+    mutate: (target: SceneData) => void,
+    applyLive?: () => void,
+    patch?: CollabScenePatch,
+  ): void {
+    if (sc.id !== this.sceneData.id) {
+      mutate(sc);
+      this.persistence.saveNow(sc);
+      this.refreshLanding();
+      return;
+    }
+    mutate(this.sceneData);
+    applyLive?.();
+    this.persistence.saveNow(this.sceneData);
+    if (patch) this.collabSession.broadcastPatch(patch);
+    this.markDirty();
+    // The landing page is hidden in AR and refreshed when the session ends.
+    if (!this.session.session) this.refreshLanding();
+  }
+
+  /**
+   * Older builds kept the Gemini API key inside each scene's set-dressing
+   * config, so it was autosaved, exported and sent to collab peers. It is now a
+   * per-device setting and normalizeScene drops it from scenes. Runs once per
+   * device, before the first scene loads: moves the key from the most recently
+   * edited scene that has one into the device setting, then rewrites every
+   * stored scene without it, so no scene in storage still holds the key.
+   */
+  private migrateGeminiKeyOnce(): void {
+    let store: Storage | null = null;
+    try {
+      store = window.localStorage;
+    } catch {
+      return; // storage blocked: nothing stored to move, nowhere to put it
+    }
+    // Mirrors SCENE_PREFIX in persistence.ts. If that ever changes this finds
+    // nothing and the user re-enters the key once (the Set Dressing modal says so).
+    const prefix = 'setview.scene.';
+    const sceneKeys = this.persistence.listScenes().map((e) => prefix + e.id); // most recently updated first
+    if (migrateEmbeddedGeminiKey(store, sceneKeys)) {
+      this.debug.log('Gemini API key moved from scene data to a per-device setting');
+    }
+  }
+
+  /**
+   * props.setScene disposes and rebuilds every prop object (asynchronously) and
+   * clears PropsManager's own selection. Drop main's prop selection and prop
+   * hover with it, as loadScene and restoreScene do, so Delete and Duplicate
+   * never act on a prop that is gone, the radial does not linger on it, and the
+   * gizmo never drives a disposed root.
+   */
+  private dropPropSelectionForRebuild(): void {
+    if (this.hover?.kind === 'prop') this.hover = null;
+    if (this.selectedPropId) this.selectProp(null);
+    else if (this.gizmo.getTarget()?.kind === 'prop') this.gizmo.detach();
+  }
+
+  /** Points the splat renderer at the scene's active cloud and floorplan. */
+  private applySplatState(data: SceneData): void {
+    const clouds = data.gaussianClouds ?? [];
+    this.splatRenderer.setCloud(clouds.find((c) => c.id === data.activeSplatCloudId) ?? clouds[0] ?? null);
+    this.splatRenderer.setFloorplanOverlay(data.architecture ?? null);
+  }
+
+  private openSplatStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('3DGS Studio');
+    if (!host) return;
+    const sc = sceneToUse ?? this.sceneData;
+    // The studio replaces scene.architecture only when Extract Walls staged a
+    // new one; otherwise Save must not write this (possibly stale) copy back
+    // over an architecture changed meanwhile by an undo or a collab patch.
+    const architectureAtOpen = sc.architecture;
+    openGaussianSplatStudioModal(
+      sc,
+      (updated) => {
+        // A normal undo step. This used to run loadScene, whose history.reset
+        // wiped the whole undo stack on every save. Only the splat renderer
+        // reads these fields, so actors, cameras and their anchors stay put.
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.gaussianClouds = updated.gaussianClouds;
+            t.activeSplatCloudId = updated.activeSplatCloudId;
+            if (updated.architecture !== architectureAtOpen) t.architecture = updated.architecture;
+          },
+          () => this.applySplatState(this.sceneData),
+        );
+      },
+      host,
+      // Live preview while editing; Cancel sends the opening cloud back here.
+      (cloud) => {
+        if (sc.id === this.sceneData.id) this.splatRenderer.setCloud(cloud);
+      },
+    );
+  }
+
   private openPerformanceSettings(): void {
+    const host = this.studioHost('Performance Settings');
+    if (!host) return;
     openPerformanceSettingsModal(
       this.performanceGovernor,
       (cfg) => {
         this.debug.log(`Perf governor config updated: target ${cfg.targetFps} FPS`);
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openDmxBridgeDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('DMX Bridge');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openDmxBridgeStudioModal(
       sc,
       (config) => {
-        sc.dmxBridge = config;
-        this.dmxStreamer.setConfig(config);
-        this.persistence.saveNow(this.sceneData);
-        this.markDirty();
+        // Only the loaded scene reconfigures the live streamer (commitStudioEdit
+        // skips applyLive for any other scene). No collab patch, as before: rig
+        // control stays with whoever is at the console.
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.dmxBridge = config;
+          },
+          () => this.dmxStreamer.setConfig(config),
+        );
       },
       (patches) => {
-        sc.dmxPatches = patches;
-        this.persistence.saveNow(this.sceneData);
-        this.markDirty();
+        this.commitStudioEdit(sc, (t) => {
+          t.dmxPatches = patches;
+        });
       },
       (cue) => {
         this.debug.log(`Triggered DMX Cue: ${cue.name}`);
       },
-      this.dmxStreamer,
-      document.getElementById('overlay') ?? document.body,
+      // The studio's rig buttons and network edits act on this streamer at
+      // once, so it gets the live one only for the loaded scene. For another
+      // scene it previews on a private streamer that never transmits.
+      sc.id === this.sceneData.id ? this.dmxStreamer : undefined,
+      host,
     );
   }
 
   private openIcvfxStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('ICVFX Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openIcvfxStudioModal(
       sc,
       (config) => {
-        sc.icvfx = config;
-        if (sc.id === this.sceneData.id) {
-          this.icvfxRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'icvfx_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.icvfx = config;
+          },
+          () => this.icvfxRenderer.setConfig(config),
+          { type: 'icvfx_update', config },
+        );
       },
       () => {
         this.debug.log('Exported nDisplay configuration');
@@ -3426,25 +3638,25 @@ class App {
       () => {
         this.debug.log('Exported OpenUSD LED volume stage');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openAcousticsStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Acoustics Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openAcousticsStudioModal(
       sc,
       (config) => {
-        sc.acoustics = config;
-        if (sc.id === this.sceneData.id) {
-          this.acousticsRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'acoustics_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.acoustics = config;
+          },
+          () => this.acousticsRenderer.setConfig(config),
+          { type: 'acoustics_update', config },
+        );
       },
       () => {
         this.debug.log('Exported BWF sound report');
@@ -3452,25 +3664,25 @@ class App {
       () => {
         this.debug.log('Exported AES31-3 / iXML manifest');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openSolarStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Solar Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openSolarStudioModal(
       sc,
       (config) => {
-        sc.solar = config;
-        if (sc.id === this.sceneData.id) {
-          this.solarRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'solar_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.solar = config;
+          },
+          () => this.solarRenderer.setConfig(config),
+          { type: 'solar_update', config },
+        );
       },
       () => {
         this.debug.log('Exported solar tracking CSV');
@@ -3478,39 +3690,46 @@ class App {
       () => {
         this.debug.log('Exported standalone DP Sun-Report HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openScreenplayStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Screenplay Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openScreenplayBreakdownModal(
       sc,
       (config) => {
-        sc.screenplay = config;
-        if (sc.id === this.sceneData.id) {
-          this.screenplayRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'screenplay_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.screenplay = config;
+          },
+          () => this.screenplayRenderer.setConfig(config),
+          { type: 'screenplay_update', config },
+        );
       },
       (coverage) => {
         const patch: CollabScenePatch = {
           type: 'screenplay_apply_coverage',
           coverage,
         };
-        this.collabSession.broadcastPatch(patch);
-        applyScenePatch(this.sceneData, patch);
-        this.cams.setScene(this.sceneData);
-        this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
-        this.contentVersion++;
-        this.persistence.saveNow(this.sceneData);
+        // Coverage cameras go into the scene the studio was opened for; this
+        // used to add them to the live scene whichever scene that was.
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            applyScenePatch(t, patch);
+          },
+          () => {
+            this.cams.setScene(this.sceneData);
+            this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
+            this.contentVersion++;
+          },
+          patch,
+        );
         this.debug.log(`Applied ${coverage.length} AI coverage cameras to scene`);
-        this.markDirty();
       },
       () => {
         this.debug.log('Exported Screenplay Shot List CSV');
@@ -3518,25 +3737,25 @@ class App {
       () => {
         this.debug.log('Exported Director Pitch Deck HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openWebXRProfilerDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('WebXR Profiler');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openWebXRProfilerModal(
       sc,
       (config) => {
-        sc.profiler = config;
-        if (sc.id === this.sceneData.id) {
-          this.profilerRuntime.updateConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'profiler_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.profiler = config;
+          },
+          () => this.profilerRuntime.updateConfig(config),
+          { type: 'profiler_update', config },
+        );
       },
       async (scenarioId) => {
         const report = await this.profilerRuntime.startBenchmark(scenarioId);
@@ -3550,25 +3769,25 @@ class App {
       () => {
         this.debug.log('Exported WebXR standalone performance audit deck HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openVRComfortDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('VR Comfort Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openVRComfortModal(
       sc,
       (config) => {
-        sc.comfort = config;
-        if (sc.id === this.sceneData.id) {
-          this.comfortRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'comfort_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.comfort = config;
+          },
+          () => this.comfortRenderer.setConfig(config),
+          { type: 'comfort_update', config },
+        );
       },
       undefined,
       () => {
@@ -3577,49 +3796,66 @@ class App {
       () => {
         this.debug.log('Exported VR standalone comfort audit deck HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openSetDressingDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Set Dressing Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openSetDressingStudioModal(
       sc,
       (config) => {
-        sc.setDressing = config;
-        if (sc.id === this.sceneData.id) {
-          this.setDressingRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'set_dressing_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.setDressing = config;
+          },
+          () => this.setDressingRenderer.setConfig(config),
+          // Normalized copy: the Gemini key is a device setting and must never
+          // travel in a patch, whatever the modal hands over.
+          { type: 'set_dressing_update', config: normalizeSetDressingConfig(config) },
+        );
       },
       (_theme, _density, _enablePhysics) => {
-        if (sc.id === this.sceneData.id && sc.setDressing) {
-          this.setDressingRenderer.setConfig(sc.setDressing);
-        }
-        this.persistence.saveNow(this.sceneData);
-        if (sc.setDressing) {
-          this.collabSession.broadcastPatch({
-            type: 'set_dressing_scatter',
-            theme: sc.setDressing.activeTheme,
-            items: sc.setDressing.settledItems,
-          });
-        }
-        this.markDirty();
+        const scattered = sc.setDressing;
+        if (!scattered) return;
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            // The modal scattered into sc.setDressing already; mirror it when the
+            // live scene is a different object (an undo replaced it meanwhile).
+            if (t === sc) return;
+            if (!t.setDressing) t.setDressing = createSetDressingConfig();
+            t.setDressing.activeTheme = scattered.activeTheme;
+            t.setDressing.settledItems = scattered.settledItems;
+          },
+          () => this.setDressingRenderer.setConfig(this.sceneData.setDressing ?? scattered),
+          { type: 'set_dressing_scatter', theme: scattered.activeTheme, items: scattered.settledItems },
+        );
       },
       (mutations) => {
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'set_dressing_ai_mutate',
-          mutations,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            // The modal applied the mutations to sc; repeat them only on a
+            // different live object (see the scatter callback above).
+            if (t !== sc) applyAiMutationsToScene(t, mutations);
+          },
+          () => {
+            // AI edits add and remove props, not just the dressing config: the
+            // same refresh a remote set_dressing_ patch gets, so AI-added props
+            // appear without a reload.
+            this.setDressingRenderer.setConfig(this.sceneData.setDressing ?? createSetDressingConfig());
+            this.dropPropSelectionForRebuild();
+            this.props.setScene(this.sceneData);
+            this.contentVersion++;
+          },
+          { type: 'set_dressing_ai_mutate', mutations },
+        );
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
@@ -3964,6 +4200,8 @@ class App {
   }
 
   private async openPropsLibrary(): Promise<void> {
+    const host = this.studioHost('Prop Library');
+    if (!host) return;
     const customAssets = await globalPropStore.listAssets();
     openPropsLibraryModal(
       async (assetId, customKey) => {
@@ -3991,6 +4229,7 @@ class App {
       async (id) => {
         await globalPropStore.deleteAsset(id);
       },
+      host,
     );
   }
 
@@ -4013,6 +4252,8 @@ class App {
   }
 
   private openLiveLinkDialog(): void {
+    const host = this.studioHost('LiveLink');
+    if (!host) return;
     openLiveLinkModal(
       this.liveLinkStreamer,
       this.sceneData,
@@ -4020,7 +4261,7 @@ class App {
         this.sceneData.livelink = cfg;
         this.persistence.saveNow(this.sceneData);
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 }

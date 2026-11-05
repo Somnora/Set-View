@@ -28,6 +28,9 @@ export class WheelPanel {
   private dirty = true;
   private raycastHits: THREE.Intersection[] = [];
   private touchState: TouchState = { armed: false };
+  /** Temporary hub text (see showHubNotice); null = the menu's own hub. */
+  private notice: { label: string; sub: string } | null = null;
+  private noticeUntil = 0;
 
   constructor() {
     this.canvas = document.createElement('canvas');
@@ -66,8 +69,27 @@ export class WheelPanel {
     }
   }
 
+  /**
+   * Shows a short message in the hub for `ms` (for example why the pressed
+   * sector did nothing here), then reverts to the menu's own hub text. The hub
+   * keeps its action while the notice shows.
+   */
+  showHubNotice(label: string, sub: string, ms = 3000): void {
+    this.notice = { label, sub };
+    this.noticeUntil = performance.now() + ms;
+    this.dirty = true;
+  }
+
+  private expireNotice(): void {
+    if (this.notice && performance.now() >= this.noticeUntil) {
+      this.notice = null;
+      this.dirty = true;
+    }
+  }
+
   /** Per-frame ray hover (controllers); true while the pointer engages it. */
   update(ray: THREE.Raycaster | null): boolean {
+    this.expireNotice();
     let newHover: number | 'hub' | null = null;
     let onWheel = false;
     if (ray && this.group.visible) {
@@ -94,6 +116,7 @@ export class WheelPanel {
    */
   touchAt(tipWorld: THREE.Vector3 | null): boolean {
     if (!this.group.visible || !tipWorld) return this.update(null);
+    this.expireNotice();
     this.mesh.updateMatrixWorld();
     _local.copy(tipWorld);
     this.mesh.worldToLocal(_local);
@@ -185,12 +208,15 @@ export class WheelPanel {
     ctx.font = '700 24px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.strokeText(this.menu.hub.label, c, c - 9);
-    ctx.fillText(this.menu.hub.label, c, c - 9);
+    const hubLabel = this.notice ? this.notice.label : this.menu.hub.label;
+    const hubSub = this.notice ? this.notice.sub : this.menu.hub.sub;
+    if (this.notice) ctx.fillStyle = '#fbbf24';
+    ctx.strokeText(hubLabel, c, c - 9);
+    ctx.fillText(hubLabel, c, c - 9);
     ctx.fillStyle = '#b0b8c8';
     ctx.font = '600 15px system-ui, sans-serif';
-    ctx.strokeText(this.menu.hub.sub, c, c + 15);
-    ctx.fillText(this.menu.hub.sub, c, c + 15);
+    ctx.strokeText(hubSub, c, c + 15);
+    ctx.fillText(hubSub, c, c + 15);
     ctx.shadowBlur = 0;
 
     this.texture.needsUpdate = true;

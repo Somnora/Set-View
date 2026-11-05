@@ -235,6 +235,11 @@ import {
   parseDeterministicNlCommand,
   parseGeminiAiResponse,
 } from './setDressingEngine.ts';
+import {
+  carryAiScatterIntoConfig,
+  readDeviceGeminiKey,
+  writeDeviceGeminiKey,
+} from './setDressingEngine.ts';
 
 
 
@@ -2083,6 +2088,41 @@ export class NoteEditor {
   }
 }
 
+/**
+ * Root classes of the full-screen DOM modals (studios, libraries, exporters).
+ * They mount on document.body on the 2D page and in #overlay during an AR
+ * session with dom-overlay. Keep in sync with the `#overlay > ...` rule in
+ * style.css that gives these roots pointer events back.
+ */
+export const STUDIO_MODAL_ROOT_CLASSES: readonly string[] = [
+  'ai-modal-overlay',
+  'collab-modal-overlay',
+  'props-modal-overlay',
+  'livelink-modal-overlay',
+  'actor-studio-overlay',
+  'grip-studio-overlay',
+  'splat-modal-overlay',
+  'perf-modal-overlay',
+  'dailies-modal-overlay',
+  'dmx-modal-overlay',
+  'icvfx-modal-overlay',
+  'acoustics-modal-overlay',
+  'solar-modal-overlay',
+  'screenplay-modal-overlay',
+  'profiler-modal-overlay',
+  'comfort-modal-overlay',
+  'dressing-modal-overlay',
+];
+
+/** window.localStorage, or null where reading the accessor throws (blocked storage). */
+function deviceStorage(): Storage | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
 // --- AI Shot Analysis Modal ----------------------------------------------------
 
 export function simulateAiShotAnalysis(scene: SceneData): string {
@@ -2161,7 +2201,7 @@ export function openAiAnalysisModal(scene: SceneData, overlayRoot?: HTMLElement)
       <button class="ai-modal-close" title="Close">✕</button>
     </div>
     <div class="ai-modal-toolbar">
-      <input type="password" id="ai-api-key" placeholder="Enter Gemini API Key (optional)" value="${escapeHtml(localStorage.getItem('setview_gemini_api_key') || '')}" />
+      <input type="password" id="ai-api-key" autocomplete="off" placeholder="Enter Gemini API Key (optional)" title="Saved on this device only and shared with Set Dressing. Never stored in scenes." />
       <button class="ai-btn-run" id="ai-run-btn">🚀 Run AI Breakdown</button>
       <button class="ai-btn-export" id="ai-export-html-btn">📐 Storyboard HTML</button>
       <button class="ai-btn-export" id="ai-export-svg-btn">🖼️ Storyboard SVG</button>
@@ -2233,8 +2273,11 @@ export function openAiAnalysisModal(scene: SceneData, overlayRoot?: HTMLElement)
   };
   closeBtn.onclick = close;
 
+  // The same per-device key Set Dressing uses. Set as a property, not
+  // interpolated into the markup; storage errors leave the typed value usable.
+  keyInput.value = readDeviceGeminiKey(deviceStorage());
   keyInput.onchange = () => {
-    localStorage.setItem('setview_gemini_api_key', keyInput.value.trim());
+    writeDeviceGeminiKey(deviceStorage(), keyInput.value);
   };
 
   exportHtmlBtn.onclick = () => exportStoryboardHtml(scene);
@@ -2842,8 +2885,10 @@ export function openPropsLibraryModal(
   customAssets: CustomPropAsset[] = [],
   onUploadCustomAsset?: (file: File) => Promise<void>,
   onDeleteCustomAsset?: (id: string) => Promise<void>,
+  // document.body on the 2D page; the dom-overlay root (#overlay) in AR, since
+  // only that subtree is displayed inside an immersive session.
+  container: HTMLElement = document.body,
 ): void {
-  const container = document.body;
   // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
   // this can be selected again with one already open. Two stacked full-screen
   // overlays in a headset leave one behind when the top is closed.
@@ -4592,16 +4637,31 @@ function exportSplatCloudUsd(cloud: GaussianCloudData): string {
   return lines.join('\n');
 }
 
+/** Cancel of the open 3DGS Studio (restores its preview), or null when none is open. */
+let activeSplatStudioCancel: (() => void) | null = null;
+
+/**
+ * Cancels an open 3DGS Studio as its Cancel button does: the splat renderer
+ * goes back to the cloud the scene had when the studio opened, and nothing is
+ * saved. No-op when no studio is open.
+ */
+function cancelGaussianSplatStudio(): void {
+  activeSplatStudioCancel?.();
+}
+
 /** Opens the 3D Gaussian Splatting & Photogrammetry Scout Studio modal dialog. */
 export function openGaussianSplatStudioModal(
   scene: SceneData,
   onSave: (scene: SceneData) => void,
   overlayRoot: HTMLElement = document.body,
-  onCloudModified?: (cloud: GaussianCloudData | null) => void,
+  onCloudPreview?: (cloud: GaussianCloudData | null) => void,
 ): void {
   // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
   // this can be selected again with one already open. Two stacked full-screen
-  // overlays in a headset leave one behind when the top is closed.
+  // overlays in a headset leave one behind when the top is closed. The one
+  // being replaced is cancelled, not just removed, so a cloud it was only
+  // previewing does not stay on the renderer.
+  cancelGaussianSplatStudio();
   const existingGaussianSplatStudioModal = document.querySelector('.splat-modal-overlay');
   if (existingGaussianSplatStudioModal) existingGaussianSplatStudioModal.remove();
 
@@ -4619,9 +4679,29 @@ export function openGaussianSplatStudioModal(
   let alignmentStatusMsg = '';
   let alignmentConfidence = 0;
 
+  // Nothing touches the scene until Save. Edits push a live preview to the
+  // renderer, and Extract Walls stages its result here; closing without Save
+  // puts the renderer back on the cloud the scene had when the studio opened.
+  const openedCloud =
+    scene.gaussianClouds?.find((c) => c.id === scene.activeSplatCloudId) ?? scene.gaussianClouds?.[0] ?? null;
+  let stagedArchitecture: SceneData['architecture'] | null = null;
+  let previewed = false;
+  const onCloudModified = onCloudPreview
+    ? (cloud: GaussianCloudData | null) => {
+        previewed = true;
+        onCloudPreview(cloud);
+      }
+    : undefined;
+
   const close = () => {
+    if (activeSplatStudioCancel === cancel) activeSplatStudioCancel = null;
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
   };
+  const cancel = () => {
+    if (previewed) onCloudPreview?.(openedCloud);
+    close();
+  };
+  activeSplatStudioCancel = cancel;
 
   const getActiveCloud = (): GaussianCloudData | null => {
     return localClouds.find((c) => c.id === activeCloudId) || (localClouds.length > 0 ? localClouds[0] : null);
@@ -4780,8 +4860,8 @@ export function openGaussianSplatStudioModal(
     `;
 
     // Wire up events
-    dialog.querySelector('#splat-close-btn')!.addEventListener('click', close);
-    dialog.querySelector('#splat-cancel-btn')!.addEventListener('click', close);
+    dialog.querySelector('#splat-close-btn')!.addEventListener('click', cancel);
+    dialog.querySelector('#splat-cancel-btn')!.addEventListener('click', cancel);
 
     const cloudSelect = dialog.querySelector<HTMLSelectElement>('#splat-cloud-select');
     if (cloudSelect) {
@@ -4900,7 +4980,7 @@ export function openGaussianSplatStudioModal(
     const autoAlignBtn = dialog.querySelector<HTMLButtonElement>('#splat-autoalign-btn');
     if (autoAlignBtn && cloud) {
       autoAlignBtn.onclick = () => {
-        const result = alignSplatCloudToFloorplan(cloud, scene.architecture);
+        const result = alignSplatCloudToFloorplan(cloud, stagedArchitecture ?? scene.architecture);
         cloud.transform = result.alignedTransform;
         cloud.floorAlignment = {
           floorHeightY: result.floorHeightY,
@@ -4919,11 +4999,15 @@ export function openGaussianSplatStudioModal(
     if (extractWallsBtn && cloud) {
       extractWallsBtn.onclick = () => {
         const arch = fitArchitecturalPlanesFromSplats(cloud, 8);
-        if (!scene.architecture) {
-          scene.architecture = arch;
+        // Staged, not written to the scene: Save commits it with the clouds as
+        // one undo step, and Cancel leaves scene.architecture untouched.
+        const base = stagedArchitecture ?? scene.architecture;
+        if (!base) {
+          stagedArchitecture = arch;
         } else {
-          scene.architecture.walls = arch.walls;
-          scene.architecture.ceilingHeightM = arch.ceilingHeightM;
+          stagedArchitecture = JSON.parse(JSON.stringify(base)) as NonNullable<SceneData['architecture']>;
+          stagedArchitecture.walls = arch.walls;
+          stagedArchitecture.ceilingHeightM = arch.ceilingHeightM;
         }
         const ceilStr = arch.ceilingHeightM !== undefined ? `${arch.ceilingHeightM.toFixed(2)}m` : 'N/A';
         alignmentStatusMsg = `Extracted ${arch.walls.length} architectural perimeter walls and ceiling at ${ceilStr}.`;
@@ -4996,6 +5080,7 @@ export function openGaussianSplatStudioModal(
     saveBtn.onclick = () => {
       scene.gaussianClouds = localClouds.map((c) => normalizeGaussianCloud(c));
       scene.activeSplatCloudId = activeCloudId || (scene.gaussianClouds.length > 0 ? scene.gaussianClouds[0].id : undefined);
+      if (stagedArchitecture) scene.architecture = stagedArchitecture;
       onSave(scene);
       close();
     };
@@ -5875,6 +5960,9 @@ export function openDailiesVideoStudioModal(
   renderContent();
 }
 
+/** Cancel of the open DMX Bridge Studio, or null when none is open. */
+let activeDmxStudioCancel: (() => void) | null = null;
+
 /** Opens the Soundstage DMX512, Art-Net 4 & ANSI E1.31 sACN Lighting Bridge Studio modal. */
 export function openDmxBridgeStudioModal(
   scene: SceneData,
@@ -5886,7 +5974,10 @@ export function openDmxBridgeStudioModal(
 ): void {
   // The wheel and wrist menus are 3D and stay live while a DOM overlay is up, so
   // this can be selected again with one already open. Two stacked full-screen
-  // overlays in a headset leave one behind when the top is closed.
+  // overlays in a headset leave one behind when the top is closed. The one
+  // being replaced is cancelled, so its unsaved live network edits are put back
+  // and its streamer listeners are released.
+  activeDmxStudioCancel?.();
   const existingDmxBridgeStudioModal = document.querySelector('.dmx-modal-overlay');
   if (existingDmxBridgeStudioModal) existingDmxBridgeStudioModal.remove();
 
@@ -5909,7 +6000,21 @@ export function openDmxBridgeStudioModal(
     ? scene.dmxCues.map((c) => ({ ...c }))
     : [];
 
-  const activeStreamer = streamer ?? new DmxStreamer(currentConfig);
+  // Rig buttons and network edits act on the streamer at once. The caller
+  // passes the live streamer only for the scene that is loaded. Without one
+  // (another scene, opened from the landing page) the studio previews on a
+  // private streamer that is never enabled, so it opens no socket and sends
+  // nothing: editing scene B must not reconfigure or drive scene A's rig.
+  const liveRig = !!streamer;
+  const activeStreamer = streamer ?? new DmxStreamer({ ...currentConfig, enabled: false });
+  // Network edits reconfigure the live streamer as they are made; Cancel puts
+  // back the config it had when the studio opened.
+  const openedStreamerConfig = activeStreamer.getConfig();
+  let streamerConfigTouched = false;
+  const applyStreamerConfig = () => {
+    streamerConfigTouched = true;
+    activeStreamer.setConfig(liveRig ? currentConfig : { ...currentConfig, enabled: false });
+  };
   let diag = activeStreamer.getDiagnostics();
 
   const renderBadge = (state: DmxConnectionState, protocol: DmxProtocol): string => {
@@ -5929,12 +6034,22 @@ export function openDmxBridgeStudioModal(
   };
 
   const closeModal = () => {
+    if (activeDmxStudioCancel === cancelModal) activeDmxStudioCancel = null;
     unsubDiag();
     unsubUni();
+    if (!liveRig) activeStreamer.stop();
     if (overlay.parentNode) {
       overlay.parentNode.removeChild(overlay);
     }
   };
+  const cancelModal = () => {
+    if (liveRig && streamerConfigTouched) activeStreamer.setConfig(openedStreamerConfig);
+    closeModal();
+  };
+
+  const previewNote = liveRig
+    ? ''
+    : `<div style="padding:6px 16px; font-size:12px; color:#fbbf24;">This scene is not the one loaded, so the rig controls here only preview: nothing is sent to the network. Save keeps your changes in this scene. Load it to drive the rig.</div>`;
 
   dialog.innerHTML = `
     <div class="dmx-modal-header">
@@ -5951,6 +6066,7 @@ export function openDmxBridgeStudioModal(
       <button class="dmx-tab-btn" id="tab-network-btn">📡 Protocol & Network</button>
       <button class="dmx-tab-btn" id="tab-cues-btn">🎬 Lighting Cues (${currentCues.length})</button>
     </div>
+    ${previewNote}
 
     <div class="dmx-modal-body" id="dmx-body-content">
       <!-- Dynamic tab content -->
@@ -5992,8 +6108,8 @@ export function openDmxBridgeStudioModal(
   tabNetworkBtn.onclick = () => setTab('network');
   tabCuesBtn.onclick = () => setTab('cues');
 
-  dialog.querySelector<HTMLButtonElement>('#dmx-close-btn')!.onclick = closeModal;
-  dialog.querySelector<HTMLButtonElement>('#dmx-cancel-btn')!.onclick = closeModal;
+  dialog.querySelector<HTMLButtonElement>('#dmx-close-btn')!.onclick = cancelModal;
+  dialog.querySelector<HTMLButtonElement>('#dmx-cancel-btn')!.onclick = cancelModal;
 
   dialog.querySelector<HTMLButtonElement>('#dmx-blackout-btn')!.onclick = () => {
     activeStreamer.blackoutAll();
@@ -6039,6 +6155,8 @@ export function openDmxBridgeStudioModal(
       updateFadersVisual();
     }
   });
+  // Set once closeModal's listeners exist, so a later open can cancel this one.
+  activeDmxStudioCancel = cancelModal;
 
   const renderTabBody = () => {
     bodyEl.innerHTML = '';
@@ -6449,7 +6567,7 @@ export function openDmxBridgeStudioModal(
         currentConfig.priority = parseInt(priorityIn.value, 10) || 100;
         currentConfig.syncWithSceneLights = syncChk.checked;
         currentConfig.enabled = enableChk.checked;
-        activeStreamer.setConfig(currentConfig);
+        applyStreamerConfig();
       };
 
       protoSel.onchange = () => {
@@ -7983,9 +8101,9 @@ export function openSolarStudioModal(
   onSaveConfig?: (config: SolarEnvironmentConfig) => void,
   onExportCsv?: () => void,
   onExportHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.solar-modal-overlay');
+  const existingModal = document.querySelector('.solar-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -8656,9 +8774,9 @@ export function openScreenplayBreakdownModal(
   onApplyCoverageCameras?: (coverage: ShotCoverageRecommendation[]) => void,
   onExportCsv?: () => void,
   onExportDirectorDeckHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.screenplay-modal-overlay');
+  const existingModal = document.querySelector('.screenplay-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -9197,9 +9315,9 @@ export function openWebXRProfilerModal(
   ) => Promise<{ report: VRBenchmarkReport; samples: FrameTelemetrySample[] }>,
   onExportCsv?: () => void,
   onExportHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.profiler-modal-overlay');
+  const existingModal = document.querySelector('.profiler-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -9709,9 +9827,9 @@ export function openVRComfortModal(
   _onRunAudit?: () => Promise<ComfortAuditReport> | ComfortAuditReport,
   onExportCsv?: () => void,
   onExportHtml?: () => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.comfort-modal-overlay');
+  const existingModal = document.querySelector('.comfort-modal-overlay');
   if (existingModal) existingModal.remove();
 
   const overlay = document.createElement('div');
@@ -10425,10 +10543,17 @@ export function openSetDressingStudioModal(
   onSaveConfig?: (config: SetDressingConfig) => void,
   onApplyScatter?: (theme: ScatterTheme, density: ScatterDensity, enablePhysics: boolean) => void,
   onAiMutate?: (mutations: GeminiAiSceneMutation[]) => void,
-  overlayRoot: HTMLElement = document.getElementById('overlay') ?? document.body,
+  overlayRoot: HTMLElement = document.body,
 ): void {
-  const existingModal = overlayRoot.querySelector('.dressing-modal-overlay');
+  // Document-wide: callers mount on document.body (2D page) or #overlay (AR).
+  const existingModal = document.querySelector('.dressing-modal-overlay');
   if (existingModal) existingModal.remove();
+
+  // The Gemini key is a per-device setting (shared with AI Shot Analysis), never
+  // part of the scene. When the browser refuses storage, a key typed here still
+  // works until the modal closes.
+  let sessionGeminiKey = '';
+  const currentGeminiKey = (): string => readDeviceGeminiKey(deviceStorage()) || sessionGeminiKey;
 
   const overlay = document.createElement('div');
   overlay.className = 'dressing-modal-overlay';
@@ -10519,8 +10644,13 @@ export function openSetDressingStudioModal(
               <div style="display:flex; flex-direction:column; gap:8px;">
                 <label style="font-size:11px; color:#cbd5e1;">Google AI API Key</label>
                 <div style="display:flex; gap:6px;">
-                  <input type="password" id="input-gemini-key" value="${currentConfig.aiConfig.apiKey || ''}" placeholder="AIzaSy..." style="flex:1; background:#040711; border:1px solid #1e293b; color:#f8fafc; border-radius:6px; padding:6px 10px; font-size:12px;" />
+                  <input type="password" id="input-gemini-key" autocomplete="off" placeholder="AIzaSy..." style="flex:1; background:#040711; border:1px solid #1e293b; color:#f8fafc; border-radius:6px; padding:6px 10px; font-size:12px;" />
                   <button class="dressing-btn-secondary" id="btn-toggle-key-vis">👁️</button>
+                </div>
+                <div id="gemini-key-note" style="font-size:11px; color:#94a3b8; line-height:1.4;">
+                  Saved on this device only, and shared with AI Shot Analysis. It is never stored in the scene, exports or collab sessions.
+                  Keys from older scenes were moved here once; if this is empty, enter yours again.
+                  If you shared a scene file that contained your key, rotate the key.
                 </div>
                 <div style="display:flex; gap:8px; align-items:center;">
                   <label style="font-size:11px; color:#cbd5e1;">Model:</label>
@@ -10569,11 +10699,21 @@ export function openSetDressingStudioModal(
 
       // Wire up Key visibility toggle
       const keyInput = pane.querySelector<HTMLInputElement>('#input-gemini-key')!;
+      // Set as a property, not interpolated into the markup above.
+      keyInput.value = currentGeminiKey();
       pane.querySelector<HTMLButtonElement>('#btn-toggle-key-vis')!.onclick = () => {
         keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
       };
       keyInput.onchange = () => {
-        currentConfig.aiConfig.apiKey = keyInput.value.trim();
+        sessionGeminiKey = keyInput.value.trim();
+        if (!writeDeviceGeminiKey(deviceStorage(), sessionGeminiKey)) {
+          const note = pane.querySelector<HTMLElement>('#gemini-key-note');
+          if (note) {
+            note.textContent =
+              'This browser blocked local storage, so the key was not saved. It is used only until this window closes.';
+            note.style.color = '#f87171';
+          }
+        }
       };
 
       const modelSelect = pane.querySelector<HTMLSelectElement>('#select-gemini-model')!;
@@ -10601,9 +10741,10 @@ export function openSetDressingStudioModal(
         renderModal();
 
         try {
-          if (currentConfig.aiConfig.apiKey) {
+          const apiKey = currentGeminiKey();
+          if (apiKey) {
             // Live Gemini API Call
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentConfig.aiConfig.model}:generateContent?key=${currentConfig.aiConfig.apiKey}`;
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentConfig.aiConfig.model}:generateContent?key=${encodeURIComponent(apiKey)}`;
             const sysPrompt = buildGeminiAiSystemPrompt(scene);
             const body = {
               contents: [
@@ -10656,6 +10797,12 @@ export function openSetDressingStudioModal(
       applyBtn.onclick = () => {
         if (pendingMutations.length > 0) {
           applyAiMutationsToScene(scene, pendingMutations);
+          // An AI scatter rewrites scene.setDressing. Carry what it changed into
+          // the staged copy, or onSaveConfig below (and any later Save) would put
+          // the pre-AI items back. Other staged edits in this modal are kept.
+          if (scene.setDressing && pendingMutations.some((m) => m.action === 'scatter_theme')) {
+            carryAiScatterIntoConfig(currentConfig, scene.setDressing);
+          }
           if (onAiMutate) onAiMutate(pendingMutations);
           if (onSaveConfig) onSaveConfig(currentConfig);
           aiStatusText = `Successfully applied ${pendingMutations.length} mutation(s) to the live scene.`;
