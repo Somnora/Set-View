@@ -97,7 +97,8 @@ const SEMANTIC_LABEL_ALIASES: Record<string, string> = {
  */
 export function normalizeSemanticLabel(raw: string | null | undefined): string {
   if (typeof raw !== 'string') return UNLABELED_SCAN_LABEL;
-  const key = raw.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+  // Trim last: a leading or trailing '_' / '-' becomes a space first.
+  const key = raw.toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!key) return UNLABELED_SCAN_LABEL;
   return SEMANTIC_LABEL_ALIASES[key] ?? key;
 }
@@ -123,6 +124,33 @@ export const MOVABLE_SCAN_LABELS: ReadonlySet<string> = new Set([
 /** True for scan meshes the user can pick up and re-place (Stage 1). */
 export function isMovableScanMesh(label: string): boolean {
   return MOVABLE_SCAN_LABELS.has(normalizeSemanticLabel(label));
+}
+
+// --- floor height ---------------------------------------------------------------
+
+/**
+ * Height of the scan's labelled floor in the scan's own space: the lowest
+ * vertex of the meshes or planes labelled 'floor'. Null when nothing is
+ * labelled floor. Unlabelled geometry is deliberately not used: a depth-built
+ * room mesh can hold phantom surfaces below a glossy floor, and treating one
+ * as the floor would sink the whole scene.
+ */
+export function scanFloorY(scan: LocationScan): number | null {
+  let min = Infinity;
+  for (const m of scan.meshes) {
+    if (normalizeSemanticLabel(m.label) !== 'floor') continue;
+    const p = m.positions;
+    for (let i = 1; i < p.length; i += 3) if (p[i] < min) min = p[i];
+  }
+  return Number.isFinite(min) ? min : null;
+}
+
+/** Moves every vertex of a scan up by dy meters (in place). */
+export function translateScanY(scan: LocationScan, dy: number): void {
+  for (const m of scan.meshes) {
+    const p = m.positions;
+    for (let i = 1; i < p.length; i += 3) p[i] += dy;
+  }
 }
 
 // --- capture capability -------------------------------------------------------

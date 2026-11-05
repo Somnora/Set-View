@@ -115,6 +115,9 @@ export class LocationRenderer {
   private meshColors: number[] = [];
   /** Bounded furniture meshes, movable in Stage 1. */
   private furniture: FurnitureEntry[] = [];
+  /** Footprint center of a static mesh with a saved placement, by mesh index
+   *  (computed on first use; see applyPlacements). */
+  private staticPivots = new Map<number, THREE.Vector3>();
   /** Active scan geometry bounding box info. */
   private activeDimensions: RoomDimensions | null = null;
   /** Bounding box visualization group. */
@@ -289,13 +292,42 @@ export class LocationRenderer {
 
   // --- movable furniture (Stage 1) -------------------------------------------
 
-  /** Sets every movable mesh from its placement (absent entry = as captured). */
+  /**
+   * Sets every mesh from its placement (absent entry = as captured). Static
+   * pieces can carry one too: before labels were normalized everything except
+   * the room shell was grabbable, so a wall, door or unlabeled piece may have
+   * been moved. Those keep rendering where they were moved, but are not grab
+   * targets any more.
+   */
   applyPlacements(placements: FurniturePlacement[] | undefined): void {
     for (const f of this.furniture) {
       const p = placements?.find((x) => x.meshIndex === f.meshIndex);
       f.mesh.position.set(f.center.x + (p?.dx ?? 0), 0, f.center.z + (p?.dz ?? 0));
       f.mesh.rotation.set(0, p?.rotY ?? 0, 0);
       // A built wire overlay is the mesh's child, so it follows on its own.
+    }
+    for (let i = 0; i < this.meshes.length; i++) {
+      const mesh = this.meshes[i];
+      if (mesh.userData.scanMeshIndex !== undefined) continue; // furniture, set above
+      const p = placements?.find((x) => x.meshIndex === i);
+      if (!p) {
+        mesh.position.set(0, 0, 0);
+        mesh.rotation.set(0, 0, 0);
+        continue;
+      }
+      // A static mesh's geometry is not re-centered (it shares the scan's
+      // buffer), so yaw it about its footprint center c and then move it by
+      // (dx, dz): position = c + d - R(rotY) c. Same result as furniture.
+      let c = this.staticPivots.get(i);
+      if (!c) {
+        const fc = meshFootprintCenter(mesh.geometry.getAttribute('position').array as Float32Array);
+        c = new THREE.Vector3(fc.x, 0, fc.z);
+        this.staticPivots.set(i, c);
+      }
+      const cos = Math.cos(p.rotY);
+      const sin = Math.sin(p.rotY);
+      mesh.rotation.set(0, p.rotY, 0);
+      mesh.position.set(c.x + p.dx - (c.x * cos + c.z * sin), 0, c.z + p.dz - (c.z * cos - c.x * sin));
     }
   }
 
@@ -430,6 +462,7 @@ export class LocationRenderer {
     this.meshes = [];
     this.meshColors = [];
     this.furniture = [];
+    this.staticPivots.clear();
     this.wireframeLines = [];
     this.activeDimensions = null;
     while (this.boundsGroup.children.length > 0) {

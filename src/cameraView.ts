@@ -75,6 +75,8 @@ export interface CamObject {
   label: Label;
   frustum: THREE.LineSegments;
   anchor: XRAnchor | null;
+  /** Bumped by each reanchor; a createAnchor resolving for an older one is stale. */
+  anchorGen?: number;
   currentFocusDistanceM?: number;
 }
 
@@ -563,11 +565,14 @@ export class CameraSystem {
   reanchor(obj: CamObject, frame: XRFrame): void {
     obj.anchor?.delete?.();
     obj.anchor = null;
+    const gen = (obj.anchorGen ?? 0) + 1;
+    obj.anchorGen = gen;
     const p = obj.data.position;
     void this.session.createAnchor(frame, new THREE.Vector3(p.x, p.y, p.z)).then((anchor) => {
       // Deleted / replaced / re-anchored while createAnchor was in flight —
-      // don't leak an anchor onto a dead object (see ActorManager.reanchor).
-      if (this.objects.get(obj.data.id) !== obj) {
+      // don't leak an anchor onto a dead object or over a newer one (see
+      // ActorManager.reanchor).
+      if (this.objects.get(obj.data.id) !== obj || obj.anchorGen !== gen) {
         anchor?.delete?.();
         return;
       }

@@ -79,6 +79,8 @@ export class SessionManager {
   featuresReported = false;
   /** initiateRoomCapture may run once per XRSession (WebXR spec); reset in start(). */
   roomCaptureUsed = false;
+  /** The platform rejected room capture with NotSupportedError; reset in start(). */
+  roomCaptureUnsupported = false;
   /** The reference space jumped (pose discontinuity, e.g. after Space Setup). */
   onReferenceSpaceReset: () => void = () => {};
   /** XRSession visibility changed ('visible' again after system UI such as Space Setup). */
@@ -130,6 +132,7 @@ export class SessionManager {
     // drift resistance on every later session until a page reload.
     this.anchorsBroken = false;
     this.roomCaptureUsed = false;
+    this.roomCaptureUnsupported = false;
 
     const enabled: string[] = (session as unknown as { enabledFeatures?: string[] }).enabledFeatures ?? [];
     const has = (f: string) => enabled.includes(f);
@@ -213,7 +216,8 @@ export class SessionManager {
     const s = this.session;
     return roomCaptureRefusal({
       hasSession: !!s,
-      hasApi: !!s && typeof s.initiateRoomCapture === 'function',
+      // A NotSupportedError means the API is a stub here: 'not available', not 'used'.
+      hasApi: !!s && typeof s.initiateRoomCapture === 'function' && !this.roomCaptureUnsupported,
       enabledFeatures: this.enabledFeatures,
       used: this.roomCaptureUsed,
     });
@@ -239,6 +243,7 @@ export class SessionManager {
     } catch (e) {
       const name = (e as { name?: unknown } | null)?.name;
       const error = typeof name === 'string' && name ? name : 'Error';
+      if (error === 'NotSupportedError') this.roomCaptureUnsupported = true;
       this.log(`room capture request failed: ${error}: ${(e as Error)?.message ?? e}`);
       return { ok: false, error };
     }

@@ -29,7 +29,7 @@ import { classifyCameraMove } from './timeline.ts';
 import { History } from './history.ts';
 import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
-import { roomCaptureMessage, summarizeScan, type ScanSource } from './scan.ts';
+import { roomCaptureMessage, scanFloorY, summarizeScan, translateScanY, type ScanSource } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
 import { LocationRenderer, type LocationMode } from './location.ts';
 import { checkSupport, SessionManager } from './session.ts';
@@ -51,7 +51,13 @@ import {
   type WheelPath,
 } from './wheel.ts';
 import { WheelPanel } from './wheelView.ts';
-import { floorCorrection, floorSettled, newFloorEstimate, observeFloorHit } from './floor.ts';
+import {
+  floorCorrection,
+  floorCorrectionFromScan,
+  floorSettled,
+  newFloorEstimate,
+  observeFloorHit,
+} from './floor.ts';
 import { Persistence } from './persistence.ts';
 import {
   buildWristPanel,
@@ -155,6 +161,8 @@ const WHEEL_FRONT_POS = new THREE.Vector3(0, -0.05, -0.5);
 const _pt = new THREE.Vector3();
 // Reused for the world → scene-space re-basing at scan capture.
 const _worldToScene = new THREE.Matrix4();
+// Reused by the post-reset anchor check (anchorPosition writes into it).
+const _anchorProbe = new THREE.Vector3();
 // Reused each frame for locomotion basis vectors (no per-frame allocation).
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
@@ -176,6 +184,8 @@ const SCAN_HINT_AFTER_MS = 5_000;
 const SPACE_SETUP_CONFIRM_MS = 5_000;
 /** Longest a scan waits for the floor estimate to settle before capturing anyway. */
 const SCAN_FLOOR_WAIT_MS = 5_000;
+/** After a tracking reset or Space Setup, anchors get this long to report before re-anchoring. */
+const ANCHOR_RECHECK_GRACE_MS = 1_000;
 
 /** What the pointer ray is over ('furniture' id = scan mesh index as string). */
 type Hover = { kind: 'actor' | 'camera' | 'furniture' | 'prop'; id: string } | null;
@@ -276,6 +286,12 @@ class App {
   private spaceSetupConfirmUntil = 0;
   /** Session whose Space Setup request is still in flight (OS flow open). */
   private spaceSetupSession: XRSession | null = null;
+  /**
+   * Armed by a reference-space reset or a finished Space Setup; recheckAnchors
+   * re-anchors only what lost its anchor. `due` is loop time, -1 = start the
+   * grace window on the next frame.
+   */
+  private anchorRecheck: { due: number; shiftHinted: boolean } | null = null;
   /** Blob id currently loaded into the location renderer. */
   private displayedScanId: string | null = null;
   /** Invalidates stale async scan-blob loads (scene switches, undo). */
@@ -891,6 +907,7 @@ class App {
     if (!summary) {
       this.displayedScanId = null;
       this.location.setScan(null);
+      delete this.sceneData.locationMode; // the next scan starts in Ghost (normalizeScene)
       return;
     }
     if (summary.id === this.displayedScanId) {
@@ -1043,7 +1060,19 @@ class App {
     const scan = captureScanFromFrame(frame, refSpace, _worldToScene);
     if (scan) {
       this.pendingScan = null;
-      // Freeze the floor estimate for the rest of the session: a later re-base
+      // The scan's labelled floor is direct evidence of the real floor. If the
+      // floor origin is too high and hits have not re-based yet (they only
+      // found a desk, or too few landed), re-base now and lift the scan by the
+      // same amount, so the room and the blocking land on the real floor
+      // together. Uncommitted means the floor offset is still 0, so scene y is
+      // reference-space y here.
+      const floorFix = floorCorrectionFromScan(this.floorEst, scanFloorY(scan), this.lastViewerPos.y);
+      if (floorFix !== null) {
+        translateScanY(scan, -floorFix);
+        this.views.setFloorOffset(floorFix);
+        this.debug.log(`⚠ floor origin was ${(-floorFix).toFixed(2)} m too high: re-based to the scanned floor`);
+      }
+      // Then freeze the estimate for the rest of the session: a later re-base
       // would shift contentRoot under geometry captured in this scene space.
       this.floorEst.committed = true;
       const summary = summarizeScan(scan);
@@ -1071,9 +1100,11 @@ class App {
     if (!pending.hinted && waited > SCAN_HINT_AFTER_MS) {
       pending.hinted = true;
       this.debug.log(
-        meshes
-          ? 'no room data yet: Space Setup done? (wrist: Space Setup)'
-          : 'no planes yet: look around at floor, walls and tables',
+        !meshes
+          ? 'no planes yet: look around at floor, walls and tables'
+          : this.session.roomCaptureRefusal() === null
+            ? 'no room data yet: Space Setup done? (wrist: Space Setup)'
+            : 'no room data yet: run Space Setup in Quest Settings',
       );
     }
     if (waited > SCAN_TIMEOUT_MS) {
@@ -1088,36 +1119,81 @@ class App {
   }
 
   /**
-   * Re-creates every actor and camera anchor on the next frame, at its current
-   * scene position (the startAR / restoreScene pattern). Skipped while shifted:
-   * anchors are created at scene coordinates read as reference-space ones,
-   * which only holds at true registration. Returns whether anything was queued.
+   * Arms a check of every actor and camera anchor (see recheckAnchors). Each
+   * new event restarts the grace window.
    */
-  private requeueAllAnchors(): boolean {
-    if (!this.session.session || this.views.isShifted) return false;
-    // Clear first so an object already queued isn't anchored twice (the
-    // second request would leak the first anchor).
-    this.pendingReanchorActors.length = 0;
-    this.pendingReanchorCams.length = 0;
-    for (const obj of this.actors.all()) this.pendingReanchorActors.push(obj);
-    for (const obj of this.cams.all()) this.pendingReanchorCams.push(obj);
-    return true;
+  private scheduleAnchorRecheck(): void {
+    if (!this.session.session) return;
+    this.anchorRecheck = { due: -1, shiftHinted: false };
   }
 
   /**
-   * The tracking origin jumped (reference-space 'reset', likely after Space
-   * Setup). Anchors may be gone or re-based, so re-anchor everything where the
-   * scene has it, and tell the user to check alignment: the scan and the
-   * blocking move together, but not necessarily onto the real room.
+   * Runs once per frame, right after the anchor refresh, while a recheck is
+   * armed. Anchors are world-locked: after a reset a surviving anchor reports
+   * its pose in the new origin, and updateFromAnchors has already moved its
+   * object there. Re-anchoring it at its pre-reset scene coordinates would
+   * throw that away, so only objects whose anchor is gone (wiped by Space
+   * Setup, or never made) are re-anchored, where the scene has them. The grace
+   * window lets anchors that are only relocalizing report again first. While
+   * shifted it waits: anchors are created at scene coordinates read as
+   * reference-space ones, which only holds at true registration.
+   */
+  private recheckAnchors(frame: XRFrame, time: number): void {
+    const check = this.anchorRecheck;
+    if (!check) return;
+    if (check.due < 0) check.due = time + ANCHOR_RECHECK_GRACE_MS;
+    if (time < check.due) return;
+    if (this.views.isShifted) {
+      if (!check.shiftHinted) {
+        check.shiftHinted = true;
+        this.debug.log('tracking reset: Re-align to re-anchor');
+      }
+      return;
+    }
+    this.anchorRecheck = null;
+    if (!this.session.features.anchors) {
+      this.debug.log('tracking reset: check alignment to the room');
+      return;
+    }
+    let held = 0;
+    let lost = 0;
+    for (const obj of this.actors.all()) {
+      if (obj === this.draggedActor) continue; // its release re-anchors it
+      if (obj.anchor && this.session.anchorPosition(frame, obj.anchor, _anchorProbe)) {
+        held++;
+        continue;
+      }
+      if (!this.pendingReanchorActors.includes(obj)) this.pendingReanchorActors.push(obj);
+      lost++;
+    }
+    for (const obj of this.cams.all()) {
+      if (obj === this.draggedCamera) continue;
+      if (obj.anchor && this.session.anchorPosition(frame, obj.anchor, _anchorProbe)) {
+        held++;
+        continue;
+      }
+      if (!this.pendingReanchorCams.includes(obj)) this.pendingReanchorCams.push(obj);
+      lost++;
+    }
+    // The scan is not anchored: it stays at scene coordinates while anchored
+    // blocking holds to the real room, so alignment is worth a look either way.
+    this.debug.log(
+      lost > 0
+        ? `${lost} re-anchored: check alignment to the room`
+        : held > 0
+          ? 'anchors held: check scan alignment'
+          : 'tracking reset: check alignment to the room',
+    );
+  }
+
+  /**
+   * The tracking origin jumped (reference-space 'reset', for example after
+   * Space Setup or a recenter). The event fires before the first frame that
+   * uses the new origin, so the anchors are checked after that frame's
+   * refresh rather than re-created here (see recheckAnchors).
    */
   private onReferenceSpaceReset(): void {
-    if (!this.session.session) return;
-    const requeued = this.requeueAllAnchors();
-    this.debug.log(
-      requeued
-        ? 'tracking reset: re-anchored, check alignment to the room'
-        : 'tracking reset: Re-align, then check alignment to the room',
-    );
+    this.scheduleAnchorRecheck();
   }
 
   /**
@@ -1142,7 +1218,8 @@ class App {
     const now = performance.now();
     if (now > this.spaceSetupConfirmUntil) {
       this.spaceSetupConfirmUntil = now + SPACE_SETUP_CONFIRM_MS;
-      this.debug.log('Space Setup may reset tracking and anchors: press again to run');
+      // The wrist tail shows ~40 characters: the instruction leads.
+      this.debug.log('Press again to run Space Setup (may reset anchors)');
       this.refreshWristState();
       return;
     }
@@ -1155,16 +1232,11 @@ class App {
       if (this.spaceSetupSession === session) this.spaceSetupSession = null;
       if (this.session.session !== session) return; // session ended during the OS flow
       if (result.ok) {
-        // Anchors may have been wiped by the room capture.
-        const requeued = this.requeueAllAnchors();
+        // Room capture may have wiped anchors: re-anchor the ones that are
+        // gone once the next frames show which (survivors keep world-lock).
+        this.scheduleAnchorRecheck();
         const quick = performance.now() - now < 1000;
-        this.debug.log(
-          quick
-            ? 'Space Setup returned at once: maybe nothing ran'
-            : requeued
-              ? 'Space Setup done: re-anchored, now Scan Room'
-              : 'Space Setup done: Re-align, then Scan Room',
-        );
+        this.debug.log(quick ? 'Space Setup returned at once: maybe nothing ran' : 'Space Setup done: now Scan Room');
       } else {
         this.debug.log(roomCaptureMessage(result.error));
       }
@@ -1786,6 +1858,7 @@ class App {
         obj.anchor = null;
         this.pendingReanchorCams.push(obj);
       }
+      this.anchorRecheck = null; // everything is re-anchored above
       this.lastTime = 0;
       // Every session opens planning the shot; Dress is an explicit switch.
       this.interactionMode = 'block';
@@ -2989,6 +3062,8 @@ class App {
     // Drift resistance: snap anchored content to tracked anchor positions.
     if (!this.keyframes.active) this.actors.updateFromAnchors(frame);
     this.cams.updateFromAnchors(frame, this.draggedCamera?.data.id ?? null);
+    // After a reset: survivors have just reported their new pose; re-anchor the rest.
+    if (this.anchorRecheck) this.recheckAnchors(frame, time);
 
     this.keyframes.tick(dt);
     this.views.update(time);

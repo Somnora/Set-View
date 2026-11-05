@@ -1820,6 +1820,9 @@ export function normalizeScene(s: SceneData): SceneData {
   // A bad value is dropped rather than failing the import (it is only a view
   // preference); a scene with a scan shows it as Ghost unless told otherwise.
   if (s.locationMode !== undefined && !isLocationDisplayMode(s.locationMode)) delete s.locationMode;
+  // It belongs to the scan: the next scan attached must not inherit a removed
+  // one's Hidden and seem to do nothing.
+  if (!s.scan) delete s.locationMode;
   if (s.scan && s.locationMode === undefined) s.locationMode = 'ghost';
   if (!Array.isArray(s.lights)) {
     s.lights = [];
