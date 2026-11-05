@@ -27,7 +27,8 @@
 import { uid, type ScanSummary, type Vec3 } from './model.ts';
 
 export interface ScanMeshData {
-  /** Semantic label from the platform ('global mesh', 'table', 'couch', …). */
+  /** Semantic label from the platform ('global mesh', 'table', 'couch', …),
+   *  normalized at capture; older stored scans may carry raw spellings. */
   label: string;
   /** Vertex positions as xyz triplets, scene space, meters. */
   positions: Float32Array;
@@ -65,12 +66,63 @@ export function transformPositions(positions: Float32Array, m: ArrayLike<number>
 
 // --- furniture placement (movable labeled meshes) ---------------------------
 
-/** The platform's whole-room mesh label; everything else is a movable piece. */
+/** The platform's whole-room mesh label (the room shell, never movable). */
 export const GLOBAL_MESH_LABEL = 'global mesh';
+
+/** Label for a mesh or plane the platform did not classify (static). */
+export const UNLABELED_SCAN_LABEL = 'unlabeled';
+
+/**
+ * Platform label spellings folded onto one canonical label. Keys are already
+ * lowercased, trimmed, and have '_' / '-' turned into spaces. Quest emits
+ * 'wall face', 'door frame', 'window frame', 'invisible wall face' and
+ * 'storage'; the synthetic test room uses 'walls'. The exact strings each
+ * headset emits are still unconfirmed on device (P0.0 probe).
+ */
+const SEMANTIC_LABEL_ALIASES: Record<string, string> = {
+  'wall face': 'wall',
+  walls: 'wall',
+  'door frame': 'door',
+  'window frame': 'window',
+  'invisible wall face': 'window',
+  storage: 'shelf',
+  sofa: 'couch',
+};
+
+/**
+ * Canonical form of a platform semantic label: lowercase, trimmed, with known
+ * aliases folded ('door frame' to 'door', 'storage' to 'shelf', ...). A missing
+ * or blank label becomes 'unlabeled'. Idempotent, so stored scans that still
+ * carry raw platform labels can be normalized again on load.
+ */
+export function normalizeSemanticLabel(raw: string | null | undefined): string {
+  if (typeof raw !== 'string') return UNLABELED_SCAN_LABEL;
+  const key = raw.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+  if (!key) return UNLABELED_SCAN_LABEL;
+  return SEMANTIC_LABEL_ALIASES[key] ?? key;
+}
+
+/**
+ * Bounded furniture the user may pick up and re-place. Everything else
+ * (floor, ceiling, walls, doors, windows, wall art, the room shell and
+ * unlabeled geometry) stays put: grabbing a floor or a wall is never intended.
+ */
+export const MOVABLE_SCAN_LABELS: ReadonlySet<string> = new Set([
+  'table',
+  'desk',
+  'couch',
+  'chair',
+  'shelf',
+  'bed',
+  'screen',
+  'lamp',
+  'plant',
+  'other',
+]);
 
 /** True for scan meshes the user can pick up and re-place (Stage 1). */
 export function isMovableScanMesh(label: string): boolean {
-  return label.toLowerCase() !== GLOBAL_MESH_LABEL;
+  return MOVABLE_SCAN_LABELS.has(normalizeSemanticLabel(label));
 }
 
 /**

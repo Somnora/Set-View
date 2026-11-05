@@ -194,6 +194,8 @@ import {
   transformPositions,
   type LocationScan,
 } from '../src/scan.ts';
+import { MOVABLE_SCAN_LABELS, normalizeSemanticLabel, UNLABELED_SCAN_LABEL } from '../src/scan.ts';
+import { LocationRenderer } from '../src/location.ts';
 import { estimateScanSizeBytes, ScanStore } from '../src/scanStore.ts';
 import {
   calculateMeshAABB,
@@ -11329,6 +11331,72 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
   const setDressingActions = generateEntityContextActions('set_dressing', 'dressing_root');
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_open_studio'));
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_quick_scatter'));
+});
+
+// --- P0 scan ---
+
+test('P0.6 normalizeSemanticLabel: folds platform spellings onto canonical labels', () => {
+  const table: [string | null | undefined, string][] = [
+    ['door frame', 'door'],
+    ['Door Frame', 'door'],
+    ['window frame', 'window'],
+    ['invisible wall face', 'window'],
+    ['storage', 'shelf'],
+    ['wall_face', 'wall'],
+    ['  WALL FACE ', 'wall'],
+    ['walls', 'wall'],
+    ['Sofa', 'couch'],
+    ['global mesh', 'global mesh'],
+    ['Global_Mesh', 'global mesh'],
+    ['table', 'table'],
+    ['wall art', 'wall art'],
+    ['', UNLABELED_SCAN_LABEL],
+    ['   ', UNLABELED_SCAN_LABEL],
+    [null, UNLABELED_SCAN_LABEL],
+    [undefined, UNLABELED_SCAN_LABEL],
+  ];
+  for (const [raw, want] of table) {
+    assert.equal(normalizeSemanticLabel(raw), want, `normalize(${JSON.stringify(raw)})`);
+    // Idempotent: stored scans can be normalized again on load.
+    assert.equal(normalizeSemanticLabel(normalizeSemanticLabel(raw)), want);
+  }
+});
+
+test('P0.6 isMovableScanMesh: only bounded furniture is grabbable', () => {
+  for (const label of MOVABLE_SCAN_LABELS) assert.equal(isMovableScanMesh(label), true, label);
+  for (const label of ['Couch', 'storage', 'Sofa', 'other']) assert.equal(isMovableScanMesh(label), true, label);
+  for (const label of [
+    'floor',
+    'ceiling',
+    'wall',
+    'walls',
+    'wall face',
+    'door',
+    'door frame',
+    'window',
+    'window frame',
+    'invisible wall face',
+    'wall art',
+    'global mesh',
+    'unlabeled',
+    '',
+  ]) {
+    assert.equal(isMovableScanMesh(label), false, label);
+  }
+  // Every label the synthetic test room emits.
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk', 'chair', 'bed', 'shelf', 'screen']);
+  const shell = new Set(['floor', 'ceiling', 'walls', 'door', 'window']);
+  for (const m of room.meshes) assert.equal(isMovableScanMesh(m.label), !shell.has(m.label), m.label);
+});
+
+test('P0.6 LocationRenderer: the synthetic room shell is never a grab target', () => {
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+  const loc = new LocationRenderer();
+  loc.setScan(room);
+  loc.setMode('ghost');
+  const grabbed = loc.furnitureTargets().map((o) => room.meshes[o.userData.scanMeshIndex as number].label);
+  assert.deepEqual([...grabbed].sort(), ['couch', 'desk', 'table']);
+  for (const label of ['floor', 'ceiling', 'walls', 'door', 'window']) assert.ok(!grabbed.includes(label), label);
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(

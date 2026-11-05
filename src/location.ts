@@ -18,21 +18,27 @@
 
 import * as THREE from 'three';
 import type { FurniturePlacement } from './model.ts';
-import { isMovableScanMesh, meshFootprintCenter, quatYaw, type LocationScan } from './scan.ts';
+import {
+  isMovableScanMesh,
+  meshFootprintCenter,
+  normalizeSemanticLabel,
+  quatYaw,
+  type LocationScan,
+} from './scan.ts';
 
 export type LocationMode = 'hidden' | 'ghost' | 'solid' | 'wireframe';
 
 const GHOST_OPACITY = 0.35;
 const WIREFRAME_OPACITY = 0.85;
 
-/** Subtle semantic tints so walls/floor/furniture read at a glance. */
+/** Subtle semantic tints so walls/floor/furniture read at a glance. Keys are
+ *  normalized labels (see normalizeSemanticLabel). */
 const LABEL_COLORS: Record<string, number> = {
   floor: 0x6e7480,
   ceiling: 0xb9bec8,
-  'wall face': 0x9aa1ac,
   wall: 0x9aa1ac,
-  walls: 0x9aa1ac,
   table: 0x7a8aa6,
+  chair: 0x7a8aa6,
   desk: 0x7a8aa6,
   couch: 0x7a8aa6,
   bed: 0x7a8aa6,
@@ -381,5 +387,6 @@ export class LocationRenderer {
 }
 
 function labelColor(label: string): number {
-  return LABEL_COLORS[label.toLowerCase()] ?? DEFAULT_COLOR;
+  // Normalized so scans stored before label normalization still tint right.
+  return LABEL_COLORS[normalizeSemanticLabel(label)] ?? DEFAULT_COLOR;
 }
