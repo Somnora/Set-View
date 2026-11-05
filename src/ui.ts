@@ -751,6 +751,8 @@ export interface SceneSummary {
   actors: number;
   cameras: number;
   hasScan?: boolean;
+  /** The last save failed: the scene is only in memory (or newer than the stored copy). */
+  unsaved?: boolean;
 }
 
 export interface LandingCallbacks {
@@ -948,9 +950,15 @@ export class Landing {
    * Shows a dismissible message at the top of the landing page. Save, storage and
    * import problems used to reach only the console and the 3D wrist panel, which are
    * invisible on the 2D page. A banner with the same key is updated in place, so a
-   * failure that repeats on every autosave stays one banner.
+   * failure that repeats on every autosave stays one banner. `action` adds a button
+   * (e.g. Export for a scene that could not be saved); an update without one removes it.
    */
-  showBanner(message: string, kind: 'error' | 'warn' | 'info' = 'error', key: string = message): void {
+  showBanner(
+    message: string,
+    kind: 'error' | 'warn' | 'info' = 'error',
+    key: string = message,
+    action?: { label: string; run: () => void },
+  ): void {
     const palette = {
       error: ['rgba(127, 29, 29, 0.94)', '#f87171', '#fee2e2'],
       warn: ['rgba(120, 53, 15, 0.94)', '#fbbf24', '#fef3c7'],
@@ -990,6 +998,15 @@ export class Landing {
     banner.setAttribute('role', kind === 'error' ? 'alert' : 'status');
     const text = banner.querySelector('.banner-text');
     if (text) text.textContent = message;
+    banner.querySelector('.banner-action')?.remove();
+    if (action) {
+      const btn = document.createElement('button');
+      btn.className = 'small banner-action';
+      btn.textContent = action.label;
+      btn.style.marginLeft = 'auto'; // sits next to the dismiss button
+      btn.onclick = () => action.run();
+      banner.insertBefore(btn, banner.lastElementChild); // before the dismiss button
+    }
     this.bannerEl.style.display = 'flex';
   }
 
@@ -1027,6 +1044,7 @@ export class Landing {
     for (const s of scenes) {
       const row = document.createElement('div');
       row.className = 'scene' + (s.id === currentId ? ' current' : '');
+      if (s.unsaved) row.dataset.unsaved = 'true';
 
       const head = document.createElement('div');
       head.className = 'scene-head';
@@ -1034,7 +1052,11 @@ export class Landing {
       info.className = 'load';
       info.innerHTML = `<b>${escapeHtml(s.name)}</b><span>${s.actors} actors · ${s.cameras} cams${
         s.hasScan ? ' · location scan' : ''
-      } · ${new Date(s.updatedAt).toLocaleString()}</span>`;
+      } · ${new Date(s.updatedAt).toLocaleString()}</span>${
+        s.unsaved
+          ? '<span class="unsaved-note" style="color: #fbbf24;">Not saved: Export it to keep it</span>'
+          : ''
+      }`;
       info.onclick = () => this.cb.onSelect(s.id);
       head.appendChild(info);
       for (const [label, fn] of [

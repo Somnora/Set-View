@@ -511,12 +511,7 @@ class App {
         if (this.sceneData.id === id) this.newScene('Scene 1');
         this.refreshLanding();
       },
-      // The live scene is passed so Export hands out what is in memory, not an older
-      // localStorage copy (or nothing) after a failed save.
-      onExport: (id) =>
-        void this.persistence.exportScene(id, this.sceneData).then((ok) => {
-          if (!ok) this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
-        }),
+      onExport: (id) => this.exportSceneFile(id),
       onImport: (file) => {
         void this.persistence.importScene(file).then((res) => {
           if (!res.ok) {
@@ -525,9 +520,12 @@ class App {
           }
           this.loadScene(res.scene);
           if (!res.saved) {
+            // The scene also gets a "Not saved" row with its own Export button.
+            const id = res.scene.id;
             this.reportDataIssue(
               `"${res.scene.name}" is open but could not be saved (storage full), so it will be gone after a reload. Export it now, or delete scenes you no longer need.`,
               'import',
+              { label: 'Export', run: () => this.exportSceneFile(id) },
             );
           }
           if (res.heavy) this.requestPersistentStorage();
@@ -562,15 +560,16 @@ class App {
       onExportScanGeoJson: (id) => void this.persistence.exportScanGeoJson(id),
       onExportScanPackage: (id) => void this.persistence.exportScanPackage(id),
       onAddSyntheticScan: (id) => {
-        const live = id === this.sceneData.id ? this.sceneData : null;
-        void this.persistence.attachSyntheticScan(id, live).then((scan) => {
+        // The live scene is looked up after the scan blob is written, so an undo or
+        // restore landing during that await is not overwritten by an older object.
+        void this.persistence.attachSyntheticScan(id, () => this.sceneData).then((res) => {
           // The scan was attached to the live scene object itself. Replacing
           // this.sceneData with a reloaded copy (as before) left actors, props and
           // cameras editing the old object while autosave wrote the new one.
           // Mirrors removeScan: show it and make it undoable.
-          if (scan && live && live === this.sceneData) {
+          if (res && res.scene === this.sceneData) {
             this.syncLocation();
-            this.history.record(live);
+            this.history.record(res.scene);
           }
           this.refreshLanding();
         });
@@ -697,8 +696,15 @@ class App {
     }
 
     // Save, storage and prop-library failures reach the debug log, the 3D wrist and
-    // a banner on the 2D landing page (the wrist is invisible there).
-    this.persistence.onError = (m) => this.reportDataIssue(m);
+    // a banner on the 2D landing page (the wrist is invisible there). A failed save
+    // also re-lists the scenes, so the scene shows a "Not saved" row with Export
+    // (in AR the hidden landing is not rebuilt per failed autosave; session end
+    // re-lists it). Failures raised before this point (the first-run save in
+    // loadCurrentOrCreate) were held by Persistence and are delivered here.
+    this.persistence.onError = (m) => {
+      this.reportDataIssue(m);
+      if (!this.renderer.xr.isPresenting) this.refreshLanding();
+    };
     globalPropStore.onError = (m) => this.reportDataIssue(m);
 
     // Fires whichever way a take ends (wrist toggle, camera deleted, session
@@ -1191,7 +1197,17 @@ class App {
   }
 
   private refreshLanding(): void {
-    this.landing.refreshScenes(this.persistence.listScenes(), this.sceneData.id);
+    // Includes scenes whose save failed (and the live scene if the index lacks it):
+    // they exist only in memory, and their row is where Export is.
+    this.landing.refreshScenes(this.persistence.listScenesForLanding(this.sceneData), this.sceneData.id);
+  }
+
+  /** Downloads a scene as .setview.json. The live scene is passed so Export hands out
+   *  what is in memory, not an older localStorage copy (or nothing) after a failed save. */
+  private exportSceneFile(id: string): void {
+    void this.persistence.exportScene(id, this.sceneData).then((ok) => {
+      if (!ok) this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
+    });
   }
 
   /**
@@ -1199,10 +1215,10 @@ class App {
    * debug log (console and drift board), the 3D wrist status, and a landing banner
    * on the 2D page. Banners sharing a key replace each other (default: the text).
    */
-  private reportDataIssue(message: string, key?: string): void {
+  private reportDataIssue(message: string, key?: string, action?: { label: string; run: () => void }): void {
     this.debug.log(message);
     this.wrist.setStatus(message);
-    this.landing.showBanner(message, 'error', key);
+    this.landing.showBanner(message, 'error', key, action);
   }
 
   /** On the first heavy import, asks once for persistent storage and says what the browser decided. */

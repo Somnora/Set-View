@@ -11455,7 +11455,9 @@ test('P0.8: a null or empty file read is "blocked", not "corrupt"', () => {
   assert.equal(decodeSceneFileBytes(bytes.buffer as ArrayBuffer), '{"a":"é"}');
 });
 
-test('P0.8: importScene tells a blocked read apart from a file that is not a scene', async () => {
+// Async: run from the final Promise.all, so its result is part of the reported total
+// (test() does not await, so it would print a check mark before any assertion ran).
+async function p0ImportReadsTest(): Promise<void> {
   const p = new Persistence();
   const blocked = {
     name: 'scene.setview.json',
@@ -11481,7 +11483,39 @@ test('P0.8: importScene tells a blocked read apart from a file that is not a sce
   // P0.9: Node has no navigator.storage, and the request is made once per page.
   assert.equal(await p.requestPersistentStorage(), 'unsupported');
   assert.equal(await p.requestPersistentStorage(), 'already-asked');
-});
+}
+
+/** Async: Add Test Room looks up the live scene after the scan blob is written. */
+async function p0SyntheticScanLiveTest(): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: new P0MemoryStorage(), configurable: true, writable: true });
+  try {
+    const p = new Persistence();
+    p.onError = () => {}; // the Node scan store is memory-only and says so
+    const before = createScene('Test Room');
+    assert.equal(p.saveNow(before), true);
+    let live: SceneData = before;
+    const pending = p.attachSyntheticScan(before.id, () => live);
+    // An undo or restore replaces the live object while the blob write is pending.
+    const restored = normalizeScene(JSON.parse(JSON.stringify(before)) as SceneData);
+    live = restored;
+    const res = await pending;
+    assert.ok(res);
+    assert.equal(res.scene, restored, 'the scan goes onto the scene that is live now');
+    assert.equal(before.scan, null, 'the replaced object is not written');
+    assert.equal(restored.scan?.id, res.scan.id);
+    assert.equal(p.loadScene(before.id)?.scan?.id, res.scan.id);
+    // A scene that is not live gets the stored copy.
+    const other = createScene('Other');
+    assert.equal(p.saveNow(other), true);
+    const res2 = await p.attachSyntheticScan(other.id, () => live);
+    assert.ok(res2 && res2.scene !== live);
+    assert.equal(p.loadScene(other.id)?.scan?.id, res2.scan.id);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+}
 
 test('P0.8: after a failed save, Export hands out the in-memory scene, not the stale stored copy', () => {
   withP0MemoryStorage((storage) => {
@@ -11496,13 +11530,15 @@ test('P0.8: after a failed save, Export hands out the in-memory scene, not the s
     storage.failWrites = true;
     assert.equal(p.saveNow(scene), false);
     assert.equal(errors.length, 1);
-    assert.equal(p.loadScene(scene.id)?.name, 'Quota Victim'); // storage holds the old copy
+    const storedCopy = JSON.parse(storage.getItem(`setview.scene.${scene.id}`) ?? '{}') as { name?: string };
+    assert.equal(storedCopy.name, 'Quota Victim'); // storage holds the old copy
+    assert.equal(p.loadScene(scene.id)?.name, 'Quota Victim (edited)'); // reopening gets the newer one
     assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
 
     // A scene that never saved at all (e.g. a failed import) can still be exported.
     const neverSaved = createScene('Never Saved');
     assert.equal(p.saveNow(neverSaved), false);
-    assert.equal(p.loadScene(neverSaved.id), null);
+    assert.equal(storage.getItem(`setview.scene.${neverSaved.id}`), null);
     assert.equal(p.sceneForExport(neverSaved.id), neverSaved);
 
     // The live scene always wins for its own id; other ids fall through.
@@ -11515,6 +11551,83 @@ test('P0.8: after a failed save, Export hands out the in-memory scene, not the s
     assert.equal(p.saveNow(scene), true);
     assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
     assert.notEqual(p.sceneForExport(scene.id), scene); // a fresh load, not the cached object
+  });
+});
+
+test('P0.8: a scene whose save failed gets a landing row (with Export), and reopening it keeps the edits', () => {
+  withP0MemoryStorage((storage) => {
+    const p = new Persistence();
+    p.onError = () => {};
+    const stored = createScene('Stored');
+    assert.equal(p.saveNow(stored), true);
+    assert.deepEqual(
+      p.listScenesForLanding(stored).map((e) => [e.name, !!e.unsaved]),
+      [['Stored', false]],
+    );
+
+    // An import (or New, or Dup) that does not fit never reaches the index...
+    storage.failWrites = true;
+    const imported = createScene('Big Import (imported)');
+    assert.equal(p.saveNow(imported), false);
+    assert.equal(p.listScenes().some((e) => e.id === imported.id), false);
+    // ...but the landing still lists it, flagged, so its Export button exists.
+    const rows = p.listScenesForLanding(imported);
+    const row = rows.find((e) => e.id === imported.id);
+    assert.ok(row, 'the failed import has a landing row');
+    assert.equal(row.unsaved, true);
+    assert.equal(row.name, 'Big Import (imported)');
+    assert.equal(rows.find((e) => e.id === stored.id)?.unsaved, undefined);
+    assert.equal(p.sceneForExport(imported.id), imported);
+
+    // A stored scene whose later save failed: the row shows the in-memory name.
+    stored.name = 'Stored (edited)';
+    assert.equal(p.saveNow(stored), false);
+    const storedRow = p.listScenesForLanding(imported).find((e) => e.id === stored.id);
+    assert.equal(storedRow?.name, 'Stored (edited)');
+    assert.equal(storedRow?.unsaved, true);
+
+    // Re-opening it after switching away gets the edits, not the stale stored copy,
+    // as a clone the caller may edit; Export then hands out that reopened copy.
+    const reopened = p.loadScene(stored.id);
+    assert.equal(reopened?.name, 'Stored (edited)');
+    assert.notEqual(reopened, stored);
+    reopened!.name = 'Stored (edited again)';
+    assert.equal(stored.name, 'Stored (edited)', 'editing the reopened copy does not touch the cache');
+    assert.equal(p.sceneForExport(stored.id, reopened)?.name, 'Stored (edited again)');
+    // Landing edits on a non-current scene go through loadScene too.
+    assert.equal(p.renameScene(imported.id, 'Renamed Import'), false);
+    assert.equal(p.listScenesForLanding(stored).find((e) => e.id === imported.id)?.name, 'Renamed Import');
+
+    // The live scene is listed even when the index lacks it and no save was tried.
+    const orphanLive = createScene('Live Only');
+    assert.equal(p.listScenesForLanding(orphanLive).find((e) => e.id === orphanLive.id)?.unsaved, true);
+
+    // Once saves work again the flag clears; deleting drops the in-memory copy.
+    storage.failWrites = false;
+    assert.equal(p.saveNow(reopened!), true);
+    assert.equal(p.listScenesForLanding(reopened).find((e) => e.id === stored.id)?.unsaved, undefined);
+    assert.equal(p.loadScene(stored.id)?.name, 'Stored (edited again)');
+    p.deleteScene(imported.id);
+    assert.equal(p.listScenesForLanding(reopened).some((e) => e.id === imported.id), false);
+    assert.equal(p.loadScene(imported.id), null);
+  });
+});
+
+test('P0.9: a save failure before onError is wired (first-run scene) is held, then delivered', () => {
+  withP0MemoryStorage((storage) => {
+    storage.failWrites = true;
+    const p = new Persistence();
+    const first = p.loadCurrentOrCreate(); // main.ts runs this before wiring onError
+    assert.equal(p.listScenesForLanding(first)[0]?.unsaved, true);
+    const got: string[] = [];
+    p.onError = (m) => got.push(m);
+    assert.equal(got.length, 1);
+    assert.ok(got[0].includes('storage full'));
+    // Later failures go straight to the handler; nothing is delivered twice.
+    p.saveNow(first);
+    assert.equal(got.length, 2);
+    p.onError = (m) => got.push(`second: ${m}`);
+    assert.equal(got.length, 2);
   });
 });
 
@@ -11716,6 +11829,11 @@ test('P0.14: the splat renderer rebuilds only when the drawn count changes, and 
   (first.material as THREE.Material).addEventListener('dispose', () => {
     disposed = true;
   });
+  // three frees an InstancedMesh's instanceMatrix GPU buffer only on its 'dispose' event.
+  let meshDisposed = false;
+  first.addEventListener('dispose', () => {
+    meshDisposed = true;
+  });
   // Budgets above the cloud size draw the same 300 splats: no rebuild.
   renderer.setSplatBudget(5000);
   renderer.setSplatBudget(250000);
@@ -11727,19 +11845,27 @@ test('P0.14: the splat renderer rebuilds only when the drawn count changes, and 
   assert.notEqual(second, first);
   assert.equal(second.count, 150);
   assert.equal(disposed, true);
+  assert.equal(meshDisposed, true, 'the old InstancedMesh is disposed on rebuild');
+  let lastDisposed = false;
+  second.addEventListener('dispose', () => {
+    lastDisposed = true;
+  });
   renderer.dispose();
+  assert.equal(lastDisposed, true, 'dispose() releases the current InstancedMesh');
 });
 
-void Promise.all([scanStoreFallback(), propStoreFallback()]).then(
+void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
 
   () => {
-    passed += 2;
+    passed += 4;
     console.log('  ✓ ScanStore: memory fallback contract (put/get/list/prune/delete + warning)');
     console.log('  ✓ PropStore: memory fallback contract (save/get/list/delete + warning)');
+    console.log('  ✓ P0.8: importScene tells a blocked read apart from a file that is not a scene');
+    console.log('  ✓ P0.8: Add Test Room attaches to the scene that is live after the scan write');
     console.log(`\n${passed} tests passed`);
   },
   (e) => {
-    console.error('  ✗ Stores: memory fallback contract');
+    console.error('  ✗ async tests (store fallbacks, P0.8 import read, P0.8 test room)');
     throw e;
   },
 );

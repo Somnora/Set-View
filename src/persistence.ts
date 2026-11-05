@@ -145,15 +145,33 @@ export interface SceneIndexEntry {
   hasScan?: boolean;
 }
 
+/** A landing row: an index entry, flagged when the scene's last save failed. */
+export interface SceneListEntry extends SceneIndexEntry {
+  /** Only in memory (or newer than the stored copy): lost on reload unless exported. */
+  unsaved?: boolean;
+}
+
+function indexEntryFor(scene: SceneData): SceneIndexEntry {
+  return {
+    id: scene.id,
+    name: scene.name,
+    updatedAt: scene.updatedAt,
+    actors: scene.actors.length,
+    cameras: scene.cameras.length,
+    hasScan: !!scene.scan,
+  };
+}
+
 export class Persistence {
   /** Scan geometry blobs (IndexedDB) — scene JSON carries only the summary. */
   readonly scans = new ScanStore();
 
   private saveTimer: number | null = null;
-  /** Notified when a save fails (e.g. storage full) so the UI can warn. */
-  onError: (msg: string) => void = () => {};
-  /** Scenes whose last save failed, so Export can still hand out what the user did
-   *  (localStorage holds an older copy, or none at all). */
+  private errorHandler: ((msg: string) => void) | null = null;
+  /** Errors raised before a handler was attached, delivered when one is. */
+  private pendingErrors: string[] = [];
+  /** Scenes whose last save failed, so reopening, the landing list and Export still
+   *  hand out what the user did (localStorage holds an older copy, or none at all). */
   private unsaved = new Map<string, SceneData>();
   private persistRequested = false;
   private storageReportCache: { at: number; report: Promise<StorageReport> } | null = null;
@@ -161,6 +179,25 @@ export class Persistence {
   constructor() {
     this.scans.onError = (m) => this.onError(m);
   }
+
+  /**
+   * Notified when a save fails (e.g. storage full) so the UI can warn. A failure
+   * raised before a handler is attached (the first-run save in loadCurrentOrCreate
+   * runs before the app wires this up) is held and delivered on assignment.
+   */
+  get onError(): (msg: string) => void {
+    return this.reportError;
+  }
+
+  set onError(fn: (msg: string) => void) {
+    this.errorHandler = fn;
+    for (const m of this.pendingErrors.splice(0)) fn(m);
+  }
+
+  private reportError = (msg: string): void => {
+    if (this.errorHandler) this.errorHandler(msg);
+    else if (this.pendingErrors.length < 8) this.pendingErrors.push(msg);
+  };
 
   /**
    * Deletes scan blobs no scene references. Run once at app start: replaced
@@ -186,7 +223,27 @@ export class Persistence {
     }
   }
 
+  /**
+   * The landing's scene list: the stored index, plus every scene whose last save
+   * failed (an import, New or Dup that did not fit has no index entry at all) and
+   * the live scene when the index lacks it. Those rows carry `unsaved`, and their
+   * name and counts come from memory. Without them a scene that only exists in
+   * memory had no row, so no Export button, although the warning said to export it.
+   */
+  listScenesForLanding(live?: SceneData | null): SceneListEntry[] {
+    const rows = new Map<string, SceneListEntry>();
+    for (const e of this.listScenes()) rows.set(e.id, e);
+    const addUnsaved = (s: SceneData) => rows.set(s.id, { ...indexEntryFor(s), unsaved: true });
+    for (const s of this.unsaved.values()) addUnsaved(live && live.id === s.id ? live : s);
+    if (live && !rows.has(live.id)) addUnsaved(live);
+    return [...rows.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  /** A stored scene, or the in-memory copy when its last save failed, which is newer. */
   loadScene(id: string): SceneData | null {
+    const pending = this.unsaved.get(id);
+    // A clone, as a load from storage would be: the caller may edit it freely.
+    if (pending) return normalizeScene(JSON.parse(JSON.stringify(pending)) as SceneData);
     try {
       const raw = localStorage.getItem(SCENE_PREFIX + id);
       if (!raw) return null;
@@ -249,14 +306,7 @@ export class Persistence {
     try {
       localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
       const index = this.listScenes().filter((e) => e.id !== scene.id);
-      index.push({
-        id: scene.id,
-        name: scene.name,
-        updatedAt: scene.updatedAt,
-        actors: scene.actors.length,
-        cameras: scene.cameras.length,
-        hasScan: !!scene.scan,
-      });
+      index.push(indexEntryFor(scene));
       localStorage.setItem(INDEX_KEY, JSON.stringify(index));
       this.unsaved.delete(scene.id);
       return true;
@@ -397,27 +447,30 @@ export class Persistence {
 
   /**
    * Attaches a synthetic 3D room scan to a scene for desktop scouting & testing.
-   * Pass `live` (the in-memory current scene) to attach to that object itself, so
-   * every manager bound to it sees the scan; otherwise the stored copy is loaded,
-   * which for the current scene could be older than what is in memory.
+   * Pass `getLive` (returns the in-memory current scene) to attach to that object
+   * itself, so every manager bound to it sees the scan; otherwise the stored copy is
+   * loaded, which for the current scene could be older than what is in memory.
+   * Resolves to the scene the scan went onto, or null.
    */
   async attachSyntheticScan(
     id: string,
-    live?: SceneData | null,
+    getLive?: () => SceneData | null,
     widthM = 6.0,
     depthM = 5.0,
     heightM = 2.8,
     furnitureLabels = ['couch', 'table', 'desk'],
-  ): Promise<LocationScan | null> {
+  ): Promise<{ scan: LocationScan; scene: SceneData } | null> {
     const scan = createSyntheticLocationScan(widthM, depthM, heightM, furnitureLabels);
     await this.scans.putScan(scan);
-    // Resolved after the blob write so an edit made meanwhile is not overwritten.
+    // Resolved after the blob write, so an undo, redo or restore that replaced the
+    // live scene meanwhile is neither overwritten nor missed.
+    const live = getLive?.() ?? null;
     const scene = live && live.id === id ? live : this.loadScene(id);
     if (!scene) return null;
     scene.scan = summarizeScan(scan);
     this.saveNow(scene);
     this.storageReportCache = null;
-    return scan;
+    return { scan, scene };
   }
 
   /**

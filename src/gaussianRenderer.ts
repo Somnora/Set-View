@@ -291,6 +291,9 @@ export class GaussianSplatRenderer {
     if (this.instancedMesh) {
       this.group.remove(this.instancedMesh);
       this.instancedMesh.geometry?.dispose();
+      // Frees the instanceMatrix GPU buffer (64 bytes per splat): three releases it
+      // only on the InstancedMesh 'dispose' event, not with the geometry.
+      this.instancedMesh.dispose();
       this.instancedMesh = null;
     }
     // The material was rebuilt (and its GPU program kept alive) on every rebuild
@@ -474,6 +477,7 @@ export class GaussianSplatRenderer {
     if (this.instancedMesh) {
       this.group.remove(this.instancedMesh);
       this.instancedMesh.geometry?.dispose();
+      this.instancedMesh.dispose(); // the instanceMatrix GPU buffer
       this.instancedMesh = null;
     }
     if (this.splatMaterial) {

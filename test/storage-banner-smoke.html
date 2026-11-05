@@ -4,8 +4,11 @@
      with ?scan, plus the synthetic room scan and one moved furniture piece):
        1. with every localStorage write throwing QuotaExceededError: the failed save
           must show as a visible landing banner (it used to reach only the console
-          and the 3D wrist);
-       2. with storage working: the scene must import and appear in the scene list.
+          and the 3D wrist), the scene must get a "Not saved" row, and both that
+          row's Export button and the banner's Export button must download it
+          (the download is intercepted and its JSON read back);
+       2. with storage working: the scene must import and appear in the scene list
+          as a saved row.
      Also checks the Scene & Environment card's storage line and LED volume row.
      (test/sample_scene.setview.json is not used: it fails isSceneData even at
      cd82a8e, its lights use an old schema, and test/import-test.py depends on it.)
@@ -19,8 +22,9 @@
      this Mac can hang IndexedDB transactions (no watchdog covers them), so run ?scan
      headed only; the default run has no scan and needs no IndexedDB writes. Checks
      poll for up to 12 s each.
-     PASS = banner visible with the save failure, second import listed, storage line
-     measured, LED row present. -->
+     PASS = banner visible with the save failure, failed import listed as not saved
+     and exportable from its row and the banner, second import listed as saved,
+     storage line measured, LED row present. -->
 <html>
   <head><meta charset="utf-8" /><title>storage banner smoke</title></head>
   <body>
@@ -42,7 +46,19 @@
         [...document.querySelectorAll('#landing .scan-info')].map((e) => e.textContent ?? '');
       const bannerTexts = () =>
         [...document.querySelectorAll('#landing .banners .banner-text')].map((e) => e.textContent ?? '');
-      const sceneNames = () => [...document.querySelectorAll('#landing .scene .load b')].map((e) => e.textContent ?? '');
+      const sceneRows = (n) =>
+        [...document.querySelectorAll('#landing .scene')].filter((r) => r.querySelector('.load b')?.textContent === n);
+      // Intercept the export download (an anchor click on a blob URL) and keep its URL.
+      const downloads = [];
+      HTMLAnchorElement.prototype.click = function () {
+        if (this.download) downloads.push({ name: this.download, href: this.href });
+      };
+      const exportedName = async (fromIndex) => {
+        const d = await until(() => downloads[fromIndex], 12000);
+        if (!d) return null;
+        const file = await (await fetch(d.href)).json();
+        return file?.name ?? null;
+      };
       try {
         await import('../src/main.ts');
         const { createScene } = await import('../src/model.ts');
@@ -80,18 +96,40 @@
         const box = document.querySelector('#landing .banners')?.getBoundingClientRect();
         const visible = !!box && box.height > 0;
 
-        // 2. Storage working: the same file imports and is listed.
+        // The failed import has a "Not saved" row whose Export downloads it, and the
+        // banner's Export does the same (the scene is in memory only).
+        const unsavedRow = await until(
+          () => sceneRows(`${name} (imported)`).find((r) => r.dataset.unsaved === 'true'),
+          12000,
+        );
+        const rowExport = unsavedRow
+          ? [...unsavedRow.querySelectorAll('.scene-head button.small')].find((b) => b.textContent === 'Export')
+          : null;
+        rowExport?.click();
+        const rowExported = rowExport ? await exportedName(0) : null;
+        const bannerExport = [...document.querySelectorAll('#landing .banners .banner-action')].find(
+          (b) => b.textContent === 'Export',
+        );
+        bannerExport?.click();
+        const bannerExported = bannerExport ? await exportedName(rowExport ? 1 : 0) : null;
+        const exportOk = rowExported === `${name} (imported)` && bannerExported === `${name} (imported)`;
+
+        // 2. Storage working: the same file imports and is listed as saved.
         importFile('banner-smoke-ok.setview.json');
-        const listed = await until(() => sceneNames().find((n) => n === `${name} (imported)`), 12000);
+        const listed = await until(
+          () => sceneRows(`${name} (imported)`).find((r) => r.dataset.unsaved !== 'true'),
+          12000,
+        );
 
         const storageLine = await until(
           () => infoLines().find((t) => t.startsWith('Storage:') && !t.includes('measuring')),
           12000,
         );
         const ledRow = infoLines().find((t) => t.startsWith('LED volume:'));
-        const pass = !!saveBanner && visible && !!listed && !!storageLine && !!ledRow;
+        const pass = !!saveBanner && visible && !!unsavedRow && exportOk && !!listed && !!storageLine && !!ledRow;
         out.textContent =
-          `STORAGE-SMOKE ${pass ? 'PASS' : 'FAIL'} | visible=${visible} | listed=${!!listed}` +
+          `STORAGE-SMOKE ${pass ? 'PASS' : 'FAIL'} | visible=${visible} | unsavedRow=${!!unsavedRow}` +
+          ` | rowExport=${rowExported ?? 'none'} | bannerExport=${bannerExported ?? 'none'} | listed=${!!listed}` +
           ` | banners=${JSON.stringify(bannerTexts())} | storage=${storageLine ?? 'none'} | led=${ledRow ?? 'none'}`;
       } catch (e) {
         out.textContent = `STORAGE-SMOKE ERROR ${e.message}`;
