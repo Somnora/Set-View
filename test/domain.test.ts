@@ -200,6 +200,7 @@ import { scanCapability } from '../src/scan.ts';
 import { roomCaptureMessage, roomCaptureRefusal } from '../src/scan.ts';
 import { floorSettled, FLOOR_MIN_HITS, FLOOR_SETTLE_MS } from '../src/floor.ts';
 import { ViewManager } from '../src/views.ts';
+import { isLocationDisplayMode, LOCATION_DISPLAY_MODES } from '../src/model.ts';
 import { estimateScanSizeBytes, ScanStore } from '../src/scanStore.ts';
 import {
   calculateMeshAABB,
@@ -11493,6 +11494,179 @@ test('P0.5 roomCaptureRefusal: once per session, plane-detection required', () =
   // Unreported features are not a grant: the spec rejects without plane-detection.
   assert.equal(roomCaptureRefusal({ ...base, enabledFeatures: [] }), 'no-plane-detection');
   assert.equal(roomCaptureRefusal({ ...base, used: true }), 'already-used');
+});
+
+/** Two tables (same label) plus a static floor, for the P0.7 renderer tests. */
+function twoTableScan(): LocationScan {
+  const quad = (x: number, z: number, y: number) =>
+    new Float32Array([x - 0.5, y, z - 0.5, x + 0.5, y, z - 0.5, x + 0.5, y, z + 0.5, x - 0.5, y, z + 0.5]);
+  const idx = () => new Uint32Array([0, 1, 2, 0, 2, 3]);
+  return {
+    version: 1,
+    id: 'p07',
+    capturedAt: 1,
+    meshes: [
+      { label: 'floor', positions: quad(0, 0, 0), indices: idx() },
+      { label: 'table', positions: quad(2, 3, 0.7), indices: idx() },
+      { label: 'table', positions: quad(-2, 1, 0.7), indices: idx() },
+    ],
+  };
+}
+
+function scanMeshes(loc: LocationRenderer): THREE.Mesh[] {
+  const out: THREE.Mesh[] = [];
+  loc.group.traverse((o) => {
+    if ((o as THREE.Mesh).isMesh && o.name.startsWith('scan:')) out.push(o as THREE.Mesh);
+  });
+  return out;
+}
+
+function scanWires(loc: LocationRenderer): THREE.LineSegments[] {
+  const out: THREE.LineSegments[] = [];
+  loc.group.traverse((o) => {
+    if ((o as THREE.LineSegments).isLineSegments && o.name.startsWith('scan-wire:')) out.push(o as THREE.LineSegments);
+  });
+  return out;
+}
+
+test('P0.7 LocationRenderer: Ghost and Wireframe stay translucent after a Solid compile', () => {
+  const loc = new LocationRenderer();
+  loc.setScan(twoTableScan());
+  loc.setMode('solid');
+  const seen = new Map<THREE.Material, { transparent: boolean; version: number }>();
+  const record = () => {
+    for (const m of scanMeshes(loc)) {
+      const mat = m.material as THREE.MeshLambertMaterial;
+      const prior = seen.get(mat);
+      // three bakes '#define OPAQUE' into a program compiled while transparent
+      // is false; a material whose flag later flips keeps drawing at alpha 1.
+      if (prior) assert.equal(mat.transparent, prior.transparent, 'a material flipped its transparent flag');
+      else seen.set(mat, { transparent: mat.transparent, version: mat.version });
+    }
+  };
+  for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, false);
+  record();
+  loc.setMode('ghost');
+  for (const m of scanMeshes(loc)) {
+    const mat = m.material as THREE.MeshLambertMaterial;
+    assert.equal(mat.transparent, true);
+    assert.equal(mat.opacity, 0.35);
+    assert.equal(mat.depthWrite, false);
+    assert.equal(mat.wireframe, false);
+  }
+  record();
+  // The Camera View pass forces Solid every frame and restores the mode.
+  for (let frame = 0; frame < 3; frame++) {
+    loc.beginCameraPass();
+    for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, false);
+    record();
+    loc.endCameraPass();
+    for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, true);
+    record();
+  }
+  loc.setMode('wireframe');
+  for (const m of scanMeshes(loc)) {
+    const mat = m.material as THREE.MeshLambertMaterial;
+    assert.equal(mat.transparent, true);
+    assert.equal(mat.wireframe, true);
+    assert.equal(mat.opacity, 0.85);
+  }
+  record();
+  loc.setMode('solid');
+  record();
+  // No mode switch or camera pass forces a shader recompile (version bump).
+  for (const [mat, { version }] of seen) assert.equal(mat.version, version);
+});
+
+test('P0.7 LocationRenderer: wire overlay is lazy, keyed by mesh index, and follows furniture', () => {
+  const loc = new LocationRenderer();
+  const scan = twoTableScan();
+  loc.setScan(scan);
+  loc.setMode('ghost');
+  assert.equal(scanWires(loc).length, 0, 'no edge geometry until Wireframe is first shown');
+  loc.setMode('wireframe');
+  const wires = scanWires(loc);
+  assert.equal(wires.length, scan.meshes.length);
+  const meshes = scanMeshes(loc);
+  for (const w of wires) {
+    assert.ok(meshes.includes(w.parent as THREE.Mesh), 'wire is parented to its own mesh');
+    assert.equal(w.visible, true);
+  }
+  // Two tables share a label: each must still get its own overlay.
+  const [t1, t2] = loc.furnitureTargets();
+  const wireOf = (o: THREE.Object3D) => o.children.find((c) => (c as THREE.LineSegments).isLineSegments)!;
+  assert.notEqual(wireOf(t1), wireOf(t2));
+  assert.equal(wireOf(t1).name, `scan-wire:${t1.userData.scanMeshIndex}`);
+
+  const worldOf = (o: THREE.Object3D) => {
+    o.updateWorldMatrix(true, false);
+    return new THREE.Vector3().setFromMatrixPosition(o.matrixWorld);
+  };
+  loc.applyPlacements([{ meshIndex: 2, dx: 1, dz: -1, rotY: Math.PI / 2 }]);
+  const placed = loc.furnitureTargets().find((m) => m.userData.scanMeshIndex === 2)!;
+  assert.ok(worldOf(wireOf(placed)).distanceTo(worldOf(placed)) < 1e-9);
+  approx(worldOf(placed).x, -1);
+  approx(worldOf(placed).z, 0);
+  // A carry then commitFurniture: the overlay stays on the piece.
+  placed.position.set(4, 0.3, 4);
+  placed.rotation.set(0.1, 0.5, 0);
+  loc.commitFurniture(placed);
+  assert.ok(worldOf(wireOf(placed)).distanceTo(worldOf(placed)) < 1e-9);
+  approx(worldOf(wireOf(placed)).x, 4);
+  // Reloading the same scan with no placements puts both back as captured.
+  loc.applyPlacements(undefined);
+  approx(worldOf(wireOf(placed)).x, -2);
+  approx(worldOf(wireOf(placed)).z, 1);
+
+  // Hidden hides the overlay; Ghost hides it again too (overlay flag off).
+  loc.setMode('ghost');
+  for (const w of scanWires(loc)) assert.equal(w.visible, false);
+  loc.setWireframeOverlay(true);
+  for (const w of scanWires(loc)) assert.equal(w.visible, true);
+  loc.setMode('hidden');
+  for (const w of scanWires(loc)) assert.equal(w.visible, false);
+});
+
+test('P0.7 LocationRenderer: wires never steal a furniture raycast; setScan(null) clears all', () => {
+  const loc = new LocationRenderer();
+  loc.setScan(twoTableScan());
+  loc.setMode('wireframe');
+  // The fixture quads wind facing down (front side), so aim up from below.
+  const rc = new THREE.Raycaster(new THREE.Vector3(2, -1, 3), new THREE.Vector3(0, 1, 0));
+  loc.group.updateMatrixWorld(true);
+  const hits = rc.intersectObjects(loc.furnitureTargets(), true);
+  assert.ok(hits.length > 0);
+  for (const h of hits) assert.equal(typeof h.object.userData.scanMeshIndex, 'number');
+
+  loc.setScan(null);
+  assert.equal(loc.hasScan, false);
+  assert.equal(scanMeshes(loc).length, 0);
+  assert.equal(scanWires(loc).length, 0);
+  assert.equal(loc.group.visible, false);
+});
+
+test('P0.7 locationMode: validated, defaults to ghost with a scan, survives a round-trip', () => {
+  for (const m of LOCATION_DISPLAY_MODES) assert.equal(isLocationDisplayMode(m), true, m);
+  assert.equal(isLocationDisplayMode('neon'), false);
+  assert.equal(isLocationDisplayMode(undefined), false);
+
+  const withScan = () => {
+    const s = createScene('loc mode');
+    s.scan = { id: 'b', capturedAt: 1, vertices: 3, triangles: 1, boundsMin: { x: 0, y: 0, z: 0 }, boundsMax: { x: 1, y: 1, z: 1 } };
+    return s;
+  };
+  assert.equal(normalizeScene(withScan()).locationMode, 'ghost', 'a reloaded scan is visible, not hidden');
+  assert.equal(normalizeScene(createScene('no scan')).locationMode, undefined);
+
+  const solid = withScan();
+  solid.locationMode = 'solid';
+  const back = normalizeScene(JSON.parse(JSON.stringify(solid)));
+  assert.equal(back.locationMode, 'solid');
+
+  const bad = withScan() as unknown as Record<string, unknown>;
+  bad.locationMode = 'neon';
+  assert.equal(isSceneData(bad), true, 'a bad view preference does not fail an import');
+  assert.equal(normalizeScene(bad as unknown as ReturnType<typeof createScene>).locationMode, 'ghost');
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(

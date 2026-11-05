@@ -31,7 +31,7 @@ import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
 import { roomCaptureMessage, summarizeScan, type ScanSource } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
-import { LocationRenderer } from './location.ts';
+import { LocationRenderer, type LocationMode } from './location.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
@@ -467,6 +467,10 @@ class App {
     this.preview.onOpenWebXRProfiler = () => this.openWebXRProfilerDialog();
     this.preview.onOpenVRComfort = () => this.openVRComfortDialog();
     this.preview.onOpenSetDressing = () => this.openSetDressingDialog();
+    // Room display toggle (the scan was invisible on desktop: no control, and
+    // the mode always came back Hidden).
+    this.preview.getLocationMode = () => (this.sceneData.scan ? this.location.mode : null);
+    this.preview.onCycleLocationMode = () => void this.cycleLocationMode();
 
     this.profilerRuntime = new WebXRProfilerRuntime(this.sceneData.profiler);
     this.comfortRenderer = new SpatialComfortRenderer(this.sceneData.comfort);
@@ -893,8 +897,15 @@ class App {
       // Same geometry, possibly different furniture placements (undo/redo,
       // scene restore) — re-apply without reloading the blob.
       this.location.applyPlacements(summary.furniture);
+      // The display mode is a view preference, not an undoable edit: keep what
+      // is on screen, and write it back so a snapshot taken before the last
+      // mode change doesn't revert it on the next save.
+      this.sceneData.locationMode = this.location.mode;
       return;
     }
+    // New geometry (scene switch, reload, undo across a rescan): show it in the
+    // scene's saved mode, Ghost when it has none (normalizeScene's default).
+    this.location.setMode(this.sceneData.locationMode ?? 'ghost');
     void this.persistence.scans.getScan(summary.id).then((scan) => {
       if (token !== this.locationSyncToken) return; // superseded
       if (!scan) {
@@ -930,6 +941,28 @@ class App {
       this.persistence.updateScene(scene);
     }
     this.refreshLanding();
+  }
+
+  /**
+   * Sets the scan display mode and remembers it on the scene, so a reload
+   * shows the scan the way it was left. A view preference: saved (debounced)
+   * but not recorded as an undo step.
+   */
+  private setLocationMode(mode: LocationMode): void {
+    this.location.setMode(mode);
+    this.contentVersion++; // hidden scans aren't grabbable: targets change
+    if (this.sceneData.locationMode !== mode) {
+      this.sceneData.locationMode = mode;
+      this.persistence.markDirty(this.sceneData);
+    }
+    this.refreshWristState();
+  }
+
+  /** Hidden, Ghost, Solid, Wireframe (wrist 'Loc:', wheel 'Room:', desktop preview). */
+  private cycleLocationMode(): LocationMode {
+    const next = this.location.cycleMode();
+    this.setLocationMode(next); // remember it on the scene
+    return next;
   }
 
   /** Wrist "Scan Room": starts (or cancels) waiting for the platform's room data. */
@@ -1018,7 +1051,7 @@ class App {
       this.displayedScanId = scan.id;
       this.locationSyncToken++; // kill any in-flight stale load
       this.location.setScan(scan);
-      this.location.setMode('ghost'); // show alignment over passthrough for confirmation
+      this.setLocationMode('ghost'); // show alignment over passthrough for confirmation
       this.contentVersion++; // fresh furniture raycast targets
       this.markDirty();
       this.refreshLanding();
@@ -1407,7 +1440,7 @@ class App {
     this.contentVersion++; // grab targets swap between furniture and actors/cams
     if (mode === 'dress' && this.location.hasScan && this.location.mode === 'hidden') {
       // Give the dresser something to grab — ghost the scan in.
-      this.location.setMode('ghost');
+      this.setLocationMode('ghost');
     }
     this.guide.refresh(this.guideCtx());
     this.debug.log(mode === 'dress' ? 'DRESS mode — move the set' : 'BLOCK mode — plan the shot');
@@ -1622,10 +1655,8 @@ class App {
           this.debug.log('no location scan in this scene yet — press Scan Room');
           break;
         }
-        const mode = this.location.cycleMode();
-        this.contentVersion++; // hidden scans aren't grabbable — targets change
+        const mode = this.cycleLocationMode();
         this.debug.log(`location: ${mode}`);
-        this.refreshWristState();
         break;
       }
       case 'drift': {

@@ -1061,6 +1061,21 @@ export interface SceneData {
   walkSpeed: number;
   /** Captured location scan, if any. Absent/null = no scan. */
   scan?: ScanSummary | null;
+  /**
+   * How the scan is displayed (a per-scene view preference, saved but not an
+   * undo step). normalizeScene defaults it to 'ghost' when a scan exists, so a
+   * reloaded scan is visible (it used to come back hidden).
+   */
+  locationMode?: LocationDisplayMode;
+}
+
+/** Location scan display modes (rendered by location.ts). */
+export type LocationDisplayMode = 'hidden' | 'ghost' | 'solid' | 'wireframe';
+
+export const LOCATION_DISPLAY_MODES: readonly LocationDisplayMode[] = ['hidden', 'ghost', 'solid', 'wireframe'];
+
+export function isLocationDisplayMode(v: unknown): v is LocationDisplayMode {
+  return typeof v === 'string' && (LOCATION_DISPLAY_MODES as readonly string[]).includes(v);
 }
 
 // --- factories --------------------------------------------------------------
@@ -1802,6 +1817,10 @@ export function normalizeScene(s: SceneData): SceneData {
     s.scan.furniture = s.scan.furniture.filter(isFurniturePlacement);
     if (s.scan.furniture.length === 0) delete s.scan.furniture;
   }
+  // A bad value is dropped rather than failing the import (it is only a view
+  // preference); a scene with a scan shows it as Ghost unless told otherwise.
+  if (s.locationMode !== undefined && !isLocationDisplayMode(s.locationMode)) delete s.locationMode;
+  if (s.scan && s.locationMode === undefined) s.locationMode = 'ghost';
   if (!Array.isArray(s.lights)) {
     s.lights = [];
   } else {
