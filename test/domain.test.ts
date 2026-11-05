@@ -544,6 +544,15 @@ import {
   parseGeminiAiResponse,
   simulatePhysicsImpulseSettling,
 } from '../src/setDressingEngine.ts';
+import {
+  COMPRESSED_PLY_MESSAGE,
+  MAX_INLINE_SPLATS,
+  SPLAT_HEADER_SNIFF_BYTES,
+  sniffSplatFile,
+  splatImportRefusal,
+} from '../src/gaussianSplat.ts';
+import { SPLAT_BUDGET_STEP, stepSplatBudget } from '../src/performanceGovernor.ts';
+import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
 
 
 let passed = 0;
@@ -11329,6 +11338,183 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
   const setDressingActions = generateEntityContextActions('set_dressing', 'dressing_root');
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_open_studio'));
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_quick_scatter'));
+});
+
+// --- P0 data ---
+
+/** Builds a binary little-endian PLY from a header body and per-vertex writer. */
+function p0BinaryPly(
+  props: string[],
+  count: number,
+  stride: number,
+  write: (view: DataView, base: number, i: number) => void,
+): Uint8Array {
+  const header =
+    'ply\nformat binary_little_endian 1.0\n' +
+    `element vertex ${count}\n` +
+    props.map((p) => `property ${p}\n`).join('') +
+    'end_header\n';
+  const head = new TextEncoder().encode(header);
+  const out = new Uint8Array(head.length + count * stride);
+  out.set(head, 0);
+  const view = new DataView(out.buffer, head.length);
+  for (let i = 0; i < count; i++) write(view, i * stride, i);
+  return out;
+}
+
+test('P0.14: a ushort PLY property has a 2-byte stride', () => {
+  // x y z float, ushort flags, float opacity: 18 bytes per vertex. The old 4-byte
+  // ushort stride read 20, misplaced every field after it and dropped a vertex.
+  const ply = p0BinaryPly(['float x', 'float y', 'float z', 'ushort flags', 'float opacity'], 2, 18, (v, b, i) => {
+    v.setFloat32(b, 1 + i * 3, true);
+    v.setFloat32(b + 4, 2 + i * 3, true);
+    v.setFloat32(b + 8, 3 + i * 3, true);
+    v.setUint16(b + 12, 7 + i, true);
+    v.setFloat32(b + 14, i === 0 ? 0.25 : 0.75, true);
+  });
+  const cloud = parseGaussianPly(ply);
+  assert.equal(cloud.splatCount, 2);
+  assert.deepEqual(cloud.splats[1].position, { x: 4, y: 5, z: 6 });
+  approx(cloud.splats[0].opacity, 0.25, 1e-6); // no 3DGS layout: linear opacity stays linear
+  approx(cloud.splats[1].opacity, 0.75, 1e-6);
+});
+
+test('P0.14: 3DGS-layout opacity is always a logit (0.5 reads 0.622)', () => {
+  const props = ['x', 'y', 'z', 'f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3'];
+  const ascii =
+    'ply\nformat ascii 1.0\nelement vertex 1\n' +
+    props.map((p) => `property float ${p}\n`).join('') +
+    'end_header\n' +
+    '0 0 0 0 0 0 0.5 -3 -3 -3 1 0 0 0\n';
+  approx(parseGaussianPly(ascii).splats[0].opacity, 1 / (1 + Math.exp(-0.5)), 1e-4);
+  approx(parseGaussianPly(ascii).splats[0].opacity, 0.6225, 1e-3);
+  const bin = p0BinaryPly(props.map((p) => `float ${p}`), 1, 56, (v, b) => {
+    const vals = [0, 0, 0, 0, 0, 0, 0.5, -3, -3, -3, 1, 0, 0, 0];
+    vals.forEach((x, k) => v.setFloat32(b + k * 4, x, true));
+  });
+  approx(parseGaussianPly(bin).splats[0].opacity, 0.6225, 1e-3);
+});
+
+test('P0.14: compressed and pre-vertex PLY layouts are refused with a message', () => {
+  const compressedHeader =
+    'ply\nformat binary_little_endian 1.0\n' +
+    'element chunk 1\nproperty float min_x\nproperty float max_x\n' +
+    'element vertex 256\nproperty uint packed_position\nproperty uint packed_rotation\n' +
+    'property uint packed_scale\nproperty uint packed_color\nend_header\n';
+  const bytes = new Uint8Array(compressedHeader.length + 8 + 256 * 16);
+  bytes.set(new TextEncoder().encode(compressedHeader), 0);
+  const sniff = sniffSplatFile('room.compressed.ply', bytes.length, bytes);
+  assert.equal(sniff.ok, false);
+  if (!sniff.ok) assert.equal(sniff.message, COMPRESSED_PLY_MESSAGE);
+  assert.throws(() => parseGaussianPly(bytes), /compressed PLY/);
+
+  const preVertex =
+    'ply\nformat ascii 1.0\nelement camera 1\nproperty float fx\n' +
+    'element vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n500\n1 2 3\n';
+  assert.throws(() => parseGaussianPly(preVertex), /element "camera" comes before the vertex data/);
+});
+
+test('P0.14: the header sniff returns the splat count without the body', () => {
+  // Header only: the body of a 1.2M-splat capture is never read or parsed.
+  const header =
+    'ply\nformat binary_little_endian 1.0\nelement vertex 1200000\n' +
+    ['x', 'y', 'z', 'opacity', 'scale_0', 'rot_0'].map((p) => `property float ${p}\n`).join('') +
+    'end_header\n';
+  const head = new TextEncoder().encode(header);
+  const sniff = sniffSplatFile('capture.ply', head.length + 1200000 * 24, head);
+  assert.deepEqual(sniff, { ok: true, format: 'ply', splatCount: 1200000 });
+  assert.ok(SPLAT_HEADER_SNIFF_BYTES >= head.length);
+
+  assert.deepEqual(sniffSplatFile('cloud.splat', 32 * 20000, null), { ok: true, format: 'splat', splatCount: 20000 });
+  assert.equal(sniffSplatFile('cloud.splat', 33, null).ok, false);
+  assert.equal(sniffSplatFile('notes.ply', 10, new TextEncoder().encode('hello there')).ok, false);
+  assert.equal(sniffSplatFile('broken.ply', 0, null).ok, false);
+
+  // Size guard: the cap applies to the scene's total.
+  assert.equal(splatImportRefusal(MAX_INLINE_SPLATS), null);
+  assert.equal(splatImportRefusal(4000, 8000), null);
+  const refusal = splatImportRefusal(1200000);
+  assert.ok(refusal && refusal.startsWith('Too large for now'));
+  assert.ok(refusal.includes('mesh export') && refusal.includes('splat locations'));
+  assert.ok(splatImportRefusal(10000, 6000)?.includes('already in this scene'));
+  assert.ok(!/[\u2014\u2013]/.test(refusal), 'no em or en dashes in UI copy');
+});
+
+test('P0.14: voxel downsampling keeps splats 12.8 m apart separate', () => {
+  const splat = (z: number): GaussianSplat => ({
+    position: { x: 0.01, y: 0.01, z },
+    scale: { x: 0.01, y: 0.01, z: 0.01 },
+    rotation: { x: 0, y: 0, z: 0, w: 1 },
+    color: { r: 0.5, g: 0.5, b: 0.5 },
+    opacity: 1,
+  });
+  const out = voxelDownsampleSplats([splat(0.01), splat(12.81)], 0.05);
+  assert.equal(out.length, 2);
+  const zs = out.map((s) => s.position.z).sort((a, b) => a - b);
+  approx(zs[0], 0.01, 1e-9);
+  approx(zs[1], 12.81, 1e-9);
+  // Far apart on every axis and on both sides of the origin.
+  assert.equal(voxelDownsampleSplats([splat(-300.01), splat(300.01), splat(-300.02)], 0.05).length, 2);
+});
+
+test('P0.14: the splat budget only moves past a full step and snaps to it', () => {
+  assert.equal(stepSplatBudget(100000, 102000), 100000);
+  assert.equal(stepSplatBudget(100000, 105000), 100000); // exactly one step: hold
+  assert.equal(stepSplatBudget(100000, 94999), 95000);
+  assert.equal(stepSplatBudget(100000, 72400), 70000);
+  assert.equal(stepSplatBudget(100000, Number.NaN), 100000);
+  // Jitter around a value or a step boundary never flips the budget.
+  let b = 100000;
+  for (let i = 0; i < 100; i++) b = stepSplatBudget(b, i % 2 ? 97400 : 97600);
+  assert.equal(b, 100000);
+  assert.equal(stepSplatBudget(100000, 77777) % SPLAT_BUDGET_STEP, 0);
+});
+
+test('P0.14: the governor only pushes a splat budget change, not one per frame', () => {
+  let budget = 100000;
+  const pushes: number[] = [];
+  const fakeSplats = {
+    getSplatBudget: () => budget,
+    setSplatBudget: (n: number) => {
+      pushes.push(n);
+      budget = n;
+    },
+  } as unknown as GaussianSplatRenderer;
+  const governor = new XRPerformanceGovernor();
+  let t = 0;
+  for (let i = 0; i < 400; i++) {
+    t += i % 2 ? 16 : 17.5; // over a 72 fps budget, with jitter
+    governor.beginFrame(t);
+    governor.endFrame(undefined, fakeSplats, null, t);
+  }
+  assert.ok(pushes.length >= 1, 'an overloaded frame rate lowers the budget');
+  assert.ok(pushes.length <= 4, `expected a handful of budget changes, got ${pushes.length}`);
+  assert.ok(budget < 100000);
+  assert.ok(pushes.every((n) => n % SPLAT_BUDGET_STEP === 0));
+});
+
+test('P0.14: the splat renderer rebuilds only when the drawn count changes, and frees the old material', () => {
+  const renderer = new GaussianSplatRenderer();
+  renderer.setCloud(generateSyntheticScoutSplatCloud('Budget', 300));
+  const meshOf = () => renderer.group.children.find((c) => (c as THREE.InstancedMesh).isInstancedMesh) as THREE.InstancedMesh;
+  const first = meshOf();
+  assert.ok(first);
+  let disposed = false;
+  (first.material as THREE.Material).addEventListener('dispose', () => {
+    disposed = true;
+  });
+  // Budgets above the cloud size draw the same 300 splats: no rebuild.
+  renderer.setSplatBudget(5000);
+  renderer.setSplatBudget(250000);
+  assert.equal(meshOf(), first);
+  assert.equal(disposed, false);
+  // Below the cloud size the drawn count changes: rebuild, and the old material is released.
+  renderer.setSplatBudget(150);
+  const second = meshOf();
+  assert.notEqual(second, first);
+  assert.equal(second.count, 150);
+  assert.equal(disposed, true);
+  renderer.dispose();
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(

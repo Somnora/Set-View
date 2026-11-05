@@ -102,6 +102,7 @@ import {
   parseGaussianPly,
   voxelDownsampleSplats,
 } from './gaussianSplat.ts';
+import { SPLAT_HEADER_SNIFF_BYTES, sniffSplatFile, splatImportRefusal } from './gaussianSplat.ts';
 import type { XRPerformanceGovernor } from './xrPerformance.ts';
 import type { GovernorConfig } from './performanceGovernor.ts';
 import {
@@ -4679,31 +4680,48 @@ export function openGaussianSplatStudioModal(
     const fileInput = dialog.querySelector<HTMLInputElement>('#splat-file-input')!;
     const uploadBtn = dialog.querySelector<HTMLButtonElement>('#splat-upload-btn')!;
     uploadBtn.onclick = () => fileInput.click();
-    fileInput.onchange = () => {
+    fileInput.onchange = async () => {
       const file = fileInput.files?.[0];
+      fileInput.value = ''; // a refused file can be picked again after fixing it
       if (!file) return;
 
-      const reader = new FileReader();
-      reader.onload = () => {
-        try {
-          const buf = reader.result as ArrayBuffer;
-          let parsed: GaussianCloudData;
-          if (file.name.toLowerCase().endsWith('.splat')) {
-            parsed = parseCompactSplat(buf);
-          } else {
-            parsed = parseGaussianPly(buf);
-          }
-          parsed.name = file.name.replace(/\.[^/.]+$/, '');
-          localClouds.push(parsed);
-          activeCloudId = parsed.id;
-          alignmentStatusMsg = `Imported ${parsed.splatCount.toLocaleString()} splats successfully.`;
-          renderContent();
-          onCloudModified?.(parsed);
-        } catch (err) {
-          alert(`Failed to parse Gaussian Splat file: ${(err as Error).message}`);
+      try {
+        // Count the splats from the file size (.splat) or the PLY header before
+        // reading the body. Clouds are stored inline in the scene JSON, so a real
+        // phone capture would freeze the page while parsing and then make the
+        // scene silently stop saving; refuse it up front instead.
+        const isCompact = file.name.toLowerCase().endsWith('.splat');
+        const head = isCompact
+          ? null
+          : new Uint8Array(await file.slice(0, SPLAT_HEADER_SNIFF_BYTES).arrayBuffer());
+        const sniff = sniffSplatFile(file.name, file.size, head);
+        if (!sniff.ok) {
+          alert(`Cannot import ${file.name}: ${sniff.message}`);
+          return;
         }
-      };
-      reader.readAsArrayBuffer(file);
+        const inScene = localClouds.reduce((n, c) => n + c.splatCount, 0);
+        const refusal = splatImportRefusal(sniff.splatCount, inScene);
+        if (refusal) {
+          alert(refusal);
+          return;
+        }
+
+        const buf = await file.arrayBuffer();
+        let parsed: GaussianCloudData;
+        if (isCompact) {
+          parsed = parseCompactSplat(buf);
+        } else {
+          parsed = parseGaussianPly(buf);
+        }
+        parsed.name = file.name.replace(/\.[^/.]+$/, '');
+        localClouds.push(parsed);
+        activeCloudId = parsed.id;
+        alignmentStatusMsg = `Imported ${parsed.splatCount.toLocaleString()} splats successfully.`;
+        renderContent();
+        onCloudModified?.(parsed);
+      } catch (err) {
+        alert(`Failed to parse Gaussian Splat file: ${(err as Error).message}`);
+      }
     };
 
     // Synthetic Scout Scan
