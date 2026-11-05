@@ -45,7 +45,7 @@
       const infoLines = () =>
         [...document.querySelectorAll('#landing .scan-info')].map((e) => e.textContent ?? '');
       const bannerTexts = () =>
-        [...document.querySelectorAll('#landing .banners .banner-text')].map((e) => e.textContent ?? '');
+        [...document.querySelectorAll('.banners .banner-text')].map((e) => e.textContent ?? '');
       const sceneRows = (n) =>
         [...document.querySelectorAll('#landing .scene')].filter((r) => r.querySelector('.load b')?.textContent === n);
       // Intercept the export download (an anchor click on a blob URL) and keep its URL.
@@ -93,7 +93,7 @@
         importFile('banner-smoke-full.setview.json');
         const saveBanner = await until(() => bannerTexts().find((t) => t.includes('could not be saved')), 12000);
         Storage.prototype.setItem = realSetItem;
-        const box = document.querySelector('#landing .banners')?.getBoundingClientRect();
+        const box = document.querySelector('.banners')?.getBoundingClientRect();
         const visible = !!box && box.height > 0;
 
         // The failed import has a "Not saved" row whose Export downloads it, and the
@@ -107,7 +107,7 @@
           : null;
         rowExport?.click();
         const rowExported = rowExport ? await exportedName(0) : null;
-        const bannerExport = [...document.querySelectorAll('#landing .banners .banner-action')].find(
+        const bannerExport = [...document.querySelectorAll('.banners .banner-action')].find(
           (b) => b.textContent === 'Export',
         );
         bannerExport?.click();

@@ -270,6 +270,7 @@ import {
 } from '../src/recording.ts';
 import { buildAiShotAnalysisPrompt, renderFloorplanSvg } from '../src/exporters.ts';
 import { simulateAiShotAnalysis } from '../src/ui.ts';
+import { bannerEvictionIndex } from '../src/ui.ts';
 import {
   COLLAB_ROLES,
   generateRoomCode,
@@ -13788,6 +13789,136 @@ function p0MakeGlb(json: Record<string, unknown>, bin: Uint8Array): ArrayBuffer 
   if (!hadDocument) delete g.document;
   if (!hadSelf) delete g.self;
 }
+
+// --- P0 integration ui-data ---
+// Landing banner cap, the shared autosave timer, and the scan size cache.
+
+async function p0iTestAsync(name: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    console.error(`  ✗ ${name}`);
+    throw e;
+  }
+}
+
+/** Installs a window whose timers run only when the test calls runTimers (sync, like withP0MemoryStorage). */
+function withP0iFakeTimers(fn: (runTimers: () => number) => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const timers = new Map<number, () => void>();
+  let nextId = 1;
+  const fake = {
+    setTimeout: (cb: () => void) => {
+      const id = nextId++;
+      timers.set(id, cb);
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+  };
+  Object.defineProperty(globalThis, 'window', { value: fake, configurable: true, writable: true });
+  try {
+    fn(() => {
+      const due = [...timers.values()];
+      timers.clear();
+      for (const cb of due) cb();
+      return due.length;
+    });
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'window', original);
+    else delete (globalThis as { window?: unknown }).window;
+  }
+}
+
+test('P0 integration: the banner cap drops notices before an error with an Export action', () => {
+  const info = { error: false, action: false };
+  const err = { error: true, action: false };
+  const errExport = { error: true, action: true };
+  const warnAction = { error: false, action: true };
+  // Storage full, the import banner with Export, the persist notice, then prop-load failures.
+  assert.equal(bannerEvictionIndex([err, errExport, info, err, err]), 2);
+  assert.equal(bannerEvictionIndex([err, errExport, err, err, err]), 0, 'oldest of the same rank');
+  assert.equal(bannerEvictionIndex([errExport, warnAction, errExport, warnAction, errExport]), 1);
+  assert.equal(bannerEvictionIndex([errExport, errExport, errExport, errExport, errExport]), 0);
+  assert.equal(bannerEvictionIndex([errExport, errExport, errExport, errExport, info]), 4, 'a newer notice goes first');
+
+  // However many action-less banners arrive, the cap of 4 never drops the Export banner.
+  const shown = [{ key: 'storage-full', ...err }, { key: 'import', ...errExport }, { key: 'persist', ...info }];
+  for (let i = 0; i < 8; i++) {
+    shown.push({ key: `prop-load-${i}`, ...err });
+    while (shown.length > 4) shown.splice(bannerEvictionIndex(shown), 1);
+  }
+  assert.ok(shown.some((b) => b.key === 'import'));
+  assert.equal(shown.length, 4);
+});
+
+test("P0 integration: saving another scene writes the live scene's pending autosave instead of dropping it", () => {
+  withP0MemoryStorage(() => {
+    withP0iFakeTimers((runTimers) => {
+      const p = new Persistence();
+      const live = createScene('Live');
+      const other = createScene('Other');
+      assert.equal(p.saveNow(live), true);
+      assert.equal(p.saveNow(other), true);
+
+      // A prop placed on the live scene (debounced), then another scene's card saves.
+      live.name = 'Live edited';
+      p.markDirty(live);
+      assert.equal(p.loadScene(live.id)?.name, 'Live', 'not written until the timer fires');
+      other.name = 'Other edited';
+      assert.equal(p.updateScene(other), true);
+      assert.equal(p.loadScene(live.id)?.name, 'Live edited');
+      assert.equal(p.loadScene(other.id)?.name, 'Other edited');
+      const names = p.listScenes().map((e) => e.name);
+      assert.ok(names.includes('Live edited') && names.includes('Other edited'));
+      assert.equal(runTimers(), 0, 'the flushed save does not run again');
+
+      // The same scene: the timer is still cancelled, so a stale object cannot win.
+      live.name = 'Before undo';
+      p.markDirty(live);
+      const restored = normalizeScene(JSON.parse(JSON.stringify(live)) as SceneData);
+      restored.name = 'After undo';
+      assert.equal(p.saveNow(restored), true);
+      assert.equal(runTimers(), 0);
+      assert.equal(p.loadScene(live.id)?.name, 'After undo');
+
+      // A scene switch inside the window: the previous scene's pending save is written.
+      const next = createScene('Next');
+      restored.name = 'Live before switch';
+      p.markDirty(restored);
+      p.markDirty(next);
+      assert.equal(p.loadScene(live.id)?.name, 'Live before switch');
+      assert.equal(p.loadScene(next.id), null, 'the new scene is still debounced');
+      assert.equal(runTimers(), 1);
+      assert.equal(p.loadScene(next.id)?.name, 'Next');
+
+      // Deleting the scene with the pending save cancels it, so no later save brings it back.
+      p.markDirty(next);
+      p.deleteScene(next.id);
+      assert.equal(p.saveNow(createScene('Fresh')), true);
+      assert.equal(runTimers(), 0);
+      assert.equal(p.loadScene(next.id), null);
+      assert.ok(!p.listScenes().some((e) => e.id === next.id));
+    });
+  });
+});
+
+await p0iTestAsync('P0 integration: a scan this page wrote is sized without reading it back', async () => {
+  const store = new ScanStore();
+  store.onError = () => {}; // Node has no IndexedDB: memory fallback
+  const scan = createSyntheticLocationScan(4, 3, 2.6, ['table']);
+  await store.putScan(scan);
+  let reads = 0;
+  store.getScan = async () => {
+    reads++;
+    return null;
+  };
+  assert.equal(await store.getTotalStorageBytes(), estimateScanSizeBytes(scan));
+  assert.equal(reads, 0);
+});
 
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
 

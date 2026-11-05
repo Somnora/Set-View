@@ -833,6 +833,24 @@ export interface LandingCallbacks {
   onOpenSetDressingStudio?: (sceneId: string) => void;
 }
 
+/**
+ * Which landing banner to drop when there are too many, given oldest first: the
+ * oldest of the least important. Info and warn banners without an action go
+ * first, then errors without one, then banners with an action, and an error with
+ * an action (e.g. Export for a scene that could not be saved) last.
+ */
+export function bannerEvictionIndex(banners: ReadonlyArray<{ error: boolean; action: boolean }>): number {
+  let drop = 0;
+  let dropRank = Infinity;
+  for (let i = 0; i < banners.length; i++) {
+    const rank = (banners[i].action ? 2 : 0) + (banners[i].error ? 1 : 0);
+    if (rank < dropRank) {
+      drop = i;
+      dropRank = rank;
+    }
+  }
+  return drop;
+}
 
 export class Landing {
   private root: HTMLElement;
@@ -865,11 +883,16 @@ export class Landing {
     el('h1', '', titleBox, 'AR Shot Blocking & 3D Desktop Prep');
     el('p', 'sub', wrap, 'Professional spatial previsualization: block actor keyframes, configure optical camera physics, rig lighting, and preview in 3D & WebXR.');
     this.diagEl = el('div', 'diag', wrap);
-    // Sticky so a storage or import problem stays in view while scrolled down a
-    // scene's prep panel. Hidden while empty so it adds no gap to the layout.
-    this.bannerEl = el('div', 'banners', wrap);
-    this.bannerEl.style.cssText =
-      'display: none; position: sticky; top: 8px; z-index: 20; flex-direction: column; gap: 8px;';
+    // Fixed on the body, not inside #landing: the landing is hidden while the
+    // desktop preview is open, and the studios and Prop Library opened from the
+    // preview save, upload and load models too. It stays in view while scrolled,
+    // sits above the preview bar and below the studio modals (style.css .banners).
+    // Hidden while empty. In AR only #overlay is composited, so it never reaches
+    // the headset.
+    this.bannerEl = document.createElement('div');
+    this.bannerEl.className = 'banners';
+    this.bannerEl.style.display = 'none';
+    document.body.appendChild(this.bannerEl);
     this.enterBtn = el('button', 'enter', wrap, 'Enter WebXR / AR Mode') as HTMLButtonElement;
     this.enterBtn.disabled = true;
     this.enterBtn.onclick = () => this.cb.onEnter();
@@ -953,9 +976,9 @@ export class Landing {
   }
 
   /**
-   * Shows a dismissible message at the top of the landing page. Save, storage and
-   * import problems used to reach only the console and the 3D wrist panel, which are
-   * invisible on the 2D page. A banner with the same key is updated in place, so a
+   * Shows a dismissible message at the top of the 2D page, over the landing or the
+   * desktop preview. Save, storage and import problems used to reach only the
+   * console and the 3D wrist panel, which are invisible on the 2D page. A banner with the same key is updated in place, so a
    * failure that repeats on every autosave stays one banner. `action` adds a button
    * (e.g. Export for a scene that could not be saved); an update without one removes it.
    */
@@ -994,13 +1017,12 @@ export class Landing {
       };
       b.appendChild(dismiss);
       this.bannerEl.appendChild(b);
-      // Keep the newest few; older ones are still in the debug log.
-      while (this.bannerEl.children.length > 4) this.bannerEl.firstElementChild?.remove();
       banner = b;
     }
     banner.style.background = palette[0];
     banner.style.borderColor = palette[1];
     banner.style.color = palette[2];
+    banner.dataset.kind = kind;
     banner.setAttribute('role', kind === 'error' ? 'alert' : 'status');
     const text = banner.querySelector('.banner-text');
     if (text) text.textContent = message;
@@ -1012,6 +1034,15 @@ export class Landing {
       btn.style.marginLeft = 'auto'; // sits next to the dismiss button
       btn.onclick = () => action.run();
       banner.insertBefore(btn, banner.lastElementChild); // before the dismiss button
+    }
+    // Keep a few; the rest are still in the debug log. The least important go
+    // first, so a run of notices never pushes out an error with its Export button.
+    while (this.bannerEl.children.length > 4) {
+      const shown = Array.from(this.bannerEl.children) as HTMLElement[];
+      const drop = bannerEvictionIndex(
+        shown.map((s) => ({ error: s.dataset.kind === 'error', action: !!s.querySelector('.banner-action') })),
+      );
+      shown[drop].remove();
     }
     this.bannerEl.style.display = 'flex';
   }
@@ -4710,14 +4741,22 @@ export function openGaussianSplatStudioModal(
     scene.gaussianClouds?.find((c) => c.id === scene.activeSplatCloudId) ?? scene.gaussianClouds?.[0] ?? null;
   let stagedArchitecture: SceneData['architecture'] | null = null;
   let previewed = false;
+  // Set once this studio is closed (Save, Cancel, or replaced by a re-open). A
+  // file read that resolves after that must not preview onto the renderer: the
+  // Cancel restore has already run, so nothing would put it back.
+  let closed = false;
+  // Each file pick bumps this; a read that resolves after a newer pick is dropped.
+  let filePick = 0;
   const onCloudModified = onCloudPreview
     ? (cloud: GaussianCloudData | null) => {
+        if (closed) return;
         previewed = true;
         onCloudPreview(cloud);
       }
     : undefined;
 
   const close = () => {
+    closed = true;
     if (activeSplatStudioCancel === cancel) activeSplatStudioCancel = null;
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
   };
@@ -4910,6 +4949,8 @@ export function openGaussianSplatStudioModal(
       const file = fileInput.files?.[0];
       fileInput.value = ''; // a refused file can be picked again after fixing it
       if (!file) return;
+      const pick = ++filePick;
+      const stale = () => closed || pick !== filePick;
 
       try {
         // Count the splats from the file size (.splat) or the PLY header before
@@ -4920,6 +4961,7 @@ export function openGaussianSplatStudioModal(
         const head = isCompact
           ? null
           : new Uint8Array(await file.slice(0, SPLAT_HEADER_SNIFF_BYTES).arrayBuffer());
+        if (stale()) return;
         const sniff = sniffSplatFile(file.name, file.size, head);
         if (!sniff.ok) {
           alert(`Cannot import ${file.name}: ${sniff.message}`);
@@ -4933,6 +4975,7 @@ export function openGaussianSplatStudioModal(
         }
 
         const buf = await file.arrayBuffer();
+        if (stale()) return;
         let parsed: GaussianCloudData;
         if (isCompact) {
           parsed = parseCompactSplat(buf);
@@ -4946,6 +4989,7 @@ export function openGaussianSplatStudioModal(
         renderContent();
         onCloudModified?.(parsed);
       } catch (err) {
+        if (stale()) return;
         alert(`Failed to parse Gaussian Splat file: ${(err as Error).message}`);
       }
     };
