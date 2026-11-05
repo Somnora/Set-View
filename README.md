@@ -102,7 +102,7 @@ Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit, Lig
 | **Wrist ▶ Play / ⏸ Pause** | Play/pause scene blocking playback |
 | **Wrist Focus Pull / Touch** | Rack focus to selected actor or focus distance in Camera View |
 | **Wrist ⏺ Rec** | Record virtual camera feed + mic dialogue to MP4/WebM |
-| **Wrist Light ▸** | Place & adjust Point/Spot/Area lights (Kelvin, lumens, cone) |
+| **Lights** | Lights from an imported scene render and export; placing and adjusting lights in AR is not wired yet (roadmap P4.5) |
 | **Wrist Scale ▸** | Adjust selected actor scale (0.5x – 2.5x height) |
 | **Wrist AI Analysis** | Trigger AI Shot Analysis Assistant for coverage feedback |
 

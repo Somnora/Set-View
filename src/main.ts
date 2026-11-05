@@ -422,6 +422,8 @@ class App {
       const reason = err instanceof Error ? err.message : String(err);
       this.debug.log(`prop model ${key} failed to load, showing a box: ${reason}`);
       this.noteStatus(`Prop model not shown: ${reason}`);
+      // The wrist is invisible on the 2D page, where uploads are placed from.
+      this.landing.showBanner(`An uploaded prop model could not be shown (a box stands in): ${reason}`, 'error', `prop-load-${key}`);
     };
     globalPropRenderer.onLoadWarning = (key, message) => {
       this.debug.log(`prop model ${key}: ${message}`);
@@ -1377,7 +1379,7 @@ class App {
     if (data.dmxBridge) {
       this.dmxStreamer.setConfig(data.dmxBridge);
     }
-    this.icvfxRenderer.setConfig(data.icvfx || createLedVolumeConfig());
+    this.icvfxRenderer.setConfig(data.icvfx || createLedVolumeConfig('horseshoe_270', { enabled: false }));
     this.acousticsRenderer.setConfig(data.acoustics || createAcousticsConfig());
     this.solarRenderer.setConfig(data.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
     this.screenplayRenderer.setConfig(data.screenplay || createScreenplayConfig());
@@ -4381,7 +4383,7 @@ class App {
     } else if (patch.type.startsWith('solar_')) {
       this.solarRenderer.setConfig(this.sceneData.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
     } else if (patch.type.startsWith('icvfx_')) {
-      this.icvfxRenderer.setConfig(this.sceneData.icvfx || createLedVolumeConfig());
+      this.icvfxRenderer.setConfig(this.sceneData.icvfx || createLedVolumeConfig('horseshoe_270', { enabled: false }));
     } else if (patch.type.startsWith('acoustics_')) {
       this.acousticsRenderer.setConfig(this.sceneData.acoustics || createAcousticsConfig());
     } else if (patch.type.startsWith('set_dressing_')) {
