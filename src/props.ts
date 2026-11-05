@@ -523,6 +523,28 @@ export function settlePropY(prop: Vec3, hit: Vec3 | null): number {
   return 0;
 }
 
+/** A spawn hit farther than this (m, horizontally) from the viewer is not where they meant. */
+export const PROP_SPAWN_HIT_MAX_M = 3;
+/** ...and neither is one less than this far (m) below the viewer's eyes (a wall, not a surface). */
+export const PROP_SPAWN_HIT_BELOW_EYE_M = 0.6;
+
+/**
+ * Whether a hit-test point (scene space) is a plausible place to drop a newly
+ * spawned prop, given the viewer's eye position in the same space. A preset
+ * picked by controller ray, above all with the wheel parked in front of the
+ * face, leaves the ray running on through the virtual wheel to a far wall or
+ * a distant patch of floor; spawning there sticks the prop to the wall at
+ * chest height or several meters away. Only a hit within reach
+ * (PROP_SPAWN_HIT_MAX_M) and at least PROP_SPAWN_HIT_BELOW_EYE_M below the
+ * eyes (floor, table, counter) counts; otherwise the caller uses its
+ * in-front-of-you floor point.
+ */
+export function propSpawnHitUsable(hit: Vec3, eye: Vec3): boolean {
+  const dx = hit.x - eye.x;
+  const dz = hit.z - eye.z;
+  return dx * dx + dz * dz <= PROP_SPAWN_HIT_MAX_M * PROP_SPAWN_HIT_MAX_M && hit.y <= eye.y - PROP_SPAWN_HIT_BELOW_EYE_M;
+}
+
 /** Step (m) of the prop Snap to Grid action; matches the gizmo translate snap. */
 export const PROP_GRID_STEP_M = 0.1;
 

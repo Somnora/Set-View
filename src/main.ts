@@ -127,7 +127,7 @@ import { CollabAvatarManager } from './avatars.ts';
 import { openCollabModal, openPropsLibraryModal } from './ui.ts';
 import { PropsManager, type PropObject } from './propsManager.ts';
 import { globalPropRenderer } from './propRenderer.ts';
-import { getBuiltinPropDefinition, settlePropY, snapPropToGrid } from './props.ts';
+import { getBuiltinPropDefinition, propSpawnHitUsable, settlePropY, snapPropToGrid } from './props.ts';
 import { locomotionSuppressed, type LocomotionState } from './locomotion.ts';
 import { quatYaw } from './scan.ts';
 import { submenuForSector, wheelPropPreset, wheelSectorRoute } from './wheel.ts';
@@ -170,6 +170,8 @@ const _radialPos = new THREE.Vector3();
 
 /** Wheel / Prop Library props with no live hit land this far ahead of you (m). */
 const PROP_SPAWN_AHEAD_M = 1.2;
+/** How long a load error or warning holds the wrist status line (ms). */
+const STATUS_NOTE_MS = 6000;
 
 /** Smooth-glide speed (m/s) for thumbstick locomotion through the set. */
 const LOCOMOTION_SPEED = 1.8;
@@ -245,6 +247,13 @@ class App {
   private placeMode: PlaceArm = 'none';
   /** Catalog id Place: Prop drops: the last Props sub-wheel preset picked. */
   private lastPropPreset = 'directors_chair';
+  /**
+   * A message the wrist status line keeps showing until `until` (ms,
+   * performance.now) instead of the selection summary refreshWristState writes,
+   * which otherwise replaced a load error the moment the spawn path selected
+   * the prop.
+   */
+  private statusNote: { text: string; until: number } | null = null;
   /** Reused every frame for the glide gate (no per-frame allocation). */
   private readonly locoState: LocomotionState = {
     viewMode: 'full',
@@ -357,11 +366,20 @@ class App {
     this.contentRoot.add(this.actors.group);
     this.props = new PropsManager(this.session, this.sceneData);
     this.contentRoot.add(this.props.group);
+    // An uploaded model can finish loading frames after setScene (undo, redo,
+    // remote patch, scene load): refresh the hover and Camera View caches then.
+    this.props.onObjectsChanged = () => {
+      this.contentVersion++;
+    };
     // An uploaded model that can't be shown falls back to a box: say why.
     globalPropRenderer.onLoadError = (key, err) => {
       const reason = err instanceof Error ? err.message : String(err);
       this.debug.log(`prop model ${key} failed to load, showing a box: ${reason}`);
-      this.wrist.setStatus(`Prop model not shown: ${reason}`);
+      this.noteStatus(`Prop model not shown: ${reason}`);
+    };
+    globalPropRenderer.onLoadWarning = (key, message) => {
+      this.debug.log(`prop model ${key}: ${message}`);
+      this.noteStatus(`Prop model: ${message}`);
     };
     this.keyframes = new KeyframeSystem(this.sceneData, this.actors);
     this.contentRoot.add(this.keyframes.vizGroup);
@@ -1693,6 +1711,14 @@ class App {
       return;
     }
     if (this.hover?.kind === 'camera') {
+      // Selecting a camera ends any actor or prop selection, as selectActor
+      // and selectProp do for each other: Delete / Dup without a hover fall
+      // back to the selected prop or actor, which must not be a stale one
+      // hidden behind the camera's ring.
+      this.selectedPropId = null;
+      this.props.setSelected(null);
+      this.selectedActorId = null;
+      this.actors.setSelected(null);
       this.cams.setActive(this.hover.id);
       const camObj = this.cams.active;
       if (camObj) {
@@ -1788,8 +1814,9 @@ class App {
       const ray = this.input.raySpace(hand);
       if (obj && ray) {
         this.draggedProp = obj;
-        this.props.setSelected(obj.data.id);
-        this.selectedPropId = obj.data.id;
+        // Same as the actor path: what you carry is the selection (and no
+        // stale actor stays selected behind it).
+        this.selectProp(obj.data.id);
         ray.attach(obj.root);
         this.debug.log(`moving ${obj.data.name}`);
       }
@@ -1979,6 +2006,12 @@ class App {
   }
 
   private selectProp(id: string | null): void {
+    if (id) {
+      // Selecting a prop ends any actor selection (mirror of selectActor), so
+      // Stance, Mark and the Delete / Dup fallback never act on a hidden one.
+      this.selectedActorId = null;
+      this.actors.setSelected(null);
+    }
     this.selectedPropId = id;
     this.props.setSelected(id);
     if (id) {
@@ -2025,14 +2058,17 @@ class App {
 
   /**
    * Where a prop from the wheel or the Prop Library lands, in content space:
-   * the live hit-test point when there is one (where you point), otherwise
-   * PROP_SPAWN_AHEAD_M along your horizontal heading, on the floor.
+   * the live hit-test point when it is a plausible surface within reach
+   * (props.ts propSpawnHitUsable: not a far wall the ray hit through the
+   * wheel), otherwise PROP_SPAWN_AHEAD_M along your horizontal heading, on
+   * the floor.
    */
   private propSpawnPoint(): Vec3 {
     const hit = this.session.session ? this.session.lastHit : null;
     if (hit) {
       const p = this.contentRoot.worldToLocal(hit.point.clone());
-      return { x: p.x, y: p.y, z: p.z };
+      const eye = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
+      if (propSpawnHitUsable(p, eye)) return { x: p.x, y: p.y, z: p.z };
     }
     const ahead = new THREE.Vector3(0, 0, -1).applyQuaternion(this.lastViewerQuat);
     ahead.y = 0;
@@ -2154,18 +2190,7 @@ class App {
       return;
     }
     if (this.hover?.kind === 'camera') {
-      const data = duplicateCameraSetup(this.sceneData, this.hover.id);
-      if (!data) return;
-      const obj = this.cams.adopt(data);
-      this.contentVersion++;
-      if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
-      this.collabSession.broadcastPatch({
-        type: 'camera_add',
-        camera: data,
-      });
-      this.debug.log(`duplicated → ${data.name}`);
-      this.refreshWristState();
-      this.markDirty();
+      this.duplicateCamera(this.hover.id);
       return;
     }
     const id = this.hover?.kind === 'actor' ? this.hover.id : this.selectedActorId;
@@ -2185,6 +2210,22 @@ class App {
       actor: data,
     });
     this.debug.log(`duplicated → ${data.name}`);
+    this.markDirty();
+  }
+
+  /** Clones a camera setup a short step away (Dup on a hovered camera, or its radial). */
+  private duplicateCamera(id: string): void {
+    const data = duplicateCameraSetup(this.sceneData, id);
+    if (!data) return;
+    const obj = this.cams.adopt(data);
+    this.contentVersion++;
+    if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
+    this.collabSession.broadcastPatch({
+      type: 'camera_add',
+      camera: data,
+    });
+    this.debug.log(`duplicated → ${data.name}`);
+    this.refreshWristState();
     this.markDirty();
   }
 
@@ -2392,7 +2433,7 @@ class App {
             : mode === 'prop'
               ? `ARMED: pinch/trigger on the floor ring places a ${
                   getBuiltinPropDefinition(this.lastPropPreset)?.name ?? 'prop'
-                } (pick another under Edit ▸ Props ▸)`
+                } (Edit ▸ Props ▸ places another kind and makes it the default)`
               : 'light placing is not available yet',
     );
     this.guide.refresh(this.guideCtx());
@@ -2505,7 +2546,26 @@ class App {
     this.wrist.setLabel('stance', selObj ? `Stance ▸ ${poseFor(selObj.data.stance).short}` : 'Stance ▸');
     const sel = selObj?.data.name ?? '—';
     const cam = this.cams.active;
+    if (this.statusNote && performance.now() < this.statusNote.until) {
+      this.wrist.setStatus(this.statusNote.text);
+      return;
+    }
+    this.statusNote = null;
     this.wrist.setStatus(`${sel}${cam ? ` · ${cam.data.name} ${Math.round(cam.data.lensFocalLength)}mm` : ''}`);
+  }
+
+  /**
+   * Shows `text` on the wrist status line for STATUS_NOTE_MS, through any
+   * refreshWristState in between, then hands the line back to the selection
+   * summary.
+   */
+  private noteStatus(text: string): void {
+    const note = { text, until: performance.now() + STATUS_NOTE_MS };
+    this.statusNote = note;
+    this.wrist.setStatus(text);
+    window.setTimeout(() => {
+      if (this.statusNote === note) this.refreshWristState();
+    }, STATUS_NOTE_MS + 50);
   }
 
   /** Everything that must not appear in the virtual camera's frame. Cached and
@@ -2839,12 +2899,12 @@ class App {
         const rotY = this.draggedActor.data.rotationY - axes.x * dt * 3.0;
         this.actors.applyPose(this.draggedActor, this.draggedActor.data.position, rotY);
       }
-    } else if (this.draggedFurniture || this.draggedProp) {
-      // Yaw the carried piece (scanned furniture or a prop) about the world
-      // up-axis (same stick gesture as rotating a dragged actor); world axis so
-      // the ray-space parent doesn't skew the spin. Being a branch of this
-      // chain, a carry also keeps the stick from snap-turning the set.
-      const held = this.draggedFurniture ?? this.draggedProp!.root;
+    } else if (this.draggedFurniture || this.draggedProp || this.draggedCamera) {
+      // Yaw the carried piece (scanned furniture, a prop or a camera) about the
+      // world up-axis (same stick gesture as rotating a dragged actor); world
+      // axis so the ray-space parent doesn't skew the spin. Being a branch of
+      // this chain, a carry also keeps the stick from snap-turning the set.
+      const held = this.draggedFurniture ?? this.draggedProp?.root ?? this.draggedCamera!.root;
       if (Math.abs(axes.x) > 0.15) held.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
     } else if (this.miniGrabbing) {
       const grip = this.input.gripSpace(pointer);
@@ -3553,6 +3613,10 @@ class App {
         this.refreshWristState();
         break;
       }
+      case 'camera_duplicate': {
+        this.duplicateCamera(entityId);
+        break;
+      }
       case 'record_take': {
         void this.toggleRecording();
         break;
@@ -3612,7 +3676,10 @@ class App {
         break;
       }
       default:
-        this.debug.log(`Quick action executed: ${action.label}`);
+        // Not "executed": nothing ran. The domain tests keep every action the
+        // headset radial can show wired, so this is only reachable from a
+        // stale or foreign action list.
+        this.debug.log(`${action.label}: no handler for "${actionKey}"`);
         break;
     }
   }
@@ -3668,20 +3735,29 @@ class App {
     const success = applyScenePatch(this.sceneData, patch);
     if (!success) return;
 
+    // A branch below that rebuilds a manager disposes and replaces every object
+    // in it. If the local user is carrying one of those objects, end the carry
+    // first (as loadScene / restoreScene do): a carried camera or prop root sits
+    // under the controller ray, out of reach of the rebuild, and releasing the
+    // stale object afterwards would leave an undeletable ghost in the set.
     if (patch.type.startsWith('actor_')) {
+      if (this.draggedActor) this.cancelActiveManipulation();
       this.actors.setScene(this.sceneData);
       this.keyframes.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('prop_')) {
+      if (this.draggedProp) this.cancelActiveManipulation();
       this.props.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('camera_')) {
+      if (this.draggedCamera) this.cancelActiveManipulation();
       this.cams.setScene(this.sceneData);
       this.keyframes.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('screenplay_')) {
       this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
       if (patch.type === 'screenplay_apply_coverage') {
+        if (this.draggedCamera) this.cancelActiveManipulation();
         this.cams.setScene(this.sceneData);
         this.contentVersion++;
       }
@@ -3705,6 +3781,7 @@ class App {
     } else if (patch.type.startsWith('set_dressing_')) {
       this.setDressingRenderer.setConfig(this.sceneData.setDressing || createSetDressingConfig());
       // Dressing mutates the prop list itself, not just the config.
+      if (this.draggedProp) this.cancelActiveManipulation();
       this.props.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('profiler_')) {
@@ -3721,7 +3798,11 @@ class App {
       // refresh here. Rebuilding everything is heavier than necessary and correct,
       // which is the right way round: a patch that silently fails to reach its
       // renderer leaves the receiving peer looking at stale geometry while their
-      // scene data has already moved on.
+      // scene data has already moved on. The rebuild also re-applies furniture
+      // placements, so a carried scanned piece ends its carry too.
+      if (this.draggedActor || this.draggedCamera || this.draggedProp || this.draggedFurniture) {
+        this.cancelActiveManipulation();
+      }
       this.applySceneToSubsystems(this.sceneData);
     }
 

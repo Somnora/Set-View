@@ -192,6 +192,7 @@ import {
   type WheelPath,
 } from '../src/wheel.ts';
 import { readFileSync } from 'node:fs';
+import { PROP_SPAWN_HIT_BELOW_EYE_M, PROP_SPAWN_HIT_MAX_M, propSpawnHitUsable } from '../src/props.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from '../src/floor.ts';
 import {
   buildShotList,
@@ -11464,14 +11465,59 @@ test('P0.11: every reachable sector has a handler; submenu openers resolve via S
   assert.ok(blockRoot.sectors.some((s) => s.id === 'resetview'));
   assert.ok(!blockRoot.sectors.some((s) => s.id === 'sub-light'));
 
-  // main.ts must actually handle every id it is routed: a case label in its
-  // wheel switch ('wheel') or the wrist-panel switch ('wrist').
+  // main.ts must actually handle every id it is routed: a case label inside
+  // onWheelPress's own switch ('wheel') or inside onWristPress ('wrist'), not
+  // just somewhere in the file (a smartwatch or radial switch would not run).
   const mainSrc = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const bodies = { wheel: mainMethodBody(mainSrc, 'onWheelPress'), wrist: mainMethodBody(mainSrc, 'onWristPress') };
   for (const [id, route] of Object.entries(WHEEL_SECTOR_HANDLERS)) {
     if (route === 'wheel' || route === 'wrist') {
-      assert.ok(mainSrc.includes(`case '${id}':`), `main.ts has no case for ${route} sector "${id}"`);
+      assert.ok(bodies[route].includes(`case '${id}':`), `main.ts ${route} switch has no case for "${id}"`);
     }
   }
+});
+
+/**
+ * The source of one App method in main.ts: from `  private <name>(` to its
+ * closing brace (class members sit at two spaces, method bodies deeper, so the
+ * first line that is exactly "  }" closes it).
+ */
+function mainMethodBody(src: string, name: string): string {
+  const start = src.indexOf(`\n  private ${name}(`);
+  assert.ok(start >= 0, `main.ts has no method ${name}`);
+  const end = src.indexOf('\n  }\n', start);
+  assert.ok(end > start, `main.ts ${name} has no closing brace`);
+  return src.slice(start, end);
+}
+
+test('P0.11: every action the headset radial can show has a handler (no "executed" no-ops)', () => {
+  const mainSrc = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const body = mainMethodBody(mainSrc, 'handleContextQuickAction');
+  // The entity types main.ts actually opens the radial for.
+  const shown = [...new Set([...mainSrc.matchAll(/contextualRadial\.show\(\s*'([a-z_]+)'/g)].map((m) => m[1]))].sort();
+  assert.deepEqual(shown, ['actor', 'camera', 'prop']);
+  for (const type of shown) {
+    const actions = generateEntityContextActions(type as 'actor' | 'camera' | 'prop', `${type}-1`);
+    assert.ok(actions.length >= 4, `${type}: ${actions.length} actions`);
+    for (const a of actions) {
+      assert.ok(body.includes(`case '${a.actionType}':`), `${type} radial "${a.label}" (${a.actionType}) has no handler`);
+    }
+  }
+  assert.ok(!/Quick action executed/.test(body), 'the fallback must not claim an action ran');
+});
+
+test('P0.3: a spawn uses the pointed hit only when it is a surface within reach', () => {
+  const eye = { x: 0, y: 1.6, z: 0 };
+  assert.equal(propSpawnHitUsable({ x: 0, y: 0, z: -1.5 }, eye), true, 'floor in front');
+  assert.equal(propSpawnHitUsable({ x: 0.3, y: 0.75, z: -1 }, eye), true, 'table top');
+  // Ray through the parked wheel: a wall at chest height, a floor far away.
+  assert.equal(propSpawnHitUsable({ x: 0, y: 1.4, z: -2.5 }, eye), false, 'wall at chest height');
+  assert.equal(propSpawnHitUsable({ x: 0, y: 0, z: -6 }, eye), false, 'floor 6 m away');
+  // Boundaries are inclusive.
+  assert.equal(propSpawnHitUsable({ x: PROP_SPAWN_HIT_MAX_M, y: 0, z: 0 }, eye), true);
+  assert.equal(propSpawnHitUsable({ x: PROP_SPAWN_HIT_MAX_M + 0.01, y: 0, z: 0 }, eye), false);
+  assert.equal(propSpawnHitUsable({ x: 0, y: eye.y - PROP_SPAWN_HIT_BELOW_EYE_M, z: -1 }, eye), true);
+  assert.equal(propSpawnHitUsable({ x: 0, y: eye.y - PROP_SPAWN_HIT_BELOW_EYE_M + 0.01, z: -1 }, eye), false);
 });
 
 test('P0.11: the Place cycle never arms Light, and the guide chips follow it', () => {
@@ -11539,6 +11585,253 @@ test('P0.11: Snap to Grid moves a prop to the nearest grid point on the floor pl
   approx(coarse.position.x, 1.0, 1e-9);
   approx(coarse.position.z, -0.5, 1e-9);
 });
+
+// Runtime checks of the prop loader and PropsManager with real three.js objects.
+// propRenderer / propsManager import ui.ts (canvas labels), so they need a
+// document stub, installed only for this block; GLTFLoader also reads `self`.
+async function testAsyncPropsBuild(name: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    console.error(`  ✗ ${name}`);
+    throw e;
+  }
+}
+
+/** A minimal binary glTF: `json` without `buffers`, plus one BIN chunk. */
+function p0MakeGlb(json: Record<string, unknown>, bin: Uint8Array): ArrayBuffer {
+  const binPad = new Uint8Array(Math.ceil(bin.length / 4) * 4);
+  binPad.set(bin);
+  const full = { asset: { version: '2.0' }, ...json, buffers: [{ byteLength: binPad.length }] };
+  const raw = new TextEncoder().encode(JSON.stringify(full));
+  const jb = new Uint8Array(Math.ceil(raw.length / 4) * 4).fill(0x20);
+  jb.set(raw);
+  const total = 12 + 8 + jb.length + 8 + binPad.length;
+  const out = new ArrayBuffer(total);
+  const dv = new DataView(out);
+  dv.setUint32(0, 0x46546c67, true); // 'glTF'
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, total, true);
+  dv.setUint32(12, jb.length, true);
+  dv.setUint32(16, 0x4e4f534a, true); // JSON
+  new Uint8Array(out, 20, jb.length).set(jb);
+  dv.setUint32(20 + jb.length, binPad.length, true);
+  dv.setUint32(24 + jb.length, 0x004e4942, true); // BIN
+  new Uint8Array(out, 28 + jb.length, binPad.length).set(binPad);
+  return out;
+}
+
+{
+  const g = globalThis as unknown as Record<string, unknown>;
+  const hadDocument = 'document' in g;
+  const hadSelf = 'self' in g;
+  const noop: unknown = new Proxy(function () {}, {
+    get: (_t, k) => (k === 'measureText' ? () => ({ width: 10 }) : noop),
+    apply: () => noop,
+    set: () => true,
+  });
+  if (!hadDocument) g.document = { createElement: () => ({ width: 0, height: 0, getContext: () => noop, style: {} }) };
+  if (!hadSelf) g.self = globalThis;
+
+  const { globalPropStore } = await import('../src/propStore.ts');
+  const { globalPropRenderer } = await import('../src/propRenderer.ts');
+  const { PropsManager } = await import('../src/propsManager.ts');
+
+  // One triangle, base at y = 2 (normalization grounds it), 1 m tall.
+  const tri = new Uint8Array(new Float32Array([0, 2, 0, 1, 2, 0, 0, 3, 0]).buffer);
+  const triAccessor = { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 2, 0], max: [1, 3, 0] };
+  // A metallic red PBR material and a punctual light whose node also holds a child mesh.
+  const litGlb = p0MakeGlb(
+    {
+      extensionsUsed: ['KHR_lights_punctual'],
+      extensions: { KHR_lights_punctual: { lights: [{ type: 'point', intensity: 5 }] } },
+      scene: 0,
+      scenes: [{ nodes: [0, 1] }],
+      nodes: [{ mesh: 0 }, { extensions: { KHR_lights_punctual: { light: 0 } }, children: [2] }, { mesh: 0, translation: [2, 0, 0] }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }] }],
+      materials: [{ pbrMetallicRoughness: { baseColorFactor: [1, 0, 0, 1], metallicFactor: 1 } }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: tri.length }],
+      accessors: [triAccessor],
+    },
+    tri,
+  );
+  // Declares an embedded (bufferView) base-colour image. Node cannot decode
+  // images, so it fails the way a refused blob: fetch would on a headset.
+  const texBin = new Uint8Array(tri.length + 8);
+  texBin.set(tri);
+  const texturedGlb = p0MakeGlb(
+    {
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ mesh: 0 }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }] }],
+      materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }],
+      textures: [{ source: 0 }],
+      images: [{ bufferView: 1, mimeType: 'image/png' }],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: tri.length },
+        { buffer: 0, byteOffset: tri.length, byteLength: 8 },
+      ],
+      accessors: [triAccessor],
+    },
+    texBin,
+  );
+  const put = (id: string, fileType: string, buffer: ArrayBuffer) =>
+    globalPropStore.putAsset({
+      id,
+      name: id,
+      fileName: `${id}.${fileType}`,
+      fileType: fileType as 'glb',
+      category: 'custom',
+      dimensions: { width: 1, height: 1, depth: 1 },
+      sizeBytes: buffer.byteLength,
+      uploadedAt: 0,
+      buffer,
+    });
+  const quietStore = globalPropStore.onError;
+  globalPropStore.onError = () => {};
+  await put('p0-lit', 'glb', litGlb);
+  await put('p0-textured', 'glb', texturedGlb);
+  await put('p0-obj', 'obj', new TextEncoder().encode('v 0 1 0\nv 1 1 0\nv 0 2 0\nf 1 2 3\n').buffer as ArrayBuffer);
+  await put('p0-usdz', 'usdz', new ArrayBuffer(8));
+  await put('p0-broken', 'glb', new TextEncoder().encode('not a model').buffer as ArrayBuffer);
+  globalPropStore.onError = quietStore;
+
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  globalPropRenderer.onLoadError = (key, err) => errors.push(`${key}: ${(err as Error).message}`);
+  globalPropRenderer.onLoadWarning = (key, message) => warnings.push(`${key}: ${message}`);
+  const uploaded = (key: string) => createPropData(key, key, { x: 0, y: 0, z: 0 }, { customModelKey: key, sourceType: 'builtin' });
+  const meshesOf = (o: THREE.Object3D) => {
+    const out: THREE.Mesh[] = [];
+    o.traverse((c) => {
+      if ((c as THREE.Mesh).isMesh) out.push(c as THREE.Mesh);
+    });
+    return out;
+  };
+  const isPlaceholderBox = (o: THREE.Object3D) => meshesOf(o).some((m) => m.geometry.type === 'BoxGeometry');
+
+  await testAsyncPropsBuild('P0.2: an uploaded GLB renders as its model: grounded, flat Lambert, no lights of its own', async () => {
+    const g = await globalPropRenderer.createPropMesh(uploaded('p0-lit'));
+    assert.ok(!isPlaceholderBox(g), 'the model, not the placeholder box');
+    const meshes = meshesOf(g);
+    assert.equal(meshes.length, 2, 'the mesh under the light node survives');
+    let lights = 0;
+    g.traverse((o) => {
+      if ((o as THREE.Light).isLight) lights++;
+    });
+    assert.equal(lights, 0, 'KHR_lights_punctual lights are stripped');
+    for (const m of meshes) {
+      const mat = m.material as THREE.MeshLambertMaterial;
+      assert.equal(mat.type, 'MeshLambertMaterial');
+      approx(mat.color.r, 1, 1e-6);
+      approx(mat.color.g, 0, 1e-6);
+    }
+    g.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(g);
+    approx(box.min.y, 0, 1e-6);
+    approx(box.max.y, 1, 1e-6);
+    approx(box.max.x - box.min.x, 3, 1e-6);
+  });
+
+  await testAsyncPropsBuild('P0.2: OBJ loads as Lambert; bad, unsupported and missing uploads fall back to a box and report', async () => {
+    errors.length = 0;
+    const obj = await globalPropRenderer.createPropMesh(uploaded('p0-obj'));
+    assert.ok(!isPlaceholderBox(obj));
+    assert.ok(meshesOf(obj).every((m) => (m.material as THREE.Material).type === 'MeshLambertMaterial'));
+    for (const key of ['p0-usdz', 'p0-broken', 'p0-missing']) {
+      assert.ok(isPlaceholderBox(await globalPropRenderer.createPropMesh(uploaded(key))), `${key} shows the box`);
+    }
+    assert.equal(errors.length, 3, errors.join(' | '));
+    assert.match(errors[0], /unsupported model type "usdz"/);
+    assert.match(errors[1], /could not read/);
+    assert.match(errors[2], /not found/);
+  });
+
+  await testAsyncPropsBuild('P0.2: a GLB whose textures all fail shows untextured and says so', async () => {
+    warnings.length = 0;
+    errors.length = 0;
+    const logged: unknown[] = [];
+    const consoleError = console.error;
+    console.error = (...a: unknown[]) => logged.push(a[0]);
+    let g: THREE.Group;
+    try {
+      g = await globalPropRenderer.createPropMesh(uploaded('p0-textured'));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.ok(!isPlaceholderBox(g), 'geometry still shown');
+    assert.equal(errors.length, 0);
+    assert.equal(warnings.length, 1, warnings.join(' | '));
+    assert.match(warnings[0], /textures did not load/);
+    assert.ok(logged.some((m) => /load texture/i.test(String(m))), 'GLTFLoader only console.errors it');
+  });
+
+  await testAsyncPropsBuild('P0.12: prop picking ignores the hidden selection box; late builds and same-scene rebuilds are tracked', async () => {
+    const settle = async (done: () => boolean) => {
+      for (let i = 0; i < 200 && !done(); i++) await new Promise((r) => setTimeout(r, 0));
+      assert.ok(done(), 'builds did not land');
+    };
+    const scene = createScene('P0 props runtime');
+    const mgr = new PropsManager({} as never, scene);
+    let changes = 0;
+    mgr.onObjectsChanged = () => changes++;
+
+    // A ray 0.5 m beside the box misses; one at it hits and walks up to the prop id.
+    const box = await mgr.addProp('apple_box_full', { x: 0, y: 0, z: -2 });
+    assert.ok(box);
+    assert.ok(changes >= 1, 'a landed build reports itself');
+    mgr.setSelected(box.data.id); // the selection box is a LineSegments child of the root
+    mgr.group.updateMatrixWorld(true);
+    const half = new THREE.Box3().setFromObject(box.contentGroup).getSize(new THREE.Vector3()).multiplyScalar(0.5);
+    const rc = new THREE.Raycaster();
+    rc.camera = new THREE.PerspectiveCamera(); // as main.ts sets it (sprite labels)
+    rc.set(new THREE.Vector3(half.x + 0.5, 0.1, 0), new THREE.Vector3(0, 0, -1));
+    assert.equal(rc.intersectObjects(mgr.raycastTargets(), true).length, 0, 'near miss must not pick the prop');
+    rc.set(new THREE.Vector3(0, 0.1, 0), new THREE.Vector3(0, 0, -1));
+    const hits = rc.intersectObjects(mgr.raycastTargets(), true);
+    assert.ok(hits.length > 0, 'direct ray picks the prop');
+    let o: THREE.Object3D | null = hits[0].object;
+    while (o && typeof o.userData.propId !== 'string') o = o.parent;
+    assert.equal(o?.userData.propId, box.data.id);
+
+    // An uploaded model lands after setScene returns; the change hook fires then.
+    const up = await mgr.addProp('p0-lit', { x: 1, y: 0, z: -2 }, { customModelKey: 'p0-lit' });
+    assert.ok(up);
+    mgr.setSelected(up.data.id);
+    mgr.setScene(scene); // same scene: what undo-free remote patches do
+    const afterSync = changes;
+    await settle(() => mgr.all().length === 2);
+    assert.ok(changes > afterSync, 'late build bumps the caches');
+    assert.equal(mgr.getSelected()?.data.id, up.data.id, 'same-scene re-apply keeps the highlight');
+    assert.equal(mgr.group.children.length, 2, 'no ghost roots');
+
+    // A remote patch re-applies the same scene while an add is still loading:
+    // the add follows the rebuild instead of resolving null.
+    const pending = mgr.addProp('p0-lit', { x: 2, y: 0, z: -2 }, { customModelKey: 'p0-lit' });
+    mgr.setScene(scene);
+    const added = await pending;
+    assert.ok(added, 'add survives a same-scene rebuild');
+    await settle(() => mgr.all().length === 3);
+    assert.equal(mgr.get(added.data.id), added);
+    assert.equal(scene.props?.filter((p) => p.id === added.data.id).length, 1);
+    assert.equal(mgr.group.children.length, 3, 'one root per prop');
+
+    // A different scene loaded mid-load: the add is dropped.
+    const dropped = mgr.addProp('apple_box_full', { x: 0, y: 0, z: 0 });
+    mgr.setScene(createScene('Other'));
+    assert.equal(await dropped, null);
+    assert.equal(mgr.all().length, 0);
+    assert.equal(mgr.group.children.length, 0);
+  });
+
+  globalPropRenderer.onLoadError = undefined;
+  globalPropRenderer.onLoadWarning = undefined;
+  if (!hadDocument) delete g.document;
+  if (!hadSelf) delete g.self;
+}
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(
 

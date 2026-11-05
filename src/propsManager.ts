@@ -39,6 +39,17 @@ export class PropsManager {
    * discarded instead of adding a ghost prop to the new scene.
    */
   private generation = 0;
+  /** The newest in-flight build per prop id (see addProp: a same-scene rebuild supersedes it). */
+  private pending = new Map<string, Promise<PropObject | null>>();
+
+  /**
+   * Fires whenever the set of built prop objects changes: a build landing
+   * (possibly frames after setScene, for an uploaded model), a removal, or a
+   * clear. main.ts keys its hover-target and camera-overlay caches on it, so a
+   * prop whose model finished loading late is still pickable and its helpers
+   * stay out of Camera View.
+   */
+  onObjectsChanged?: () => void;
 
   constructor(session: SessionManager, scene: SceneData) {
     this.session = session;
@@ -47,24 +58,31 @@ export class PropsManager {
   }
 
   setScene(scene: SceneData): void {
+    // Re-applying the same scene (a remote prop patch) keeps the highlight on
+    // a prop that is still there: main.ts keeps it as the Delete / Dup target.
+    const keep = scene === this.scene ? this.selectedId : null;
     this.scene = scene;
     this.clear();
+    if (keep && scene.props?.some((p) => p.id === keep)) this.selectedId = keep;
     if (scene.props) {
       for (const p of scene.props) {
-        this.buildObject(p);
+        void this.build(p);
       }
     }
   }
 
   clear(): void {
     this.generation++;
+    const had = this.objects.size > 0;
     for (const obj of this.objects.values()) {
       obj.anchor?.delete?.();
-      this.group.remove(obj.root);
+      // From whatever parent holds it: a carried root sits under the controller ray.
+      obj.root.removeFromParent();
       disposeTree(obj.root);
     }
     this.objects.clear();
     this.selectedId = null;
+    if (had) this.onObjectsChanged?.();
   }
 
   all(): PropObject[] {
@@ -93,17 +111,17 @@ export class PropsManager {
   }
 
   /**
-   * Spawns a new prop into the scene and 3D viewport. Resolves null if the
-   * scene was replaced while the model loaded (the prop never appears).
+   * Spawns a new prop into the scene and 3D viewport. Resolves null only if
+   * the scene was replaced while the model loaded (the prop never appears).
    */
   async addProp(assetId: string, position: Vec3, options: Partial<PropData> = {}): Promise<PropObject | null> {
     const data = createPropData(assetId, options.name, position, options);
     if (!this.scene.props) this.scene.props = [];
     this.scene.props.push(data);
 
-    const obj = await this.buildObject(data);
+    const obj = await this.buildLive(data);
     if (!obj) return null;
-    this.setSelected(data.id);
+    this.setSelected(obj.data.id);
     return obj;
   }
 
@@ -116,9 +134,43 @@ export class PropsManager {
     if (!this.scene.props) this.scene.props = [];
     this.scene.props.push(dupData);
 
-    const obj = await this.buildObject(dupData);
+    const obj = await this.buildLive(dupData);
     if (!obj) return null;
-    this.setSelected(dupData.id);
+    this.setSelected(obj.data.id);
+    return obj;
+  }
+
+  /** Starts a build and records it as the newest one for that prop id. */
+  private build(data: PropData): Promise<PropObject | null> {
+    const p = this.buildObject(data);
+    this.pending.set(data.id, p);
+    const done = () => {
+      if (this.pending.get(data.id) === p) this.pending.delete(data.id);
+    };
+    p.then(done, done);
+    return p;
+  }
+
+  /**
+   * Builds a prop the caller just pushed into the live scene and resolves its
+   * object. A clear() during the model load discards that first build; when
+   * it was the SAME scene being re-applied (a remote prop patch runs
+   * setScene(this.sceneData)), setScene has already started a fresh build of
+   * this prop from scene.props, so follow that one instead of reporting null:
+   * the caller still broadcasts, records and selects the prop it added. Null
+   * only when the prop is no longer in the live scene (a different scene was
+   * loaded or restored).
+   */
+  private async buildLive(data: PropData): Promise<PropObject | null> {
+    let obj = await this.build(data);
+    while (!obj) {
+      if (!this.scene.props?.some((p) => p.id === data.id)) return null;
+      const built = this.objects.get(data.id);
+      if (built) return built;
+      const next = this.pending.get(data.id);
+      if (!next) return null;
+      obj = await next;
+    }
     return obj;
   }
 
@@ -128,7 +180,7 @@ export class PropsManager {
     if (!obj) return false;
 
     obj.anchor?.delete?.();
-    this.group.remove(obj.root);
+    obj.root.removeFromParent();
     disposeTree(obj.root);
     this.objects.delete(id);
 
@@ -137,6 +189,7 @@ export class PropsManager {
       if (idx >= 0) this.scene.props.splice(idx, 1);
     }
     if (this.selectedId === id) this.selectedId = null;
+    this.onObjectsChanged?.();
     return true;
   }
 
@@ -161,11 +214,17 @@ export class PropsManager {
     }
   }
 
-  /** Meshes for hover/select raycasting; carries userData.propId. */
+  /**
+   * The prop models themselves, for hover/select raycasting. Not the root: it
+   * also holds the label sprite, the floor ring and the hidden selection box,
+   * and three's Raycaster tests invisible lines with a 1 m threshold, so a ray
+   * passing near a prop would "hit" it ahead of the furniture or actor it was
+   * aimed at. A hit's parent walk still reaches the root's userData.propId.
+   */
   raycastTargets(): THREE.Object3D[] {
     const out: THREE.Object3D[] = [];
     for (const obj of this.objects.values()) {
-      if (obj.data.visible !== false) out.push(obj.root);
+      if (obj.data.visible !== false) out.push(obj.contentGroup);
     }
     return out;
   }
@@ -213,6 +272,8 @@ export class PropsManager {
 
     // Bounding box selection visualizer
     const selectionBox = globalPropRenderer.createSelectionGizmo(aabb.size, 0x38bdf8);
+    // A helper, never a pick target (Line raycasts ignore visibility; see raycastTargets).
+    selectionBox.raycast = () => {};
     selectionBox.visible = this.selectedId === data.id;
     root.add(selectionBox);
 
@@ -251,6 +312,7 @@ export class PropsManager {
 
     this.objects.set(data.id, obj);
     this.group.add(root);
+    this.onObjectsChanged?.();
     return obj;
   }
 
@@ -260,7 +322,7 @@ export class PropsManager {
 
     for (const obj of this.objects.values()) {
       if (!obj.data.visible) continue;
-      const intersects = raycaster.intersectObject(obj.root, true);
+      const intersects = raycaster.intersectObject(obj.contentGroup, true);
       if (intersects.length > 0) {
         const hit = intersects[0];
         if (!closest || hit.distance < closest.distance) {

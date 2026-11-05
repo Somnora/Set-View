@@ -43,6 +43,93 @@ const FABRIC_MAT = getOrCreateMaterial('#1e293b', 0.9, 0.0);
 const GREEN_CHROMA_MAT = getOrCreateMaterial('#22c55e', 0.9, 0.0);
 const EMISSIVE_WARM_MAT = new THREE.MeshBasicMaterial({ color: 0xffedd5 });
 
+/** Texture slots carried over when an uploaded model's materials become Lambert. */
+type LambertSource = THREE.Material & {
+  color?: THREE.Color;
+  map?: THREE.Texture | null;
+  emissive?: THREE.Color;
+  emissiveMap?: THREE.Texture | null;
+  emissiveIntensity?: number;
+  alphaMap?: THREE.Texture | null;
+  flatShading?: boolean;
+};
+
+/**
+ * Makes an uploaded model obey the render budget (flat Lambert, no lights of
+ * its own). glTF materials parse as MeshStandard/Physical (PBR: costlier, and
+ * metallic parts render black with no environment map) and OBJ as Phong; each
+ * becomes a MeshLambertMaterial with the same colour, base and emissive maps,
+ * vertex colours, transparency and side. Unlit (MeshBasic) materials stay.
+ * KHR_lights_punctual lights would light the whole set and force a shader
+ * recompile, so each is swapped for an empty group that keeps its children.
+ *
+ * Returns how many texture maps the original materials carried, so a caller
+ * can tell when a model that declares textures got none of them.
+ */
+export function flattenModelForBudget(root: THREE.Object3D): number {
+  const lights: THREE.Light[] = [];
+  const meshes: THREE.Mesh[] = [];
+  root.traverse((o) => {
+    if ((o as THREE.Light).isLight) lights.push(o as THREE.Light);
+    else if ((o as THREE.Mesh).isMesh) meshes.push(o as THREE.Mesh);
+  });
+
+  for (const light of lights) {
+    const stand = new THREE.Group();
+    stand.name = light.name;
+    stand.position.copy(light.position);
+    stand.quaternion.copy(light.quaternion);
+    stand.scale.copy(light.scale);
+    const target = (light as THREE.Light & { target?: THREE.Object3D }).target;
+    for (const child of [...light.children]) if (child !== target) stand.add(child);
+    const parent = light.parent;
+    light.removeFromParent();
+    parent?.add(stand);
+    light.dispose();
+  }
+
+  const swapped = new Map<THREE.Material, THREE.Material>();
+  const seenMaps = new Set<THREE.Texture>();
+  const keptMaps = new Set<THREE.Texture>();
+  const swap = (m: THREE.Material): THREE.Material => {
+    const known = swapped.get(m);
+    if (known) return known;
+    for (const v of Object.values(m)) if ((v as THREE.Texture | null)?.isTexture) seenMaps.add(v as THREE.Texture);
+    if ((m as THREE.MeshLambertMaterial).isMeshLambertMaterial || (m as THREE.MeshBasicMaterial).isMeshBasicMaterial) {
+      for (const v of Object.values(m)) if ((v as THREE.Texture | null)?.isTexture) keptMaps.add(v as THREE.Texture);
+      swapped.set(m, m);
+      return m;
+    }
+    const src = m as LambertSource;
+    const lambert = new THREE.MeshLambertMaterial({
+      name: src.name,
+      color: src.color ?? 0xffffff,
+      map: src.map ?? null,
+      emissive: src.emissive ?? 0x000000,
+      emissiveMap: src.emissiveMap ?? null,
+      emissiveIntensity: src.emissiveIntensity ?? 1,
+      alphaMap: src.alphaMap ?? null,
+      vertexColors: src.vertexColors,
+      transparent: src.transparent,
+      opacity: src.opacity,
+      alphaTest: src.alphaTest,
+      side: src.side,
+      depthWrite: src.depthWrite,
+      flatShading: src.flatShading ?? false,
+    });
+    for (const t of [lambert.map, lambert.emissiveMap, lambert.alphaMap]) if (t) keptMaps.add(t);
+    swapped.set(m, lambert);
+    return lambert;
+  };
+  for (const mesh of meshes) {
+    mesh.material = Array.isArray(mesh.material) ? mesh.material.map(swap) : swap(mesh.material);
+  }
+  // Free what the Lambert copies no longer reference (PBR maps, old materials).
+  for (const t of seenMaps) if (!keptMaps.has(t)) t.dispose();
+  for (const [from, to] of swapped) if (from !== to) from.dispose();
+  return seenMaps.size;
+}
+
 export interface PropRenderInstance {
   data: PropData;
   root: THREE.Group;
@@ -63,6 +150,13 @@ export class PropRenderer {
    * debug log and the wrist status.
    */
   onLoadError?: (assetKey: string, err: unknown) => void;
+
+  /**
+   * Called when an uploaded model IS shown but incompletely: today, a model
+   * that declares textures and got none of them (GLTFLoader only logs a
+   * failed texture to the console and carries on untextured).
+   */
+  onLoadWarning?: (assetKey: string, message: string) => void;
 
   /** Builds the Three.js 3D visual object for a given PropData. */
   async createPropMesh(prop: PropData): Promise<THREE.Group> {
@@ -86,9 +180,12 @@ export class PropRenderer {
   /**
    * Loads and normalizes a custom 3D model from PropStore. Parses the stored
    * bytes directly (GLTFLoader.parseAsync / OBJLoader.parse) rather than
-   * fetching a blob: URL, which Quest Browser has been reported to refuse with
-   * ERR_ACCESS_DENIED. Failures go to onLoadError and return null (the caller
-   * then shows the placeholder box).
+   * fetching the model through a blob: URL, which Quest Browser has been
+   * reported to refuse with ERR_ACCESS_DENIED. Images embedded in a GLB still
+   * go through blob: URLs inside GLTFLoader, so textured GLBs on Quest are
+   * unverified on device; if every texture fails the model shows untextured
+   * and onLoadWarning says so. Failures go to onLoadError and return null (the
+   * caller then shows the placeholder box).
    */
   private async loadCustomModel(customKey: string): Promise<THREE.Group | null> {
     const root = new THREE.Group();
@@ -101,6 +198,7 @@ export class PropRenderer {
       if (asset.fileType !== 'glb' && asset.fileType !== 'gltf' && asset.fileType !== 'obj') {
         throw new Error(`unsupported model type "${asset.fileType}" (use GLB, glTF or OBJ)`);
       }
+      let declaredTextures = 0;
       try {
         if (asset.fileType === 'obj') {
           root.add(this.objLoader.parse(new TextDecoder().decode(asset.buffer)));
@@ -109,11 +207,17 @@ export class PropRenderer {
           // cannot resolve them and fails here (reported); embedded data URIs
           // work. Draco / meshopt / KTX2 compressed files fail too (no decoders).
           const gltf = await this.gltfLoader.parseAsync(asset.buffer, '');
+          declaredTextures = (gltf.parser.json as { textures?: unknown[] }).textures?.length ?? 0;
           root.add(gltf.scene);
         }
       } catch (parseErr) {
         const why = parseErr instanceof Error ? parseErr.message : String(parseErr);
         throw new Error(`could not read ${asset.fileName || asset.fileType.toUpperCase()}: ${why}`);
+      }
+
+      const loadedTextures = flattenModelForBudget(root);
+      if (declaredTextures > 0 && loadedTextures === 0) {
+        this.onLoadWarning?.(customKey, `${asset.fileName || 'model'}: textures did not load, shown untextured`);
       }
 
       // Compute bounding box and normalize center/floor
