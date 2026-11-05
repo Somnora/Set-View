@@ -11428,40 +11428,83 @@ test('P0.15 Gemini key: embeddedGeminiKey reads only a real string key from raw 
   assert.equal(embeddedGeminiKey(null), '');
 });
 
-test('P0.15 Gemini key: migration moves the first embedded key once and never overwrites', () => {
-  // Takes the first scene (most recent) that has a key, and stops parsing there.
-  const store = p0MemStore();
-  let parsed = 0;
-  function* scenes(): Generator<string | null> {
-    parsed++;
-    yield JSON.stringify(createScene('no key'));
-    parsed++;
-    yield p0SceneJsonWithKey('newest keyed', 'AIzaSy-FIRST');
-    parsed++;
-    yield p0SceneJsonWithKey('older keyed', 'AIzaSy-SECOND');
-  }
-  assert.equal(migrateEmbeddedGeminiKey(store, scenes()), true);
-  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-FIRST');
-  assert.equal(parsed, 2, 'stops at the first key found');
+test('P0.15 Gemini key: one device key, shared with AI Shot Analysis', () => {
+  // The name AI Shot Analysis already stored its key under: one key per device,
+  // and a device that set it there needs no re-entry in Set Dressing.
+  assert.equal(GEMINI_KEY_STORAGE_KEY, 'setview_gemini_api_key');
+  const store = p0MemStore({ setview_gemini_api_key: 'AIzaSy-SHOTS' });
+  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-SHOTS');
+});
+
+test('P0.15 Gemini key: migration moves the first embedded key once and strips every stored scene', () => {
+  const p0Scene = (name: string, key?: string, updatedAt = 1000): string => {
+    const raw = JSON.parse(key === undefined ? JSON.stringify(createScene(name)) : p0SceneJsonWithKey(name, key));
+    raw.updatedAt = updatedAt;
+    return JSON.stringify(raw);
+  };
+  const keys = ['s.none', 's.first', 's.second', 's.emptyField'];
+  const store = p0MemStore({
+    's.none': p0Scene('no key', undefined, 4000),
+    's.first': p0Scene('newest keyed', 'AIzaSy-FIRST', 3000),
+    's.second': p0Scene('older keyed', 'AIzaSy-SECOND', 2000),
+    's.emptyField': p0Scene('old default', '', 1000), // older builds wrote apiKey: ''
+  });
+  const before = new Map(keys.map((k) => [k, store.map.get(k)!]));
+  assert.equal(migrateEmbeddedGeminiKey(store, keys), true);
+  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-FIRST', 'the most recent scene\'s key wins');
   assert.equal(store.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
+  for (const k of keys) {
+    const raw = store.map.get(k)!;
+    assert.ok(!raw.includes('apiKey'), `${k} no longer holds the key field`);
+    // Everything else is kept, updatedAt included, so the scene list order holds.
+    const was = JSON.parse(before.get(k)!);
+    delete was.setDressing.aiConfig.apiKey;
+    assert.deepEqual(JSON.parse(raw), was);
+  }
+  assert.equal(store.map.get('s.none'), before.get('s.none'), 'a scene without the field is not rewritten');
 
-  // Once per device: a second run does nothing, even with new keyed scenes.
+  // Once per device: a second run does nothing, even with a new keyed scene.
+  store.map.set('s.later', p0Scene('later', 'AIzaSy-LATER'));
   writeDeviceGeminiKey(store, '');
-  assert.equal(migrateEmbeddedGeminiKey(store, [p0SceneJsonWithKey('later', 'AIzaSy-LATER')]), false);
+  assert.equal(migrateEmbeddedGeminiKey(store, ['s.later']), false);
   assert.equal(readDeviceGeminiKey(store), '');
+  assert.ok(store.map.get('s.later')!.includes('AIzaSy-LATER'));
 
-  // A key the device already has is never replaced; the flag is still set.
-  const existing = p0MemStore({ [GEMINI_KEY_STORAGE_KEY]: 'AIzaSy-MINE' });
-  assert.equal(migrateEmbeddedGeminiKey(existing, [p0SceneJsonWithKey('x', 'AIzaSy-OTHER')]), false);
+  // A key the device already has is never replaced, and the scenes are still stripped.
+  const existing = p0MemStore({ [GEMINI_KEY_STORAGE_KEY]: 'AIzaSy-MINE', 's.x': p0Scene('x', 'AIzaSy-OTHER') });
+  assert.equal(migrateEmbeddedGeminiKey(existing, ['s.x']), false);
   assert.equal(readDeviceGeminiKey(existing), 'AIzaSy-MINE');
+  assert.ok(!existing.map.get('s.x')!.includes('AIzaSy-OTHER'));
   assert.equal(existing.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
 
-  // Nothing to move: flag set, no key written. No storage: no throw.
-  const empty = p0MemStore();
-  assert.equal(migrateEmbeddedGeminiKey(empty, [null, '{bad', JSON.stringify(createScene('k'))]), false);
+  // Nothing to move: flag set, no key written, malformed and missing scenes left alone.
+  const empty = p0MemStore({ 's.bad': '{bad "apiKey"', 's.plain': p0Scene('k') });
+  assert.equal(migrateEmbeddedGeminiKey(empty, ['s.missing', 's.bad', 's.plain']), false);
   assert.equal(empty.map.has(GEMINI_KEY_STORAGE_KEY), false);
+  assert.equal(empty.map.get('s.bad'), '{bad "apiKey"');
   assert.equal(empty.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
-  assert.equal(migrateEmbeddedGeminiKey(null, [p0SceneJsonWithKey('y', 'k')]), false);
+});
+
+test('P0.15 Gemini key: a move that storage refuses keeps the scene key and retries next boot', () => {
+  const base = p0MemStore({ 's.k': p0SceneJsonWithKey('k', 'AIzaSy-ONLY') });
+  const refusing: KeyValueStore = {
+    getItem: (k) => base.getItem(k),
+    setItem: (k, v) => {
+      if (k === GEMINI_KEY_STORAGE_KEY) throw new Error('QuotaExceededError');
+      base.setItem(k, v);
+    },
+    removeItem: (k) => base.removeItem(k),
+  };
+  assert.equal(migrateEmbeddedGeminiKey(refusing, ['s.k']), false);
+  assert.ok(base.map.get('s.k')!.includes('AIzaSy-ONLY'), 'the only copy of the key is not stripped');
+  assert.equal(base.map.has(GEMINI_KEY_MIGRATED_FLAG), false, 'flag left unset so the next boot retries');
+  // Next boot, storage has room again.
+  assert.equal(migrateEmbeddedGeminiKey(base, ['s.k']), true);
+  assert.equal(readDeviceGeminiKey(base), 'AIzaSy-ONLY');
+  assert.ok(!base.map.get('s.k')!.includes('apiKey'));
+
+  // No storage, or storage that throws on read: no throw, nothing moved.
+  assert.equal(migrateEmbeddedGeminiKey(null, ['s.k']), false);
   const reader: KeyValueStore = {
     getItem: () => {
       throw new Error('SecurityError');
@@ -11469,7 +11512,7 @@ test('P0.15 Gemini key: migration moves the first embedded key once and never ov
     setItem: () => {},
     removeItem: () => {},
   };
-  assert.equal(migrateEmbeddedGeminiKey(reader, [p0SceneJsonWithKey('z', 'k')]), false);
+  assert.equal(migrateEmbeddedGeminiKey(reader, ['s.k']), false);
 });
 
 test('P0.15 Set Dressing: an applied AI scatter survives the modal Save (no stale overwrite)', () => {

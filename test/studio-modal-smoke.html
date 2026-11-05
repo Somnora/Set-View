@@ -7,20 +7,29 @@
              the hidden #overlay), have a non-zero rect, and elementFromPoint at
              their visible centre lands inside the dialog. A studio opened for a
              scene that is NOT current saves that scene, not the current one.
+             DMX for a non-current scene never reconfigures the live streamer;
+             for the loaded scene, Cancel reverts its live network edits.
        P0.13 3DGS Studio Cancel after Extract Walls leaves scene.architecture
-             untouched; Save stores the synthetic cloud.
-       P0.15 A Gemini key embedded in a stored scene is moved to the device
-             setting at boot; a key typed in Set Dressing is stored per device
-             and never in the scene; offline NLP "add a desk" adds a prop; an AI
-             scatter survives a later Save.
+             untouched; replacing an open studio drops its unsaved preview;
+             Save stores the synthetic cloud and Undo takes it back out while
+             an earlier edit (the AI desk) survives.
+       P0.15 A Gemini key embedded in stored scenes is moved to the device
+             setting at boot and stripped from every stored scene; AI Shot
+             Analysis shows the same device key; a key typed in Set Dressing is
+             stored per device and never in the scene; offline NLP "add a desk"
+             saves AND renders a new prop; an AI scatter survives a later Save;
+             no collab patch sent along the way carries a key.
 
      It also checks the in-AR CSS contract (#overlay stays click-through, each
      studio root inside it takes pointer events back). The AR routing itself
      (mount in #overlay with dom-overlay, refuse on the wheel without it) needs
      a real session: on-headset only.
 
-     Undo after a 3DGS save is not reachable from the DOM (it lives on the 3D
-     wheel and wrist), so that half of P0.13 is a domain test plus on-headset.
+     Undo, the rendered prop count, the splat renderer's cloud, the live DMX
+     streamer and sent collab patches are not reachable from the DOM; the dev
+     server exposes them as window.__setviewTest (main.ts installDevTestHooks,
+     never installed in a vite build). The session-end move of an open studio from
+     #overlay to body needs a real session: on-headset only.
 
      WARNING: clears localStorage for the origin it runs on (like the marks
      smoke). Use the HTTP config's localhost:5174 origin, not the one you keep
@@ -94,7 +103,8 @@
         localStorage.clear();
         const a = JSON.parse(JSON.stringify(createScene('smoke A')));
         a.setDressing.aiConfig.apiKey = 'AIzaSy-SEEDED';
-        const b = createScene('smoke B');
+        const b = JSON.parse(JSON.stringify(createScene('smoke B')));
+        b.setDressing.aiConfig.apiKey = 'AIzaSy-OLDER';
         const t0 = Date.now() - 60_000;
         a.updatedAt = t0;
         b.updatedAt = t0 - 1000;
@@ -113,8 +123,13 @@
         await sleep(400);
 
         // --- P0.15 migration ran at boot, before any save ---
-        check(localStorage.getItem('setview.geminiApiKey') === 'AIzaSy-SEEDED', 'P0.15 embedded key moved to the device setting at boot');
+        check(localStorage.getItem('setview_gemini_api_key') === 'AIzaSy-SEEDED', 'P0.15 embedded key moved to the device setting at boot (most recent scene wins)');
         check(localStorage.getItem('setview.geminiApiKeyMigrated') === '1', 'P0.15 migration flag set');
+        check(!localStorage.getItem('setview.scene.' + a.id).includes('apiKey'), 'P0.15 migration stripped the key from current scene A in storage');
+        check(!localStorage.getItem('setview.scene.' + b.id).includes('apiKey'), 'P0.15 migration stripped the key from non-current scene B in storage');
+        check(stored(b.id).updatedAt === b.updatedAt, 'stripping kept scene B updatedAt (scene list order unchanged)');
+        const hook = window.__setviewTest;
+        check(!!hook, 'dev test hook installed');
 
         const landing = document.getElementById('landing');
         const rowFor = (name) =>
@@ -142,6 +157,13 @@
         assertUsable('.dressing-modal-overlay', '.dressing-modal-dialog', 'landing Set Dressing');
         document.querySelector('.dressing-modal-overlay')?.remove();
 
+        prepButton('smoke A', '🤖 AI Shot Analysis')?.click();
+        await sleep(100);
+        const shotKey = document.querySelector('#ai-api-key');
+        check(shotKey?.value === 'AIzaSy-SEEDED', 'P0.15 AI Shot Analysis shows the same device key');
+        check(!!shotKey && !shotKey.outerHTML.includes('AIzaSy-SEEDED'), 'AI Shot Analysis key is not interpolated into the markup');
+        document.querySelector('.ai-modal-overlay')?.remove();
+
         buttonByText(landing, '📦 Prop Library')?.click();
         const props = await waitFor(() => document.querySelector('.props-modal-overlay'), 6000);
         if (props) {
@@ -162,6 +184,41 @@
         await sleep(100);
         check(stored(b.id).updatedAt > bBefore, 'non-current ICVFX save wrote scene B');
         check(stored(a.id).updatedAt === aBefore, 'non-current ICVFX save left current scene A untouched');
+
+        // --- P0.1 DMX for a non-current scene never touches the live rig ---
+        const enableDmxStreaming = async () => {
+          document.querySelector('#tab-network-btn')?.click();
+          await sleep(50);
+          const en = document.querySelector('#net-enable-chk');
+          en.checked = true;
+          en.dispatchEvent(new Event('change'));
+        };
+        check(hook?.liveDmxEnabled() === false, 'live DMX streamer starts disabled');
+        prepButton('smoke B', '💡 DMX Bridge')?.click();
+        await sleep(100);
+        check(!!document.querySelector('.dmx-modal-overlay')?.textContent.includes('only preview'), 'DMX for scene B says its rig controls only preview');
+        await enableDmxStreaming();
+        document.querySelector('#dmx-blackout-btn')?.click();
+        check(hook?.liveDmxEnabled() === false, 'enabling streaming in scene B DMX left the live streamer off');
+        document.querySelector('#dmx-save-btn')?.click();
+        await sleep(100);
+        check(stored(b.id).dmxBridge?.enabled === true, 'scene B DMX Save stored the config in B');
+        check(hook?.liveDmxEnabled() === false, 'scene B DMX Save left the live streamer off');
+        check(stored(a.id).updatedAt === aBefore, 'scene B DMX Save left current scene A untouched');
+
+        prepButton('smoke A', '💡 DMX Bridge')?.click();
+        await sleep(100);
+        check(!document.querySelector('.dmx-modal-overlay')?.textContent.includes('only preview'), 'DMX for the loaded scene drives the live rig');
+        await enableDmxStreaming();
+        check(hook?.liveDmxEnabled() === true, 'loaded-scene DMX network edit reaches the live streamer');
+        prepButton('smoke A', '💡 DMX Bridge')?.click();
+        await sleep(100);
+        check(document.querySelectorAll('.dmx-modal-overlay').length === 1, 'reopening replaced the open DMX studio');
+        check(hook?.liveDmxEnabled() === false, 'the replaced DMX studio was cancelled (live network edit put back)');
+        await enableDmxStreaming();
+        document.querySelector('#dmx-cancel-btn')?.click();
+        await sleep(50);
+        check(hook?.liveDmxEnabled() === false, 'DMX Cancel put the live streamer config back');
 
         // --- P0.13: Extract Walls then Cancel leaves architecture alone; Save stores the cloud ---
         const wallsOf = (sc) => JSON.stringify({ walls: sc.architecture?.walls ?? [], ceiling: sc.architecture?.ceilingHeightM ?? null });
@@ -184,17 +241,20 @@
         await sleep(100);
         check(wallsOf(stored(a.id)) === wallsBefore, 'P0.13 Cancel left scene.architecture unchanged');
         check((stored(a.id).gaussianClouds ?? []).length === 0, 'P0.13 Cancel stored no cloud');
+        check(hook?.splatCloudId() === null, 'P0.13 Cancel put the renderer back on no cloud');
 
+        // Reopening while open (the wheel and wrist stay live in AR) cancels the old one.
         prepButton('smoke A', '✨ 3DGS Scout Studio')?.click();
         await sleep(100);
         document.querySelector('#splat-synthetic-btn')?.click();
         await sleep(100);
-        document.querySelector('#splat-save-btn')?.click();
+        check(!!hook?.splatCloudId(), 'P0.13 the synthetic cloud is previewed on the renderer');
+        buttonByText(landing, '✨ 3DGS Studio')?.click();
         await sleep(100);
-        const afterSave = stored(a.id);
-        check((afterSave.gaussianClouds ?? []).length === 1, 'P0.13 Save stored the synthetic cloud');
-        check(afterSave.activeSplatCloudId === afterSave.gaussianClouds?.[0]?.id, 'P0.13 Save set the active cloud');
-        check(!!rowFor('smoke A'), 'landing still lists the scene after the 3DGS save');
+        check(document.querySelectorAll('.splat-modal-overlay').length === 1, 'reopening replaced the open 3DGS studio');
+        check(hook?.splatCloudId() === null, 'P0.13 the replaced studio\'s unsaved preview left the renderer');
+        document.querySelector('#splat-cancel-btn')?.click();
+        await sleep(50);
 
         // --- P0.15 Set Dressing: device key, offline AI add, AI scatter survives Save ---
         prepButton('smoke A', '🎲 Set Dressing')?.click();
@@ -204,11 +264,11 @@
         check(!keyInput?.outerHTML.includes('AIzaSy-SEEDED'), 'key is not interpolated into the markup');
         keyInput.value = '  AIzaSy-TYPED  ';
         keyInput.dispatchEvent(new Event('change'));
-        check(localStorage.getItem('setview.geminiApiKey') === 'AIzaSy-TYPED', 'typed key stored per device (trimmed)');
+        check(localStorage.getItem('setview_gemini_api_key') === 'AIzaSy-TYPED', 'typed key stored per device (trimmed)');
         // Clear it again so Run AI Director takes the offline path (no network in a smoke).
         keyInput.value = '';
         keyInput.dispatchEvent(new Event('change'));
-        check(localStorage.getItem('setview.geminiApiKey') === null, 'clearing the input removes the device key');
+        check(localStorage.getItem('setview_gemini_api_key') === null, 'clearing the input removes the device key');
 
         const runAi = async (prompt) => {
           document.querySelector('#nl-director-prompt').value = prompt;
@@ -240,8 +300,12 @@
         prepButton('smoke A', '🎲 Set Dressing')?.click();
         await sleep(100);
         const propsBefore = (stored(a.id).props ?? []).length;
+        const renderedBefore = hook?.renderedPropCount() ?? -1;
         await runAi('add a desk');
         check((stored(a.id).props ?? []).length === propsBefore + 1, 'P0.15 offline "add a desk" saved one new prop');
+        // Prop meshes build asynchronously; no reload in between.
+        const renderedUp = await waitFor(() => hook?.renderedPropCount() === renderedBefore + 1);
+        check(!!renderedUp, `P0.15 the desk is rendered without a reload (${renderedBefore} -> ${hook?.renderedPropCount()} prop objects)`);
         document.querySelector('.dressing-modal-overlay')?.remove();
         const allStored = Object.keys(localStorage)
           .filter((k) => k.startsWith('setview.scene.'))
@@ -249,6 +313,30 @@
           .join('');
         check(!stored(a.id).setDressing.aiConfig.apiKey && !JSON.stringify(stored(a.id)).includes('apiKey'), 'P0.15 saved scene carries no apiKey');
         check(!allStored.includes('AIzaSy-TYPED'), 'typed key never reached stored scenes');
+        const sent = hook?.sentPatches() ?? [];
+        check(sent.some((p) => p.includes('"set_dressing_update"')), `set_dressing_update patches were broadcast (${sent.length} patches)`);
+        check(!sent.some((p) => p.includes('apiKey') || p.includes('AIzaSy')), 'P0.15 no broadcast collab patch carries a key');
+
+        // --- P0.13: Save stores the cloud as one undo step (no history.reset) ---
+        const propsWithDesk = (stored(a.id).props ?? []).length;
+        prepButton('smoke A', '✨ 3DGS Scout Studio')?.click();
+        await sleep(100);
+        document.querySelector('#splat-synthetic-btn')?.click();
+        await sleep(100);
+        document.querySelector('#splat-save-btn')?.click();
+        await sleep(100);
+        const afterSave = stored(a.id);
+        check((afterSave.gaussianClouds ?? []).length === 1, 'P0.13 Save stored the synthetic cloud');
+        check(afterSave.activeSplatCloudId === afterSave.gaussianClouds?.[0]?.id, 'P0.13 Save set the active cloud');
+        check(!!rowFor('smoke A'), 'landing still lists the scene after the 3DGS save');
+        check(hook?.canUndo() === true, 'P0.13 history can undo after the 3DGS save');
+        hook?.undo();
+        await sleep(100);
+        const afterUndo = stored(a.id);
+        check((afterUndo.gaussianClouds ?? []).length === 0, 'P0.13 Undo restored the previous cloud count (0)');
+        check((afterUndo.props ?? []).length === propsWithDesk, 'P0.13 the earlier AI desk survives that Undo');
+        check(hook?.canUndo() === true, 'P0.13 earlier history is still there after the Undo');
+        check(hook?.splatCloudId() === null, 'P0.13 Undo took the cloud off the renderer');
 
         // --- P0.1 desktop preview toolbar ---
         buttonByText(rowFor('smoke A'), 'Preview')?.click();
@@ -282,12 +370,10 @@
         // so this checks the computed style only).
         const overlayRoot = document.getElementById('overlay');
         check(getComputedStyle(overlayRoot).pointerEvents === 'none', '#overlay itself stays pointer-events:none');
-        const roots = [
-          'ai-modal-overlay', 'props-modal-overlay', 'livelink-modal-overlay', 'actor-studio-overlay',
-          'grip-studio-overlay', 'splat-modal-overlay', 'perf-modal-overlay', 'dailies-modal-overlay',
-          'dmx-modal-overlay', 'icvfx-modal-overlay', 'acoustics-modal-overlay', 'solar-modal-overlay',
-          'screenplay-modal-overlay', 'profiler-modal-overlay', 'comfort-modal-overlay', 'dressing-modal-overlay',
-        ];
+        // The list session end uses to move open studios to the page; the CSS
+        // rule must cover every one of them.
+        const { STUDIO_MODAL_ROOT_CLASSES: roots } = await import('../src/ui.ts');
+        check(roots.length >= 17, `studio root class list loaded (${roots.length})`);
         const blocked = roots.filter((cls) => {
           const d = document.createElement('div');
           d.className = cls;

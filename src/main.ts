@@ -111,6 +111,7 @@ import {
   migrateEmbeddedGeminiKey,
   normalizeSetDressingConfig,
 } from './setDressingEngine.ts';
+import { STUDIO_MODAL_ROOT_CLASSES } from './ui.ts';
 import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
 
 import { ViewfinderRig } from './viewfinder.ts';
@@ -686,6 +687,7 @@ class App {
 
     this.wireSubsystems();
     this.loadScene(this.sceneData);
+    if (import.meta.env.DEV) this.installDevTestHooks();
     // ?preview auto-opens the desktop viewer on the current scene (also the
     // hook for the headless render smoke — see test notes in TESTING.md).
     if (new URLSearchParams(location.search).has('preview')) this.openPreview(this.sceneData.id);
@@ -1655,6 +1657,7 @@ class App {
     this.pendingScan = null;
     this.noteEditor.close();
     this.persistence.saveNow(this.sceneData);
+    this.moveStudiosToPage();
     document.getElementById('overlay')!.hidden = true;
     this.landing.show(true);
     this.refreshLanding();
@@ -3011,6 +3014,32 @@ class App {
   // --- studio modals -----------------------------------------------------------------
 
   /**
+   * Dev server only (the constructor calls this under import.meta.env.DEV,
+   * which vite build compiles to false, so production never installs it): a
+   * handle for the headed smokes such as test/studio-modal-smoke.html.
+   * Undo lives on the 3D wheel and wrist and rendered props live in the 3D
+   * scene, so a DOM-driven smoke cannot reach either without it.
+   */
+  private installDevTestHooks(): void {
+    const sent: string[] = [];
+    const collab = this.collabSession;
+    const broadcast = collab.broadcastPatch.bind(collab);
+    collab.broadcastPatch = (patch) => {
+      sent.push(JSON.stringify(patch));
+      broadcast(patch);
+    };
+    const splat = this.splatRenderer as unknown as { cloud?: { id: string } | null };
+    (window as unknown as { __setviewTest?: unknown }).__setviewTest = {
+      undo: () => this.undo(),
+      canUndo: () => this.history.canUndo,
+      renderedPropCount: () => this.props.all().length,
+      splatCloudId: () => splat.cloud?.id ?? null,
+      liveDmxEnabled: () => this.dmxStreamer.getConfig().enabled,
+      sentPatches: () => sent.slice(),
+    };
+  }
+
+  /**
    * Where a DOM modal (studio, library, exporter) mounts. Outside an XR session
    * (landing page, desktop preview, the Quest 2D page) that is document.body:
    * #overlay is hidden there. Inside a session only the dom-overlay root is
@@ -3046,6 +3075,20 @@ class App {
   }
 
   /**
+   * A studio still open when the session ends sits in #overlay, which the 2D
+   * page hides. Move it to body so it stays visible and usable there, and its
+   * unsaved edits are neither lost nor brought back on the next AR entry. Its
+   * Save and Cancel still work: the callbacks do not depend on where it mounts.
+   */
+  private moveStudiosToPage(): void {
+    const overlayRoot = document.getElementById('overlay');
+    if (!overlayRoot) return;
+    for (const el of Array.from(overlayRoot.children)) {
+      if (STUDIO_MODAL_ROOT_CLASSES.some((cls) => el.classList.contains(cls))) document.body.appendChild(el);
+    }
+  }
+
+  /**
    * Commits an edit made in a studio modal. Studios opened from the landing page
    * can target a scene other than the live one: that scene is only saved, since
    * the live renderers, collab peers and undo history belong to the current
@@ -3078,9 +3121,10 @@ class App {
   /**
    * Older builds kept the Gemini API key inside each scene's set-dressing
    * config, so it was autosaved, exported and sent to collab peers. It is now a
-   * per-device setting and normalizeScene drops it from scenes. Runs before the
-   * first scene loads (and is re-saved without the key): moves the key from the
-   * most recently edited scene that has one into the device setting, once.
+   * per-device setting and normalizeScene drops it from scenes. Runs once per
+   * device, before the first scene loads: moves the key from the most recently
+   * edited scene that has one into the device setting, then rewrites every
+   * stored scene without it, so no scene in storage still holds the key.
    */
   private migrateGeminiKeyOnce(): void {
     let store: Storage | null = null;
@@ -3089,17 +3133,26 @@ class App {
     } catch {
       return; // storage blocked: nothing stored to move, nowhere to put it
     }
-    const s: Storage = store;
     // Mirrors SCENE_PREFIX in persistence.ts. If that ever changes this finds
     // nothing and the user re-enters the key once (the Set Dressing modal says so).
     const prefix = 'setview.scene.';
-    const entries = this.persistence.listScenes(); // most recently updated first
-    function* rawScenes(): Generator<string | null> {
-      for (const e of entries) yield s.getItem(prefix + e.id);
-    }
-    if (migrateEmbeddedGeminiKey(s, rawScenes())) {
+    const sceneKeys = this.persistence.listScenes().map((e) => prefix + e.id); // most recently updated first
+    if (migrateEmbeddedGeminiKey(store, sceneKeys)) {
       this.debug.log('Gemini API key moved from scene data to a per-device setting');
     }
+  }
+
+  /**
+   * props.setScene disposes and rebuilds every prop object (asynchronously) and
+   * clears PropsManager's own selection. Drop main's prop selection and prop
+   * hover with it, as loadScene and restoreScene do, so Delete and Duplicate
+   * never act on a prop that is gone, the radial does not linger on it, and the
+   * gizmo never drives a disposed root.
+   */
+  private dropPropSelectionForRebuild(): void {
+    if (this.hover?.kind === 'prop') this.hover = null;
+    if (this.selectedPropId) this.selectProp(null);
+    else if (this.gizmo.getTarget()?.kind === 'prop') this.gizmo.detach();
   }
 
   /** Points the splat renderer at the scene's active cloud and floorplan. */
@@ -3113,6 +3166,10 @@ class App {
     const host = this.studioHost('3DGS Studio');
     if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
+    // The studio replaces scene.architecture only when Extract Walls staged a
+    // new one; otherwise Save must not write this (possibly stale) copy back
+    // over an architecture changed meanwhile by an undo or a collab patch.
+    const architectureAtOpen = sc.architecture;
     openGaussianSplatStudioModal(
       sc,
       (updated) => {
@@ -3124,7 +3181,7 @@ class App {
           (t) => {
             t.gaussianClouds = updated.gaussianClouds;
             t.activeSplatCloudId = updated.activeSplatCloudId;
-            t.architecture = updated.architecture;
+            if (updated.architecture !== architectureAtOpen) t.architecture = updated.architecture;
           },
           () => this.applySplatState(this.sceneData),
         );
@@ -3156,8 +3213,9 @@ class App {
     openDmxBridgeStudioModal(
       sc,
       (config) => {
-        // Drives the physical rig, so only for the live scene. No collab patch,
-        // as before: rig control stays with whoever is at the console.
+        // Only the loaded scene reconfigures the live streamer (commitStudioEdit
+        // skips applyLive for any other scene). No collab patch, as before: rig
+        // control stays with whoever is at the console.
         this.commitStudioEdit(
           sc,
           (t) => {
@@ -3174,7 +3232,10 @@ class App {
       (cue) => {
         this.debug.log(`Triggered DMX Cue: ${cue.name}`);
       },
-      this.dmxStreamer,
+      // The studio's rig buttons and network edits act on this streamer at
+      // once, so it gets the live one only for the loaded scene. For another
+      // scene it previews on a private streamer that never transmits.
+      sc.id === this.sceneData.id ? this.dmxStreamer : undefined,
       host,
     );
   }
@@ -3411,6 +3472,7 @@ class App {
             // same refresh a remote set_dressing_ patch gets, so AI-added props
             // appear without a reload.
             this.setDressingRenderer.setConfig(this.sceneData.setDressing ?? createSetDressingConfig());
+            this.dropPropSelectionForRebuild();
             this.props.setScene(this.sceneData);
             this.contentVersion++;
           },
