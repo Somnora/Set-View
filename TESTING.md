@@ -196,3 +196,30 @@ Prereq: Space Setup done on the headset (Settings → Environment Setup → Spac
 - Frame lines too close/far → `FRAME_LINE_DIST` in `cameraView.ts`.
 - Diorama size → `MINI_SCALE` in `views.ts`.
 - Monitor size/distance → `MONITOR_IMG_W` in `cameraView.ts`, follow distance in `CameraSystem.update`.
+
+## XR capability probe (P0.0)
+
+`test/xr-probe.html` is a standalone, test-only page (nothing in `src/` loads it). It checks the platform claims the roadmap depends on before any code relies on them: which optional features each headset grants (`plane-detection`, `mesh-detection`, `dom-overlay`), the raw `semanticLabel` strings and sizes of detected planes and meshes (including `'global mesh'`), whether viewer hit-test returns results, whether focusing a hidden input raises the system keyboard, what `initiateRoomCapture()` does to the session and to an existing anchor, whether the 2D file picker returns real bytes for scan formats, and what `navigator.storage` and the persistent-anchor API report. Procedure, file naming and the report format: `test/device-reports/README.md`.
+
+- Run it once per headset: `npm run dev`, open `https://<network-ip>:5173/test/xr-probe.html` on the device, work through sections 0 to 6, and commit the downloaded JSON to `test/device-reports/`. On Quest, S5 (hit-test without Space Setup) needs an extra AR session with Space Setup cleared, run before the main session (README step 6).
+- Partial by design: S7 is answered only for `storage.estimate()`, `persisted()` and `persist()` (the 100 to 300 MB LAN fetch into IndexedDB is not probed), and S11 only for whether `requestPersistentHandle` exists (no persistent anchor is created or restored). Do not mark those spikes answered from a probe report alone.
+- Do **Run room capture** last (two presses, once per session): it may launch Space Setup and invalidate anchors.
+- Headset-free check of the probe's own code: `test/xr-probe-smoke.html` drives the real page against a fake WebXR runtime and stubbed storage (file reads, Enter AR, sampling, Keyboard test, the two-press room capture with a reset and a lost anchor, Exit AR, Download JSON) and prints `XR-PROBE-SMOKE PASS`. Serve with `npx vite --config vite.http.config.ts`, then run `chrome --headless=new --disable-gpu --enable-unsafe-swiftshader --window-size=1100,900 --virtual-time-budget=60000 --dump-dom http://localhost:5174/test/xr-probe-smoke.html`. It proves nothing about real hardware. The pure half (`test/xr-probe-core.ts`) is covered by the `P0 probe` domain tests.
+
+Results (fill in from each committed report; the Summary table on the probe page lists these answers):
+
+| question (spike) | Quest 3, Browser 154.x | Galaxy XR, Chrome 147+ |
+| --- | --- | --- |
+| Report file | not run yet | not run yet |
+| `enabledFeatures`; plane-detection and mesh-detection granted; extra permission prompt (S1, S2) | | |
+| Plane `semanticLabel` strings, including door and window variants (S1, S2; on Quest from the session with Space Setup done) | | |
+| Mesh labels and `'global mesh'` vertex and index count (S1; session with Space Setup done) | | |
+| `domOverlayState`; hidden-input focus raises the keyboard; visibility states (S3) | | |
+| File picker returns bytes for .glb .json .obj .ply .fbx .spz .splat and extensionless files (S4) | | |
+| Viewer hit-test results on the floor at 1 to 4 m (S2, Galaxy XR) | n/a | |
+| Viewer hit-test results in a session marked "Space Setup: no" (S5, Quest only) | | n/a |
+| `initiateRoomCapture()` outcome; Space Setup launched; session survived; sentinel anchor afterwards; resets (S6) | | |
+| `storage.estimate()` quota, `persisted()`, `persist()` (S7, partial: the large LAN fetch into IndexedDB is not probed) | | |
+| `typeof requestPersistentHandle` (S11, partial: API presence only) | | |
+
+These answers set the P0.5 room-capture UX, the P0.6 label table, and whether P1.2's file picker or P1.5's drop box is the primary import path. Until a row is filled in from a real report, treat the claim as unverified.
