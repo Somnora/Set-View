@@ -13572,6 +13572,223 @@ function p0MakeGlb(json: Record<string, unknown>, bin: Uint8Array): ArrayBuffer 
   if (!hadSelf) delete g.self;
 }
 
+// --- P0 integration props-render ---
+{
+  const g = globalThis as unknown as Record<string, unknown>;
+  const hadDocument = 'document' in g;
+  const hadSelf = 'self' in g;
+  const noop: unknown = new Proxy(function () {}, {
+    get: (_t, k) => (k === 'measureText' ? () => ({ width: 10 }) : noop),
+    apply: () => noop,
+    set: () => true,
+  });
+  if (!hadDocument) g.document = { createElement: () => ({ width: 0, height: 0, getContext: () => noop, style: {} }) };
+  if (!hadSelf) g.self = globalThis;
+
+  const { globalPropStore } = await import('../src/propStore.ts');
+  const { countModelTriangles, disposeModelTree, EXACT_PICK_MAX_TRIANGLES, flattenModelForBudget, globalPropRenderer } =
+    await import('../src/propRenderer.ts');
+  const { PropsManager } = await import('../src/propsManager.ts');
+
+  const disposed = new Set<object>();
+  const watch = <T extends object>(x: T): T => {
+    (x as unknown as THREE.EventDispatcher<{ dispose: object }>).addEventListener('dispose', () => disposed.add(x));
+    return x;
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  const meshesIn = (o: THREE.Object3D) => {
+    const out: THREE.Mesh[] = [];
+    o.traverse((c) => {
+      if ((c as THREE.Mesh).isMesh) out.push(c as THREE.Mesh);
+    });
+    return out;
+  };
+
+  test('P0 integration: disposeModelTree frees every texture slot a flattened upload keeps', () => {
+    const map = watch(new THREE.Texture());
+    const emissiveMap = watch(new THREE.Texture());
+    const alphaMap = watch(new THREE.Texture());
+    const normalMap = watch(new THREE.Texture());
+    const geo = watch(new THREE.BufferGeometry());
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ map, emissiveMap, alphaMap, normalMap })));
+    flattenModelForBudget(root);
+    const lambert = watch((root.children[0] as THREE.Mesh).material as THREE.MeshLambertMaterial);
+    assert.equal(lambert.emissiveMap, emissiveMap, 'the emissive map is kept on the Lambert copy');
+    assert.ok(disposed.has(normalMap) && !disposed.has(emissiveMap), 'flatten frees only what it drops');
+    const label = new THREE.Sprite(watch(new THREE.SpriteMaterial({ map: watch(new THREE.Texture()) })));
+    const labelMap = label.material.map!;
+    watch(label.geometry);
+    root.add(label);
+    disposeModelTree(root);
+    for (const x of [map, emissiveMap, alphaMap, geo, lambert, labelMap, label.material]) assert.ok(disposed.has(x));
+    assert.ok(!disposed.has(label.geometry), "three's shared sprite quad is left alone");
+  });
+
+  test('P0 integration: countModelTriangles counts indexed, plain and instanced meshes only', () => {
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1))); // 12, indexed
+    const plain = new THREE.BufferGeometry();
+    plain.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(9 * 3), 3));
+    root.add(new THREE.Mesh(plain)); // 3
+    root.add(new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial(), 4)); // 48
+    root.add(new THREE.LineSegments(new THREE.BoxGeometry(1, 1, 1)));
+    assert.equal(countModelTriangles(root), 12 + 3 + 48);
+  });
+
+  // `count` copies of one triangle spanning x 0..1, y 0..1 at z = 0, facing +Z.
+  const triangles = (count: number) => {
+    const pos = new Float32Array(count * 9);
+    for (let i = 0; i < count; i++) pos.set([0, 0, 0, 1, 0, 0, 0, 1, 0], i * 9);
+    return p0MakeGlb(
+      {
+        scene: 0,
+        scenes: [{ nodes: [0] }],
+        nodes: [{ mesh: 0 }],
+        meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+        bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: pos.byteLength }],
+        accessors: [{ bufferView: 0, componentType: 5126, count: count * 3, type: 'VEC3', min: [0, 0, 0], max: [1, 1, 0] }],
+      },
+      new Uint8Array(pos.buffer),
+    );
+  };
+  const put = (id: string, buffer: ArrayBuffer) =>
+    globalPropStore.putAsset({
+      id,
+      name: id,
+      fileName: `${id}.glb`,
+      fileType: 'glb',
+      category: 'custom',
+      dimensions: { width: 1, height: 1, depth: 1 },
+      sizeBytes: buffer.byteLength,
+      uploadedAt: 0,
+      buffer,
+    });
+  const quietStore = globalPropStore.onError;
+  globalPropStore.onError = () => {};
+  await put('p0i-small', triangles(1));
+  await put('p0i-heavy', triangles(EXACT_PICK_MAX_TRIANGLES + 1));
+  await put('p0i-del', triangles(1));
+  globalPropStore.onError = quietStore;
+
+  const errors: string[] = [];
+  globalPropRenderer.onLoadError = (key, err) => errors.push(`${key}: ${(err as Error).message}`);
+  const uploaded = (key: string) => createPropData(key, key, { x: 0, y: 0, z: 0 }, { customModelKey: key, sourceType: 'indexeddb' });
+  const isBox = (o: THREE.Object3D) => meshesIn(o).some((m) => m.geometry.type === 'BoxGeometry');
+  const loader = (globalPropRenderer as unknown as { gltfLoader: { parseAsync: (...a: unknown[]) => Promise<unknown> } })
+    .gltfLoader;
+  const parseAsync = loader.parseAsync;
+  let parses = 0;
+  loader.parseAsync = (...a: unknown[]) => {
+    parses++;
+    return parseAsync.apply(loader, a);
+  };
+
+  await testAsyncPropsBuild('P0 integration: copies of an upload share one parse; the last release frees it', async () => {
+    const [a, b] = await Promise.all([
+      globalPropRenderer.createPropMesh(uploaded('p0i-small')),
+      globalPropRenderer.createPropMesh(uploaded('p0i-small')),
+    ]);
+    assert.equal(parses, 1, 'two copies, one parse');
+    const geo = watch(meshesIn(a)[0].geometry);
+    const mat = watch(meshesIn(a)[0].material as THREE.Material);
+    assert.equal(meshesIn(b)[0].geometry, geo, 'resources are shared');
+    assert.notEqual(meshesIn(b)[0], meshesIn(a)[0], 'each prop has its own node');
+    globalPropRenderer.disposeProp(a);
+    await tick();
+    assert.ok(!disposed.has(geo), 'still used by the other copy');
+    // What setScene does: release every prop, then rebuild them in the same task.
+    globalPropRenderer.disposeProp(b);
+    const c = await globalPropRenderer.createPropMesh(uploaded('p0i-small'));
+    await tick();
+    assert.equal(parses, 1, 'a rebuild does not parse again');
+    assert.equal(meshesIn(c)[0].geometry, geo);
+    assert.ok(!disposed.has(geo) && !disposed.has(mat));
+    globalPropRenderer.disposeProp(c);
+    await tick();
+    assert.ok(disposed.has(geo) && disposed.has(mat), 'freed once no prop uses it');
+    const d = await globalPropRenderer.createPropMesh(uploaded('p0i-small'));
+    assert.equal(parses, 2, 'a freed model parses afresh');
+    assert.notEqual(meshesIn(d)[0].geometry, geo);
+    globalPropRenderer.disposeProp(d);
+    await tick();
+  });
+
+  await testAsyncPropsBuild('P0 integration: PropsManager rebuilds reuse the parsed upload and release it on removal', async () => {
+    parses = 0;
+    const scene = createScene('P0 integration props');
+    const mgr = new PropsManager({} as never, scene);
+    const one = await mgr.addProp('p0i-small', { x: 0, y: 0, z: -2 }, { customModelKey: 'p0i-small' });
+    const two = await mgr.addProp('p0i-small', { x: 1, y: 0, z: -2 }, { customModelKey: 'p0i-small' });
+    assert.ok(one && two);
+    assert.equal(parses, 1);
+    const geo = watch(meshesIn(one.contentGroup)[0].geometry);
+    const ring = watch(one.footprintRing!.geometry);
+    mgr.setScene(scene); // undo, redo and remote patches all land here
+    for (let i = 0; i < 50 && mgr.all().length < 2; i++) await tick();
+    assert.equal(mgr.all().length, 2);
+    await tick();
+    assert.equal(parses, 1, 'no re-parse on rebuild');
+    assert.ok(disposed.has(ring), 'per-prop helpers are still freed');
+    assert.ok(!disposed.has(geo), 'the shared model is not');
+    assert.equal(meshesIn(mgr.all()[0].contentGroup)[0].geometry, geo);
+    for (const o of mgr.all()) mgr.removeProp(o.data.id);
+    await tick();
+    assert.ok(disposed.has(geo), 'freed with the last prop');
+  });
+
+  await testAsyncPropsBuild('P0 integration: failures are not cached; a deleted upload is re-checked', async () => {
+    errors.length = 0;
+    assert.ok(isBox(await globalPropRenderer.createPropMesh(uploaded('p0i-late'))));
+    await put('p0i-late', triangles(1));
+    assert.ok(!isBox(await globalPropRenderer.createPropMesh(uploaded('p0i-late'))), 'imported later, then shown');
+    assert.equal(errors.length, 1);
+
+    const live = await globalPropRenderer.createPropMesh(uploaded('p0i-del'));
+    const geo = watch(meshesIn(live)[0].geometry);
+    await globalPropStore.deleteAsset('p0i-del');
+    assert.ok(isBox(await globalPropRenderer.createPropMesh(uploaded('p0i-del'))), 'a deleted upload is not served from cache');
+    assert.match(errors[1], /not found/);
+    await tick();
+    assert.ok(!disposed.has(geo), 'the prop still showing it keeps it');
+    globalPropRenderer.disposeProp(live);
+    await tick();
+    assert.ok(disposed.has(geo));
+  });
+
+  await testAsyncPropsBuild('P0 integration: a heavy upload is picked by its bounds box, not its triangles', async () => {
+    const small = await globalPropRenderer.createPropMesh(uploaded('p0i-small'));
+    assert.ok(!meshesIn(small).some((m) => m.name === 'prop_pick_box'), 'light models keep exact picking');
+    globalPropRenderer.disposeProp(small);
+
+    const mgr = new PropsManager({} as never, createScene('P0 integration pick'));
+    const heavy = await mgr.addProp('p0i-heavy', { x: 0, y: 0, z: -2 }, { customModelKey: 'p0i-heavy' });
+    assert.ok(heavy);
+    const pick = meshesIn(heavy.contentGroup).find((m) => m.name === 'prop_pick_box');
+    assert.ok(pick, 'a pick box is added');
+    assert.equal((pick.material as THREE.Material).visible, false, 'never rendered');
+    const model = meshesIn(heavy.contentGroup).find((m) => m !== pick)!;
+    assert.equal((model.material as THREE.Material).visible, true, 'the model still renders');
+    mgr.group.updateMatrixWorld(true);
+    const rc = new THREE.Raycaster();
+    rc.set(new THREE.Vector3(0, 0.3, 0), new THREE.Vector3(0, 0, -1));
+    const hits = rc.intersectObjects(mgr.raycastTargets(), true);
+    assert.equal(hits.length, 1, 'only the box is tested');
+    assert.equal(hits[0].object, pick);
+    let o: THREE.Object3D | null = hits[0].object;
+    while (o && typeof o.userData.propId !== 'string') o = o.parent;
+    assert.equal(o?.userData.propId, heavy.data.id);
+    rc.set(new THREE.Vector3(2, 0.3, 0), new THREE.Vector3(0, 0, -1));
+    assert.equal(rc.intersectObjects(mgr.raycastTargets(), true).length, 0, 'a ray beside it misses');
+    mgr.clear();
+  });
+
+  loader.parseAsync = parseAsync;
+  globalPropRenderer.onLoadError = undefined;
+  if (!hadDocument) delete g.document;
+  if (!hadSelf) delete g.self;
+}
+
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
 
   () => {

@@ -12,7 +12,7 @@ import type { PropData, SceneData, Vec3 } from './model.ts';
 import { calculatePropAABB, createPropData, duplicatePropData, getBuiltinPropDefinition } from './props.ts';
 import { globalPropRenderer } from './propRenderer.ts';
 import type { SessionManager } from './session.ts';
-import { disposeTree, makeLabel, type Label } from './ui.ts';
+import { makeLabel, type Label } from './ui.ts';
 
 export interface PropObject {
   data: PropData;
@@ -78,7 +78,7 @@ export class PropsManager {
       obj.anchor?.delete?.();
       // From whatever parent holds it: a carried root sits under the controller ray.
       obj.root.removeFromParent();
-      disposeTree(obj.root);
+      globalPropRenderer.disposeProp(obj.root);
     }
     this.objects.clear();
     this.selectedId = null;
@@ -181,7 +181,7 @@ export class PropsManager {
 
     obj.anchor?.delete?.();
     obj.root.removeFromParent();
-    disposeTree(obj.root);
+    globalPropRenderer.disposeProp(obj.root);
     this.objects.delete(id);
 
     if (this.scene.props) {
@@ -220,6 +220,8 @@ export class PropsManager {
    * and three's Raycaster tests invisible lines with a 1 m threshold, so a ray
    * passing near a prop would "hit" it ahead of the furniture or actor it was
    * aimed at. A hit's parent walk still reaches the root's userData.propId.
+   * A heavy uploaded model is picked by its invisible bounds box instead of
+   * its triangles (propRenderer EXACT_PICK_MAX_TRIANGLES).
    */
   raycastTargets(): THREE.Object3D[] {
     const out: THREE.Object3D[] = [];
@@ -261,7 +263,7 @@ export class PropsManager {
     const contentGroup = await globalPropRenderer.createPropMesh(data);
     if (gen !== this.generation) {
       // The scene this prop belonged to was cleared while its model loaded.
-      disposeTree(contentGroup);
+      globalPropRenderer.disposeProp(contentGroup);
       return null;
     }
     root.add(contentGroup);
