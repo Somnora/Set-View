@@ -125,6 +125,65 @@ export class SessionManager {
     };
     const session = await navigator.xr!.requestSession('immersive-ar', init);
     this.session = session;
+    // The full 'end' handler is attached only after the awaits below. A session
+    // that ends during them, or a setSession that throws, must not leave
+    // this.session set: the 2D page would then act as if AR were still live
+    // (studios mounting into the hidden #overlay). onEnd is not called for a
+    // start that fails: startAR is still running and reports the failure.
+    let ended = false;
+    session.addEventListener(
+      'end',
+      () => {
+        ended = true;
+        if (this.session === session) this.session = null;
+      },
+      { once: true },
+    );
+    try {
+      await this.startSession(session);
+    } catch (e) {
+      this.abandonStart(session, ended);
+      throw e;
+    }
+    if (ended) {
+      this.abandonStart(session, true);
+      throw new Error('the XR session ended while it was starting');
+    }
+
+    session.addEventListener('end', () => {
+      this.viewerHitSource = null;
+      this.controllerHitSources.clear();
+      this.session = null;
+      this.reticle.visible = false;
+      onEnd();
+    });
+
+    // '?' = the browser did not report enabledFeatures, so the flag is unknown.
+    const flag = (on: boolean) => (!this.featuresReported ? '?' : on ? 'yes' : 'no');
+    this.log(
+      `session started · ref=${this.features.referenceSpace}` +
+        ` · anchors=${this.features.anchors ? 'yes' : 'no'} · overlay=${this.features.domOverlay ? 'yes' : 'no'}` +
+        ` · mesh=${flag(this.features.meshDetection)} · planes=${flag(this.features.planeDetection)}`,
+    );
+  }
+
+  /** Undoes a start() that failed after requestSession, so no stale session stays set. */
+  private abandonStart(session: XRSession, ended: boolean): void {
+    if (this.session === session) this.session = null;
+    this.viewerHitSource = null;
+    this.controllerHitSources.clear();
+    this.reticle.visible = false;
+    if (!ended) {
+      try {
+        void session.end().catch(() => {});
+      } catch {
+        /* already ending */
+      }
+    }
+  }
+
+  /** The part of start() after requestSession: features, renderer binding, hit-test sources. */
+  private async startSession(session: XRSession): Promise<void> {
     // Fresh session: clear a stuck anchor-failure latch from a prior session.
     // features.anchors is set optimistically below; without this reset, one
     // transient createAnchor failure would disable anchoring for the lifetime
@@ -188,22 +247,6 @@ export class SessionManager {
       }
     });
     for (const src of Array.from(session.inputSources)) this.addControllerHitSource(src);
-
-    session.addEventListener('end', () => {
-      this.viewerHitSource = null;
-      this.controllerHitSources.clear();
-      this.session = null;
-      this.reticle.visible = false;
-      onEnd();
-    });
-
-    // '?' = the browser did not report enabledFeatures, so the flag is unknown.
-    const flag = (on: boolean) => (!this.featuresReported ? '?' : on ? 'yes' : 'no');
-    this.log(
-      `session started · ref=${this.features.referenceSpace}` +
-        ` · anchors=${this.features.anchors ? 'yes' : 'no'} · overlay=${this.features.domOverlay ? 'yes' : 'no'}` +
-        ` · mesh=${flag(this.features.meshDetection)} · planes=${flag(this.features.planeDetection)}`,
-    );
   }
 
   /** Whether Scan Room can run in this session, and from which sources. */

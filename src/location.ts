@@ -342,6 +342,16 @@ export class LocationRenderer {
   }
 
   /**
+   * Whether `mesh` is a furniture piece of the scan shown now. False once
+   * setScan replaced (or removed) the scan it came from: clear() has then
+   * detached and disposed it, and re-attaching it would leave a ghost that no
+   * later clear() or hover list knows about.
+   */
+  ownsFurniture(mesh: THREE.Object3D): boolean {
+    return this.furniture.some((f) => f.mesh === mesh);
+  }
+
+  /**
    * Settles a just-released (or drag-cancelled) furniture mesh back onto the
    * floor plane: position y to 0, rotation to pure yaw; returns placement.
    */

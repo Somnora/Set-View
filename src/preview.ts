@@ -15,9 +15,12 @@ import { classifyShotSize, vFovDeg } from './lens.ts';
 import { buildCameraTimeline, buildTimeline, sampleCameraTimeline, sampleTimeline } from './timeline.ts';
 import type { KeyframeSystem } from './keyframes.ts';
 import { generateDawStemManifest } from './audioCues.ts';
-import { openAiAnalysisModal, openDailiesVideoStudioModal } from './ui.ts';
+import { openAiAnalysisModal, openDailiesVideoStudioModal, STUDIO_MODAL_ROOT_CLASSES } from './ui.ts';
 import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
 import { VolumetricManager } from './volumetrics.ts';
+
+/** Matches any open studio, library or exporter modal (they mount on body here). */
+const STUDIO_MODAL_SELECTOR = STUDIO_MODAL_ROOT_CLASSES.map((c) => `.${c}`).join(', ');
 
 export class DesktopPreview {
   /** True while the preview owns the renderer's animation loop. */
@@ -548,6 +551,20 @@ export class DesktopPreview {
   }
 
   private onKey(e: KeyboardEvent): void {
+    // The shortcuts are for the timeline, not for typing: a studio opened from
+    // the toolbar mounts over the preview, and Space and the arrows were
+    // swallowed in its fields while i, o and l moved the in and out points.
+    // The scrub bar is the preview's own control and keeps the shortcuts.
+    const t = e.target as HTMLElement | null;
+    if (
+      t &&
+      t !== this.scrub &&
+      (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)
+    )
+      return;
+    // Nothing reaches the timeline behind an open studio either (Escape would
+    // close the preview under it).
+    if (document.querySelector(STUDIO_MODAL_SELECTOR)) return;
     if (e.key === 'Escape') {
       this.close();
     } else if (e.key === ' ') {

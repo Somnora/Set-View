@@ -180,6 +180,10 @@ const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
 const _tip = new THREE.Vector3();
+// Reused by the carried-piece stick spin (world up taken into the ray's frame).
+const _qParentInv = new THREE.Quaternion();
+const _qSpin = new THREE.Quaternion();
+const _spinAxis = new THREE.Vector3();
 // Reused for the contextual radial's per-frame follow of its target.
 const _radialPos = new THREE.Vector3();
 
@@ -349,6 +353,13 @@ class App {
   private readonly comfortTargetBuffer: ComfortReachTarget[] = [];
   private hoverTargets: THREE.Object3D[] = [];
   private hoverTargetsVersion = -1;
+  /** The mode hoverTargets was built for: Block and Dress grab different things. */
+  private hoverTargetsMode: InteractionMode | null = null;
+  /** Uploaded prop models already reported as not shown / incomplete in this scene.
+   *  Every props.setScene (undo, redo, remote patch, AI edit) rebuilds them and
+   *  fails the same way again; each key is reported once until the scene changes. */
+  private readonly reportedPropLoadErrors = new Set<string>();
+  private readonly reportedPropLoadWarnings = new Set<string>();
 
   // Multi-user WebRTC collaborative session
   private collabSession: WebRtcCollabSession;
@@ -417,15 +428,30 @@ class App {
     this.props.onObjectsChanged = () => {
       this.contentVersion++;
     };
-    // An uploaded model that can't be shown falls back to a box: say why.
+    // An uploaded model that can't be shown falls back to a box: say why, once
+    // per model and scene. Rebuilds would otherwise bring back a dismissed
+    // banner and retake the wrist line after every undo or peer edit.
     globalPropRenderer.onLoadError = (key, err) => {
+      if (this.reportedPropLoadErrors.has(key)) return;
+      this.reportedPropLoadErrors.add(key);
       const reason = err instanceof Error ? err.message : String(err);
       this.debug.log(`prop model ${key} failed to load, showing a box: ${reason}`);
       this.noteStatus(`Prop model not shown: ${reason}`);
       // The wrist is invisible on the 2D page, where uploads are placed from.
-      this.landing.showBanner(`An uploaded prop model could not be shown (a box stands in): ${reason}`, 'error', `prop-load-${key}`);
+      // One banner for all of them, so they never push the storage and import
+      // banners (and their Export button) out of the landing's few slots.
+      const n = this.reportedPropLoadErrors.size;
+      this.landing.showBanner(
+        n === 1
+          ? `An uploaded prop model could not be shown (a box stands in): ${reason}`
+          : `${n} uploaded prop models could not be shown (boxes stand in). Latest: ${reason}`,
+        'warn',
+        'prop-load',
+      );
     };
     globalPropRenderer.onLoadWarning = (key, message) => {
+      if (this.reportedPropLoadWarnings.has(key)) return;
+      this.reportedPropLoadWarnings.add(key);
       this.debug.log(`prop model ${key}: ${message}`);
       this.noteStatus(`Prop model: ${message}`);
     };
@@ -1020,6 +1046,8 @@ class App {
     this.location.setMode(this.sceneData.locationMode ?? 'ghost');
     void this.persistence.scans.getScan(summary.id).then((scan) => {
       if (token !== this.locationSyncToken) return; // superseded
+      // A carry started while the blob loaded holds a mesh setScan disposes.
+      if (this.draggedFurniture) this.cancelActiveManipulation();
       if (!scan) {
         this.displayedScanId = null;
         this.location.setScan(null);
@@ -1175,11 +1203,17 @@ class App {
       this.sceneData.scan = summary; // old blob (if any) stays until next-launch prune
       this.displayedScanId = scan.id;
       this.locationSyncToken++; // kill any in-flight stale load
+      // The capture can land seconds after the press (realign fade, floor
+      // settle) while a piece of the old room is in hand: end that carry
+      // before setScan disposes the mesh under it.
+      if (this.draggedFurniture) this.cancelActiveManipulation();
       this.location.setScan(scan);
       this.setLocationMode('ghost'); // show alignment over passthrough for confirmation
       this.contentVersion++; // fresh furniture raycast targets
       this.markDirty();
-      this.refreshLanding();
+      // Not rebuilt in AR: the landing is hidden (its storage line would read
+      // the just-captured scan back to size it); session end re-lists it.
+      if (!this.inXRSession()) this.refreshLanding();
       this.refreshWristState();
       this.debug.log(
         `✓ scanned ${scan.meshes.length} mesh${scan.meshes.length === 1 ? '' : 'es'} · ` +
@@ -1399,6 +1433,9 @@ class App {
       // after a heavy one would be stuck at the heavy one's resolution forever. Reloading
       // the same scene (undo, restore, re-open) keeps it: the content is the same.
       this.performanceGovernor.clearKnownBadRenderScale();
+      // A different scene reports its own missing or broken prop models.
+      this.reportedPropLoadErrors.clear();
+      this.reportedPropLoadWarnings.clear();
     }
     this.selectedActorId = null;
     this.selectedPropId = null;
@@ -1455,8 +1492,12 @@ class App {
       // or restore the scene, which re-applies the persisted placements.
       const mesh = this.draggedFurniture;
       this.draggedFurniture = null;
-      this.location.group.attach(mesh);
-      this.location.commitFurniture(mesh);
+      // A scan that replaced the room mid-carry already detached and disposed
+      // this mesh; attaching it again would leave an ungrabbable ghost.
+      if (this.location.ownsFurniture(mesh)) {
+        this.location.group.attach(mesh);
+        this.location.commitFurniture(mesh);
+      }
     }
     if (this.miniGrabbing) {
       this.views.miniGrabEnd();
@@ -1489,7 +1530,8 @@ class App {
       for (const obj of this.actors.all()) this.pendingReanchorActors.push(obj);
       for (const obj of this.cams.all()) this.pendingReanchorCams.push(obj);
     }
-    this.refreshLanding();
+    // The landing is hidden in AR and re-listed when the session ends.
+    if (!this.inXRSession()) this.refreshLanding();
     this.refreshWristState();
   }
 
@@ -2278,6 +2320,8 @@ class App {
     if (this.draggedFurniture) {
       const mesh = this.draggedFurniture;
       this.draggedFurniture = null;
+      // Replaced by a new scan mid-carry: clear() already detached and disposed it.
+      if (!this.location.ownsFurniture(mesh)) return;
       this.location.group.attach(mesh); // back under contentRoot, world pose kept
       const placement = this.location.commitFurniture(mesh);
       if (placement && this.sceneData.scan) {
@@ -3284,11 +3328,24 @@ class App {
       }
     } else if (this.draggedFurniture || this.draggedProp || this.draggedCamera) {
       // Yaw the carried piece (scanned furniture, a prop or a camera) about the
-      // world up-axis (same stick gesture as rotating a dragged actor); world
-      // axis so the ray-space parent doesn't skew the spin. Being a branch of
-      // this chain, a carry also keeps the stick from snap-turning the set.
+      // world up-axis (same stick gesture as rotating a dragged actor). Its
+      // parent is the controller ray, which pitches and rolls with the hand,
+      // and rotateOnWorldAxis assumes an unrotated parent: it would spin about
+      // the ray's own Y and give a carried camera roll and pitch. So world up
+      // is expressed in the parent's frame first. Being a branch of this
+      // chain, a carry also keeps the stick from snap-turning the set.
       const held = this.draggedFurniture ?? this.draggedProp?.root ?? this.draggedCamera!.root;
-      if (Math.abs(axes.x) > 0.15) held.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
+      if (Math.abs(axes.x) > 0.15) {
+        const parent = held.parent;
+        if (parent) {
+          parent.getWorldQuaternion(_qParentInv).invert();
+          _spinAxis.copy(_up).applyQuaternion(_qParentInv);
+          _qSpin.setFromAxisAngle(_spinAxis, -axes.x * dt * 3.0);
+          held.quaternion.premultiply(_qSpin);
+        } else {
+          held.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
+        }
+      }
     } else if (this.miniGrabbing) {
       const grip = this.input.gripSpace(pointer);
       if (grip)
@@ -3600,9 +3657,18 @@ class App {
    * otherwise, meaning the modal would be invisible and the caller must refuse.
    */
   private modalHost(): HTMLElement | null {
-    if (!this.session.session) return document.body;
+    if (!this.inXRSession()) return document.body;
     if (!this.session.features.domOverlay) return null;
     return document.getElementById('overlay');
+  }
+
+  /**
+   * True while an XR session is live and presenting. Also checks three's
+   * isPresenting, so the 2D page is never treated as in-session because of a
+   * session object a failed start left behind.
+   */
+  private inXRSession(): boolean {
+    return !!this.session.session && this.renderer.xr.isPresenting;
   }
 
   /**
@@ -3666,7 +3732,7 @@ class App {
     if (patch) this.collabSession.broadcastPatch(patch);
     this.markDirty();
     // The landing page is hidden in AR and refreshed when the session ends.
-    if (!this.session.session) this.refreshLanding();
+    if (!this.inXRSession()) this.refreshLanding();
   }
 
   /**
@@ -3898,6 +3964,9 @@ class App {
             applyScenePatch(t, patch);
           },
           () => {
+            // As applyRemotePatch: a carried camera root sits on the controller
+            // ray, out of reach of the rebuild, so end the carry first.
+            if (this.draggedCamera) this.cancelActiveManipulation();
             this.cams.setScene(this.sceneData);
             this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
             this.contentVersion++;
@@ -4021,8 +4090,11 @@ class App {
           () => {
             // AI edits add and remove props, not just the dressing config: the
             // same refresh a remote set_dressing_ patch gets, so AI-added props
-            // appear without a reload.
+            // appear without a reload. A prop still carried (grip held while
+            // clicking Apply in dom-overlay) is put back first, as there, so
+            // its release cannot re-attach a disposed root as a ghost.
             this.setDressingRenderer.setConfig(this.sceneData.setDressing ?? createSetDressingConfig());
+            if (this.draggedProp) this.cancelActiveManipulation();
             this.dropPropSelectionForRebuild();
             this.props.setScene(this.sceneData);
             this.contentVersion++;
@@ -4295,7 +4367,10 @@ class App {
   private updateHover(rc: THREE.Raycaster | null): void {
     let next: Hover = null;
     if (rc && !this.draggedActor && !this.draggedCamera && !this.draggedProp && !this.draggedFurniture && !this.miniGrabbing) {
-      if (this.hoverTargetsVersion !== this.contentVersion) {
+      // Keyed on the mode as well as the content: startAR resets the mode to
+      // Block directly, so a session that ended in Dress would otherwise keep
+      // the Dress list (furniture grabbable, actors and cameras not).
+      if (this.hoverTargetsVersion !== this.contentVersion || this.hoverTargetsMode !== this.interactionMode) {
         // The mode decides what the ray can touch: blocking never hovers the
         // couch behind an actor; dressing never disturbs the blocking. Props
         // are set dressing too, so Dress can grab them; the hits below are
@@ -4305,6 +4380,7 @@ class App {
             ? [...this.actors.raycastTargets(), ...this.cams.raycastTargets(), ...this.props.raycastTargets()]
             : [...this.location.furnitureTargets(), ...this.props.raycastTargets()];
         this.hoverTargetsVersion = this.contentVersion;
+        this.hoverTargetsMode = this.interactionMode;
       }
       const hits = rc.intersectObjects(this.hoverTargets, true);
       for (const hit of hits) {

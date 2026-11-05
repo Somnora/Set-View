@@ -13572,6 +13572,293 @@ function p0MakeGlb(json: Record<string, unknown>, bin: Uint8Array): ArrayBuffer 
   if (!hadSelf) delete g.self;
 }
 
+// --- P0 integration main-seams ---
+{
+  const g = globalThis as unknown as Record<string, unknown>;
+  const hadDocument = 'document' in g;
+  const noop: unknown = new Proxy(function () {}, {
+    get: (_t, k) => (k === 'measureText' ? () => ({ width: 10 }) : noop),
+    apply: () => noop,
+    set: () => true,
+  });
+  /** Root class of the studio modal the stub document reports as open, if any. */
+  let openModalClass: string | null = null;
+  if (!hadDocument) {
+    g.document = {
+      createElement: () => ({ width: 0, height: 0, getContext: () => noop, style: {} }),
+      querySelector: (sel: string) =>
+        openModalClass && sel.split(',').some((s) => s.trim() === `.${openModalClass}`) ? {} : null,
+    };
+  }
+  const { SessionManager } = await import('../src/session.ts');
+  const { DesktopPreview } = await import('../src/preview.ts');
+
+  const asyncTest = async (name: string, fn: () => Promise<void>): Promise<void> => {
+    try {
+      await fn();
+      passed++;
+      console.log(`  ✓ ${name}`);
+    } catch (e) {
+      console.error(`  ✗ ${name}`);
+      throw e;
+    }
+  };
+
+  /** Just enough of an XRSession for SessionManager.start. */
+  class P0iFakeSession extends EventTarget {
+    enabledFeatures = ['hit-test', 'local-floor', 'dom-overlay'];
+    inputSources: unknown[] = [];
+    visibilityState = 'visible';
+    endCalls = 0;
+    ended = false;
+    /** Runs inside requestReferenceSpace('viewer'), i.e. mid-start. */
+    duringStart: (() => void) | null = null;
+    fireEnd(): void {
+      if (this.ended) return;
+      this.ended = true;
+      this.dispatchEvent(new Event('end'));
+    }
+    async end(): Promise<void> {
+      this.endCalls++;
+      this.fireEnd();
+    }
+    async requestReferenceSpace(): Promise<object> {
+      this.duringStart?.();
+      return {};
+    }
+    async requestHitTestSource(): Promise<{ cancel(): void }> {
+      return { cancel() {} };
+    }
+  }
+  const fakeRenderer = (setSession: () => Promise<void>) =>
+    ({ xr: { setReferenceSpaceType: () => {}, setSession, getReferenceSpace: () => null } }) as never;
+  const navDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  let nextSession: P0iFakeSession | null = null;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { xr: { requestSession: async () => nextSession } },
+    configurable: true,
+    writable: true,
+  });
+  try {
+    await asyncTest('P0 integration: a start whose setSession fails leaves no session behind', async () => {
+      const s = (nextSession = new P0iFakeSession());
+      const mgr = new SessionManager(
+        fakeRenderer(async () => {
+          throw new Error('makeXRCompatible failed');
+        }),
+        () => {},
+      );
+      let onEnd = 0;
+      await assert.rejects(mgr.start({} as HTMLElement, () => onEnd++), /makeXRCompatible failed/);
+      // Studios on the 2D page decide where to mount from this.
+      assert.equal(mgr.session, null, 'no stale session after a failed start');
+      assert.equal(s.endCalls, 1, 'the half-started session is ended');
+      assert.equal(onEnd, 0, 'onEnd is for a session that started');
+    });
+
+    await asyncTest('P0 integration: a session that ends mid-start is reported as a failed start', async () => {
+      const s = (nextSession = new P0iFakeSession());
+      s.duringStart = () => s.fireEnd(); // the OS ends it between the awaits
+      const mgr = new SessionManager(fakeRenderer(async () => {}), () => {});
+      let onEnd = 0;
+      await assert.rejects(mgr.start({} as HTMLElement, () => onEnd++), /ended while it was starting/);
+      assert.equal(mgr.session, null);
+      assert.equal(s.endCalls, 0, 'an ended session is not ended again');
+      assert.equal(onEnd, 0);
+    });
+
+    await asyncTest('P0 integration: a normal start keeps the session until its end, then onEnd runs once', async () => {
+      const s = (nextSession = new P0iFakeSession());
+      const mgr = new SessionManager(fakeRenderer(async () => {}), () => {});
+      let onEnd = 0;
+      await mgr.start({} as HTMLElement, () => onEnd++);
+      assert.equal(mgr.session, s as unknown as XRSession);
+      assert.equal(mgr.features.domOverlay, true);
+      assert.equal(mgr.features.referenceSpace, 'local-floor');
+      s.fireEnd();
+      assert.equal(mgr.session, null);
+      assert.equal(onEnd, 1);
+    });
+  } finally {
+    if (navDesc) Object.defineProperty(globalThis, 'navigator', navDesc);
+    else delete g.navigator;
+  }
+
+  test('P0 integration: preview shortcuts leave typing and open studios alone', () => {
+    let toggles = 0;
+    let steps = 0;
+    let marks = 0;
+    let loops = 0;
+    const kf = {
+      playing: false,
+      play: () => toggles++,
+      pause: () => toggles++,
+      stepFrames: () => steps++,
+      setInPoint: () => marks++,
+      setOutPoint: () => marks++,
+      toggleLoop: () => loops++,
+    };
+    const preview = new DesktopPreview({} as never, new THREE.Scene(), new THREE.Group(), kf as never, []);
+    const p = preview as unknown as { onKey(e: KeyboardEvent): void; close(): void; scrub: unknown };
+    let closes = 0;
+    p.close = () => closes++;
+    const press = (key: string, target: unknown): boolean => {
+      let prevented = false;
+      p.onKey({ key, shiftKey: false, target, preventDefault: () => (prevented = true) } as unknown as KeyboardEvent);
+      return prevented;
+    };
+    const keys = [' ', 'ArrowLeft', 'ArrowRight', 'i', 'o', 'l', 'Escape'];
+    // A studio's prompt, a text input, a contenteditable: typing is not a shortcut.
+    for (const t of [
+      { tagName: 'TEXTAREA', isContentEditable: false },
+      { tagName: 'INPUT', isContentEditable: false },
+      { tagName: 'SELECT', isContentEditable: false },
+      { tagName: 'DIV', isContentEditable: true },
+    ]) {
+      for (const k of keys) assert.equal(press(k, t), false, `"${k}" in ${t.tagName} keeps its default`);
+    }
+    assert.equal(toggles + steps + marks + loops + closes, 0, 'typing drives nothing behind the field');
+
+    // A studio open over the preview: no key reaches the timeline or closes the preview.
+    const canvas = { tagName: 'CANVAS', isContentEditable: false };
+    for (const cls of ['dressing-modal-overlay', 'screenplay-modal-overlay', 'props-modal-overlay']) {
+      openModalClass = cls;
+      for (const k of keys) press(k, canvas);
+    }
+    openModalClass = null;
+    assert.equal(toggles + steps + marks + loops + closes, 0, 'nothing behind an open studio');
+
+    // No studio and no field: the shortcuts still work, the scrub bar included.
+    assert.equal(press(' ', canvas), true);
+    assert.equal(toggles, 1);
+    press('l', canvas);
+    assert.equal(loops, 1);
+    const scrub = { tagName: 'INPUT', isContentEditable: false };
+    p.scrub = scrub;
+    assert.equal(press('ArrowRight', scrub), true, "the preview's own scrub bar keeps the arrows");
+    assert.equal(steps, 1);
+    press('Escape', canvas);
+    assert.equal(closes, 1);
+  });
+
+  test('P0 integration: furniture from a replaced scan is no longer owned (no ghost on release)', () => {
+    const loc = new LocationRenderer();
+    loc.setScan(createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']));
+    loc.setMode('ghost');
+    const [couch] = loc.furnitureTargets();
+    assert.equal(loc.ownsFurniture(couch), true);
+    // A hidden scan still owns its pieces: a release then puts the couch back.
+    loc.setMode('hidden');
+    assert.equal(loc.ownsFurniture(couch), true, 'ownership does not depend on the display mode');
+    loc.setMode('ghost');
+    const ray = new THREE.Group();
+    ray.attach(couch); // grip carry
+    loc.setScan(createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']));
+    assert.equal(couch.parent, null, 'the new scan took the carried couch off the ray');
+    assert.equal(loc.ownsFurniture(couch), false, 'so a release must not attach it again');
+    assert.ok(loc.furnitureTargets().length > 0);
+    for (const m of loc.furnitureTargets()) assert.equal(loc.ownsFurniture(m), true);
+    loc.setScan(null);
+    assert.equal(loc.ownsFurniture(couch), false);
+    assert.equal(loc.ownsFurniture(new THREE.Mesh()), false);
+  });
+
+  test('P0 integration: main.ts seams end a carry before a rebuild and key hover on the mode', () => {
+    const src = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+    const before = (body: string, first: string, then: string, what: string) => {
+      const a = body.indexOf(first);
+      const b = body.indexOf(then, a);
+      assert.ok(a >= 0 && b > a, what);
+    };
+    // A rebuild disposes what is in hand: the carry ends first.
+    before(
+      mainMethodBody(src, 'openSetDressingDialog'),
+      'if (this.draggedProp) this.cancelActiveManipulation();',
+      'this.props.setScene(this.sceneData);',
+      'AI mutate ends a prop carry before props.setScene',
+    );
+    before(
+      mainMethodBody(src, 'openScreenplayStudioDialog'),
+      'if (this.draggedCamera) this.cancelActiveManipulation();',
+      'this.cams.setScene(this.sceneData);',
+      'coverage cameras end a camera carry before cams.setScene',
+    );
+    before(
+      mainMethodBody(src, 'updatePendingScan'),
+      'if (this.draggedFurniture) this.cancelActiveManipulation();',
+      'this.location.setScan(scan);',
+      'a scan capture ends a furniture carry before setScan',
+    );
+    before(
+      mainMethodBody(src, 'syncLocation'),
+      'if (this.draggedFurniture) this.cancelActiveManipulation();',
+      'this.location.setScan(scan);',
+      'a late scan load ends a furniture carry before setScan',
+    );
+    // A disowned piece is never re-attached.
+    for (const m of ['onSqueezeUp', 'cancelActiveManipulation']) {
+      before(mainMethodBody(src, m), 'ownsFurniture(mesh)', 'this.location.group.attach(mesh)', `${m} checks ownership`);
+    }
+    // The hover list is rebuilt when the mode changes, not only the content.
+    assert.match(
+      mainMethodBody(src, 'updateHover'),
+      /this\.hoverTargetsMode !== this\.interactionMode/,
+      'hover cache keyed on interactionMode',
+    );
+    // A session object a failed start left behind does not count as AR.
+    assert.match(mainMethodBody(src, 'inXRSession'), /this\.renderer\.xr\.isPresenting/);
+    assert.match(mainMethodBody(src, 'modalHost'), /if \(!this\.inXRSession\(\)\) return document\.body;/);
+    // Prop load failures: one banner key, reported once per model and scene.
+    assert.ok(!src.includes('prop-load-${key}'), 'no per-model banner keys');
+    assert.match(src, /if \(this\.reportedPropLoadErrors\.has\(key\)\) return;/);
+    assert.match(src, /if \(this\.reportedPropLoadWarnings\.has\(key\)\) return;/);
+    assert.match(mainMethodBody(src, 'loadScene'), /this\.reportedPropLoadErrors\.clear\(\);/);
+    // The carried-piece spin turns about world up in the ray's frame;
+    // rotateOnWorldAxis (which assumes an unrotated parent) is only the
+    // fallback for a piece with no parent.
+    const spin = src.indexOf('held.quaternion.premultiply(_qSpin);');
+    const toParent = src.indexOf('parent.getWorldQuaternion(_qParentInv).invert();');
+    assert.ok(toParent > 0 && spin > toParent, 'spin axis taken into the parent frame');
+    const fallback = src.indexOf('held.rotateOnWorldAxis(_up');
+    assert.ok(fallback > spin && fallback - spin < 200, 'rotateOnWorldAxis only as the parentless fallback');
+    assert.equal(src.indexOf('held.rotateOnWorldAxis(_up', fallback + 1), -1);
+  });
+
+  test('P0 integration: the carried spin formula gives pure world yaw under a pitched ray', () => {
+    // Mirrors the stick branch in main.ts: world up taken into the parent frame.
+    const ray = new THREE.Group();
+    ray.position.set(0.2, 1.2, -0.3);
+    ray.rotation.set(-Math.PI / 6, 0.4, 0.15, 'YXZ');
+    const scene = new THREE.Group();
+    scene.add(ray);
+    const held = new THREE.Group();
+    held.position.set(0, 1.5, -2);
+    held.rotation.y = 0.2;
+    scene.add(held);
+    scene.updateMatrixWorld(true);
+    ray.attach(held);
+    const start = held.getWorldPosition(new THREE.Vector3());
+    const qInv = new THREE.Quaternion();
+    const qSpin = new THREE.Quaternion();
+    const axis = new THREE.Vector3();
+    const up = new THREE.Vector3(0, 1, 0);
+    for (let i = 0; i < 30; i++) {
+      held.parent!.getWorldQuaternion(qInv).invert();
+      axis.copy(up).applyQuaternion(qInv);
+      qSpin.setFromAxisAngle(axis, Math.PI / 60);
+      held.quaternion.premultiply(qSpin);
+    }
+    scene.attach(held);
+    const e = new THREE.Euler().setFromQuaternion(held.quaternion, 'YXZ');
+    approx(e.x, 0, 1e-6);
+    approx(e.z, 0, 1e-6);
+    approx(e.y, 0.2 + Math.PI / 2, 1e-6);
+    approx(held.getWorldPosition(new THREE.Vector3()).distanceTo(start), 0, 1e-9);
+  });
+
+  if (!hadDocument) delete g.document;
+}
+
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
 
   () => {
