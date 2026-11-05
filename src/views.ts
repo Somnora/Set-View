@@ -220,6 +220,15 @@ export class ViewManager {
     return this.teleportOffset.lengthSq() > 1e-6 || Math.abs(this.viewYaw) > 1e-4;
   }
 
+  /**
+   * True while a teleport/realign is queued behind the fade and has not been
+   * applied yet (it runs at the fade's midpoint). isShifted still reports the
+   * old offset until then.
+   */
+  get fading(): boolean {
+    return this.fadeAction !== null;
+  }
+
   private startFade(action: () => void): void {
     this.fadeStart = performance.now();
     this.fadeAction = action;

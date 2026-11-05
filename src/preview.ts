@@ -10,6 +10,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { aspectValue, computeFocusDistance, computeVillageLayout, createAtmosphereConfig, type SceneData } from './model.ts';
+import type { LocationDisplayMode } from './model.ts';
 import { classifyShotSize, vFovDeg } from './lens.ts';
 import { buildCameraTimeline, buildTimeline, sampleCameraTimeline, sampleTimeline } from './timeline.ts';
 import type { KeyframeSystem } from './keyframes.ts';
@@ -33,6 +34,10 @@ export class DesktopPreview {
   onOpenWebXRProfiler?: () => void;
   onOpenVRComfort?: () => void;
   onOpenSetDressing?: () => void;
+  /** Current scan display mode, or null when the scene has no scan (no button). */
+  getLocationMode?: () => LocationDisplayMode | null;
+  /** Advances the scan display mode (Hidden, Ghost, Solid, Wireframe). */
+  onCycleLocationMode?: () => void;
 
 
   private renderer: THREE.WebGLRenderer;
@@ -65,6 +70,7 @@ export class DesktopPreview {
   private lensBtn: HTMLButtonElement | null = null;
   private loopBtn: HTMLButtonElement | null = null;
   private rateBtn: HTMLButtonElement | null = null;
+  private roomBtn: HTMLButtonElement | null = null;
   private scrub: HTMLInputElement | null = null;
   private clock: HTMLSpanElement | null = null;
   private letterbox: [HTMLDivElement, HTMLDivElement] | null = null;
@@ -163,6 +169,7 @@ export class DesktopPreview {
 
     this.bar?.remove();
     this.bar = null;
+    this.roomBtn = null;
     if (this.letterbox) {
       this.letterbox[0].remove();
       this.letterbox[1].remove();
@@ -343,6 +350,12 @@ export class DesktopPreview {
       return b;
     };
     this.lensBtn = btn('View: Orbit', () => this.cycleLens());
+    if (this.onCycleLocationMode && this.getLocationMode?.()) {
+      this.roomBtn = btn(this.roomLabel(), () => {
+        this.onCycleLocationMode?.();
+        if (this.roomBtn) this.roomBtn.textContent = this.roomLabel();
+      });
+    }
     btn('|< -1F', () => { this.keyframes.stepFrames(-1); this.syncBar(); });
     this.playBtn = btn('▶ Play', () => this.togglePlay());
     btn('+1F >|', () => { this.keyframes.stepFrames(1); this.syncBar(); });
@@ -488,6 +501,11 @@ export class DesktopPreview {
       this.letterbox[0].style.display = 'none';
       this.letterbox[1].style.display = 'none';
     }
+  }
+
+  private roomLabel(): string {
+    const mode = this.getLocationMode?.() ?? 'hidden';
+    return `Room: ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`;
   }
 
   /** Orbit → CAM A → CAM B → Video Village (if 2+ cams) → Orbit. */

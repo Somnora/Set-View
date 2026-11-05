@@ -27,7 +27,8 @@
 import { uid, type ScanSummary, type Vec3 } from './model.ts';
 
 export interface ScanMeshData {
-  /** Semantic label from the platform ('global mesh', 'table', 'couch', …). */
+  /** Semantic label from the platform ('global mesh', 'table', 'couch', …),
+   *  normalized at capture; older stored scans may carry raw spellings. */
   label: string;
   /** Vertex positions as xyz triplets, scene space, meters. */
   positions: Float32Array;
@@ -65,12 +66,176 @@ export function transformPositions(positions: Float32Array, m: ArrayLike<number>
 
 // --- furniture placement (movable labeled meshes) ---------------------------
 
-/** The platform's whole-room mesh label; everything else is a movable piece. */
+/** The platform's whole-room mesh label (the room shell, never movable). */
 export const GLOBAL_MESH_LABEL = 'global mesh';
+
+/** Label for a mesh or plane the platform did not classify (static). */
+export const UNLABELED_SCAN_LABEL = 'unlabeled';
+
+/**
+ * Platform label spellings folded onto one canonical label. Keys are already
+ * lowercased, trimmed, and have '_' / '-' turned into spaces. Quest emits
+ * 'wall face', 'door frame', 'window frame', 'invisible wall face' and
+ * 'storage'; the synthetic test room uses 'walls'. The exact strings each
+ * headset emits are still unconfirmed on device (P0.0 probe).
+ */
+const SEMANTIC_LABEL_ALIASES: Record<string, string> = {
+  'wall face': 'wall',
+  walls: 'wall',
+  'door frame': 'door',
+  'window frame': 'window',
+  'invisible wall face': 'window',
+  storage: 'shelf',
+  sofa: 'couch',
+};
+
+/**
+ * Canonical form of a platform semantic label: lowercase, trimmed, with known
+ * aliases folded ('door frame' to 'door', 'storage' to 'shelf', ...). A missing
+ * or blank label becomes 'unlabeled'. Idempotent, so stored scans that still
+ * carry raw platform labels can be normalized again on load.
+ */
+export function normalizeSemanticLabel(raw: string | null | undefined): string {
+  if (typeof raw !== 'string') return UNLABELED_SCAN_LABEL;
+  // Trim last: a leading or trailing '_' / '-' becomes a space first.
+  const key = raw.toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!key) return UNLABELED_SCAN_LABEL;
+  return SEMANTIC_LABEL_ALIASES[key] ?? key;
+}
+
+/**
+ * Bounded furniture the user may pick up and re-place. Everything else
+ * (floor, ceiling, walls, doors, windows, wall art, the room shell and
+ * unlabeled geometry) stays put: grabbing a floor or a wall is never intended.
+ */
+export const MOVABLE_SCAN_LABELS: ReadonlySet<string> = new Set([
+  'table',
+  'desk',
+  'couch',
+  'chair',
+  'shelf',
+  'bed',
+  'screen',
+  'lamp',
+  'plant',
+  'other',
+]);
 
 /** True for scan meshes the user can pick up and re-place (Stage 1). */
 export function isMovableScanMesh(label: string): boolean {
-  return label.toLowerCase() !== GLOBAL_MESH_LABEL;
+  return MOVABLE_SCAN_LABELS.has(normalizeSemanticLabel(label));
+}
+
+// --- floor height ---------------------------------------------------------------
+
+/**
+ * Height of the scan's labelled floor in the scan's own space: the lowest
+ * vertex of the meshes or planes labelled 'floor'. Null when nothing is
+ * labelled floor. Unlabelled geometry is deliberately not used: a depth-built
+ * room mesh can hold phantom surfaces below a glossy floor, and treating one
+ * as the floor would sink the whole scene.
+ */
+export function scanFloorY(scan: LocationScan): number | null {
+  let min = Infinity;
+  for (const m of scan.meshes) {
+    if (normalizeSemanticLabel(m.label) !== 'floor') continue;
+    const p = m.positions;
+    for (let i = 1; i < p.length; i += 3) if (p[i] < min) min = p[i];
+  }
+  return Number.isFinite(min) ? min : null;
+}
+
+/** Moves every vertex of a scan up by dy meters (in place). */
+export function translateScanY(scan: LocationScan, dy: number): void {
+  for (const m of scan.meshes) {
+    const p = m.positions;
+    for (let i = 1; i < p.length; i += 3) p[i] += dy;
+  }
+}
+
+// --- capture capability -------------------------------------------------------
+
+/** Where Scan Room can read room geometry from. */
+export type ScanSource = 'meshes' | 'planes';
+
+export interface ScanCapability {
+  canScan: boolean;
+  /** Sources capture may read, preferred first. */
+  sources: ScanSource[];
+  /** Short user-facing line: why scanning is refused, or what it will read. */
+  reason: string;
+}
+
+/**
+ * Whether Scan Room can run in this session. `enabledFeatures` is
+ * XRSession.enabledFeatures; `reported` is false when the browser did not
+ * expose that list. Unreported features are unknown, not absent, so both
+ * sources are tried instead of refusing (capture simply finds nothing and
+ * times out if neither exists). Meshes are preferred: Quest Scene Mesh is
+ * denser than its planes; planes are the Android XR path.
+ */
+export function scanCapability(input: { enabledFeatures: readonly string[]; reported: boolean }): ScanCapability {
+  if (!input.reported) {
+    return { canScan: true, sources: ['meshes', 'planes'], reason: 'features not reported, trying meshes and planes' };
+  }
+  const sources: ScanSource[] = [];
+  if (input.enabledFeatures.includes('mesh-detection')) sources.push('meshes');
+  if (input.enabledFeatures.includes('plane-detection')) sources.push('planes');
+  if (sources.length === 0) {
+    return { canScan: false, sources, reason: 'browser has no mesh or plane detection' };
+  }
+  const reason =
+    sources.length === 2 ? 'room mesh, planes as fallback' : sources[0] === 'meshes' ? 'room mesh' : 'detected planes';
+  return { canScan: true, sources, reason };
+}
+
+// --- room capture (Space Setup) -----------------------------------------------
+
+/** Why a Space Setup request is refused before the platform is even asked. */
+export type RoomCaptureRefusal = 'no-session' | 'unsupported' | 'no-plane-detection' | 'already-used';
+
+/**
+ * Pre-flight for XRSession.initiateRoomCapture: the spec allows one call per
+ * session, it rejects without plane-detection, and Chrome ships it as a stub
+ * that resolves without capturing. Null = a request may be made.
+ */
+export function roomCaptureRefusal(input: {
+  hasSession: boolean;
+  /** typeof session.initiateRoomCapture === 'function' */
+  hasApi: boolean;
+  enabledFeatures: readonly string[];
+  /** Already called once in this session. */
+  used: boolean;
+}): RoomCaptureRefusal | null {
+  if (!input.hasSession) return 'no-session';
+  if (!input.hasApi) return 'unsupported';
+  if (!input.enabledFeatures.includes('plane-detection')) return 'no-plane-detection';
+  if (input.used) return 'already-used';
+  return null;
+}
+
+/**
+ * User text for a Space Setup request that did not run: a RoomCaptureRefusal
+ * or the DOMException name initiateRoomCapture rejected with. The first ~40
+ * characters are what the wrist debug tail shows, so the gist comes first.
+ */
+export function roomCaptureMessage(errName: string): string {
+  switch (errName) {
+    case 'NotSupportedError':
+    case 'unsupported':
+      return 'Space Setup not available here: run it in Quest Settings';
+    case 'InvalidStateError':
+    case 'already-used':
+      return 'Space Setup already used this session: re-enter AR to run it again';
+    case 'OperationError':
+      return 'Space Setup did not finish: run it in Quest Settings';
+    case 'no-plane-detection':
+      return 'Space Setup needs plane detection: not granted in this session';
+    case 'no-session':
+      return 'Space Setup needs an AR session';
+    default:
+      return `Space Setup failed (${errName || 'unknown error'}): run it in Quest Settings`;
+  }
 }
 
 /**

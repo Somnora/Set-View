@@ -11,7 +11,7 @@
 import * as THREE from 'three';
 import { uid } from './model.ts';
 import type { LocationScan, ScanMeshData } from './scan.ts';
-import { transformPositions } from './scan.ts';
+import { GLOBAL_MESH_LABEL, normalizeSemanticLabel, transformPositions } from './scan.ts';
 
 const _meshMatrix = new THREE.Matrix4();
 
@@ -101,8 +101,10 @@ function triangulatePlanePolygon(
     indices[i * 3 + 2] = i + 2;
   }
 
-  const label = plane.semanticLabel
-    ? plane.semanticLabel.toLowerCase()
+  // Unlabeled planes (Chrome may report none) fall back to their orientation.
+  // Both fallbacks are static, so a mislabeled table top can't become grabbable.
+  const label = plane.semanticLabel?.trim()
+    ? normalizeSemanticLabel(plane.semanticLabel)
     : plane.orientation === 'horizontal'
       ? 'floor'
       : 'wall';
@@ -156,7 +158,8 @@ export function captureScanFromFrame(
       if (!sanitized) continue;
 
       meshes.push({
-        label: mesh.semanticLabel ? mesh.semanticLabel.toLowerCase() : 'global mesh',
+        // No label = the room shell. A blank one normalizes to 'unlabeled'; both are static.
+        label: mesh.semanticLabel ? normalizeSemanticLabel(mesh.semanticLabel) : GLOBAL_MESH_LABEL,
         positions: sanitized.positions,
         indices: sanitized.indices,
       });

@@ -14,6 +14,13 @@
 // real floor), so a lowest-hit ABOVE y=0 proves nothing and is never
 // "corrected". Below y=0 there is no real geometry to hit unless the floor
 // origin is wrong.
+//
+// Scan Room freezes the estimate at capture: a re-base after that would move
+// the freshly captured room off the real one. Capture first gives the scan's
+// labelled floor its own chance to re-base (floorCorrectionFromScan), so a
+// scan taken while hits had only found a desk still fixes floating actors. A
+// scan with no labelled floor gives no such evidence, and a lower hit seen
+// after its capture no longer re-bases content.
 // ---------------------------------------------------------------------------
 
 /** Only correct when the floor estimate is off by more than this. */
@@ -60,4 +67,37 @@ export function floorCorrection(e: FloorEstimate, headY: number, timeMs: number)
   const correctedEye = headY - e.minHitY;
   if (correctedEye < FLOOR_MIN_EYE_M || correctedEye > FLOOR_MAX_EYE_M) return null;
   return e.minHitY;
+}
+
+/**
+ * True once the estimate has had its chance to re-base content: a correction
+ * was committed, or the settle window has passed with enough hits and
+ * floorCorrection declines to correct. Scan capture waits for this, because
+ * geometry captured before a re-base would end up at the wrong height once
+ * contentRoot moves. Not a guarantee: a much lower hit seen later could still
+ * trigger a correction, so the caller freezes the estimate at capture (sets
+ * committed) to keep a fresh scan registered to the real room, after giving
+ * the scan's own floor a chance to re-base (floorCorrectionFromScan).
+ */
+export function floorSettled(e: FloorEstimate, headY: number, timeMs: number): boolean {
+  if (e.committed) return true;
+  if (e.hits < FLOOR_MIN_HITS || timeMs - e.firstHitAt < FLOOR_SETTLE_MS) return false;
+  return floorCorrection(e, headY, timeMs) === null;
+}
+
+/**
+ * The re-base to apply at scan capture, from the scan's labelled floor height
+ * (scene space, captured before any re-base; see scanFloorY), or null. The
+ * platform's labelled floor is direct evidence of the real floor, so unlike
+ * floorCorrection it needs no hit count or settle window. The same
+ * one-directional threshold and eye-height band apply. Null once committed:
+ * an applied re-base is final. On a non-null return the caller moves the scan
+ * up by the negated offset, applies the offset, and commits.
+ */
+export function floorCorrectionFromScan(e: FloorEstimate, scanFloorY: number | null, headY: number): number | null {
+  if (e.committed || scanFloorY === null || !Number.isFinite(scanFloorY)) return null;
+  if (scanFloorY > -FLOOR_MIN_CORRECTION_M) return null; // floor plausible
+  const correctedEye = headY - scanFloorY;
+  if (correctedEye < FLOOR_MIN_EYE_M || correctedEye > FLOOR_MAX_EYE_M) return null;
+  return scanFloorY;
 }

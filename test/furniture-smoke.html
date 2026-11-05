@@ -3,6 +3,10 @@
      the real LocationRenderer and asserts re-centering, placement apply,
      grab targets, and commitFurniture floor-settling — the renderer half of
      the Stage 1 feature (the pure half lives in domain tests).
+     P0 additions: the synthetic room's floor, walls, ceiling, door and window
+     are not grab targets; the Wireframe overlay follows a moved piece; and a
+     real WebGL read-back proves Ghost still blends with the background after
+     the scan was first drawn Solid (three's OPAQUE define bug).
 
        chrome --headless=new --disable-gpu --ignore-certificate-errors \
          --enable-unsafe-swiftshader --virtual-time-budget=8000 --dump-dom \
@@ -14,6 +18,7 @@
     <script type="module">
       import * as THREE from 'three';
       import { LocationRenderer } from '../src/location.ts';
+      import { createSyntheticLocationScan } from '../src/scanExporters.ts';
 
       const out = document.getElementById('out');
       const eq = (a, b, m) => {
@@ -81,6 +86,72 @@
         eq(p.dx, 0.5, 'placement dx');
         eq(p.dz, 0.5, 'placement dz');
         if (Math.abs(p.rotY - Math.PI / 4) > 0.02) throw new Error(`yaw kept: ${p.rotY}`);
+
+        // P0.6: only bounded furniture in the synthetic room is grabbable.
+        const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+        const roomLoc = new LocationRenderer();
+        roomLoc.setScan(room);
+        roomLoc.setMode('ghost');
+        const grabbed = roomLoc
+          .furnitureTargets()
+          .map((o) => room.meshes[o.userData.scanMeshIndex].label)
+          .sort()
+          .join(',');
+        if (grabbed !== 'couch,desk,table') throw new Error(`room grab targets: ${grabbed}`);
+
+        // P0.7: the Wireframe overlay is built on first use and follows a moved piece.
+        loc.setMode('wireframe');
+        loc.applyPlacements([{ meshIndex: 1, dx: 1, dz: 0, rotY: 0 }]);
+        const wire = table.children.find((c) => c.isLineSegments);
+        if (!wire) throw new Error('no wire overlay on the table in Wireframe');
+        wire.updateWorldMatrix(true, false); // parents first: the table just moved
+        eq(new THREE.Vector3().setFromMatrixPosition(wire.matrixWorld).x, 3, 'wire follows placement x');
+
+        // P0.7: Ghost blends with the background even after a Solid compile.
+        const renderer = new THREE.WebGLRenderer();
+        const rt = new THREE.WebGLRenderTarget(16, 16);
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(1, 0, 0);
+        scene.add(new THREE.AmbientLight(0xffffff, 1));
+        const floorLoc = new LocationRenderer();
+        floorLoc.setScan({
+          version: 1,
+          id: 'f',
+          capturedAt: 1,
+          meshes: [
+            {
+              label: 'floor', // gray, wound to face up at the camera
+              positions: new Float32Array([-5, 0, -5, 5, 0, -5, 5, 0, 5, -5, 0, 5]),
+              indices: new Uint32Array([0, 2, 1, 0, 3, 2]),
+            },
+          ],
+        });
+        scene.add(floorLoc.group);
+        const cam = new THREE.PerspectiveCamera(60, 1, 0.1, 50);
+        cam.position.set(0, 3, 0);
+        cam.lookAt(0, 0, 0);
+        const px = new Uint8Array(4);
+        const sample = () => {
+          renderer.setRenderTarget(rt);
+          renderer.render(scene, cam);
+          renderer.readRenderTargetPixels(rt, 8, 8, 1, 1, px);
+          renderer.setRenderTarget(null);
+          return [px[0], px[1], px[2]];
+        };
+        floorLoc.setMode('solid'); // compiles the floor's program first, opaque
+        const solidPx = sample();
+        floorLoc.setMode('ghost');
+        const ghostPx = sample();
+        floorLoc.beginCameraPass(); // the Camera View pass forces Solid each frame
+        const passPx = sample();
+        floorLoc.endCameraPass();
+        const afterPassPx = sample();
+        if (Math.abs(solidPx[0] - solidPx[1]) > 12) throw new Error(`solid let red through: ${solidPx}`);
+        if (ghostPx[0] < solidPx[0] + 40 || ghostPx[0] < ghostPx[1] + 40)
+          throw new Error(`ghost drew opaque: solid ${solidPx} ghost ${ghostPx}`);
+        if (Math.abs(passPx[0] - solidPx[0]) > 12) throw new Error(`camera pass not solid: ${passPx}`);
+        if (Math.abs(afterPassPx[0] - ghostPx[0]) > 12) throw new Error(`ghost lost after camera pass: ${afterPassPx}`);
+        renderer.dispose();
 
         out.textContent = 'FURNITURE-SMOKE PASS';
       } catch (e) {

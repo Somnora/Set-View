@@ -194,6 +194,17 @@ import {
   transformPositions,
   type LocationScan,
 } from '../src/scan.ts';
+import { MOVABLE_SCAN_LABELS, normalizeSemanticLabel, UNLABELED_SCAN_LABEL } from '../src/scan.ts';
+import { LocationRenderer } from '../src/location.ts';
+import { scanCapability } from '../src/scan.ts';
+import { roomCaptureMessage, roomCaptureRefusal } from '../src/scan.ts';
+import { floorSettled, FLOOR_MIN_HITS, FLOOR_SETTLE_MS } from '../src/floor.ts';
+import { floorCorrectionFromScan } from '../src/floor.ts';
+import { scanFloorY, translateScanY } from '../src/scan.ts';
+import { ActorManager, type ActorObject } from '../src/actors.ts';
+import { CameraSystem, type CamObject } from '../src/cameraView.ts';
+import { ViewManager } from '../src/views.ts';
+import { isLocationDisplayMode, LOCATION_DISPLAY_MODES } from '../src/model.ts';
 import { estimateScanSizeBytes, ScanStore } from '../src/scanStore.ts';
 import {
   calculateMeshAABB,
@@ -11809,6 +11820,499 @@ test('P0 probe: copy has no em dashes and the probe stays out of src', () => {
   const page = probeFs.readFileSync(new URL('./xr-probe.ts', import.meta.url), 'utf8');
   const specifiers = Array.from(page.matchAll(/^\s*import[^'"]*['"]([^'"]+)['"]/gm), (m) => m[1]);
   assert.deepEqual(specifiers, ['three', './xr-probe-core.ts'], 'xr-probe.ts imports only three and its core');
+});
+
+// --- P0 scan ---
+
+test('P0.6 normalizeSemanticLabel: folds platform spellings onto canonical labels', () => {
+  const table: [string | null | undefined, string][] = [
+    ['door frame', 'door'],
+    ['Door Frame', 'door'],
+    ['window frame', 'window'],
+    ['invisible wall face', 'window'],
+    ['storage', 'shelf'],
+    ['wall_face', 'wall'],
+    ['  WALL FACE ', 'wall'],
+    ['walls', 'wall'],
+    ['Sofa', 'couch'],
+    ['global mesh', 'global mesh'],
+    ['Global_Mesh', 'global mesh'],
+    ['table', 'table'],
+    ['wall art', 'wall art'],
+    ['', UNLABELED_SCAN_LABEL],
+    ['   ', UNLABELED_SCAN_LABEL],
+    [null, UNLABELED_SCAN_LABEL],
+    [undefined, UNLABELED_SCAN_LABEL],
+  ];
+  for (const [raw, want] of table) {
+    assert.equal(normalizeSemanticLabel(raw), want, `normalize(${JSON.stringify(raw)})`);
+    // Idempotent: stored scans can be normalized again on load.
+    assert.equal(normalizeSemanticLabel(normalizeSemanticLabel(raw)), want);
+  }
+});
+
+test('P0.6 isMovableScanMesh: only bounded furniture is grabbable', () => {
+  for (const label of MOVABLE_SCAN_LABELS) assert.equal(isMovableScanMesh(label), true, label);
+  for (const label of ['Couch', 'storage', 'Sofa', 'other']) assert.equal(isMovableScanMesh(label), true, label);
+  for (const label of [
+    'floor',
+    'ceiling',
+    'wall',
+    'walls',
+    'wall face',
+    'door',
+    'door frame',
+    'window',
+    'window frame',
+    'invisible wall face',
+    'wall art',
+    'global mesh',
+    'unlabeled',
+    '',
+  ]) {
+    assert.equal(isMovableScanMesh(label), false, label);
+  }
+  // Every label the synthetic test room emits.
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk', 'chair', 'bed', 'shelf', 'screen']);
+  const shell = new Set(['floor', 'ceiling', 'walls', 'door', 'window']);
+  for (const m of room.meshes) assert.equal(isMovableScanMesh(m.label), !shell.has(m.label), m.label);
+});
+
+test('P0.6 LocationRenderer: the synthetic room shell is never a grab target', () => {
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+  const loc = new LocationRenderer();
+  loc.setScan(room);
+  loc.setMode('ghost');
+  const grabbed = loc.furnitureTargets().map((o) => room.meshes[o.userData.scanMeshIndex as number].label);
+  assert.deepEqual([...grabbed].sort(), ['couch', 'desk', 'table']);
+  for (const label of ['floor', 'ceiling', 'walls', 'door', 'window']) assert.ok(!grabbed.includes(label), label);
+});
+
+test('P0.4 scanCapability: meshes, planes, both, neither, or unreported', () => {
+  const questLike = ['hit-test', 'local-floor', 'anchors', 'hand-tracking', 'dom-overlay', 'mesh-detection', 'plane-detection'];
+  assert.deepEqual(scanCapability({ enabledFeatures: questLike, reported: true }).sources, ['meshes', 'planes']);
+  const questMeshOnly = questLike.filter((f) => f !== 'plane-detection');
+  const q = scanCapability({ enabledFeatures: questMeshOnly, reported: true });
+  assert.equal(q.canScan, true);
+  assert.deepEqual(q.sources, ['meshes']);
+  // Android XR Chrome: planes but no Scene Mesh. Used to dead-end with 'needs a Quest 3'.
+  const androidXrLike = ['hit-test', 'local-floor', 'anchors', 'plane-detection'];
+  const a = scanCapability({ enabledFeatures: androidXrLike, reported: true });
+  assert.equal(a.canScan, true);
+  assert.deepEqual(a.sources, ['planes']);
+  const neither = scanCapability({ enabledFeatures: ['hit-test', 'local-floor'], reported: true });
+  assert.equal(neither.canScan, false);
+  assert.deepEqual(neither.sources, []);
+  assert.ok(neither.reason.length > 0);
+  // Browser omitted enabledFeatures: unknown, so try both instead of refusing.
+  const unknown = scanCapability({ enabledFeatures: [], reported: false });
+  assert.equal(unknown.canScan, true);
+  assert.deepEqual(unknown.sources, ['meshes', 'planes']);
+});
+
+test('P0.4 floorSettled: scan capture waits for the floor estimate', () => {
+  const e = newFloorEstimate();
+  assert.equal(floorSettled(e, 1.6, 0), false, 'no evidence yet');
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(e, 0.02, 1000 + i);
+  assert.equal(floorSettled(e, 1.6, 1000 + FLOOR_SETTLE_MS - 1), false, 'inside the settle window');
+  assert.equal(floorSettled(e, 1.6, 1000 + FLOOR_SETTLE_MS), true, 'plausible floor, nothing to correct');
+
+  const low = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(low, -0.4, 1000 + i);
+  const t = 1000 + FLOOR_SETTLE_MS;
+  assert.notEqual(floorCorrection(low, 1.3, t), null);
+  assert.equal(floorSettled(low, 1.3, t), false, 'a re-base is about to happen');
+  low.committed = true; // what the loop does when it applies the correction
+  assert.equal(floorSettled(low, 1.3, t), true);
+
+  // A correction the estimator declines (implausible eye height) counts as settled.
+  const odd = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(odd, -0.4, 1000 + i);
+  assert.equal(floorCorrection(odd, 3.5, t), null);
+  assert.equal(floorSettled(odd, 3.5, t), true);
+});
+
+test('P0.4 ViewManager.fading: realign stays shifted until the fade applies it', () => {
+  const root = new THREE.Group();
+  const views = new ViewManager(root, new THREE.PerspectiveCamera());
+  views.glide(0.5, -0.25);
+  assert.equal(views.isShifted, true);
+  assert.equal(views.fading, false);
+  views.realign();
+  // This window is what used to cancel an auto-realigned scan on the next frame.
+  assert.equal(views.fading, true);
+  assert.equal(views.isShifted, true);
+  views.update(performance.now() + 1000);
+  assert.equal(views.fading, false);
+  assert.equal(views.isShifted, false);
+  assert.equal(root.position.x, 0);
+  assert.equal(root.position.z, 0);
+});
+
+test('P0.5 roomCaptureMessage: platform errors and refusals map to user text', () => {
+  assert.match(roomCaptureMessage('NotSupportedError'), /Quest Settings/);
+  assert.match(roomCaptureMessage('InvalidStateError'), /already used this session/);
+  assert.equal(roomCaptureMessage('already-used'), roomCaptureMessage('InvalidStateError'));
+  assert.match(roomCaptureMessage('OperationError'), /did not finish/);
+  assert.equal(roomCaptureMessage('unsupported'), roomCaptureMessage('NotSupportedError'));
+  assert.match(roomCaptureMessage('no-plane-detection'), /plane detection/);
+  assert.match(roomCaptureMessage('no-session'), /AR session/);
+  assert.match(roomCaptureMessage('AbortError'), /AbortError/);
+  assert.match(roomCaptureMessage(''), /unknown error/);
+  for (const name of ['NotSupportedError', 'InvalidStateError', 'OperationError', 'no-plane-detection', 'x']) {
+    // The wrist debug tail shows ~40 characters; the subject must lead.
+    assert.ok(roomCaptureMessage(name).startsWith('Space Setup'), name);
+  }
+});
+
+test('P0.5 roomCaptureRefusal: once per session, plane-detection required', () => {
+  const planes = ['hit-test', 'local-floor', 'mesh-detection', 'plane-detection'];
+  const base = { hasSession: true, hasApi: true, enabledFeatures: planes, used: false };
+  assert.equal(roomCaptureRefusal(base), null);
+  assert.equal(roomCaptureRefusal({ ...base, hasSession: false }), 'no-session');
+  assert.equal(roomCaptureRefusal({ ...base, hasApi: false }), 'unsupported');
+  assert.equal(
+    roomCaptureRefusal({ ...base, enabledFeatures: ['hit-test', 'mesh-detection'] }),
+    'no-plane-detection',
+  );
+  // Unreported features are not a grant: the spec rejects without plane-detection.
+  assert.equal(roomCaptureRefusal({ ...base, enabledFeatures: [] }), 'no-plane-detection');
+  assert.equal(roomCaptureRefusal({ ...base, used: true }), 'already-used');
+});
+
+/** Two tables (same label) plus a static floor, for the P0.7 renderer tests. */
+function twoTableScan(): LocationScan {
+  const quad = (x: number, z: number, y: number) =>
+    new Float32Array([x - 0.5, y, z - 0.5, x + 0.5, y, z - 0.5, x + 0.5, y, z + 0.5, x - 0.5, y, z + 0.5]);
+  const idx = () => new Uint32Array([0, 1, 2, 0, 2, 3]);
+  return {
+    version: 1,
+    id: 'p07',
+    capturedAt: 1,
+    meshes: [
+      { label: 'floor', positions: quad(0, 0, 0), indices: idx() },
+      { label: 'table', positions: quad(2, 3, 0.7), indices: idx() },
+      { label: 'table', positions: quad(-2, 1, 0.7), indices: idx() },
+    ],
+  };
+}
+
+function scanMeshes(loc: LocationRenderer): THREE.Mesh[] {
+  const out: THREE.Mesh[] = [];
+  loc.group.traverse((o) => {
+    if ((o as THREE.Mesh).isMesh && o.name.startsWith('scan:')) out.push(o as THREE.Mesh);
+  });
+  return out;
+}
+
+function scanWires(loc: LocationRenderer): THREE.LineSegments[] {
+  const out: THREE.LineSegments[] = [];
+  loc.group.traverse((o) => {
+    if ((o as THREE.LineSegments).isLineSegments && o.name.startsWith('scan-wire:')) out.push(o as THREE.LineSegments);
+  });
+  return out;
+}
+
+test('P0.7 LocationRenderer: Ghost and Wireframe stay translucent after a Solid compile', () => {
+  const loc = new LocationRenderer();
+  loc.setScan(twoTableScan());
+  loc.setMode('solid');
+  const seen = new Map<THREE.Material, { transparent: boolean; version: number }>();
+  const record = () => {
+    for (const m of scanMeshes(loc)) {
+      const mat = m.material as THREE.MeshLambertMaterial;
+      const prior = seen.get(mat);
+      // three bakes '#define OPAQUE' into a program compiled while transparent
+      // is false; a material whose flag later flips keeps drawing at alpha 1.
+      if (prior) assert.equal(mat.transparent, prior.transparent, 'a material flipped its transparent flag');
+      else seen.set(mat, { transparent: mat.transparent, version: mat.version });
+    }
+  };
+  for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, false);
+  record();
+  loc.setMode('ghost');
+  for (const m of scanMeshes(loc)) {
+    const mat = m.material as THREE.MeshLambertMaterial;
+    assert.equal(mat.transparent, true);
+    assert.equal(mat.opacity, 0.35);
+    assert.equal(mat.depthWrite, false);
+    assert.equal(mat.wireframe, false);
+  }
+  record();
+  // The Camera View pass forces Solid every frame and restores the mode.
+  for (let frame = 0; frame < 3; frame++) {
+    loc.beginCameraPass();
+    for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, false);
+    record();
+    loc.endCameraPass();
+    for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, true);
+    record();
+  }
+  loc.setMode('wireframe');
+  for (const m of scanMeshes(loc)) {
+    const mat = m.material as THREE.MeshLambertMaterial;
+    assert.equal(mat.transparent, true);
+    assert.equal(mat.wireframe, true);
+    assert.equal(mat.opacity, 0.85);
+  }
+  record();
+  loc.setMode('solid');
+  record();
+  // No mode switch or camera pass forces a shader recompile (version bump).
+  for (const [mat, { version }] of seen) assert.equal(mat.version, version);
+});
+
+test('P0.7 LocationRenderer: wire overlay is lazy, keyed by mesh index, and follows furniture', () => {
+  const loc = new LocationRenderer();
+  const scan = twoTableScan();
+  loc.setScan(scan);
+  loc.setMode('ghost');
+  assert.equal(scanWires(loc).length, 0, 'no edge geometry until Wireframe is first shown');
+  loc.setMode('wireframe');
+  const wires = scanWires(loc);
+  assert.equal(wires.length, scan.meshes.length);
+  const meshes = scanMeshes(loc);
+  for (const w of wires) {
+    assert.ok(meshes.includes(w.parent as THREE.Mesh), 'wire is parented to its own mesh');
+    assert.equal(w.visible, true);
+  }
+  // Two tables share a label: each must still get its own overlay.
+  const [t1, t2] = loc.furnitureTargets();
+  const wireOf = (o: THREE.Object3D) => o.children.find((c) => (c as THREE.LineSegments).isLineSegments)!;
+  assert.notEqual(wireOf(t1), wireOf(t2));
+  assert.equal(wireOf(t1).name, `scan-wire:${t1.userData.scanMeshIndex}`);
+
+  const worldOf = (o: THREE.Object3D) => {
+    o.updateWorldMatrix(true, false);
+    return new THREE.Vector3().setFromMatrixPosition(o.matrixWorld);
+  };
+  loc.applyPlacements([{ meshIndex: 2, dx: 1, dz: -1, rotY: Math.PI / 2 }]);
+  const placed = loc.furnitureTargets().find((m) => m.userData.scanMeshIndex === 2)!;
+  assert.ok(worldOf(wireOf(placed)).distanceTo(worldOf(placed)) < 1e-9);
+  approx(worldOf(placed).x, -1);
+  approx(worldOf(placed).z, 0);
+  // A carry then commitFurniture: the overlay stays on the piece.
+  placed.position.set(4, 0.3, 4);
+  placed.rotation.set(0.1, 0.5, 0);
+  loc.commitFurniture(placed);
+  assert.ok(worldOf(wireOf(placed)).distanceTo(worldOf(placed)) < 1e-9);
+  approx(worldOf(wireOf(placed)).x, 4);
+  // Reloading the same scan with no placements puts both back as captured.
+  loc.applyPlacements(undefined);
+  approx(worldOf(wireOf(placed)).x, -2);
+  approx(worldOf(wireOf(placed)).z, 1);
+
+  // Hidden hides the overlay; Ghost hides it again too (overlay flag off).
+  loc.setMode('ghost');
+  for (const w of scanWires(loc)) assert.equal(w.visible, false);
+  loc.setWireframeOverlay(true);
+  for (const w of scanWires(loc)) assert.equal(w.visible, true);
+  loc.setMode('hidden');
+  for (const w of scanWires(loc)) assert.equal(w.visible, false);
+});
+
+test('P0.7 LocationRenderer: wires never steal a furniture raycast; setScan(null) clears all', () => {
+  const loc = new LocationRenderer();
+  loc.setScan(twoTableScan());
+  loc.setMode('wireframe');
+  // The fixture quads wind facing down (front side), so aim up from below.
+  const rc = new THREE.Raycaster(new THREE.Vector3(2, -1, 3), new THREE.Vector3(0, 1, 0));
+  loc.group.updateMatrixWorld(true);
+  const hits = rc.intersectObjects(loc.furnitureTargets(), true);
+  assert.ok(hits.length > 0);
+  for (const h of hits) assert.equal(typeof h.object.userData.scanMeshIndex, 'number');
+
+  loc.setScan(null);
+  assert.equal(loc.hasScan, false);
+  assert.equal(scanMeshes(loc).length, 0);
+  assert.equal(scanWires(loc).length, 0);
+  assert.equal(loc.group.visible, false);
+});
+
+test('P0.7 locationMode: validated, defaults to ghost with a scan, survives a round-trip', () => {
+  for (const m of LOCATION_DISPLAY_MODES) assert.equal(isLocationDisplayMode(m), true, m);
+  assert.equal(isLocationDisplayMode('neon'), false);
+  assert.equal(isLocationDisplayMode(undefined), false);
+
+  const withScan = () => {
+    const s = createScene('loc mode');
+    s.scan = { id: 'b', capturedAt: 1, vertices: 3, triangles: 1, boundsMin: { x: 0, y: 0, z: 0 }, boundsMax: { x: 1, y: 1, z: 1 } };
+    return s;
+  };
+  assert.equal(normalizeScene(withScan()).locationMode, 'ghost', 'a reloaded scan is visible, not hidden');
+  assert.equal(normalizeScene(createScene('no scan')).locationMode, undefined);
+
+  const solid = withScan();
+  solid.locationMode = 'solid';
+  const back = normalizeScene(JSON.parse(JSON.stringify(solid)));
+  assert.equal(back.locationMode, 'solid');
+
+  const bad = withScan() as unknown as Record<string, unknown>;
+  bad.locationMode = 'neon';
+  assert.equal(isSceneData(bad), true, 'a bad view preference does not fail an import');
+  assert.equal(normalizeScene(bad as unknown as ReturnType<typeof createScene>).locationMode, 'ghost');
+});
+
+test('P0.6 normalizeSemanticLabel: edge separators normalize idempotently', () => {
+  const table: [string, string][] = [
+    ['table_', 'table'],
+    ['_wall_face', 'wall'],
+    ['door-frame-', 'door'],
+    ['-Window_Frame ', 'window'],
+    ['__', UNLABELED_SCAN_LABEL],
+  ];
+  for (const [raw, want] of table) {
+    assert.equal(normalizeSemanticLabel(raw), want, `normalize(${JSON.stringify(raw)})`);
+    assert.equal(normalizeSemanticLabel(normalizeSemanticLabel(raw)), want);
+  }
+  assert.equal(isMovableScanMesh('table_'), true);
+});
+
+test('P0.4 scanFloorY / translateScanY: the labelled floor only', () => {
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+  approx(scanFloorY(room)!, -0.05); // the synthetic floor slab is 5 cm thick
+  translateScanY(room, 0.4);
+  approx(scanFloorY(room)!, 0.35);
+  approx(summarizeScan(room).boundsMin.y, 0.35);
+  // Raw platform spellings count once normalized.
+  const raw: LocationScan = {
+    version: 1,
+    id: 'f',
+    capturedAt: 1,
+    meshes: [
+      { label: 'global mesh', positions: new Float32Array([0, -1.2, 0, 1, -1.2, 0, 0, -1.2, 1]), indices: new Uint32Array([0, 1, 2]) },
+      { label: 'Floor', positions: new Float32Array([0, -0.4, 0, 1, -0.41, 0, 0, -0.4, 1]), indices: new Uint32Array([0, 1, 2]) },
+    ],
+  };
+  // The unlabelled -1.2 m surface (a phantom under a glossy floor) is ignored.
+  approx(scanFloorY(raw)!, -0.41);
+  raw.meshes.pop();
+  assert.equal(scanFloorY(raw), null, 'no labelled floor, no evidence');
+  assert.equal(scanFloorY({ version: 1, id: 'e', capturedAt: 1, meshes: [] }), null);
+});
+
+test('P0.4 floorCorrectionFromScan: a scan taken before the hits re-based still fixes the floor', () => {
+  // The review case: hits only landed on a desk, so the estimate settled
+  // without correcting, and Scan Room then froze it.
+  const desk = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(desk, 0.72, 1000 + i);
+  const t = 1000 + FLOOR_SETTLE_MS;
+  assert.equal(floorSettled(desk, 1.25, t), true);
+  assert.equal(floorCorrection(desk, 1.25, t), null);
+  // The scan's floor sits 0.4 m below the scene origin: re-base by -0.4.
+  approx(floorCorrectionFromScan(desk, -0.4, 1.25)!, -0.4);
+  // After the caller lifts the scan and commits, nothing more happens.
+  const lifted = createSyntheticLocationScan(6, 5, 2.8, []);
+  translateScanY(lifted, -0.35); // floor top at -0.35, slab bottom at -0.40
+  const fix = floorCorrectionFromScan(desk, scanFloorY(lifted), 1.25)!;
+  approx(fix, -0.4);
+  translateScanY(lifted, -fix);
+  approx(scanFloorY(lifted)!, 0);
+  assert.equal(floorCorrectionFromScan(desk, scanFloorY(lifted), 1.25), null, 'a re-based scan is plausible');
+  desk.committed = true;
+  assert.equal(floorCorrectionFromScan(desk, -0.4, 1.25), null, 'committed is final');
+
+  const fresh = newFloorEstimate(); // no hits at all (the 5 s cap)
+  approx(floorCorrectionFromScan(fresh, -0.5, 1.1)!, -0.5);
+  assert.equal(floorCorrectionFromScan(fresh, -0.1, 1.6), null, 'within tolerance');
+  assert.equal(floorCorrectionFromScan(fresh, 0.3, 1.6), null, 'one-directional');
+  assert.equal(floorCorrectionFromScan(fresh, null, 1.6), null, 'no labelled floor');
+  assert.equal(floorCorrectionFromScan(fresh, Number.NaN, 1.6), null);
+  assert.equal(floorCorrectionFromScan(fresh, -2.0, 1.6), null, 'implausible eye height (3.6 m)');
+});
+
+test('P0.5 reanchor: a stale createAnchor result is deleted, never assigned over a newer one', () => {
+  // A thenable that resolves when the test says so, keeping the test synchronous.
+  type Fake = { name: string; deleted: boolean; delete(): void };
+  const pending: ((a: Fake | null) => void)[] = [];
+  const session = {
+    createAnchor: () => ({ then: (cb: (a: Fake | null) => void) => void pending.push(cb) }),
+  };
+  const fake = (name: string): Fake => ({ name, deleted: false, delete() { this.deleted = true; } });
+  const run = (reanchor: (obj: never, frame: never) => void, obj: { data: { id: string } }) => {
+    pending.length = 0;
+    const self = { session, objects: new Map([[obj.data.id, obj]]) };
+    reanchor.call(self, obj as never, {} as never);
+    reanchor.call(self, obj as never, {} as never); // a second queue one frame later
+    const a1 = fake('A1');
+    const a2 = fake('A2');
+    pending[1](a2);
+    pending[0](a1); // the older request lands last
+    assert.equal((obj as unknown as { anchor: Fake }).anchor, a2);
+    assert.equal(a1.deleted, true, 'the stale anchor is released, not leaked');
+    assert.equal(a2.deleted, false);
+    // A removed object still releases a late anchor.
+    reanchor.call(self, obj as never, {} as never);
+    self.objects.clear();
+    const a3 = fake('A3');
+    pending[2](a3);
+    assert.equal(a3.deleted, true);
+  };
+  const actor = { data: { id: 'act', position: { x: 0, y: 0, z: 0 } }, anchor: null } as unknown as ActorObject;
+  run(ActorManager.prototype.reanchor as never, actor as never);
+  const cam = { data: { id: 'cam', position: { x: 1, y: 1.5, z: 0 } }, anchor: null } as unknown as CamObject;
+  run(CameraSystem.prototype.reanchor as never, cam as never);
+});
+
+test('P0.6 LocationRenderer: a placement saved on a now-static piece still renders, ungrabbable', () => {
+  const quad = (x: number, z: number, y: number) =>
+    new Float32Array([x - 0.5, y, z - 0.5, x + 0.5, y, z - 0.5, x + 0.5, y, z + 0.5, x - 0.5, y, z + 0.5]);
+  const idx = () => new Uint32Array([0, 1, 2, 0, 2, 3]);
+  const scan: LocationScan = {
+    version: 1,
+    id: 'p06',
+    capturedAt: 1,
+    meshes: [
+      { label: 'wall art', positions: quad(2, 3, 1.5), indices: idx() }, // grabbable before P0.6
+      { label: 'table', positions: quad(-2, 1, 0.7), indices: idx() },
+    ],
+  };
+  const loc = new LocationRenderer();
+  loc.setScan(scan);
+  loc.setMode('ghost');
+  const art = scanMeshes(loc)[0];
+  assert.equal(art.name, 'scan:wall art');
+  assert.ok(!loc.furnitureTargets().includes(art), 'static pieces are not grab targets');
+  const worldVertex = (mesh: THREE.Mesh, i: number) => {
+    mesh.updateWorldMatrix(true, false);
+    return new THREE.Vector3().fromBufferAttribute(mesh.geometry.getAttribute('position') as THREE.BufferAttribute, i).applyMatrix4(mesh.matrixWorld);
+  };
+  const placement = { meshIndex: 0, dx: 1, dz: -0.5, rotY: Math.PI / 2 };
+  loc.applyPlacements([placement, { meshIndex: 1, dx: 0.5, dz: 0, rotY: 0 }]);
+  // Same transform the furniture path gives: yaw about the footprint center
+  // (2, 3), then move by (dx, dz). Vertex 0 = (1.5, 1.5, 2.5): offset (-0.5, -0.5)
+  // yawed 90 degrees is (-0.5, 0.5), so it lands at (2 + 1 - 0.5, 3 - 0.5 + 0.5).
+  const v = worldVertex(art, 0);
+  approx(v.x, 2.5);
+  approx(v.y, 1.5);
+  approx(v.z, 3);
+  // The footprint center itself moves by exactly (dx, dz).
+  art.updateWorldMatrix(true, false);
+  const c = new THREE.Vector3(2, 0, 3).applyMatrix4(art.matrixWorld);
+  approx(c.x, 3);
+  approx(c.z, 2.5);
+  // The table keeps the furniture path.
+  const table = loc.furnitureTargets()[0];
+  approx(table.position.x, -1.5);
+  // Undo back to no placements: as captured again.
+  loc.applyPlacements(undefined);
+  const back = worldVertex(art, 0);
+  approx(back.x, 1.5);
+  approx(back.z, 2.5);
+  assert.equal(art.rotation.y, 0);
+});
+
+test('P0.7 locationMode: removing the scan drops the mode, so the next scan starts in Ghost', () => {
+  const s = createScene('loc mode removed');
+  s.scan = { id: 'b', capturedAt: 1, vertices: 3, triangles: 1, boundsMin: { x: 0, y: 0, z: 0 }, boundsMax: { x: 1, y: 1, z: 1 } };
+  s.locationMode = 'hidden';
+  assert.equal(normalizeScene(s).locationMode, 'hidden', 'kept while the scan exists');
+  s.scan = null; // Remove scan
+  const reloaded = normalizeScene(JSON.parse(JSON.stringify(s)));
+  assert.equal(reloaded.locationMode, undefined);
+  // Add Test Room on that scene.
+  reloaded.scan = summarizeScan(createSyntheticLocationScan(6, 5, 2.8, ['couch']));
+  assert.equal(normalizeScene(reloaded).locationMode, 'ghost');
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(

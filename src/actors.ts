@@ -43,6 +43,8 @@ export interface ActorObject {
   body: THREE.Group;
   skinnedInstance?: SkinnedHumanoidInstance;
   anchor: XRAnchor | null;
+  /** Bumped by each reanchor; a createAnchor resolving for an older one is stale. */
+  anchorGen?: number;
   /** True while grabbed or driven by playback — anchor updates pause. */
   overridden: boolean;
   walkPhase: number;
@@ -165,9 +167,13 @@ export class ActorManager {
   reanchor(obj: ActorObject, frame: XRFrame): void {
     obj.anchor?.delete?.();
     obj.anchor = null;
+    const gen = (obj.anchorGen ?? 0) + 1;
+    obj.anchorGen = gen;
     const p = obj.data.position;
     void this.session.createAnchor(frame, new THREE.Vector3(p.x, p.y, p.z)).then((anchor) => {
-      if (this.objects.get(obj.data.id) !== obj) {
+      // Removed, replaced, or re-anchored again while this request was in
+      // flight: the stale anchor must not overwrite (and leak) the newer one.
+      if (this.objects.get(obj.data.id) !== obj || obj.anchorGen !== gen) {
         anchor?.delete?.();
         return;
       }

@@ -10,7 +10,11 @@
 
      Inspect the PNG: grid + three posed gray-box actors (one seated at the
      end of a dotted path, one lying, one standing) + a camera gizmo + the
-     preview toolbar. The <pre> also reports PREVIEW-SMOKE PASS/FAIL. -->
+     preview toolbar. The <pre> also reports PREVIEW-SMOKE PASS/FAIL.
+
+     ?scan adds the synthetic test room the way a reload restores it (scene
+     JSON normalized, so locationMode defaults to Ghost) and asserts it is
+     visible and that the toolbar's Room button cycles the display mode. -->
 <html>
   <head><meta charset="utf-8" /><title>desktop preview smoke</title>
   <link rel="stylesheet" href="../src/style.css" /></head>
@@ -18,11 +22,16 @@
     <pre id="out" style="position:fixed;top:8px;left:8px;z-index:20;color:#9f6">running…</pre>
     <script type="module">
       import * as THREE from 'three';
-      import { addKeyframe, createActor, createCameraSetup, createScene } from '../src/model.ts';
+      import { addKeyframe, createActor, createCameraSetup, createScene, normalizeScene } from '../src/model.ts';
       import { SessionManager } from '../src/session.ts';
       import { ActorManager } from '../src/actors.ts';
       import { KeyframeSystem } from '../src/keyframes.ts';
       import { DesktopPreview } from '../src/preview.ts';
+      // ?scan fixtures. Imported statically so the module graph is loaded
+      // before the first frame (keeps the run inside the virtual-time budget).
+      import { LocationRenderer } from '../src/location.ts';
+      import { createSyntheticLocationScan } from '../src/scanExporters.ts';
+      import { summarizeScan } from '../src/scan.ts';
 
       const out = document.getElementById('out');
       try {
@@ -75,6 +84,19 @@
         keyframes.setScene(scene);
 
         const preview = new DesktopPreview(renderer, scene3, contentRoot, keyframes, []);
+        let scanLoc = null;
+        if (params.has('scan')) {
+          const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+          scene.scan = summarizeScan(room);
+          // What a reload does: the saved JSON is normalized (no mode saved yet).
+          const reloaded = normalizeScene(JSON.parse(JSON.stringify(scene)));
+          scanLoc = new LocationRenderer();
+          contentRoot.add(scanLoc.group);
+          scanLoc.setMode(reloaded.locationMode ?? 'hidden');
+          scanLoc.setScan(room);
+          preview.getLocationMode = () => scanLoc.mode;
+          preview.onCycleLocationMode = () => scanLoc.cycleMode();
+        }
         // ?focus=x,z zooms the orbit onto one spot (stance close-ups).
         const focus = params.get('focus');
         let bounds = new THREE.Box3(new THREE.Vector3(-2, 0, -2), new THREE.Vector3(2, 1.8, 2.2));
@@ -101,14 +123,30 @@
           if (frames < 10) return requestAnimationFrame(check);
           const gl = renderer.getContext();
           const err = gl.getError();
+          let scanOk = true;
+          let scanNote = '';
+          if (scanLoc) {
+            const roomBtn = [...document.querySelectorAll('.preview-bar button')].find((b) =>
+              b.textContent.startsWith('Room:'),
+            );
+            const before = roomBtn?.textContent;
+            roomBtn?.click();
+            const after = roomBtn?.textContent;
+            scanOk = scanLoc.group.visible && before === 'Room: Ghost' && after === 'Room: Solid';
+            scanNote = ` scan visible=${scanLoc.group.visible} room=${before}->${after}`;
+            roomBtn?.click(); // Wireframe
+            roomBtn?.click(); // Hidden
+            roomBtn?.click(); // back to Ghost for the screenshot
+          }
           const ok =
             err === 0 &&
             preview.active &&
             document.querySelector('.preview-bar') !== null &&
+            scanOk &&
             (params.has('gallery') || keyframes.duration > 0); // gallery has no moves
           out.textContent = ok
-            ? 'PREVIEW-SMOKE PASS'
-            : `PREVIEW-SMOKE FAIL: glError=${err} active=${preview.active} dur=${keyframes.duration}`;
+            ? `PREVIEW-SMOKE PASS${scanLoc ? ' (scan)' : ''}`
+            : `PREVIEW-SMOKE FAIL: glError=${err} active=${preview.active} dur=${keyframes.duration}${scanNote}`;
           out.style.color = ok ? '#9f6' : '#f66';
         };
         requestAnimationFrame(check);

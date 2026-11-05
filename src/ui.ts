@@ -680,8 +680,9 @@ export function buildWristPanel(): UIPanel {
       { id: 'view-camera', label: 'Cam View' },
     ],
     [
-      { id: 'scan', label: 'Scan Room', flex: 1.4 },
-      { id: 'location', label: 'Loc: Hidden' },
+      { id: 'scan', label: 'Scan Room', flex: 1.2 },
+      { id: 'space-setup', label: 'Space Setup', flex: 1.2 },
+      { id: 'location', label: 'Loc: Hidden', flex: 1.4 },
     ],
     [
       { id: 'framelines', label: 'Frame Lines', flex: 1.3 },
