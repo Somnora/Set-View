@@ -554,6 +554,7 @@ class App {
           this.refreshLanding();
         });
       },
+      onSetLedVolumeEnabled: (sceneId, enabled) => this.setLedVolumeEnabled(sceneId, enabled),
       onPreview: (id) => this.openPreview(id),
       getScene: (id) =>
         id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
@@ -848,6 +849,25 @@ class App {
       const scene = this.persistence.loadScene(sceneId);
       if (!scene) return;
       scene.walkSpeed = walkSpeed;
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
+  }
+
+  /** Turns a scene's LED volume on or off from the landing Scene card. */
+  private setLedVolumeEnabled(sceneId: string, enabled: boolean): void {
+    if (sceneId === this.sceneData.id) {
+      const icvfx = this.sceneData.icvfx;
+      if (!icvfx) return; // normalizeScene always fills it
+      icvfx.enabled = enabled;
+      this.icvfxRenderer.setConfig(icvfx);
+      this.collabSession.broadcastPatch({ type: 'icvfx_update', config: icvfx });
+      this.history.record(this.sceneData);
+      this.persistence.saveNow(this.sceneData);
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      if (!scene?.icvfx) return;
+      scene.icvfx.enabled = enabled;
       this.persistence.updateScene(scene);
     }
     this.refreshLanding();

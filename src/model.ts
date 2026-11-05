@@ -1104,7 +1104,10 @@ export function createScene(name: string): SceneData {
     dmxBridge: createDmxBridgeConfig(),
     dmxPatches: [],
     dmxCues: [],
-    icvfx: createLedVolumeConfig(),
+    // Off by default: an enabled stock horseshoe (9 m radius, 6 m tall) boxed every new
+    // scene inside an opaque LED wall over passthrough. ICVFX Studio or the landing
+    // Scene card turns it on.
+    icvfx: createLedVolumeConfig('horseshoe_270', { enabled: false }),
     acoustics: createAcousticsConfig('dialogue_soundstage'),
     solar: createSolarEnvironmentConfig('golden_hour_sunset', 'los_angeles'),
     screenplay: createScreenplayConfig(),
@@ -1879,7 +1882,8 @@ export function normalizeScene(s: SceneData): SceneData {
     s.dmxCues = s.dmxCues.filter(isDmxCue).map(normalizeDmxCue);
   }
   if (s.icvfx === undefined) {
-    s.icvfx = createLedVolumeConfig();
+    // Same disabled default as createScene; a saved config keeps its own enabled flag.
+    s.icvfx = createLedVolumeConfig('horseshoe_270', { enabled: false });
   } else {
     s.icvfx = normalizeLedVolumeConfig(s.icvfx);
   }

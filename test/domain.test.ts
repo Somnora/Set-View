@@ -9470,7 +9470,7 @@ test('icvfx: generateOpenUsdLedVolume export generation', () => {
 test('icvfx: multi-user collaboration patch sync', () => {
   const scene = createScene('ICVFX Stage Test');
   assert.ok(scene.icvfx);
-  assert.equal(scene.icvfx.enabled, true);
+  assert.equal(scene.icvfx.enabled, false); // P0.10: new scenes start without the LED volume
 
   // Collab patch: icvfx_update
   const newConfig = createLedVolumeConfig('commercial_180');
@@ -11341,6 +11341,21 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
 });
 
 // --- P0 data ---
+
+test('P0.10: new scenes start without the LED volume; saved scenes keep their own flag', () => {
+  const fresh = createScene('Empty Stage');
+  assert.equal(fresh.icvfx?.enabled, false);
+  assert.ok((fresh.icvfx?.walls.length ?? 0) > 0, 'the preset is still there to switch on');
+
+  const legacy = createScene('Pre-ICVFX Scene');
+  delete legacy.icvfx;
+  assert.equal(normalizeScene(legacy).icvfx?.enabled, false);
+
+  const saved = createScene('Saved With LED');
+  saved.icvfx!.enabled = true;
+  const reloaded = normalizeScene(JSON.parse(JSON.stringify(saved)) as SceneData);
+  assert.equal(reloaded.icvfx?.enabled, true);
+});
 
 /** Builds a binary little-endian PLY from a header body and per-vertex writer. */
 function p0BinaryPly(

@@ -775,6 +775,8 @@ export interface LandingCallbacks {
   onExportScanGeoJson?: (id: string) => void;
   onExportScanPackage?: (id: string) => void;
   onAddSyntheticScan?: (id: string) => void;
+  /** Turns a scene's ICVFX LED volume on or off without opening ICVFX Studio. */
+  onSetLedVolumeEnabled?: (sceneId: string, enabled: boolean) => void;
   /** Opens the desktop 3D preview (orbit + playback) for a scene. */
   onPreview: (id: string) => void;
   /** Full scene for the inline camera editor, or null. */
@@ -1175,6 +1177,28 @@ export class Landing {
       }
     }
     envCard.appendChild(splatRow);
+
+    // New scenes start without the LED volume; this turns an existing scene's off
+    // (or back on) without a trip through ICVFX Studio.
+    if (this.cb.onSetLedVolumeEnabled && scene.icvfx) {
+      const ledOn = scene.icvfx.enabled;
+      const ledRow = document.createElement('div');
+      ledRow.className = 'cam-edit';
+      const info = document.createElement('span');
+      info.className = 'scan-info';
+      info.textContent = ledOn
+        ? `LED volume: on (${scene.icvfx.walls.filter((w) => w.enabled).length} walls)`
+        : 'LED volume: off';
+      ledRow.appendChild(info);
+      const ledBtn = document.createElement('button');
+      ledBtn.className = 'small';
+      ledBtn.style.marginLeft = '8px';
+      ledBtn.textContent = ledOn ? 'Turn LED volume off' : 'Turn LED volume on';
+      ledBtn.setAttribute('aria-pressed', String(ledOn));
+      ledBtn.onclick = () => this.cb.onSetLedVolumeEnabled!(sceneId, !ledOn);
+      ledRow.appendChild(ledBtn);
+      envCard.appendChild(ledRow);
+    }
     grid.appendChild(envCard);
 
     // --- Card 2: Cast & Actor Blocking ---
