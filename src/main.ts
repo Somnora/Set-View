@@ -29,7 +29,7 @@ import { classifyCameraMove } from './timeline.ts';
 import { History } from './history.ts';
 import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
-import { summarizeScan, type ScanSource } from './scan.ts';
+import { roomCaptureMessage, summarizeScan, type ScanSource } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
 import { LocationRenderer } from './location.ts';
 import { checkSupport, SessionManager } from './session.ts';
@@ -170,8 +170,10 @@ const SNAP_TURN_RAD = Math.PI / 6; // 30°
 
 /** Give the platform this long to surface tracked meshes before giving up. */
 const SCAN_TIMEOUT_MS = 30_000;
-/** If nothing is tracked after this long, ask the OS to run room capture. */
-const SCAN_ROOM_CAPTURE_AFTER_MS = 2_000;
+/** If nothing is tracked after this long, say what to do about it (once). */
+const SCAN_HINT_AFTER_MS = 5_000;
+/** Run Space Setup needs a second press within this window (anchor warning). */
+const SPACE_SETUP_CONFIRM_MS = 5_000;
 /** Longest a scan waits for the floor estimate to settle before capturing anyway. */
 const SCAN_FLOOR_WAIT_MS = 5_000;
 
@@ -268,8 +270,12 @@ class App {
     awaitingRealign: boolean;
     sources: ScanSource[];
     floorHinted: boolean;
-    roomCaptureRequested: boolean;
+    hinted: boolean;
   } | null = null;
+  /** First 'Run Space Setup' press arms it; a second press before this time runs it. */
+  private spaceSetupConfirmUntil = 0;
+  /** Session whose Space Setup request is still in flight (OS flow open). */
+  private spaceSetupSession: XRSession | null = null;
   /** Blob id currently loaded into the location renderer. */
   private displayedScanId: string | null = null;
   /** Invalidates stale async scan-blob loads (scene switches, undo). */
@@ -341,6 +347,12 @@ class App {
     this.raycaster.camera = this.camera;
 
     this.session = new SessionManager(this.renderer, (m) => this.debug.log(m));
+    this.session.onReferenceSpaceReset = () => this.onReferenceSpaceReset();
+    this.session.onVisibilityChange = (state) => {
+      // Back from system UI (Space Setup, the OS menu): the scan's timeout
+      // restarts instead of expiring for time spent outside the app.
+      if (state === 'visible' && this.pendingScan) this.pendingScan.startedAt = -1;
+    };
     this.scene3.add(this.session.reticle);
 
     this.input = new InputManager(this.renderer, this.scene3);
@@ -951,7 +963,7 @@ class App {
       awaitingRealign,
       sources: cap.sources,
       floorHinted: false,
-      roomCaptureRequested: false,
+      hinted: false,
     };
     this.debug.log(awaitingRealign ? 'scan: re-aligning first…' : `scanning: reading ${cap.sources.join(' + ')}…`);
     this.refreshWristState();
@@ -974,7 +986,11 @@ class App {
       this.refreshWristState();
       return;
     }
-    if (pending.startedAt < 0) pending.startedAt = time;
+    // The timeout clock (re)starts on the first frame after the press, a
+    // realign, or a return to 'visible', and is held while system UI covers
+    // the session (no timing out mid Space Setup).
+    const visibility = this.session.session?.visibilityState;
+    if (pending.startedAt < 0 || (visibility !== undefined && visibility !== 'visible')) pending.startedAt = time;
     const waited = time - pending.startedAt;
     // Capture in a scene space the floor re-base (floor.ts) is about to move
     // would leave the scan at the wrong height, so give the estimate its
@@ -1014,20 +1030,112 @@ class App {
       );
       return;
     }
-    if (!pending.roomCaptureRequested && waited > SCAN_ROOM_CAPTURE_AFTER_MS) {
-      pending.roomCaptureRequested = true;
-      this.debug.log('no room mesh yet — asking the system to run room capture…');
-      void this.session.requestRoomCapture().then((ok) => {
-        if (!ok && this.pendingScan) {
-          this.debug.log('room capture unavailable — run Space Setup in Quest Settings, then rescan');
-        }
-      });
+    // No automatic initiateRoomCapture here: it works once per session, needs
+    // plane-detection, can wipe anchors and is a stub in Chrome. Space Setup
+    // is the explicit wrist action (runSpaceSetup) instead.
+    const meshes = pending.sources.includes('meshes');
+    if (!pending.hinted && waited > SCAN_HINT_AFTER_MS) {
+      pending.hinted = true;
+      this.debug.log(
+        meshes
+          ? 'no room data yet: Space Setup done? (wrist: Space Setup)'
+          : 'no planes yet: look around at floor, walls and tables',
+      );
     }
     if (waited > SCAN_TIMEOUT_MS) {
       this.pendingScan = null;
-      this.debug.log('scan timed out — finish Space Setup (Settings → Environment Setup) and retry');
+      this.debug.log(
+        meshes
+          ? 'scan timed out: run Space Setup in Quest Settings, then Scan Room again'
+          : 'scan timed out: no planes found, look around the room and rescan',
+      );
       this.refreshWristState();
     }
+  }
+
+  /**
+   * Re-creates every actor and camera anchor on the next frame, at its current
+   * scene position (the startAR / restoreScene pattern). Skipped while shifted:
+   * anchors are created at scene coordinates read as reference-space ones,
+   * which only holds at true registration. Returns whether anything was queued.
+   */
+  private requeueAllAnchors(): boolean {
+    if (!this.session.session || this.views.isShifted) return false;
+    // Clear first so an object already queued isn't anchored twice (the
+    // second request would leak the first anchor).
+    this.pendingReanchorActors.length = 0;
+    this.pendingReanchorCams.length = 0;
+    for (const obj of this.actors.all()) this.pendingReanchorActors.push(obj);
+    for (const obj of this.cams.all()) this.pendingReanchorCams.push(obj);
+    return true;
+  }
+
+  /**
+   * The tracking origin jumped (reference-space 'reset', likely after Space
+   * Setup). Anchors may be gone or re-based, so re-anchor everything where the
+   * scene has it, and tell the user to check alignment: the scan and the
+   * blocking move together, but not necessarily onto the real room.
+   */
+  private onReferenceSpaceReset(): void {
+    if (!this.session.session) return;
+    const requeued = this.requeueAllAnchors();
+    this.debug.log(
+      requeued
+        ? 'tracking reset: re-anchored, check alignment to the room'
+        : 'tracking reset: Re-align, then check alignment to the room',
+    );
+  }
+
+  /**
+   * Wrist 'Space Setup': asks the OS to run room capture, once per session
+   * and only with plane-detection. The first press only warns (it can reset
+   * tracking and wipe anchors); a second press within SPACE_SETUP_CONFIRM_MS
+   * runs it. Never called automatically.
+   */
+  private runSpaceSetup(): void {
+    if (!this.session.session) return;
+    if (this.spaceSetupSession === this.session.session) {
+      this.debug.log('Space Setup is already running');
+      return;
+    }
+    const refusal = this.session.roomCaptureRefusal();
+    if (refusal) {
+      this.spaceSetupConfirmUntil = 0;
+      this.debug.log(roomCaptureMessage(refusal));
+      this.refreshWristState();
+      return;
+    }
+    const now = performance.now();
+    if (now > this.spaceSetupConfirmUntil) {
+      this.spaceSetupConfirmUntil = now + SPACE_SETUP_CONFIRM_MS;
+      this.debug.log('Space Setup may reset tracking and anchors: press again to run');
+      this.refreshWristState();
+      return;
+    }
+    this.spaceSetupConfirmUntil = 0;
+    const session = this.session.session;
+    this.spaceSetupSession = session;
+    this.debug.log('Space Setup: follow the system prompts');
+    this.refreshWristState();
+    void this.session.requestRoomCapture().then((result) => {
+      if (this.spaceSetupSession === session) this.spaceSetupSession = null;
+      if (this.session.session !== session) return; // session ended during the OS flow
+      if (result.ok) {
+        // Anchors may have been wiped by the room capture.
+        const requeued = this.requeueAllAnchors();
+        const quick = performance.now() - now < 1000;
+        this.debug.log(
+          quick
+            ? 'Space Setup returned at once: maybe nothing ran'
+            : requeued
+              ? 'Space Setup done: re-anchored, now Scan Room'
+              : 'Space Setup done: Re-align, then Scan Room',
+        );
+      } else {
+        this.debug.log(roomCaptureMessage(result.error));
+      }
+      this.refreshWristState();
+    });
   }
 
   /**
@@ -1506,6 +1614,9 @@ class App {
       case 'scan':
         this.toggleScan();
         break;
+      case 'space-setup':
+        this.runSpaceSetup();
+        break;
       case 'location': {
         if (!this.location.hasScan) {
           this.debug.log('no location scan in this scene yet — press Scan Room');
@@ -1652,6 +1763,8 @@ class App {
       // Fresh reference space, fresh floor evidence.
       this.floorEst = newFloorEstimate();
       this.views.setFloorOffset(0);
+      // Wrist labels that depend on this session's features (Space Setup).
+      this.refreshWristState();
       // Teach the controls up front: chips tethered to the controllers for the
       // first few seconds; the wrist "?" button brings them back anytime.
       this.guideSticky = false;
@@ -2429,6 +2542,22 @@ class App {
     this.wrist.setToggle('redo', this.history.canRedo);
     this.wrist.setLabel('scan', this.pendingScan ? 'Scanning…' : 'Scan Room');
     this.wrist.setToggle('scan', this.pendingScan !== null);
+    const setupRunning = this.spaceSetupSession !== null && this.spaceSetupSession === this.session.session;
+    const setupArmed = performance.now() < this.spaceSetupConfirmUntil;
+    const setupRefusal = this.session.session ? this.session.roomCaptureRefusal() : null;
+    this.wrist.setLabel(
+      'space-setup',
+      setupRunning
+        ? 'Setting up…'
+        : setupRefusal === 'already-used'
+          ? 'Setup used'
+          : setupRefusal
+            ? 'Setup n/a'
+            : setupArmed
+              ? 'Confirm?'
+              : 'Space Setup',
+    );
+    this.wrist.setToggle('space-setup', setupRunning || setupArmed);
     const loc = this.location.mode;
     this.wrist.setLabel('location', `Loc: ${loc.charAt(0).toUpperCase()}${loc.slice(1)}`);
     this.wrist.setToggle('location', this.location.hasScan && loc !== 'hidden');
@@ -2991,6 +3120,11 @@ class App {
       this.wrist.setLabel('play', this.keyframes.playing ? '⏸ Pause' : '▶ Play');
       if (this.recorder.recording)
         this.wrist.setLabel('record', `⏺ ${recordingClock(this.recorder.elapsedS(time))}`);
+      // Expire an unconfirmed Space Setup press so the wrist stops saying 'Confirm?'.
+      if (this.spaceSetupConfirmUntil !== 0 && performance.now() > this.spaceSetupConfirmUntil) {
+        this.spaceSetupConfirmUntil = 0;
+        this.refreshWristState();
+      }
     }
 
     this.splatRenderer.update(this.camera);

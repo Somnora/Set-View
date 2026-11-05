@@ -197,6 +197,7 @@ import {
 import { MOVABLE_SCAN_LABELS, normalizeSemanticLabel, UNLABELED_SCAN_LABEL } from '../src/scan.ts';
 import { LocationRenderer } from '../src/location.ts';
 import { scanCapability } from '../src/scan.ts';
+import { roomCaptureMessage, roomCaptureRefusal } from '../src/scan.ts';
 import { floorSettled, FLOOR_MIN_HITS, FLOOR_SETTLE_MS } from '../src/floor.ts';
 import { ViewManager } from '../src/views.ts';
 import { estimateScanSizeBytes, ScanStore } from '../src/scanStore.ts';
@@ -11461,6 +11462,37 @@ test('P0.4 ViewManager.fading: realign stays shifted until the fade applies it',
   assert.equal(views.isShifted, false);
   assert.equal(root.position.x, 0);
   assert.equal(root.position.z, 0);
+});
+
+test('P0.5 roomCaptureMessage: platform errors and refusals map to user text', () => {
+  assert.match(roomCaptureMessage('NotSupportedError'), /Quest Settings/);
+  assert.match(roomCaptureMessage('InvalidStateError'), /already used this session/);
+  assert.equal(roomCaptureMessage('already-used'), roomCaptureMessage('InvalidStateError'));
+  assert.match(roomCaptureMessage('OperationError'), /did not finish/);
+  assert.equal(roomCaptureMessage('unsupported'), roomCaptureMessage('NotSupportedError'));
+  assert.match(roomCaptureMessage('no-plane-detection'), /plane detection/);
+  assert.match(roomCaptureMessage('no-session'), /AR session/);
+  assert.match(roomCaptureMessage('AbortError'), /AbortError/);
+  assert.match(roomCaptureMessage(''), /unknown error/);
+  for (const name of ['NotSupportedError', 'InvalidStateError', 'OperationError', 'no-plane-detection', 'x']) {
+    // The wrist debug tail shows ~40 characters; the subject must lead.
+    assert.ok(roomCaptureMessage(name).startsWith('Space Setup'), name);
+  }
+});
+
+test('P0.5 roomCaptureRefusal: once per session, plane-detection required', () => {
+  const planes = ['hit-test', 'local-floor', 'mesh-detection', 'plane-detection'];
+  const base = { hasSession: true, hasApi: true, enabledFeatures: planes, used: false };
+  assert.equal(roomCaptureRefusal(base), null);
+  assert.equal(roomCaptureRefusal({ ...base, hasSession: false }), 'no-session');
+  assert.equal(roomCaptureRefusal({ ...base, hasApi: false }), 'unsupported');
+  assert.equal(
+    roomCaptureRefusal({ ...base, enabledFeatures: ['hit-test', 'mesh-detection'] }),
+    'no-plane-detection',
+  );
+  // Unreported features are not a grant: the spec rejects without plane-detection.
+  assert.equal(roomCaptureRefusal({ ...base, enabledFeatures: [] }), 'no-plane-detection');
+  assert.equal(roomCaptureRefusal({ ...base, used: true }), 'already-used');
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(

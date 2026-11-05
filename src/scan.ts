@@ -161,6 +161,55 @@ export function scanCapability(input: { enabledFeatures: readonly string[]; repo
   return { canScan: true, sources, reason };
 }
 
+// --- room capture (Space Setup) -----------------------------------------------
+
+/** Why a Space Setup request is refused before the platform is even asked. */
+export type RoomCaptureRefusal = 'no-session' | 'unsupported' | 'no-plane-detection' | 'already-used';
+
+/**
+ * Pre-flight for XRSession.initiateRoomCapture: the spec allows one call per
+ * session, it rejects without plane-detection, and Chrome ships it as a stub
+ * that resolves without capturing. Null = a request may be made.
+ */
+export function roomCaptureRefusal(input: {
+  hasSession: boolean;
+  /** typeof session.initiateRoomCapture === 'function' */
+  hasApi: boolean;
+  enabledFeatures: readonly string[];
+  /** Already called once in this session. */
+  used: boolean;
+}): RoomCaptureRefusal | null {
+  if (!input.hasSession) return 'no-session';
+  if (!input.hasApi) return 'unsupported';
+  if (!input.enabledFeatures.includes('plane-detection')) return 'no-plane-detection';
+  if (input.used) return 'already-used';
+  return null;
+}
+
+/**
+ * User text for a Space Setup request that did not run: a RoomCaptureRefusal
+ * or the DOMException name initiateRoomCapture rejected with. The first ~40
+ * characters are what the wrist debug tail shows, so the gist comes first.
+ */
+export function roomCaptureMessage(errName: string): string {
+  switch (errName) {
+    case 'NotSupportedError':
+    case 'unsupported':
+      return 'Space Setup not available here: run it in Quest Settings';
+    case 'InvalidStateError':
+    case 'already-used':
+      return 'Space Setup already used this session: re-enter AR to run it again';
+    case 'OperationError':
+      return 'Space Setup did not finish: run it in Quest Settings';
+    case 'no-plane-detection':
+      return 'Space Setup needs plane detection: not granted in this session';
+    case 'no-session':
+      return 'Space Setup needs an AR session';
+    default:
+      return `Space Setup failed (${errName || 'unknown error'}): run it in Quest Settings`;
+  }
+}
+
 /**
  * XZ bounds center of a mesh's vertex positions — the pivot furniture yaws
  * about (y stays 0: furniture slides on the floor plane).

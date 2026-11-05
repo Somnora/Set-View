@@ -7,7 +7,12 @@
 import * as THREE from 'three';
 import { makeLabel, type Label } from './ui.ts';
 import type { PlaceArm } from './wheel.ts';
-import { scanCapability, type ScanCapability } from './scan.ts';
+import {
+  roomCaptureRefusal,
+  scanCapability,
+  type RoomCaptureRefusal,
+  type ScanCapability,
+} from './scan.ts';
 
 export interface SupportReport {
   secureContext: boolean;
@@ -54,6 +59,9 @@ export interface HitInfo {
 
 type LogFn = (msg: string) => void;
 
+/** Outcome of a Space Setup request; `error` feeds roomCaptureMessage. */
+export type RoomCaptureResult = { ok: true } | { ok: false; error: RoomCaptureRefusal | string };
+
 export class SessionManager {
   session: XRSession | null = null;
   features: XRFeatureFlags = {
@@ -69,6 +77,12 @@ export class SessionManager {
   enabledFeatures: readonly string[] = [];
   /** False when the browser omitted enabledFeatures: optional features are then unknown, not absent. */
   featuresReported = false;
+  /** initiateRoomCapture may run once per XRSession (WebXR spec); reset in start(). */
+  roomCaptureUsed = false;
+  /** The reference space jumped (pose discontinuity, e.g. after Space Setup). */
+  onReferenceSpaceReset: () => void = () => {};
+  /** XRSession visibility changed ('visible' again after system UI such as Space Setup). */
+  onVisibilityChange: (state: XRVisibilityState) => void = () => {};
 
   /** Reticle object lives in true world space (scene root, not contentRoot). */
   readonly reticle: THREE.Group;
@@ -115,6 +129,7 @@ export class SessionManager {
     // of this SessionManager (it's reused across sessions), silently killing
     // drift resistance on every later session until a page reload.
     this.anchorsBroken = false;
+    this.roomCaptureUsed = false;
 
     const enabled: string[] = (session as unknown as { enabledFeatures?: string[] }).enabledFeatures ?? [];
     const has = (f: string) => enabled.includes(f);
@@ -145,10 +160,12 @@ export class SessionManager {
     if (refSpace) {
       refSpace.addEventListener('reset', () => {
         this.log('⚠ reference space RESET (pose discontinuity — expect content jump)');
+        this.onReferenceSpaceReset();
       });
     }
     session.addEventListener('visibilitychange', () => {
       this.log(`session visibility: ${session.visibilityState}`);
+      this.onVisibilityChange(session.visibilityState);
     });
 
     // Gaze fallback hit-test source.
@@ -191,20 +208,39 @@ export class SessionManager {
     return scanCapability({ enabledFeatures: this.enabledFeatures, reported: this.featuresReported });
   }
 
-  /**
-   * Asks the OS to (re)run room capture (Space Setup). The platform may only
-   * honor this once per session and may ignore it if the room is already set
-   * up. Resolves false when unavailable.
-   */
-  async requestRoomCapture(): Promise<boolean> {
+  /** Why Space Setup can't be requested right now, or null when it can. */
+  roomCaptureRefusal(): RoomCaptureRefusal | null {
     const s = this.session;
-    if (!s || typeof s.initiateRoomCapture !== 'function') return false;
+    return roomCaptureRefusal({
+      hasSession: !!s,
+      hasApi: !!s && typeof s.initiateRoomCapture === 'function',
+      enabledFeatures: this.enabledFeatures,
+      used: this.roomCaptureUsed,
+    });
+  }
+
+  /**
+   * Asks the OS to run room capture (Space Setup). Only an explicit user
+   * action may call this: it works once per session, needs plane-detection,
+   * may reset tracking and wipe anchors (Meta disabled the automatic call in
+   * IWSDK for that reason), and is a stub in Chrome. Refuses without calling
+   * the platform when roomCaptureRefusal() says so.
+   */
+  async requestRoomCapture(): Promise<RoomCaptureResult> {
+    const refusal = this.roomCaptureRefusal();
+    if (refusal) return { ok: false, error: refusal };
+    const s = this.session!;
+    // Spent even if it rejects: the platform counts the call, and a retry
+    // would only come back as InvalidStateError.
+    this.roomCaptureUsed = true;
     try {
-      await s.initiateRoomCapture();
-      return true;
+      await s.initiateRoomCapture!();
+      return { ok: true };
     } catch (e) {
-      this.log(`room capture request failed: ${(e as Error).message}`);
-      return false;
+      const name = (e as { name?: unknown } | null)?.name;
+      const error = typeof name === 'string' && name ? name : 'Error';
+      this.log(`room capture request failed: ${error}: ${(e as Error)?.message ?? e}`);
+      return { ok: false, error };
     }
   }
 
