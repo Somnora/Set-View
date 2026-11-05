@@ -126,6 +126,11 @@ import { WebRtcCollabSession } from './network.ts';
 import { CollabAvatarManager } from './avatars.ts';
 import { openCollabModal, openPropsLibraryModal } from './ui.ts';
 import { PropsManager, type PropObject } from './propsManager.ts';
+import { globalPropRenderer } from './propRenderer.ts';
+import { getBuiltinPropDefinition, settlePropY, snapPropToGrid } from './props.ts';
+import { locomotionSuppressed, type LocomotionState } from './locomotion.ts';
+import { quatYaw } from './scan.ts';
+import { submenuForSector, wheelPropPreset, wheelSectorRoute } from './wheel.ts';
 import { globalPropStore } from './propStore.ts';
 import { LiveLinkStreamer } from './liveLinkStreamer.ts';
 import { DmxStreamer } from './dmxStreamer.ts';
@@ -160,6 +165,11 @@ const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
 const _tip = new THREE.Vector3();
+// Reused for the contextual radial's per-frame follow of its target.
+const _radialPos = new THREE.Vector3();
+
+/** Wheel / Prop Library props with no live hit land this far ahead of you (m). */
+const PROP_SPAWN_AHEAD_M = 1.2;
 
 /** Smooth-glide speed (m/s) for thumbstick locomotion through the set. */
 const LOCOMOTION_SPEED = 1.8;
@@ -223,8 +233,6 @@ class App {
   private wheel = new WheelPanel();
   /** Current wheel menu level; resets to root whenever the wheel hides. */
   private wheelPath: WheelPath = 'root';
-  /** Wheel "More" pins the detailed wrist panel open under the wheel. */
-  private panelPinned = false;
   private wheelShown = false;
   /** Menu button popped the wheel to a head-anchored spot in front of you. */
   private wheelInFront = false;
@@ -235,6 +243,17 @@ class App {
   private tipOnWheel = false;
   /** Placement is an ARMED tool, off by default — a bare pinch never places. */
   private placeMode: PlaceArm = 'none';
+  /** Catalog id Place: Prop drops: the last Props sub-wheel preset picked. */
+  private lastPropPreset = 'directors_chair';
+  /** Reused every frame for the glide gate (no per-frame allocation). */
+  private readonly locoState: LocomotionState = {
+    viewMode: 'full',
+    draggingActor: false,
+    draggingCamera: false,
+    draggingProp: false,
+    draggingFurniture: false,
+    miniGrabbing: false,
+  };
   private selectedActorId: string | null = null;
   private selectedPropId: string | null = null;
   private hover: Hover = null;
@@ -338,6 +357,12 @@ class App {
     this.contentRoot.add(this.actors.group);
     this.props = new PropsManager(this.session, this.sceneData);
     this.contentRoot.add(this.props.group);
+    // An uploaded model that can't be shown falls back to a box: say why.
+    globalPropRenderer.onLoadError = (key, err) => {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.debug.log(`prop model ${key} failed to load, showing a box: ${reason}`);
+      this.wrist.setStatus(`Prop model not shown: ${reason}`);
+    };
     this.keyframes = new KeyframeSystem(this.sceneData, this.actors);
     this.contentRoot.add(this.keyframes.vizGroup);
     this.cams = new CameraSystem(this.sceneData, this.session, this.contentRoot);
@@ -359,6 +384,9 @@ class App {
       this.handleContextQuickAction(action, entityId, entityType),
     );
 
+    // Parked: TransformGizmo's ray input (onPointerDown/Move/Up) is not wired
+    // to any controller yet, so its handles could not be moved. Selection no
+    // longer attaches it (no inert handles in the headset); it stays hidden.
     this.gizmo = new TransformGizmo();
     this.scene3.add(this.gizmo.root);
     this.gizmo.events.onTransform = () => {
@@ -1050,6 +1078,8 @@ class App {
     this.selectedActorId = null;
     this.selectedPropId = null;
     this.hover = null;
+    // Its target is about to be disposed with the old scene.
+    this.contextualRadial.hide();
     // Reparent (not just null) any in-progress drag before setScene disposes
     // the old objects: a grip-dragged camera root lives under the controller,
     // and disposing it there would orphan a phantom gizmo on the controller.
@@ -1078,7 +1108,16 @@ class App {
    */
   private cancelActiveManipulation(): void {
     if (this.draggedCamera) this.cams.gizmoGroup.attach(this.draggedCamera.root);
-    if (this.draggedProp) this.contentRoot.attach(this.draggedProp.root);
+    if (this.draggedProp) {
+      // Back into the props group (removeProp / setScene only detach from
+      // there), and back to its last committed pose: a cancelled carry writes
+      // no data, so the visual must not keep the carried pose either.
+      const { root, data } = this.draggedProp;
+      this.props.group.attach(root);
+      root.position.set(data.position.x, data.position.y, data.position.z);
+      root.rotation.set(0, data.rotationY, 0);
+      root.scale.set(data.scale.x, data.scale.y, data.scale.z);
+    }
     this.draggedActor = null;
     this.draggedCamera = null;
     this.draggedProp = null;
@@ -1112,6 +1151,7 @@ class App {
     // contain the prop that was selected, leaving a dangling id behind.
     this.selectedPropId = null;
     this.hover = null;
+    this.contextualRadial.hide();
     this.cancelActiveManipulation();
     // Drop reanchor entries queued for the objects we're about to dispose —
     // otherwise the loop would create (and leak) anchors on detached objects.
@@ -1196,48 +1236,47 @@ class App {
     };
   }
 
-  /** Palm-wheel presses: menu navigation + actions (wheel.ts defines rings). */
+  /**
+   * Palm-wheel presses: menu navigation + actions (wheel.ts defines rings).
+   * Routing goes through wheel.ts's WHEEL_SECTOR_HANDLERS, which the domain
+   * tests check covers every sector a reachable ring can show.
+   */
   private onWheelPress(id: string): void {
-    switch (id) {
-      // Navigation.
-      case 'sub-lens':
-      case 'sub-marks':
-      case 'sub-capture':
-      case 'sub-edit':
-      case 'sub-props':
-        this.wheelPath = id.slice(4) as WheelPath;
-        break;
-      case 'wheel-back':
-        this.wheelPath = 'root';
-        break;
-      // Root actions.
-      case 'wheel-mode':
-        this.setInteractionMode(this.interactionMode === 'block' ? 'dress' : 'block');
-        break;
-      case 'wheel-place':
-        this.setPlaceMode(nextPlaceMode(this.placeMode));
-        break;
-      case 'wheel-view':
-        this.cycleView();
-        break;
-      case 'wheel-more':
-        this.panelPinned = !this.panelPinned;
-        break;
-      // Sub-wheel actions with no wrist-panel equivalent.
-      case 'focal-down':
-        this.cams.stepActiveFocal(-1);
-        break;
-      case 'focal-up':
-        this.cams.stepActiveFocal(1);
-        break;
-      case 'mark':
-        // The B button is unreachable on hand tracking — this is its home.
-        if (this.interactionMode === 'block') this.captureKeyframe();
-        break;
-      // Everything else is a wrist-panel action verbatim.
-      default:
-        this.onWristPress(id);
-        break;
+    const route = wheelSectorRoute(id);
+    if (route === 'nav') {
+      this.wheelPath = submenuForSector(id) ?? 'root'; // 'wheel-back' -> root
+    } else if (route === 'prop') {
+      const assetId = wheelPropPreset(id);
+      if (assetId) this.spawnWheelProp(assetId);
+    } else if (route === 'wrist') {
+      // A wrist-panel action verbatim.
+      this.onWristPress(id);
+    } else if (route === 'wheel') {
+      switch (id) {
+        // Root actions.
+        case 'wheel-mode':
+          this.setInteractionMode(this.interactionMode === 'block' ? 'dress' : 'block');
+          break;
+        case 'wheel-place':
+          this.setPlaceMode(nextPlaceMode(this.placeMode));
+          break;
+        case 'wheel-view':
+          this.cycleView();
+          break;
+        // Sub-wheel actions with no wrist-panel equivalent.
+        case 'focal-down':
+          this.cams.stepActiveFocal(-1);
+          break;
+        case 'focal-up':
+          this.cams.stepActiveFocal(1);
+          break;
+        case 'mark':
+          // The B button is unreachable on hand tracking — this is its home.
+          if (this.interactionMode === 'block') this.captureKeyframe();
+          break;
+      }
+    } else {
+      this.debug.log(`wheel: no handler for "${id}"`);
     }
     this.refreshWristState();
   }
@@ -1524,31 +1563,8 @@ class App {
       case 'exit':
         void this.session.session?.end();
         break;
-      case 'prop-chair':
-      case 'prop-applebox':
-      case 'prop-cstand':
-      case 'prop-slate':
-      case 'prop-desk':
-      case 'prop-lamp':
-      case 'prop-greenscreen': {
-        const propAssetId = id.slice(5);
-        const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
-        const spawnPos = {
-          x: viewerLocal.x,
-          y: 0,
-          z: viewerLocal.z - 1.2,
-        };
-        void this.props.addProp(propAssetId, spawnPos).then((obj) => {
-          this.contentVersion++;
-          this.collabSession.broadcastPatch({
-            type: 'prop_add',
-            prop: obj.data,
-          });
-          this.debug.log(`spawned ${obj.data.name}`);
-          this.markDirty();
-        });
-        break;
-      }
+      // The Props sub-wheel presets (prop-chair ...) route through
+      // onWheelPress -> spawnWheelProp (wheel.ts WHEEL_PROP_PRESETS).
       case 'prop-library':
         void this.openPropsLibrary();
         break;
@@ -1602,7 +1618,6 @@ class App {
       this.lastTime = 0;
       // Every session opens planning the shot; Dress is an explicit switch.
       this.interactionMode = 'block';
-      this.panelPinned = false;
       this.wheelInFront = false; // wheel starts on the hand, Y parks it in front
       this.placeMode = 'none'; // placing is armed per use, never carried over
       // Fresh reference space, fresh floor evidence.
@@ -1687,7 +1702,7 @@ class App {
           y: camObj.root.position.y,
           z: camObj.root.position.z,
         });
-        this.contextualRadial.show('camera', camObj.data.id, camObj.root.position, {
+        this.contextualRadial.show('camera', camObj.data.id, camObj.root.getWorldPosition(_radialPos), {
           name: camObj.data.name,
           focalLength: camObj.data.lensFocalLength,
         });
@@ -1727,18 +1742,23 @@ class App {
       this.debug.log(`placed ${obj.data.name} at head (${Math.round(obj.data.lensFocalLength)}mm)`);
       this.markDirty();
     } else if (this.placeMode === 'prop') {
+      // Drops the last Props sub-wheel preset (Director's Chair until one is picked).
       if (!this.session.lastHit) return;
       const local = this.contentRoot.worldToLocal(this.session.lastHit.point.clone());
-      void this.props.addProp('chair', { x: local.x, y: local.y, z: local.z }).then((obj) => {
-        this.contentVersion++;
-        this.selectProp(obj.data.id);
-        this.collabSession.broadcastPatch({
-          type: 'prop_add',
-          prop: obj.data,
+      const pos = { x: local.x, y: local.y, z: local.z };
+      void this.props
+        .addProp(this.lastPropPreset, pos, { rotationY: this.faceViewerYaw(pos) })
+        .then((obj) => {
+          if (!obj) return;
+          this.contentVersion++;
+          this.selectProp(obj.data.id);
+          this.collabSession.broadcastPatch({
+            type: 'prop_add',
+            prop: obj.data,
+          });
+          this.debug.log(`placed ${obj.data.name}`);
+          this.markDirty();
         });
-        this.debug.log(`placed ${obj.data.name}`);
-        this.markDirty();
-      });
     }
     // Hands place ONE per arm: stray pinches are constant on hand tracking,
     // so the tool disarms after each placement (the wheel is a glance away).
@@ -1821,16 +1841,32 @@ class App {
     if (this.draggedProp) {
       const obj = this.draggedProp;
       this.draggedProp = null;
-      this.contentRoot.attach(obj.root);
+      // Back under the props group (content space), world pose kept.
+      this.props.group.attach(obj.root);
+      // Settle like released furniture (location.ts commitFurniture): pure
+      // yaw, no pitch/roll from the free carry, and down onto the real surface
+      // under the prop or the floor (props.ts settlePropY). The ray hit only
+      // counts when it is under the prop, not wherever the ray happens to end.
+      const q = obj.root.quaternion;
+      const rotY = quatYaw(q.x, q.y, q.z, q.w);
       const pos = obj.root.position;
-      const rotY = obj.root.rotation.y;
-      obj.data.position = { x: pos.x, y: pos.y, z: pos.z };
+      const hit = this.session.lastHit
+        ? this.props.group.worldToLocal(_pt.copy(this.session.lastHit.point))
+        : null;
+      obj.data.position = { x: pos.x, y: settlePropY(pos, hit), z: pos.z };
       obj.data.rotationY = rotY;
+      obj.data.rotationX = 0;
+      obj.data.rotationZ = 0;
+      obj.root.position.set(obj.data.position.x, obj.data.position.y, obj.data.position.z);
+      obj.root.rotation.set(0, rotY, 0);
+      obj.root.scale.set(obj.data.scale.x, obj.data.scale.y, obj.data.scale.z);
       this.collabSession.broadcastPatch({
         type: 'prop_move',
         propId: obj.data.id,
         position: obj.data.position,
         rotationY: rotY,
+        rotationX: 0,
+        rotationZ: 0,
       });
       this.markDirty();
     }
@@ -1912,30 +1948,31 @@ class App {
   }
 
   private selectActor(id: string | null): void {
+    if (id) {
+      // Selecting an actor ends any prop selection; otherwise Delete/Dup
+      // (which prefer a selected prop) would act on the stale prop.
+      this.selectedPropId = null;
+      this.props.setSelected(null);
+    }
     this.selectedActorId = id;
     this.actors.setSelected(id);
     if (id) {
       const actor = this.actors.get(id);
       if (actor) {
-        this.gizmo.attachActor(actor);
         globalSpatialFeedback.triggerHaptic('both', 'grab');
         globalSpatialFeedback.playSpatialSound('click', {
           x: actor.root.position.x,
           y: actor.root.position.y,
           z: actor.root.position.z,
         });
-        this.contextualRadial.show('actor', id, actor.root.position, {
+        this.contextualRadial.show('actor', id, actor.root.getWorldPosition(_radialPos), {
           stance: actor.data.stance,
           name: actor.data.name,
         });
       } else {
-        this.gizmo.detach();
         this.contextualRadial.hide();
       }
     } else {
-      if (this.gizmo.getTarget()?.kind === 'actor') {
-        this.gizmo.detach();
-      }
       this.contextualRadial.hide();
     }
     this.refreshWristState();
@@ -1947,28 +1984,92 @@ class App {
     if (id) {
       const prop = this.props.get(id);
       if (prop) {
-        this.gizmo.attachProp(prop);
         globalSpatialFeedback.triggerHaptic('both', 'grab');
         globalSpatialFeedback.playSpatialSound('click', {
           x: prop.root.position.x,
           y: prop.root.position.y,
           z: prop.root.position.z,
         });
-        this.contextualRadial.show('prop', id, prop.root.position, {
+        this.contextualRadial.show('prop', id, prop.root.getWorldPosition(_radialPos), {
           name: prop.data.name,
           category: prop.data.category,
         });
       } else {
-        this.gizmo.detach();
         this.contextualRadial.hide();
       }
     } else {
-      if (this.gizmo.getTarget()?.kind === 'prop') {
-        this.gizmo.detach();
-      }
       this.contextualRadial.hide();
     }
     this.refreshWristState();
+  }
+
+  /**
+   * The object the contextual radial belongs to, so the loop can keep the ring
+   * on it as the set moves (glide, snap-turn, teleport) or the object is
+   * carried. Map lookups only: no allocation.
+   */
+  private radialTargetRoot(): THREE.Object3D | null {
+    const id = this.contextualRadial.getActiveEntityId();
+    if (!id) return null;
+    switch (this.contextualRadial.getActiveEntityType()) {
+      case 'actor':
+        return this.actors.get(id)?.root ?? null;
+      case 'prop':
+        return this.props.get(id)?.root ?? null;
+      case 'camera':
+        return this.cams.get(id)?.root ?? null;
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Where a prop from the wheel or the Prop Library lands, in content space:
+   * the live hit-test point when there is one (where you point), otherwise
+   * PROP_SPAWN_AHEAD_M along your horizontal heading, on the floor.
+   */
+  private propSpawnPoint(): Vec3 {
+    const hit = this.session.session ? this.session.lastHit : null;
+    if (hit) {
+      const p = this.contentRoot.worldToLocal(hit.point.clone());
+      return { x: p.x, y: p.y, z: p.z };
+    }
+    const ahead = new THREE.Vector3(0, 0, -1).applyQuaternion(this.lastViewerQuat);
+    ahead.y = 0;
+    if (ahead.lengthSq() < 1e-6) ahead.set(0, 0, -1); // looking straight down
+    ahead.normalize().multiplyScalar(PROP_SPAWN_AHEAD_M).add(this.lastViewerPos);
+    const p = this.contentRoot.worldToLocal(ahead);
+    return { x: p.x, y: 0, z: p.z };
+  }
+
+  /** Heading (rotationY) that turns a prop at `pos` (content space) to face the viewer. */
+  private faceViewerYaw(pos: Vec3): number {
+    const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
+    return Math.atan2(viewerLocal.x - pos.x, viewerLocal.z - pos.z);
+  }
+
+  /** Props sub-wheel preset: spawn that catalog prop where you look and select it. */
+  private spawnWheelProp(assetId: string): void {
+    // Place: Prop drops whatever preset was picked last.
+    this.lastPropPreset = assetId;
+    if (this.views.mode === 'mini') {
+      // The miniature is scaled: "where you look" maps far outside the set.
+      // Placing actors and cameras is Full-view only for the same reason.
+      this.debug.log('Props: switch to Full view to place one here');
+      return;
+    }
+    const pos = this.propSpawnPoint();
+    void this.props.addProp(assetId, pos, { rotationY: this.faceViewerYaw(pos) }).then((obj) => {
+      if (!obj) return;
+      this.contentVersion++;
+      this.selectProp(obj.data.id);
+      this.collabSession.broadcastPatch({
+        type: 'prop_add',
+        prop: obj.data,
+      });
+      this.debug.log(`spawned ${obj.data.name}`);
+      this.markDirty();
+    });
   }
 
   private deleteTarget(): void {
@@ -2039,6 +2140,9 @@ class App {
       void this.props.duplicateProp(propId).then((obj) => {
         if (obj) {
           this.contentVersion++;
+          // The manager already highlights the copy; make it the selection too,
+          // so the next Delete/Dup acts on what is shown selected.
+          this.selectProp(obj.data.id);
           this.collabSession.broadcastPatch({
             type: 'prop_add',
             prop: obj.data,
@@ -2283,7 +2387,13 @@ class App {
         ? 'placing off'
         : mode === 'actor'
           ? 'ARMED: pinch/trigger on the floor ring places an actor'
-          : 'ARMED: pinch/trigger places a camera at your head',
+          : mode === 'camera'
+            ? 'ARMED: pinch/trigger places a camera at your head'
+            : mode === 'prop'
+              ? `ARMED: pinch/trigger on the floor ring places a ${
+                  getBuiltinPropDefinition(this.lastPropPreset)?.name ?? 'prop'
+                } (pick another under Edit ▸ Props ▸)`
+              : 'light placing is not available yet',
     );
     this.guide.refresh(this.guideCtx());
     this.refreshWristState();
@@ -2507,6 +2617,13 @@ class App {
     // the ray as a fallback hover so a pinch can press the pointed-at sector
     // even when the occluded tip loses tracking; controllers by ray + trigger.
     const rc = this.input.raycaster(pointer, this.raycaster);
+    if (this.contextualRadial.isVisible()) {
+      // Keep the ring on its target: the set moves under glide, snap-turn and
+      // teleport, and a carried prop moves with the hand.
+      const target = this.radialTargetRoot();
+      if (target) this.contextualRadial.setAnchor(target.getWorldPosition(_radialPos));
+      else this.contextualRadial.hide(); // target gone (deleted, remote patch)
+    }
     this.contextualRadial.update(this.camera);
     if (rc) this.contextualRadial.handlePointer(rc, false);
 
@@ -2722,11 +2839,13 @@ class App {
         const rotY = this.draggedActor.data.rotationY - axes.x * dt * 3.0;
         this.actors.applyPose(this.draggedActor, this.draggedActor.data.position, rotY);
       }
-    } else if (this.draggedFurniture) {
-      // Yaw the carried piece about the world up-axis (same stick gesture as
-      // rotating a dragged actor); world axis so the ray-space parent doesn't
-      // skew the spin.
-      if (Math.abs(axes.x) > 0.15) this.draggedFurniture.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
+    } else if (this.draggedFurniture || this.draggedProp) {
+      // Yaw the carried piece (scanned furniture or a prop) about the world
+      // up-axis (same stick gesture as rotating a dragged actor); world axis so
+      // the ray-space parent doesn't skew the spin. Being a branch of this
+      // chain, a carry also keeps the stick from snap-turning the set.
+      const held = this.draggedFurniture ?? this.draggedProp!.root;
+      if (Math.abs(axes.x) > 0.15) held.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
     } else if (this.miniGrabbing) {
       const grip = this.input.gripSpace(pointer);
       if (grip)
@@ -2757,13 +2876,14 @@ class App {
     // Suppressed while manipulating so it never fights a drag/grab. The radial
     // deadzone gate keeps the hot path allocation-free when the stick is centered
     // (the common case) — locomotionAmount only runs on real input.
-    if (
-      this.views.mode === 'full' &&
-      !this.draggedActor &&
-      !this.draggedCamera &&
-      !this.draggedFurniture &&
-      !this.miniGrabbing
-    ) {
+    const loco = this.locoState;
+    loco.viewMode = this.views.mode;
+    loco.draggingActor = this.draggedActor !== null;
+    loco.draggingCamera = this.draggedCamera !== null;
+    loco.draggingProp = this.draggedProp !== null;
+    loco.draggingFurniture = this.draggedFurniture !== null;
+    loco.miniGrabbing = this.miniGrabbing;
+    if (!locomotionSuppressed(loco)) {
       const ls = this.input.axes('left');
       if (ls.x * ls.x + ls.y * ls.y > LOCOMOTION_DEADZONE * LOCOMOTION_DEADZONE) {
         const mv = locomotionAmount(ls.x, ls.y, LOCOMOTION_SPEED, dt, LOCOMOTION_DEADZONE);
@@ -2987,7 +3107,6 @@ class App {
       this.comfortRenderer.getIsVisible() ? this.comfortReachTargets() : undefined,
     );
     this.volumetrics.tick(dt, this.sceneData.atmosphere, this.sceneData.lights ?? [], this.camera);
-    this.gizmo.update(this.camera);
     this.renderer.render(this.scene3, this.camera);
     // See the non-XR path above: endFrame stamps its own clock so the begin->end span
     // is real CPU time rather than a zero delta against the frame-start timestamp.
@@ -3439,21 +3558,38 @@ class App {
         break;
       }
       case 'prop_ground_floor': {
-        const prop = this.props.all().find((p) => p.data.id === entityId);
+        const prop = this.props.get(entityId);
         if (prop) {
           prop.data.position.y = 0;
           prop.root.position.y = 0;
+          this.collabSession.broadcastPatch({ type: 'prop_move', propId: entityId, position: prop.data.position });
           this.debug.log(`Grounded prop ${prop.data.name} to floor`);
           this.markDirty();
         }
         break;
       }
+      case 'prop_grid_snap': {
+        const prop = this.props.get(entityId);
+        if (prop) {
+          prop.data.position = snapPropToGrid(prop.data).position;
+          const p = prop.data.position;
+          prop.root.position.set(p.x, p.y, p.z);
+          this.collabSession.broadcastPatch({ type: 'prop_move', propId: entityId, position: p });
+          this.debug.log(`Snapped ${prop.data.name} to the 10 cm grid`);
+          this.markDirty();
+        }
+        break;
+      }
       case 'prop_duplicate': {
-        const prop = this.props.all().find((p) => p.data.id === entityId);
+        const prop = this.props.get(entityId);
         if (prop) {
           void this.props.duplicateProp(prop.data.id).then((spawned) => {
             if (spawned) {
+              // Same commit as the wrist/wheel Dup: hover targets, peers, undo.
+              this.contentVersion++;
               this.selectProp(spawned.data.id);
+              this.collabSession.broadcastPatch({ type: 'prop_add', prop: spawned.data });
+              this.debug.log(`duplicated → ${spawned.data.name}`);
               this.markDirty();
             }
           });
@@ -3461,10 +3597,18 @@ class App {
         break;
       }
       case 'prop_delete': {
-        this.props.removeProp(entityId);
+        // Same commit as the wrist/wheel Delete (deleteTarget): end any carry
+        // first, then hover targets, peers and undo.
+        this.cancelActiveManipulation();
+        if (this.props.removeProp(entityId)) {
+          this.collabSession.broadcastPatch({ type: 'prop_remove', propId: entityId });
+          this.contentVersion++;
+          this.hover = null;
+          this.debug.log('deleted prop');
+          this.markDirty();
+        }
         this.contextualRadial.hide();
-        this.selectedPropId = null;
-        this.markDirty();
+        if (this.selectedPropId === entityId) this.selectedPropId = null;
         break;
       }
       default:
@@ -3478,11 +3622,13 @@ class App {
     if (rc && !this.draggedActor && !this.draggedCamera && !this.draggedProp && !this.draggedFurniture && !this.miniGrabbing) {
       if (this.hoverTargetsVersion !== this.contentVersion) {
         // The mode decides what the ray can touch: blocking never hovers the
-        // couch behind an actor; dressing never disturbs the blocking.
+        // couch behind an actor; dressing never disturbs the blocking. Props
+        // are set dressing too, so Dress can grab them; the hits below are
+        // distance-sorted, so the nearer of a prop and a scanned piece wins.
         this.hoverTargets =
           this.interactionMode === 'block'
             ? [...this.actors.raycastTargets(), ...this.cams.raycastTargets(), ...this.props.raycastTargets()]
-            : [...this.location.furnitureTargets()];
+            : [...this.location.furnitureTargets(), ...this.props.raycastTargets()];
         this.hoverTargetsVersion = this.contentVersion;
       }
       const hits = rc.intersectObjects(this.hoverTargets, true);
@@ -3591,21 +3737,27 @@ class App {
     const customAssets = await globalPropStore.listAssets();
     openPropsLibraryModal(
       async (assetId, customKey) => {
-        const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
-        const spawnPos = {
-          x: viewerLocal.x,
-          y: 0,
-          z: viewerLocal.z - 1.2,
-        };
+        const spawnPos = this.propSpawnPoint();
+        // An upload is an IndexedDB model: without sourceType 'indexeddb' the
+        // renderer drew it as a placeholder box. Name and file it as the upload.
+        const upload = customKey ? customAssets.find((a) => a.id === customKey) : undefined;
         const obj = await this.props.addProp(assetId, spawnPos, {
           customModelKey: customKey,
+          ...(customKey ? { sourceType: 'indexeddb' as const, category: upload?.category ?? 'custom' } : {}),
+          ...(upload ? { name: upload.name } : {}),
+          rotationY: this.faceViewerYaw(spawnPos),
         });
+        if (!obj) return;
         this.collabSession.broadcastPatch({
           type: 'prop_add',
           prop: obj.data,
         });
         this.markDirty();
         this.contentVersion++;
+        // Keep main's selection in step with the manager's highlight (Delete /
+        // Dup act on it); the radial menu only means something in a session.
+        if (this.session.session) this.selectProp(obj.data.id);
+        else this.selectedPropId = obj.data.id;
         this.debug.log(`placed prop: ${obj.data.name}`);
       },
       customAssets,

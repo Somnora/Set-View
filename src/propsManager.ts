@@ -32,6 +32,13 @@ export class PropsManager {
   readonly session: SessionManager;
   private scene: SceneData;
   private selectedId: string | null = null;
+  /**
+   * Bumped by clear(). buildObject awaits the model load (an IndexedDB read
+   * plus a GLB/OBJ parse for uploads), so a scene switch, undo or remote patch
+   * can land mid-load; a build that finishes for an older generation is
+   * discarded instead of adding a ghost prop to the new scene.
+   */
+  private generation = 0;
 
   constructor(session: SessionManager, scene: SceneData) {
     this.session = session;
@@ -50,6 +57,7 @@ export class PropsManager {
   }
 
   clear(): void {
+    this.generation++;
     for (const obj of this.objects.values()) {
       obj.anchor?.delete?.();
       this.group.remove(obj.root);
@@ -84,13 +92,17 @@ export class PropsManager {
     }
   }
 
-  /** Spawns a new prop into the scene and 3D viewport. */
-  async addProp(assetId: string, position: Vec3, options: Partial<PropData> = {}): Promise<PropObject> {
+  /**
+   * Spawns a new prop into the scene and 3D viewport. Resolves null if the
+   * scene was replaced while the model loaded (the prop never appears).
+   */
+  async addProp(assetId: string, position: Vec3, options: Partial<PropData> = {}): Promise<PropObject | null> {
     const data = createPropData(assetId, options.name, position, options);
     if (!this.scene.props) this.scene.props = [];
     this.scene.props.push(data);
 
     const obj = await this.buildObject(data);
+    if (!obj) return null;
     this.setSelected(data.id);
     return obj;
   }
@@ -105,6 +117,7 @@ export class PropsManager {
     this.scene.props.push(dupData);
 
     const obj = await this.buildObject(dupData);
+    if (!obj) return null;
     this.setSelected(dupData.id);
     return obj;
   }
@@ -177,7 +190,7 @@ export class PropsManager {
     return out;
   }
 
-  private async buildObject(data: PropData): Promise<PropObject> {
+  private async buildObject(data: PropData): Promise<PropObject | null> {
     const root = new THREE.Group();
     root.name = `prop_root_${data.id}`;
     root.userData.propId = data.id;
@@ -185,7 +198,13 @@ export class PropsManager {
     root.rotation.y = data.rotationY;
     root.scale.set(data.scale.x, data.scale.y, data.scale.z);
 
+    const gen = this.generation;
     const contentGroup = await globalPropRenderer.createPropMesh(data);
+    if (gen !== this.generation) {
+      // The scene this prop belonged to was cleared while its model loaded.
+      disposeTree(contentGroup);
+      return null;
+    }
     root.add(contentGroup);
 
     // Compute dimensions for bounding box and label

@@ -2,7 +2,10 @@
 <!-- Palm tool-wheel smoke: renders the root ring and the Lens sub-wheel, then
      drives BOTH input paths against the real WheelPanel — a controller
      raycast (hover + trigger) and a simulated fingertip tap (hover in front,
-     push through the disc) — asserting press routing for each.
+     push through the disc) — asserting press routing for each. A third panel
+     is then navigated by ray through wheel.ts's routing tables (the same
+     ones main.ts onWheelPress uses): Edit > Stance > a height preset, Back,
+     Edit > Props > a preset, and the Block-root Re-align sector.
 
        chrome --headless=new --disable-gpu --ignore-certificate-errors \
          --enable-unsafe-swiftshader --window-size=1000,560 \
@@ -16,6 +19,7 @@
       import * as THREE from 'three';
       import { WheelPanel } from '../src/wheelView.ts';
       import { wheelMenu } from '../src/wheel.ts';
+      import { sectorAngle, submenuForSector, wheelPropPreset, wheelSectorRoute } from '../src/wheel.ts';
 
       const out = document.getElementById('out');
       try {
@@ -67,10 +71,60 @@
         if (pressed.join(',') !== 'wheel-place,wheel-mode,wheel-place')
           throw new Error(`press routing: ${pressed.join(',')}`);
 
+        // Sub-wheel navigation through the routing tables, by ray.
+        const navCtx = { ...ctx, mode: 'block' };
+        const nav = new WheelPanel();
+        nav.group.position.set(0.35, 0, 0); // off-screen; rays target it directly
+        scene.add(nav.group);
+        scene.updateMatrixWorld(true);
+        let path = 'root';
+        let menu = wheelMenu(navCtx, path);
+        nav.setMenu(menu);
+        const routed = [];
+        nav.onPress = (id) => {
+          const route = wheelSectorRoute(id);
+          if (!route) throw new Error(`no handler for "${id}"`);
+          routed.push(`${route}:${id}`);
+          if (route === 'nav') {
+            path = submenuForSector(id) ?? 'root';
+            menu = wheelMenu(navCtx, path);
+            nav.setMenu(menu);
+          }
+        };
+        const press = (id) => {
+          let x = 0.35;
+          let y = 0;
+          if (id !== menu.hub.id) {
+            const i = menu.sectors.findIndex((s) => s.id === id);
+            if (i < 0) throw new Error(`"${id}" not on the ${path} ring`);
+            const a = sectorAngle(i, menu.sectors.length);
+            x += Math.sin(a) * 0.05; // sector band sits between hub and rim
+            y += Math.cos(a) * 0.05;
+          }
+          rc.set(new THREE.Vector3(x, y, 0.42), new THREE.Vector3(0, 0, -1));
+          nav.update(rc);
+          if (!nav.handleTriggerDown()) throw new Error(`press on "${id}" not consumed`);
+        };
+        press('sub-edit');
+        press('sub-stance');
+        if (path !== 'stance') throw new Error(`Stance sub-wheel did not open (at ${path})`);
+        press('h-preset-175');
+        press('wheel-back');
+        press('resetview');
+        press('sub-edit');
+        press('sub-props');
+        press('prop-cstand');
+        const want = [
+          'nav:sub-edit', 'nav:sub-stance', 'wrist:h-preset-175', 'nav:wheel-back',
+          'wrist:resetview', 'nav:sub-edit', 'nav:sub-props', 'prop:prop-cstand',
+        ].join(',');
+        if (routed.join(',') !== want) throw new Error(`nav routing: ${routed.join(',')}`);
+        if (wheelPropPreset('prop-cstand') !== 'c_stand_with_arm') throw new Error('C-Stand preset');
+
         const n = wheelMenu(ctx, 'root').sectors.length;
         lens.update(null);
         renderer.render(scene, camera);
-        out.textContent = `WHEEL-SMOKE PASS (${n} root sectors, ray + touch)`;
+        out.textContent = `WHEEL-SMOKE PASS (${n} root sectors, ray + touch, sub-wheel nav)`;
       } catch (e) {
         out.textContent = `WHEEL-SMOKE FAIL: ${e.message}`;
         out.style.color = '#f66';

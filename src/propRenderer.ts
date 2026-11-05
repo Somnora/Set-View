@@ -12,6 +12,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import {
   getBuiltinPropDefinition,
+  resolvePropSourceType,
   type PropData,
 } from './props.ts';
 import { globalPropStore } from './propStore.ts';
@@ -55,12 +56,20 @@ export class PropRenderer {
   private gltfLoader = new GLTFLoader();
   private objLoader = new OBJLoader();
 
+  /**
+   * Called when an uploaded model cannot be shown and the prop falls back to a
+   * placeholder box (missing from this device's store, unsupported file type,
+   * or a parse error such as a Draco-compressed GLB). main.ts routes it to the
+   * debug log and the wrist status.
+   */
+  onLoadError?: (assetKey: string, err: unknown) => void;
+
   /** Builds the Three.js 3D visual object for a given PropData. */
   async createPropMesh(prop: PropData): Promise<THREE.Group> {
     const group = new THREE.Group();
     group.name = `prop_${prop.id}`;
 
-    if (prop.sourceType === 'indexeddb' && prop.customModelKey) {
+    if (prop.customModelKey && resolvePropSourceType(prop.sourceType, prop.customModelKey) === 'indexeddb') {
       const customMesh = await this.loadCustomModel(prop.customModelKey);
       if (customMesh) {
         group.add(customMesh);
@@ -74,27 +83,42 @@ export class PropRenderer {
     return group;
   }
 
-  /** Loads and normalizes a custom 3D model from PropStore. */
+  /**
+   * Loads and normalizes a custom 3D model from PropStore. Parses the stored
+   * bytes directly (GLTFLoader.parseAsync / OBJLoader.parse) rather than
+   * fetching a blob: URL, which Quest Browser has been reported to refuse with
+   * ERR_ACCESS_DENIED. Failures go to onLoadError and return null (the caller
+   * then shows the placeholder box).
+   */
   private async loadCustomModel(customKey: string): Promise<THREE.Group | null> {
+    const root = new THREE.Group();
     try {
       const asset = await globalPropStore.getAsset(customKey);
-      if (!asset) return null;
+      if (!asset || !asset.buffer) {
+        throw new Error('model not found in this device\'s prop library (uploaded on another device, or deleted)');
+      }
 
-      const url = await globalPropStore.getAssetBlobUrl(customKey);
-      if (!url) return null;
-
-      const root = new THREE.Group();
-
-      if (asset.fileType === 'glb' || asset.fileType === 'gltf') {
-        const gltf = await this.gltfLoader.loadAsync(url);
-        root.add(gltf.scene);
-      } else if (asset.fileType === 'obj') {
-        const obj = await this.objLoader.loadAsync(url);
-        root.add(obj);
+      if (asset.fileType !== 'glb' && asset.fileType !== 'gltf' && asset.fileType !== 'obj') {
+        throw new Error(`unsupported model type "${asset.fileType}" (use GLB, glTF or OBJ)`);
+      }
+      try {
+        if (asset.fileType === 'obj') {
+          root.add(this.objLoader.parse(new TextDecoder().decode(asset.buffer)));
+        } else {
+          // Empty base path: a .gltf whose buffers or textures are separate files
+          // cannot resolve them and fails here (reported); embedded data URIs
+          // work. Draco / meshopt / KTX2 compressed files fail too (no decoders).
+          const gltf = await this.gltfLoader.parseAsync(asset.buffer, '');
+          root.add(gltf.scene);
+        }
+      } catch (parseErr) {
+        const why = parseErr instanceof Error ? parseErr.message : String(parseErr);
+        throw new Error(`could not read ${asset.fileName || asset.fileType.toUpperCase()}: ${why}`);
       }
 
       // Compute bounding box and normalize center/floor
       const box = new THREE.Box3().setFromObject(root);
+      if (box.isEmpty()) throw new Error('model has no visible geometry');
       const size = new THREE.Vector3();
       box.getSize(size);
       const center = new THREE.Vector3();
@@ -108,7 +132,10 @@ export class PropRenderer {
       const wrapper = new THREE.Group();
       wrapper.add(root);
       return wrapper;
-    } catch {
+    } catch (err) {
+      // Free anything a parse got as far as building before it failed.
+      disposeTree(root);
+      this.onLoadError?.(customKey, err);
       return null;
     }
   }
