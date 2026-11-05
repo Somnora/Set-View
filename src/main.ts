@@ -988,8 +988,9 @@ class App {
     // Capture bakes the content transform into the geometry, so it must run at
     // true registration. Re-align here instead of refusing. realign() applies
     // behind a fade, so isShifted stays true for about half the fade; the scan
-    // waits for it in updatePendingScan rather than cancelling itself.
-    const awaitingRealign = this.views.isShifted;
+    // waits for it in updatePendingScan rather than cancelling itself. A
+    // teleport still inside its fade (not applied yet) is replaced the same way.
+    const awaitingRealign = this.views.isShifted || this.views.fading;
     if (awaitingRealign) this.views.realign();
     this.pendingScan = {
       startedAt: -1,
