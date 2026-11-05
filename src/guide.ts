@@ -63,7 +63,7 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
             : ctx.placeMode === 'actor'
               ? 'X: switch to camera placing'
               : ctx.placeMode === 'camera'
-                ? 'X: switch to light placing'
+                ? 'X: switch to prop placing'
                 : 'X: placing off',
       });
     }
@@ -86,7 +86,7 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
             ? 'Place actor on the ring'
             : ctx.placeMode === 'camera'
               ? 'Place camera at your head'
-              : 'Place light fixture',
+              : 'Place prop on the ring',
     });
     items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab an actor or camera' });
     items.push({ hand: 'right', anchor: 'upper', label: 'B: mark a move for the actor' });

@@ -56,6 +56,33 @@ export function snapTurnAngle(step: -1 | 0 | 1, incrementRad: number): number {
   return step * incrementRad;
 }
 
+/** What the user is doing this frame, as far as thumbstick glide cares. */
+export interface LocomotionState {
+  viewMode: 'full' | 'mini' | 'camera';
+  draggingActor: boolean;
+  draggingCamera: boolean;
+  draggingProp: boolean;
+  draggingFurniture: boolean;
+  miniGrabbing: boolean;
+}
+
+/**
+ * True when the left-stick glide must NOT move the set this frame. Glide is a
+ * Full-view tool, and any grab in progress owns the sticks: gliding mid-carry
+ * would drag the whole set out from under the held object. The caller keeps one
+ * reused state object (no per-frame allocation).
+ */
+export function locomotionSuppressed(s: LocomotionState): boolean {
+  return (
+    s.viewMode !== 'full' ||
+    s.draggingActor ||
+    s.draggingCamera ||
+    s.draggingProp ||
+    s.draggingFurniture ||
+    s.miniGrabbing
+  );
+}
+
 export interface XZ {
   x: number;
   z: number;

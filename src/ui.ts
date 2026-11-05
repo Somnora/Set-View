@@ -1322,7 +1322,10 @@ export class Landing {
     if (scene.actors.length === 0) {
       const empty = document.createElement('p');
       empty.className = 'empty';
-      empty.textContent = 'No actors yet — click "+ Add Actor" or place actors in AR.';
+      // Only point at "+ Add Actor" when that button is actually drawn.
+      empty.textContent = this.cb.onAddActor
+        ? 'No actors yet. Click "+ Add Actor" or place actors in AR.'
+        : 'No actors yet. Place them in AR: wheel Place (or X) to Actor, then pinch the floor ring.';
       actorCard.appendChild(empty);
     } else {
       for (const actor of scene.actors) {
@@ -1349,7 +1352,9 @@ export class Landing {
     if (scene.cameras.length === 0) {
       const empty = document.createElement('p');
       empty.className = 'empty';
-      empty.textContent = 'No cameras yet — click "+ Add Camera" or commit one in AR.';
+      empty.textContent = this.cb.onAddCamera
+        ? 'No cameras yet. Click "+ Add Camera" or commit one in AR.'
+        : 'No cameras yet. Place one in AR: wheel Place (or X) to Cam, then pinch to drop it at your head.';
       camCard.appendChild(empty);
     } else {
       if (scene.actors.length >= 2) {
@@ -1411,7 +1416,9 @@ export class Landing {
     if (!scene.lights || scene.lights.length === 0) {
       const empty = document.createElement('p');
       empty.className = 'empty';
-      empty.textContent = 'No lights yet — click "+ Add Light".';
+      empty.textContent = this.cb.onAddLight
+        ? 'No lights yet. Click "+ Add Light".'
+        : 'No lights yet. Adding lights is not available yet (they arrive only with an imported scene).';
       lightCard.appendChild(empty);
     } else {
       for (const light of scene.lights) {
@@ -2007,34 +2014,51 @@ function escapeHtml(s: string): string {
 }
 
 export const CONTROLS_CHEATSHEET = `MOVING AROUND THE SET
-  Walk ............ just walk — you're in passthrough, the set is registered
+  Walk ............ just walk: you're in passthrough, the set is registered
   LEFT stick ...... glide through the set (forward/back + strafe), full view
-  RIGHT stick ← → . snap-turn the set 30° (full view, when not framing)
+  RIGHT stick L/R . snap-turn the set 30 deg (full view, nothing held, not framing)
   RIGHT stick click teleport to the aimed floor point (full view)
-  Wrist Re-align .. undo all glide/turn/teleport — back to true registration
+  Re-align ........ undo all glide/turn/teleport, back to true registration
+                    (Block wheel sector, or the wrist menu)
+
+TOOL WHEEL (the menu)
+  Rides your LEFT palm; Y parks it in front of your face (Y again: back to hand).
+  Press a sector: point + trigger, pinch, or tap it with your right fingertip.
+  Hub (center) .... Block / Dress switch on the main ring; Back in a sub-wheel
+  Block ring ...... Place · Marks · Lens · View · Camera · Edit · Re-align · Help
+  Dress ring ...... Scan Room · Room · 3DGS · Props · View · Camera · Edit · Help
+  Edit ............ Undo · Redo · Duplicate · Delete · Props · Stance
+  Props ........... 7 catalog props (spawn where you point, or ahead of you)
+                    · Prop Library
+  Stance .......... cycle pose · height - / + · height presets (selected actor)
 
 RIGHT controller (pointer)
-  Trigger ......... place actor/camera · select · click wrist menu
-  Grip (hold) ..... grab actor/camera to move · grab miniature
-  Stick ← → ....... rotate held actor · focal (Cam View / frame lines) · snap-turn
-  Stick click ..... teleport to reticle (full-scale view)
+  Trigger ......... press the wheel / wrist menu · select · place when armed
+  Grip (hold) ..... carry an actor, camera or prop (Block), furniture or a prop
+                    (Dress), the miniature (Mini), the monitor (Cam View)
+  Stick L/R ....... spin what you hold · focal (Cam View / frame lines) · turn
+  Stick click ..... teleport to the reticle (full view)
   A ............... commit camera (frame lines on) · capture PNG (Cam View)
-  B ............... store keyframe for selected actor (max 5)
+  B ............... mark a move for the selected actor (max 5), else a camera mark
 
 LEFT controller
-  Stick ........... glide through the set (full-scale view)
-  X ............... toggle placement mode (actor / camera)
-  Y ............... cycle view: full-scale → miniature → camera
-  Wrist menu ...... point at the panel above your left wrist and pull trigger
-  Undo / Redo ..... step back / forward through placement & keyframe edits
-  Dup ............. clone the pointed-at (or selected) actor / camera
-  Pace − / + ...... slow down / speed up blocking playback (per scene)
-  Stance ▸ ........ cycle the selected actor's pose (stand/lean/sit/lie)
-  DOF ............. toggle simulated depth of field on the camera monitor
-  Scan Room ....... capture the room's Scene Mesh into this scene
-  Loc: … .......... location display: Hidden → Ghost → Solid
+  Stick ........... glide through the set (full view)
+  X ............... cycle placing: Off > Actor > Cam > Prop (Place on the wheel)
+  Y ............... park the tool wheel in front of your face / back on your hand
+  Wrist menu ...... the panel on your left wrist: point at it and pull trigger
 
-Hands (no controllers): pinch = trigger (place/select). Menu needs controllers.
+ON THE SET
+  Place ........... arm it first; trigger on the floor ring drops an actor or the
+                    last Props preset, Cam drops a camera at your head
+  Selected item ... a ring of quick actions appears beside it (props: Snap to
+                    Floor, Snap to Grid, Duplicate, Delete)
+  Release a prop .. it stands upright on the floor, or on the real surface
+                    right under it
+  Room (Dress) .... scanned room display: Hidden > Ghost > Solid > Wireframe
+
+Hands (no controllers): pinch = trigger (place / select / press); tap the palm
+  wheel with your right index fingertip. Hands place one item per arm. Carrying
+  needs a grab (squeeze), which is not yet verified with hand tracking.
 
 Desktop prep (no headset)
   Rename scenes · set each actor's stance · edit each camera's lens / format /

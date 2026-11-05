@@ -219,6 +219,12 @@ export function calculateTrackTangentAlignment(
 
 /**
  * Generates contextual quick-action items based on selected entity type and properties.
+ *
+ * The camera, actor and prop lists are what the headset's contextual radial
+ * shows, so every actionType in them must have a handler in main.ts
+ * handleContextQuickAction (a domain test checks this). Grip Rig, Aim at
+ * Target, Look-At IK and Lock were removed until they do something: they used
+ * to fall through to a log line that claimed the action had run.
  */
 export function generateEntityContextActions(
   entityType:
@@ -240,7 +246,7 @@ export function generateEntityContextActions(
     | 'dressing'
     | 'set_dressing',
   entityId: string,
-  metadata?: Record<string, unknown>,
+  _metadata?: Record<string, unknown>,
 ): ContextQuickAction[] {
 
   switch (entityType) {
@@ -252,20 +258,6 @@ export function generateEntityContextActions(
           icon: '🔍',
           category: 'optics',
           actionType: 'camera_step_focal',
-        },
-        {
-          id: `${entityId}_grip_rig`,
-          label: 'Grip Rig',
-          icon: '🎥',
-          category: 'rig',
-          actionType: 'camera_grip_config',
-        },
-        {
-          id: `${entityId}_look_at`,
-          label: 'Aim at Target',
-          icon: '🎯',
-          category: 'optics',
-          actionType: 'camera_look_at',
         },
         {
           id: `${entityId}_audit_180`,
@@ -313,7 +305,6 @@ export function generateEntityContextActions(
     }
 
     case 'actor': {
-      const isLocked = metadata?.locked === true;
       return [
         {
           id: `${entityId}_dialogue_pair`,
@@ -351,25 +342,11 @@ export function generateEntityContextActions(
           actionType: 'actor_boom_target',
         },
         {
-          id: `${entityId}_look_at_ik`,
-          label: 'Look-At IK',
-          icon: '👀',
-          category: 'ik',
-          actionType: 'actor_toggle_look_ik',
-        },
-        {
           id: `${entityId}_duplicate`,
           label: 'Duplicate',
           icon: '📋',
           category: 'transform',
           actionType: 'actor_duplicate',
-        },
-        {
-          id: `${entityId}_lock`,
-          label: isLocked ? 'Unlock' : 'Lock',
-          icon: isLocked ? '🔓' : '🔒',
-          category: 'state',
-          actionType: 'entity_toggle_lock',
         },
       ];
     }
