@@ -83,6 +83,15 @@ import {
   type PropData,
 } from '../src/props.ts';
 import {
+  getBuiltinPropDefinition,
+  PROP_GRID_STEP_M,
+  PROP_SETTLE_ABOVE_M,
+  PROP_SETTLE_RADIUS_M,
+  resolvePropSourceType,
+  settlePropY,
+  snapPropToGrid,
+} from '../src/props.ts';
+import {
   calculateBeamLuminance,
   calculateVolumetricAttenuation,
   createAtmosphereConfig,
@@ -172,6 +181,17 @@ import {
   wheelHit,
   wheelMenu,
 } from '../src/wheel.ts';
+import {
+  SUBMENU_IDS,
+  submenuForSector,
+  WHEEL_PROP_PRESETS,
+  WHEEL_SECTOR_HANDLERS,
+  wheelPropPreset,
+  wheelSectorRoute,
+  type WheelContext,
+  type WheelPath,
+} from '../src/wheel.ts';
+import { readFileSync } from 'node:fs';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from '../src/floor.ts';
 import {
   buildShotList,
@@ -222,6 +242,7 @@ import {
 } from '../src/timecode.ts';
 import { createTakeRecord, TakeLibrary, type TakeRecord } from '../src/dailies.ts';
 import { locomotionAmount, rotateOffsetAboutPivot, snapTurnAngle } from '../src/locomotion.ts';
+import { locomotionSuppressed, type LocomotionState } from '../src/locomotion.ts';
 import {
   containScale,
   fileExtensionFor,
@@ -2276,12 +2297,13 @@ test('wheel: sub-wheels carry live values and hands get a Mark button', () => {
   assert.ok(cap.sectors.some((s) => s.id === 'exit'), 'hands must be able to exit AR');
 });
 
-test('wheel: placement arming cycles Off, Actor, Cam, Light, Prop and the Place sector shows it', () => {
+test('wheel: placement arming cycles Off, Actor, Cam, Prop and the Place sector shows it', () => {
+  // P0.11: Light is out of the cycle until lights can be placed.
   assert.equal(nextPlaceMode('none'), 'actor');
   assert.equal(nextPlaceMode('actor'), 'camera');
-  assert.equal(nextPlaceMode('camera'), 'light');
-  assert.equal(nextPlaceMode('light'), 'prop');
+  assert.equal(nextPlaceMode('camera'), 'prop');
   assert.equal(nextPlaceMode('prop'), 'none');
+  assert.equal(nextPlaceMode('light'), 'none');
   const label = (placeMode: 'none' | 'actor' | 'camera' | 'light' | 'prop') =>
     wheelMenu({ ...WHEEL_BASE, mode: 'block', placeMode }, 'root').sectors.find((s) => s.id === 'wheel-place')
       ?.label ?? '';
@@ -11329,6 +11351,193 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
   const setDressingActions = generateEntityContextActions('set_dressing', 'dressing_root');
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_open_studio'));
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_quick_scatter'));
+});
+
+// --- P0 props-build ---
+
+test('P0.2: a prop with a customModelKey is an IndexedDB model (create, normalize, migrate)', () => {
+  // createPropData infers the loader from the key (the Prop Library used to pass only the key).
+  const created = createPropData('custom-asset-abc', 'Upload', { x: 0, y: 0, z: 0 }, { customModelKey: 'custom-asset-abc' });
+  assert.equal(created.sourceType, 'indexeddb');
+  assert.equal(created.customModelKey, 'custom-asset-abc');
+  assert.equal(createPropData('directors_chair').sourceType, 'builtin', 'no key: catalog prop stays builtin');
+  assert.equal(
+    createPropData('x', undefined, undefined, { customModelKey: 'k', sourceType: 'builtin' }).sourceType,
+    'indexeddb',
+    'an explicit builtin with a key is the old bug, not a choice',
+  );
+
+  // Saved scenes from before the fix are repaired on load.
+  const migrated = normalizePropData({
+    id: 'p1',
+    assetId: 'custom-asset-abc',
+    name: 'Old upload',
+    position: { x: 1, y: 0, z: 2 },
+    rotationY: 0,
+    sourceType: 'builtin',
+    customModelKey: 'custom-asset-abc',
+  });
+  assert.equal(migrated?.sourceType, 'indexeddb');
+  assert.equal(normalizePropData({ id: 'p2', assetId: 'a', customModelKey: 'k' })?.sourceType, 'indexeddb');
+  assert.equal(normalizePropData({ id: 'p3', assetId: 'apple_box_full' })?.sourceType, 'builtin');
+  assert.equal(normalizePropData({ id: 'p4', assetId: 'apple_box_full', sourceType: 'bogus' })?.sourceType, 'builtin');
+
+  // Through the scene normalizer, which is what a load or import runs.
+  const scene = createScene('P0.2 migrate');
+  (scene as unknown as { props: unknown[] }).props = [
+    { id: 'p5', assetId: 'custom-asset-x', name: 'U', position: { x: 0, y: 0, z: 0 }, rotationY: 0, sourceType: 'builtin', customModelKey: 'custom-asset-x' },
+  ];
+  assert.equal(normalizeScene(scene).props?.[0].sourceType, 'indexeddb');
+
+  // The resolver itself: other explicit loaders are kept, empty keys ignored.
+  assert.equal(resolvePropSourceType('procedural', 'k'), 'procedural');
+  assert.equal(resolvePropSourceType('custom_url', 'k'), 'custom_url');
+  assert.equal(resolvePropSourceType(undefined, ''), 'builtin');
+  assert.equal(resolvePropSourceType(undefined, undefined, 'procedural'), 'procedural');
+});
+
+test('P0.3: every Props sub-wheel preset spawns its own catalog prop', () => {
+  const ring = wheelMenu({ ...WHEEL_BASE, mode: 'block' }, 'props');
+  const presetIds = ring.sectors.map((s) => s.id).filter((id) => id.startsWith('prop-') && id !== 'prop-library');
+  assert.equal(presetIds.length, 7);
+  const assets = presetIds.map((id) => {
+    const assetId = wheelPropPreset(id);
+    assert.ok(assetId, `${id} has no preset`);
+    assert.ok(getBuiltinPropDefinition(assetId), `${id} -> ${assetId} is not a catalog prop`);
+    return assetId;
+  });
+  assert.equal(new Set(assets).size, assets.length, 'presets must not collapse onto one prop');
+  assert.deepEqual(Object.keys(WHEEL_PROP_PRESETS).sort(), [...presetIds].sort(), 'no preset without a sector');
+  assert.equal(wheelPropPreset('prop-chair'), 'directors_chair');
+  assert.equal(wheelPropPreset('prop-library'), null, 'the library opens a modal, not a preset');
+  assert.equal(wheelPropPreset('constructor'), null, 'own keys only');
+});
+
+/** Every ring a user can actually reach from the root, in each state that changes the rings. */
+function reachableWheelMenus(): { where: string; menu: ReturnType<typeof wheelMenu> }[] {
+  const out: { where: string; menu: ReturnType<typeof wheelMenu> }[] = [];
+  for (const mode of ['block', 'dress'] as const) {
+    for (const placeMode of ['none', 'actor', 'camera', 'prop'] as const) {
+      for (const hasScan of [true, false]) {
+        const ctx: WheelContext = { ...WHEEL_BASE, mode, placeMode, hasScan };
+        const seen = new Set<WheelPath>();
+        const queue: WheelPath[] = ['root'];
+        while (queue.length) {
+          const path = queue.shift()!;
+          if (seen.has(path)) continue;
+          seen.add(path);
+          const menu = wheelMenu(ctx, path);
+          out.push({ where: `${mode}/${placeMode}/${hasScan ? 'scan' : 'noscan'}/${path}`, menu });
+          for (const s of menu.sectors) if (s.submenu) queue.push(s.submenu);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+test('P0.11: every reachable sector has a handler; submenu openers resolve via SUBMENU_IDS', () => {
+  const reachableIds = new Set<string>();
+  for (const { where, menu } of reachableWheelMenus()) {
+    for (const s of [...menu.sectors, menu.hub]) {
+      reachableIds.add(s.id);
+      const route = wheelSectorRoute(s.id);
+      assert.ok(route, `${where}: "${s.id}" has no handler`);
+      if ('submenu' in s && s.submenu) {
+        assert.equal(SUBMENU_IDS[s.id], s.submenu, `${where}: ${s.id} not in SUBMENU_IDS`);
+        assert.equal(submenuForSector(s.id), s.submenu);
+        assert.equal(route, 'nav');
+      }
+      if (route === 'nav') assert.ok(s.id === 'wheel-back' || submenuForSector(s.id), `${where}: nav ${s.id}`);
+      if (route === 'prop') assert.ok(wheelPropPreset(s.id), `${where}: prop ${s.id}`);
+      assert.ok(!/^light-|^sub-light$|^wheel-more$/.test(s.id), `${where}: dead sector ${s.id} is reachable`);
+    }
+  }
+  // The table has no stale rows: every entry is a sector some ring can show.
+  for (const id of Object.keys(WHEEL_SECTOR_HANDLERS)) assert.ok(reachableIds.has(id), `unreachable handler row ${id}`);
+  for (const id of Object.keys(SUBMENU_IDS)) assert.ok(reachableIds.has(id), `unreachable submenu opener ${id}`);
+  assert.ok(reachableIds.has('sub-stance'), 'Stance sub-wheel is reachable');
+  assert.equal(wheelSectorRoute('toString'), null, 'own keys only');
+
+  // Re-align now lives on the Block root (it used to exist only on the wrist).
+  const blockRoot = wheelMenu({ ...WHEEL_BASE, mode: 'block' }, 'root');
+  assert.ok(blockRoot.sectors.some((s) => s.id === 'resetview'));
+  assert.ok(!blockRoot.sectors.some((s) => s.id === 'sub-light'));
+
+  // main.ts must actually handle every id it is routed: a case label in its
+  // wheel switch ('wheel') or the wrist-panel switch ('wrist').
+  const mainSrc = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  for (const [id, route] of Object.entries(WHEEL_SECTOR_HANDLERS)) {
+    if (route === 'wheel' || route === 'wrist') {
+      assert.ok(mainSrc.includes(`case '${id}':`), `main.ts has no case for ${route} sector "${id}"`);
+    }
+  }
+});
+
+test('P0.11: the Place cycle never arms Light, and the guide chips follow it', () => {
+  let m: 'none' | 'actor' | 'camera' | 'light' | 'prop' = 'none';
+  const visited: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    m = nextPlaceMode(m);
+    visited.push(m);
+  }
+  assert.deepEqual(visited, ['actor', 'camera', 'prop', 'none']);
+  const camX = guideItems({ mode: 'full', placeMode: 'camera', eyesMode: false, interaction: 'block' }).find(
+    (i) => i.hand === 'left' && i.anchor === 'lower',
+  );
+  assert.ok(camX && /prop/i.test(camX.label) && !/light/i.test(camX.label), `X chip: ${camX?.label}`);
+  const propTrig = guideItems({ mode: 'full', placeMode: 'prop', eyesMode: false, interaction: 'block' }).find(
+    (i) => i.anchor === 'trigger',
+  );
+  assert.ok(propTrig && /prop/i.test(propTrig.label), `trigger chip: ${propTrig?.label}`);
+});
+
+test('P0.12: any carry or non-Full view suppresses glide', () => {
+  const idle: LocomotionState = {
+    viewMode: 'full',
+    draggingActor: false,
+    draggingCamera: false,
+    draggingProp: false,
+    draggingFurniture: false,
+    miniGrabbing: false,
+  };
+  assert.equal(locomotionSuppressed(idle), false, 'free to glide');
+  for (const k of ['draggingActor', 'draggingCamera', 'draggingProp', 'draggingFurniture', 'miniGrabbing'] as const) {
+    assert.equal(locomotionSuppressed({ ...idle, [k]: true }), true, k);
+  }
+  assert.equal(locomotionSuppressed({ ...idle, viewMode: 'mini' }), true);
+  assert.equal(locomotionSuppressed({ ...idle, viewMode: 'camera' }), true);
+});
+
+test('P0.12: a released prop settles on the surface under it, else the floor', () => {
+  const carried = { x: 1, y: 1.2, z: -2 };
+  assert.equal(settlePropY(carried, null), 0, 'no hit: floor');
+  // A table top straight under the prop: rest on it.
+  assert.equal(settlePropY(carried, { x: 1.1, y: 0.74, z: -2.05 }), 0.74);
+  // The ray ended on a far wall or floor: not under the prop, so the floor.
+  assert.equal(settlePropY(carried, { x: 4, y: 1.5, z: -6 }), 0);
+  assert.equal(settlePropY(carried, { x: 1.5, y: 0.74, z: -2 }), 0, '0.5 m away is not under it');
+  // Radius boundary is inclusive.
+  assert.equal(settlePropY(carried, { x: 1 + PROP_SETTLE_RADIUS_M, y: 0.5, z: -2 }), 0.5);
+  assert.equal(settlePropY(carried, { x: 1 + PROP_SETTLE_RADIUS_M + 0.01, y: 0.5, z: -2 }), 0);
+  // Never jumps up onto something well above its base; a little (tracking noise) is fine.
+  const low = { x: 0, y: 0.5, z: 0 };
+  assert.equal(settlePropY(low, { x: 0, y: 0.5 + PROP_SETTLE_ABOVE_M, z: 0 }), 0.5 + PROP_SETTLE_ABOVE_M);
+  assert.equal(settlePropY(low, { x: 0, y: 0.75, z: 0 }), 0, 'surface above the base: floor instead');
+});
+
+test('P0.11: Snap to Grid moves a prop to the nearest grid point on the floor plane only', () => {
+  const p = createPropData('apple_box_full', 'Box', { x: 1.234, y: 0.5, z: -0.36 }, { rotationY: 0.7 });
+  const snapped = snapPropToGrid(p);
+  assert.equal(PROP_GRID_STEP_M, 0.1);
+  approx(snapped.position.x, 1.2, 1e-9);
+  approx(snapped.position.z, -0.4, 1e-9);
+  assert.equal(snapped.position.y, 0.5, 'height untouched');
+  assert.equal(snapped.rotationY, 0.7, 'heading untouched');
+  assert.equal(p.position.x, 1.234, 'input not mutated');
+  const coarse = snapPropToGrid(p, 0.5);
+  approx(coarse.position.x, 1.0, 1e-9);
+  approx(coarse.position.z, -0.5, 1e-9);
 });
 
 void Promise.all([scanStoreFallback(), propStoreFallback()]).then(

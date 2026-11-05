@@ -297,6 +297,26 @@ export function findPropDefinition(assetId: string, customCatalog: readonly Prop
   return customCatalog.find((p) => p.id === assetId) ?? getBuiltinPropDefinition(assetId);
 }
 
+const PROP_SOURCE_TYPES: readonly PropSourceType[] = ['builtin', 'custom_url', 'indexeddb', 'procedural'];
+
+/**
+ * The loader a prop needs. A prop that carries a customModelKey is an uploaded
+ * model in the IndexedDB PropStore, so an absent or 'builtin' source type is
+ * upgraded to 'indexeddb'. Older builds saved uploads as 'builtin', which made
+ * them render as placeholder cubes; this repairs those on load. Unknown
+ * strings fall back to `fallback`.
+ */
+export function resolvePropSourceType(
+  sourceType: unknown,
+  customModelKey: unknown,
+  fallback: PropSourceType = 'builtin',
+): PropSourceType {
+  const known = PROP_SOURCE_TYPES.includes(sourceType as PropSourceType) ? (sourceType as PropSourceType) : null;
+  const hasKey = typeof customModelKey === 'string' && customModelKey.length > 0;
+  if (hasKey && (known === null || known === 'builtin')) return 'indexeddb';
+  return known ?? fallback;
+}
+
 let _propCounter = 1;
 
 export function createPropData(
@@ -308,7 +328,7 @@ export function createPropData(
   const def = getBuiltinPropDefinition(assetId);
   const defaultName = def ? `${def.name} ${_propCounter++}` : `Prop ${_propCounter++}`;
   const category = options.category ?? def?.category ?? 'set_dressing';
-  const sourceType = options.sourceType ?? def?.sourceType ?? 'builtin';
+  const sourceType = resolvePropSourceType(options.sourceType, options.customModelKey, def?.sourceType ?? 'builtin');
 
   return {
     id: options.id || `prop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
@@ -398,8 +418,8 @@ export function normalizePropData(raw: unknown): PropData | null {
   const colorHex = typeof r.colorHex === 'string' && r.colorHex.startsWith('#') ? r.colorHex : def?.defaultColorHex;
   const isLocked = Boolean(r.isLocked);
   const visible = r.visible !== false;
-  const sourceType = (typeof r.sourceType === 'string' ? r.sourceType : def?.sourceType || 'builtin') as PropSourceType;
   const customModelKey = typeof r.customModelKey === 'string' ? r.customModelKey : undefined;
+  const sourceType = resolvePropSourceType(r.sourceType, customModelKey, def?.sourceType || 'builtin');
 
   return {
     id,
@@ -475,6 +495,50 @@ export function snapPropToFloor(prop: PropData, floorY = 0.0): PropData {
     position: {
       ...prop.position,
       y: floorY,
+    },
+  };
+}
+
+/** A real-surface hit this close (horizontally, m) to a released prop counts as under it. */
+export const PROP_SETTLE_RADIUS_M = 0.25;
+/** ...and may sit at most this far (m) above the prop's base: a prop drops onto a surface, never up. */
+export const PROP_SETTLE_ABOVE_M = 0.1;
+
+/**
+ * Base height (scene space) a just-released prop settles to. `hit` is the
+ * current platform hit-test point in the same space, or null. The hit is where
+ * the pointer ray meets the real room, which is usually NOT under the prop, so
+ * it only counts when it lies within PROP_SETTLE_RADIUS_M of the prop's XZ and
+ * no more than PROP_SETTLE_ABOVE_M above its base (the prop rests on that real
+ * surface, e.g. a table). Anything else lands the prop on the floor, y = 0.
+ */
+export function settlePropY(prop: Vec3, hit: Vec3 | null): number {
+  if (hit) {
+    const dx = hit.x - prop.x;
+    const dz = hit.z - prop.z;
+    if (dx * dx + dz * dz <= PROP_SETTLE_RADIUS_M * PROP_SETTLE_RADIUS_M && hit.y <= prop.y + PROP_SETTLE_ABOVE_M) {
+      return hit.y;
+    }
+  }
+  return 0;
+}
+
+/** Step (m) of the prop Snap to Grid action; matches the gizmo translate snap. */
+export const PROP_GRID_STEP_M = 0.1;
+
+/**
+ * Snaps a prop's floor position (x, z) to the nearest point of a square grid
+ * with the given step, keeping its height and heading. (calculateGridPlacement
+ * below lays out the Nth prop of a batch; it does not snap a single prop.)
+ */
+export function snapPropToGrid(prop: PropData, step = PROP_GRID_STEP_M): PropData {
+  const snap = (v: number) => (step > 0 ? Math.round(Math.round(v / step) * step * 1e6) / 1e6 : v);
+  return {
+    ...prop,
+    position: {
+      x: snap(prop.position.x),
+      y: prop.position.y,
+      z: snap(prop.position.z),
     },
   };
 }
