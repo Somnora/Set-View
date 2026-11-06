@@ -23,9 +23,12 @@ What SetView is today and where it's headed. Dated so it stays honest.
 - localStorage autosave + JSON export/import; undo/redo; duplicate.
 - **Desktop 3D preview & modern prep UI** — orbit view of any scene on landing page: posed/scaled actors, blocking playback, lighting rig editor, per-camera lens views; pre-verifies content without a headset.
 
+## Scan, import and build (planned 2026-11-05)
+
+The detailed plan for scanning locations, importing them and building sets from scratch in the headset is in [docs/roadmap-scan-import-build.md](docs/roadmap-scan-import-build.md). Phase 0 (make the existing scan, import and build paths work or fail clearly) is implemented in PR #1 and waiting for a headset check. Phases 1 to 4 have not started. GLB location import is item P1.2 there, and Gaussian splat locations are P3.2, which waits on an owner decision and a Quest spike.
+
 ## Near term (headset-free-buildable)
 - **Multi-camera live monitoring (video village)** — simultaneous grid view of multiple active camera feeds on a virtual desk split board.
-- **Gaussian splat & GLB location import** — import high-poly GLBs or Gaussian Splat point clouds of remote locations into IndexedDB scan storage.
 - **Stage 2 smart scan furniture swapping** — replace volumetric gray-box scan meshes with curated 3D model prefabs.
 
 ## The realistic-rendering path (Unreal handoff)
