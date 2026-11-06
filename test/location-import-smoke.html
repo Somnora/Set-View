@@ -1,0 +1,227 @@
+<!doctype html>
+<!-- Location import through the REAL app (roadmap P1.2). Boots src/main.ts on the
+     landing page, then drives the Scene & Environment card's "Import location"
+     file input the way a user's picker would:
+       1. a textured GLB of the synthetic test room (built here with GLTFExporter):
+          the live scene gets the scan, the location renders one mesh per part,
+          and the textured original is kept in the blob store byte for byte;
+       2. a Draco-compressed GLB (built here with DRACOExporter) replacing it:
+          proves the decoders are served (vite.plugins.ts) and decode;
+       3. a Gaussian splat PLY header: refused with a banner, scene unchanged.
+     Needs the dev server (the test hooks are DEV-only) and a headed browser
+     (IndexedDB hangs headless on macOS; the stores then fall back to memory).
+
+     Headed (vite.http.config.ts): http://localhost:5174/test/location-import-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>location import smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6;max-width:60vw;white-space:pre-wrap">running…</pre>
+    <script src="/node_modules/three/examples/jsm/libs/draco/draco_encoder.js"></script>
+    <script type="module">
+      import * as THREE from 'three';
+      import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+      import { DRACOExporter } from 'three/examples/jsm/exporters/DRACOExporter.js';
+      import { createScene } from '../src/model.ts';
+      import { createSyntheticLocationScan } from '../src/scanExporters.ts';
+
+      const out = document.getElementById('out');
+      const CURRENT_KEY = 'setview.currentScene';
+      const INDEX_KEY = 'setview.sceneIndex';
+      const SCENE_PREFIX = 'setview.scene.';
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const notes = [];
+      const report = (ok, msg) => {
+        out.textContent = `LOCIMPORT-SMOKE ${ok ? 'PASS' : 'FAIL'} | ${msg}`;
+        out.style.color = ok ? '#9f6' : '#f66';
+      };
+      const until = async (fn, ms = 15000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          const v = await fn();
+          if (v) return v;
+          await sleep(100);
+        }
+        return null;
+      };
+      const bannerText = () =>
+        [...document.querySelectorAll('.banners .banner-text')].map((e) => e.textContent).join(' | ');
+
+      // A room the importer must reproduce: one textured mesh per scan mesh.
+      const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+      const roomTris = room.meshes.reduce((n, m) => n + m.indices.length / 3, 0);
+      const tex = (() => {
+        const c = document.createElement('canvas');
+        c.width = c.height = 16;
+        const g = c.getContext('2d');
+        g.fillStyle = '#c84';
+        g.fillRect(0, 0, 16, 16);
+        return new THREE.CanvasTexture(c);
+      })();
+      const toThree = (withUv) => {
+        const group = new THREE.Group();
+        for (const m of room.meshes) {
+          const geom = new THREE.BufferGeometry();
+          geom.setAttribute('position', new THREE.BufferAttribute(m.positions.slice(), 3));
+          geom.setIndex(new THREE.BufferAttribute(m.indices.slice(), 1));
+          if (withUv) geom.setAttribute('uv', new THREE.BufferAttribute(new Float32Array((m.positions.length / 3) * 2), 2));
+          group.add(new THREE.Mesh(geom, new THREE.MeshStandardMaterial(withUv ? { map: tex } : {})));
+        }
+        return group;
+      };
+
+      async function texturedGlb() {
+        return new GLTFExporter().parseAsync(toThree(true), { binary: true });
+      }
+
+      /** One Draco-compressed mesh (the whole room merged) wrapped in a GLB by hand. */
+      function dracoGlb() {
+        let verts = 0;
+        for (const m of room.meshes) verts += m.positions.length / 3;
+        const pos = new Float32Array(verts * 3);
+        const idx = new Uint32Array(roomTris * 3);
+        let vo = 0;
+        let io = 0;
+        for (const m of room.meshes) {
+          pos.set(m.positions, vo * 3);
+          for (let i = 0; i < m.indices.length; i++) idx[io++] = m.indices[i] + vo;
+          vo += m.positions.length / 3;
+        }
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        geom.setIndex(new THREE.BufferAttribute(idx, 1));
+        const drc = new DRACOExporter().parse(new THREE.Mesh(geom), { exportNormals: false, exportUvs: false });
+        const bin = new Uint8Array(Math.ceil(drc.byteLength / 4) * 4);
+        bin.set(new Uint8Array(drc.buffer, drc.byteOffset, drc.byteLength));
+        geom.computeBoundingBox();
+        const bb = geom.boundingBox;
+        const json = {
+          asset: { version: '2.0', generator: 'location-import-smoke' },
+          extensionsUsed: ['KHR_draco_mesh_compression'],
+          extensionsRequired: ['KHR_draco_mesh_compression'],
+          scene: 0,
+          scenes: [{ nodes: [0] }],
+          nodes: [{ mesh: 0 }],
+          meshes: [
+            {
+              primitives: [
+                {
+                  attributes: { POSITION: 0 },
+                  indices: 1,
+                  extensions: { KHR_draco_mesh_compression: { bufferView: 0, attributes: { POSITION: 0 } } },
+                },
+              ],
+            },
+          ],
+          accessors: [
+            { componentType: 5126, count: verts, type: 'VEC3', min: bb.min.toArray(), max: bb.max.toArray() },
+            { componentType: 5125, count: idx.length, type: 'SCALAR' },
+          ],
+          bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: drc.byteLength }],
+          buffers: [{ byteLength: bin.length }],
+        };
+        let text = JSON.stringify(json);
+        while (text.length % 4) text += ' ';
+        const jb = new TextEncoder().encode(text);
+        const total = 12 + 8 + jb.length + 8 + bin.length;
+        const glb = new Uint8Array(total);
+        const dv = new DataView(glb.buffer);
+        glb.set([0x67, 0x6c, 0x54, 0x46], 0);
+        dv.setUint32(4, 2, true);
+        dv.setUint32(8, total, true);
+        dv.setUint32(12, jb.length, true);
+        dv.setUint32(16, 0x4e4f534a, true);
+        glb.set(jb, 20);
+        dv.setUint32(20 + jb.length, bin.length, true);
+        dv.setUint32(24 + jb.length, 0x004e4942, true);
+        glb.set(bin, 28 + jb.length);
+        return glb.buffer;
+      }
+
+      /** Picks a file the way a user does: the card's hidden input, then a change event. */
+      function pick(file) {
+        const btn = [...document.querySelectorAll('button')].find((b) => /^(Import|Replace) location/.test(b.textContent));
+        if (!btn) throw new Error('no Import location button on the landing card');
+        const input = btn.parentElement.querySelector('input[type=file]');
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change'));
+      }
+
+      const prevCurrent = localStorage.getItem(CURRENT_KEY);
+      const scene = createScene('location import smoke');
+      const cleanup = () => {
+        try {
+          localStorage.removeItem(SCENE_PREFIX + scene.id);
+          const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+          localStorage.setItem(INDEX_KEY, JSON.stringify(index.filter((e) => e.id !== scene.id)));
+          if (prevCurrent) localStorage.setItem(CURRENT_KEY, prevCurrent);
+          else localStorage.removeItem(CURRENT_KEY);
+        } catch {
+          /* storage blocked: nothing was seeded */
+        }
+      };
+      try {
+        localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
+        const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+        index.push({ id: scene.id, name: scene.name, updatedAt: Date.now(), actors: 0, cameras: 0, hasScan: false });
+        localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+        localStorage.setItem(CURRENT_KEY, scene.id);
+        await import('../src/main.ts');
+        addEventListener('beforeunload', cleanup);
+        const t = await until(() => window.__setviewTest);
+        if (!t) throw new Error('no __setviewTest hooks (not the dev server?)');
+        if (t.currentSceneId() !== scene.id) throw new Error('the seeded scene is not current');
+        window.confirm = () => true; // "Replace this scene's location?" in step 2
+
+        // 1. Textured GLB.
+        const glb = await texturedGlb();
+        pick(new File([glb], 'Polycam room.glb'));
+        const s1 = await until(() => t.currentScan());
+        if (!s1) throw new Error(`no scan after the GLB import; banners: ${bannerText()}`);
+        const shown1 = await until(() => t.displayedScanId() === s1.id && t.locationMeshCount() > 0);
+        const kept = s1.source ? await t.blobBytes(s1.source.blobId) : null;
+        const ok1 =
+          s1.triangles === roomTris &&
+          !!shown1 &&
+          t.locationMeshCount() === room.meshes.length &&
+          s1.source?.textured === true &&
+          s1.source?.app === 'polycam' &&
+          kept === glb.byteLength &&
+          /Imported "Polycam room\.glb"/.test(bannerText());
+        notes.push(
+          `glb tris=${s1.triangles}/${roomTris} meshes=${t.locationMeshCount()}/${room.meshes.length} source=${s1.source?.format}:${s1.source?.app} kept=${kept}/${glb.byteLength}`,
+        );
+
+        // 2. Draco GLB replaces it.
+        const drc = dracoGlb();
+        pick(new File([drc], 'compressed.glb'));
+        const s2 = await until(() => {
+          const s = t.currentScan();
+          return s && s.id !== s1.id ? s : null;
+        }, 30000);
+        if (!s2) throw new Error(`the Draco GLB did not replace the location; banners: ${bannerText()}`);
+        await until(() => t.displayedScanId() === s2.id);
+        const ok2 = s2.triangles === roomTris && t.displayedScanId() === s2.id && t.locationMeshCount() === 1 && !s2.source;
+        notes.push(`draco tris=${s2.triangles}/${roomTris} meshes=${t.locationMeshCount()} source=${s2.source ? 'kept' : 'none'}`);
+
+        // 3. A splat is refused and the scene keeps its location.
+        const splat = new TextEncoder().encode(
+          'ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n',
+        );
+        pick(new File([splat], 'capture.ply'));
+        const refused = await until(() => /was not imported.*splat/i.test(bannerText()));
+        const ok3 = !!refused && t.currentScan()?.id === s2.id;
+        notes.push(`splat refused=${!!refused}`);
+
+        report(ok1 && ok2 && ok3, `${ok1 ? 'glb ok' : 'GLB FAIL'} ${ok2 ? 'draco ok' : 'DRACO FAIL'} ${ok3 ? 'splat ok' : 'SPLAT FAIL'} | ${notes.join(' | ')}`);
+      } catch (e) {
+        report(false, `${e.message} | ${notes.join(' | ')}`);
+      } finally {
+        cleanup();
+      }
+    </script>
+  </body>
+</html>

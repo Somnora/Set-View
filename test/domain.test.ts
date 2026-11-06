@@ -610,6 +610,7 @@ import { SPLAT_BUDGET_STEP, stepSplatBudget } from '../src/performanceGovernor.t
 import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
 import * as ingest from '../src/sceneImport.ts';
 import { BlobStore } from '../src/blobStore.ts';
+import { importLocationBytes, partsFromObject3D } from '../src/locationImport.ts';
 import { collectBlobRefs, isScanSourceFile } from '../src/model.ts';
 import { sanitizeMeshBuffers } from '../src/scan.ts';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
@@ -14581,9 +14582,227 @@ async function p1BlobStoreTest(): Promise<void> {
   console.log('  ✓ P1.3: launch pruning keeps referenced originals and sweeps orphans; storage report counts them');
 }
 
+// --- P1 location import (P1.2) ---
+/** Builds a minimal one-triangle GLB by hand (Node has no FileReader for GLTFExporter). */
+function p1MakeGlb(opts: { generator?: string; textured?: boolean; translation?: [number, number, number] } = {}): ArrayBuffer {
+  const pos = new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const idx = new Uint16Array([0, 1, 2]);
+  const bin = new Uint8Array(52);
+  bin.set(new Uint8Array(pos.buffer), 0);
+  bin.set(new Uint8Array(idx.buffer), 36);
+  bin.set([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4], 44); // a "PNG" that must never be decoded
+  const json: Record<string, unknown> = {
+    asset: { version: '2.0', ...(opts.generator ? { generator: opts.generator } : {}) },
+    scene: 0,
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0, ...(opts.translation ? { translation: opts.translation } : {}) }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, indices: 1, ...(opts.textured ? { material: 0 } : {}) }] }],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, 0], max: [1, 0, 1] },
+      { bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' },
+    ],
+    bufferViews: [
+      { buffer: 0, byteOffset: 0, byteLength: 36 },
+      { buffer: 0, byteOffset: 36, byteLength: 6 },
+      { buffer: 0, byteOffset: 44, byteLength: 8 },
+    ],
+    buffers: [{ byteLength: bin.length }],
+  };
+  if (opts.textured) {
+    json.materials = [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }];
+    json.textures = [{ source: 0 }];
+    json.images = [{ bufferView: 2, mimeType: 'image/png' }];
+  }
+  let jsonText = JSON.stringify(json);
+  while (jsonText.length % 4) jsonText += ' ';
+  const jsonBytes = new TextEncoder().encode(jsonText);
+  const total = 12 + 8 + jsonBytes.length + 8 + bin.length;
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  out.set([0x67, 0x6c, 0x54, 0x46], 0);
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, total, true);
+  dv.setUint32(12, jsonBytes.length, true);
+  dv.setUint32(16, 0x4e4f534a, true);
+  out.set(jsonBytes, 20);
+  const binAt = 20 + jsonBytes.length;
+  dv.setUint32(binAt, bin.length, true);
+  dv.setUint32(binAt + 4, 0x004e4942, true);
+  out.set(bin, binAt + 8);
+  return out.buffer;
+}
+
+{
+  test('P1.2: partsFromObject3D flattens nested and instanced meshes with world matrices and skips points', () => {
+    const tri = () => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]), 3));
+      return g;
+    };
+    const root = new THREE.Group();
+    const parent = new THREE.Group();
+    parent.position.set(5, 0, 0);
+    const child = new THREE.Mesh(tri());
+    child.position.set(0, 1, 0);
+    parent.add(child);
+    root.add(parent);
+    const inst = new THREE.InstancedMesh(tri(), undefined, 2);
+    inst.setMatrixAt(0, new THREE.Matrix4().makeTranslation(0, 0, 0));
+    inst.setMatrixAt(1, new THREE.Matrix4().makeTranslation(0, 0, 9));
+    root.add(inst);
+    root.add(new THREE.Points(tri()));
+    const parts = partsFromObject3D(root);
+    assert.equal(parts.length, 3, 'one nested mesh plus two instances; points skipped');
+    const at = (i: number) => [parts[i].matrix![12], parts[i].matrix![13], parts[i].matrix![14]];
+    assert.deepEqual(at(0), [5, 1, 0]);
+    assert.deepEqual(at(1), [0, 0, 0]);
+    assert.deepEqual(at(2), [0, 0, 9]);
+    assert.equal(parts[0].indices, null, 'non-indexed geometry stays null for the core to index');
+  });
+
+  test('P1.2: partsFromObject3D dequantizes normalized and interleaved positions', () => {
+    const plain = new THREE.BufferGeometry();
+    plain.setAttribute('position', new THREE.BufferAttribute(new Int16Array([0, 0, 0, 32767, 0, 0, 0, 0, 32767]), 3, true));
+    const ib = new THREE.InterleavedBuffer(new Int16Array([0, 0, 0, 0, 32767, 0, 0, 0, 0, 0, 32767, 0]), 4);
+    const inter = new THREE.BufferGeometry();
+    inter.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 3, 0, true));
+    inter.setIndex([0, 1, 2]);
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(plain), new THREE.Mesh(inter));
+    const parts = partsFromObject3D(root);
+    assert.equal(parts.length, 2);
+    for (const p of parts) assert.ok(p.positions instanceof Float32Array && p.positions.length === 9);
+    approx(parts[0].positions[3], 1, 1e-4);
+    approx(parts[0].positions[8], 1, 1e-4);
+    approx(parts[1].positions[3], 1, 1e-4);
+    approx(parts[1].positions[8], 1, 1e-4);
+    assert.deepEqual(Array.from(parts[1].indices!), [0, 1, 2]);
+  });
+}
+
+/** Async: the adapter end to end on OBJ, PLY and GLB bytes, and attaching an import to a scene. */
+async function p1LocationImportTest(): Promise<void> {
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+  const roomSum = summarizeScan(room);
+  const enc = (s: string) => new TextEncoder().encode(s).buffer as ArrayBuffer;
+
+  const obj = await importLocationBytes(enc(exportScanAsObj(room).obj), { fileName: 'room.obj' });
+  assert.ok(obj.ok);
+  if (obj.ok) {
+    assert.equal(obj.kind, 'obj');
+    assert.equal(obj.built.stats.triangles, roomSum.triangles);
+    assert.equal(obj.unit, 'm');
+    assert.equal(obj.textured, false);
+    assert.equal(obj.budget.level, 'ok');
+  }
+  // The same room in centimetres: the unit is guessed and said.
+  const big = createSyntheticLocationScan(6, 5, 2.8, ['couch']);
+  for (const m of big.meshes) for (let i = 0; i < m.positions.length; i++) m.positions[i] *= 100;
+  const cm = await importLocationBytes(enc(exportScanAsObj(big).obj), { fileName: 'room-cm.obj' });
+  assert.ok(cm.ok && cm.unit === 'cm');
+  if (cm.ok) {
+    const s = summarizeScan(cm.built.scan);
+    const ref = summarizeScan(createSyntheticLocationScan(6, 5, 2.8, ['couch']));
+    approx(s.boundsMax.x - s.boundsMin.x, ref.boundsMax.x - ref.boundsMin.x, 1e-3);
+    assert.ok(cm.notes.some((n) => /centimetres/.test(n)));
+  }
+  const forced = await importLocationBytes(enc(exportScanAsObj(big).obj), { unit: 'm' });
+  assert.ok(forced.ok && forced.unit === 'm', 'an explicit unit is not second-guessed');
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes reads OBJ and guesses centimetres unless told the unit');
+
+  const ply = exportScanAsPly(room, true) as Uint8Array;
+  const plyRes = await importLocationBytes(ply.buffer.slice(ply.byteOffset, ply.byteOffset + ply.byteLength) as ArrayBuffer);
+  assert.ok(plyRes.ok);
+  if (plyRes.ok) {
+    assert.equal(plyRes.kind, 'ply-mesh');
+    assert.equal(plyRes.built.stats.triangles, roomSum.triangles);
+    assert.equal(plyRes.textured, true, 'vertex colours count as worth drawing in Photo mode');
+  }
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes reads a binary PLY mesh with vertex colours');
+
+  const glb = await importLocationBytes(p1MakeGlb({ generator: 'Polycam glTF Exporter', textured: true, translation: [10, 3, 0] }), {
+    fileName: 'scan.glb',
+  });
+  assert.ok(glb.ok, glb.ok ? '' : glb.message);
+  if (glb.ok) {
+    assert.equal(glb.kind, 'glb');
+    assert.equal(glb.app, 'polycam');
+    assert.equal(glb.textured, true);
+    assert.equal(glb.built.stats.triangles, 1);
+    assert.ok(glb.notes.some((n) => /Polycam plan/.test(n)), 'license reminder');
+    const s = summarizeScan(glb.built.scan);
+    approx(s.boundsMin.y, 0, 1e-6);
+    // The source transform takes the file's root to scene space. The node sits at
+    // x 10..11, y 3, z 0..1, so recentring moves the root by (-10.5, -3, -0.5).
+    const m = glb.built.sourceTransform;
+    approx(m[12], -10.5, 1e-6);
+    approx(m[13], -3, 1e-6);
+    approx(m[14], -0.5, 1e-6);
+  }
+  const zup = await importLocationBytes(p1MakeGlb(), { upAxis: 'ZUP' });
+  assert.ok(zup.ok);
+  if (zup.ok) {
+    const s = summarizeScan(zup.built.scan);
+    approx(s.boundsMax.y - s.boundsMin.y, 1, 1e-6);
+  }
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes reads a GLB without decoding its textures, detects Polycam, applies Z-up');
+
+  const splat = new Uint8Array(new TextEncoder().encode('ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n'));
+  const refused = await importLocationBytes(splat.buffer as ArrayBuffer);
+  assert.ok(!refused.ok && /splat/i.test(refused.message));
+  const sceneFile = probeFs.readFileSync(new URL('./sample_scene.setview.json', import.meta.url));
+  const scene = await importLocationBytes(
+    sceneFile.buffer.slice(sceneFile.byteOffset, sceneFile.byteOffset + sceneFile.byteLength) as ArrayBuffer,
+  );
+  assert.ok(!scene.ok && /Import Scene/.test(scene.message));
+  const junk = await importLocationBytes(enc('not a mesh at all'));
+  assert.ok(!junk.ok && /not recognised/.test(junk.message));
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes refuses splats, scenes and unknown files with a reason');
+
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: new P0MemoryStorage(), configurable: true, writable: true });
+  try {
+    const p = new Persistence();
+    p.onError = () => {};
+    const other = createScene('other scene');
+    other.locationMode = 'hidden';
+    other.scan = summarizeScan(createSyntheticLocationScan());
+    assert.equal(p.saveNow(other), true);
+    const live = createScene('live scene');
+    assert.equal(p.saveNow(live), true);
+    const source = { blobId: 'blob-src', format: 'glb', transform: glb.ok ? glb.built.sourceTransform : [], textured: true };
+    // Opened for a scene that is not the live one (review R4): that scene is written.
+    const r1 = await p.attachImportedScan(other.id, obj.ok ? obj.built.scan : room, source, () => live);
+    assert.ok(r1);
+    assert.notEqual(r1!.scene, live);
+    const saved = p.loadScene(other.id)!;
+    assert.equal(saved.scan?.source?.blobId, 'blob-src');
+    assert.equal(saved.scan?.triangles, roomSum.triangles);
+    assert.equal(saved.locationMode, 'ghost', 'a new location starts in Ghost, not the old Hidden');
+    assert.equal(live.scan, null, 'the live scene is untouched');
+    // For the live scene, the live object itself is updated.
+    const r2 = await p.attachImportedScan(live.id, room, null, () => live);
+    assert.equal(r2!.scene, live);
+    const liveScan = (s: SceneData) => s.scan;
+    assert.ok(liveScan(live), 'the live object got the scan');
+    assert.equal(liveScan(live)?.source, undefined, 'an untextured import keeps no original');
+    assert.equal(await p.attachImportedScan('missing-scene', room, null, () => live), null);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+  passed++;
+  console.log('  ✓ P1.2: attachImportedScan writes the scene it was opened for and resets its display mode');
+}
+
 // Async tests that swap globalThis.localStorage run one after another, never concurrently.
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()])
   .then(() => p1BlobStoreTest())
+  .then(() => p1LocationImportTest())
   .then(
   () => {
     passed += 4;

@@ -60,6 +60,8 @@ import {
 } from './floor.ts';
 import { Persistence } from './persistence.ts';
 import { formatStorageLine } from './persistence.ts';
+import { importLocationBytes, type UnitChoice, type UpAxisChoice } from './locationImport.ts';
+import type { ScanSourceFile } from './model.ts';
 import {
   buildWristPanel,
   DebugLog,
@@ -704,6 +706,7 @@ class App {
           this.refreshLanding();
         });
       },
+      onImportLocation: (id, file, opts) => void this.importLocationFile(id, file, opts),
       getStorageSummary: () => this.persistence.storageReport().then(formatStorageLine),
       onSetLedVolumeEnabled: (sceneId, enabled) => this.setLedVolumeEnabled(sceneId, enabled),
       onPreview: (id) => this.openPreview(id),
@@ -1578,6 +1581,74 @@ class App {
     this.debug.log(message);
     this.wrist.setStatus(message);
     this.landing.showBanner(message, 'error', key, action);
+  }
+
+  /**
+   * Imports a phone scan or any mesh file as a scene's location (roadmap P1.2).
+   * Runs on the 2D page. The file is identified by its bytes, converted to a
+   * LocationScan (geometry), and attached to the scene it was opened for, which
+   * need not be the current one (review R4). A textured original is kept in
+   * the blob store for Photo mode. Results and refusals show as banners.
+   */
+  private async importLocationFile(
+    sceneId: string,
+    file: { name: string; arrayBuffer(): Promise<ArrayBuffer> },
+    opts: { upAxis?: UpAxisChoice; unit?: UnitChoice } = {},
+  ): Promise<boolean> {
+    const key = 'location-import';
+    const name = file.name || 'file';
+    let bytes: ArrayBuffer | null = null;
+    try {
+      bytes = await file.arrayBuffer();
+    } catch (e) {
+      console.warn('[setview] location read failed', e);
+    }
+    if (!bytes || bytes.byteLength === 0) {
+      this.reportDataIssue(
+        `Could not read "${name}": the browser returned no data (it blocked the read, or the file is empty).`,
+        key,
+      );
+      return false;
+    }
+    this.landing.showBanner(`Importing "${name}" as the location...`, 'info', key);
+    const res = await importLocationBytes(bytes, { fileName: name, upAxis: opts.upAxis, unit: opts.unit, renderer: this.renderer });
+    if (!res.ok) {
+      this.reportDataIssue(`"${name}" was not imported. ${res.message}`, key);
+      return false;
+    }
+    let source: ScanSourceFile | null = null;
+    if (res.textured) {
+      const blob = await this.persistence.blobs.putBlob({ data: bytes, format: res.kind, name });
+      source = {
+        blobId: blob.id,
+        format: res.kind,
+        fileName: name,
+        ...(res.app !== 'unknown' ? { app: res.app } : {}),
+        transform: res.built.sourceTransform,
+        textured: true,
+      };
+    }
+    const attached = await this.persistence.attachImportedScan(sceneId, res.built.scan, source, () => this.sceneData);
+    if (!attached) {
+      this.reportDataIssue(`"${name}" was read, but its scene no longer exists.`, key);
+      return false;
+    }
+    if (attached.scene === this.sceneData) {
+      this.syncLocation();
+      this.history.record(this.sceneData);
+      this.contentVersion++;
+    }
+    this.refreshLanding();
+    const s = res.built.stats;
+    const lines = [
+      `Imported "${name}" as the location: ${Math.round(s.triangles / 1000)}k triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}.`,
+      ...res.notes,
+    ];
+    if (!attached.scanSaved) lines.push('The geometry could not be saved to storage and is lost on reload.');
+    this.debug.log(lines.join(' '));
+    this.landing.showBanner(lines.join(' '), res.budget.level === 'warn' || !attached.scanSaved ? 'warn' : 'info', key);
+    if (bytes.byteLength > 5 * 1024 * 1024) this.requestPersistentStorage();
+    return true;
   }
 
   /** On the first heavy import, asks once for persistent storage and says what the browser decided. */
@@ -3646,6 +3717,18 @@ class App {
       splatCloudId: () => splat.cloud?.id ?? null,
       liveDmxEnabled: () => this.dmxStreamer.getConfig().enabled,
       sentPatches: () => sent.slice(),
+      // test/location-import-smoke.html: what the live scene shows after an import.
+      currentSceneId: () => this.sceneData.id,
+      currentScan: () => this.sceneData.scan ?? null,
+      displayedScanId: () => this.displayedScanId,
+      locationMeshCount: () => {
+        let n = 0;
+        this.location.group.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh) n++;
+        });
+        return n;
+      },
+      blobBytes: async (id: string) => (await this.persistence.blobs.getBytes(id))?.byteLength ?? null,
     };
   }
 

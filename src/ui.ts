@@ -5,6 +5,7 @@
 
 import * as THREE from 'three';
 import type { SupportReport } from './session.ts';
+import type { UnitChoice, UpAxisChoice } from './locationImport.ts';
 import {
   ASPECT_NAMES,
   MAX_KEYFRAMES,
@@ -783,6 +784,8 @@ export interface LandingCallbacks {
   onExportScanGeoJson?: (id: string) => void;
   onExportScanPackage?: (id: string) => void;
   onAddSyntheticScan?: (id: string) => void;
+  /** Imports a mesh file (phone scan, GLB, OBJ, FBX, PLY) as the scene's location. */
+  onImportLocation?: (sceneId: string, file: File, opts: { upAxis: UpAxisChoice; unit: UnitChoice }) => void;
   /** One-line storage usage for the Scene & Environment card (may be cached). */
   getStorageSummary?: () => Promise<string>;
   /** Turns a scene's ICVFX LED volume on or off without opening ICVFX Studio. */
@@ -973,6 +976,100 @@ export class Landing {
     p.className = 'bad';
     p.textContent = `Enter AR failed: ${message}`;
     this.diagEl.appendChild(p);
+  }
+
+  /** Up-axis and unit choices for the next location import (kept across re-renders). */
+  private locationImportUpAxis: UpAxisChoice = 'auto';
+  private locationImportUnit: UnitChoice = 'auto';
+
+  /**
+   * "Import location" row of the Scene & Environment card: a picker with no
+   * accept filter (pickers that drop extensions must still offer the file;
+   * the importer identifies files by content), up-axis and unit overrides,
+   * and drag and drop onto the whole card. Replacing a location asks first,
+   * since a scene holds one location (review R7).
+   */
+  private buildLocationImportRow(sceneId: string, hasScan: boolean, dropTarget: HTMLElement): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'cam-edit location-import';
+    const start = (file: File) => {
+      if (hasScan && !confirm(`Replace this scene's location with "${file.name}"?`)) return;
+      this.cb.onImportLocation?.(sceneId, file, { upAxis: this.locationImportUpAxis, unit: this.locationImportUnit });
+    };
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.hidden = true;
+    input.onchange = () => {
+      const f = input.files?.[0];
+      input.value = '';
+      if (f) start(f);
+    };
+    const btn = document.createElement('button');
+    btn.className = 'small';
+    btn.textContent = hasScan ? 'Replace location...' : 'Import location...';
+    btn.title = "Use a phone scan or any mesh (GLB, OBJ, FBX or PLY mesh) as this scene's location. You can also drop the file on this card.";
+    btn.onclick = () => input.click();
+    row.append(btn, input);
+
+    const select = <T extends string>(label: string, value: T, options: [T, string][], set: (v: T) => void) => {
+      const wrap = document.createElement('label');
+      wrap.className = 'field';
+      const span = document.createElement('span');
+      span.textContent = label;
+      const sel = document.createElement('select');
+      for (const [v, text] of options) {
+        const o = document.createElement('option');
+        o.value = v;
+        o.textContent = text;
+        sel.appendChild(o);
+      }
+      sel.value = value;
+      sel.onchange = () => set(sel.value as T);
+      wrap.append(span, sel);
+      return wrap;
+    };
+    row.appendChild(
+      select<UpAxisChoice>(
+        'Up axis',
+        this.locationImportUpAxis,
+        [
+          ['auto', 'Y-up (glTF, Polycam)'],
+          ['ZUP', 'Z-up'],
+          ['RDF', 'Y-down (OpenCV)'],
+        ],
+        (v) => (this.locationImportUpAxis = v),
+      ),
+    );
+    row.appendChild(
+      select<UnitChoice>(
+        'Units',
+        this.locationImportUnit,
+        [
+          ['auto', 'Auto'],
+          ['m', 'Meters'],
+          ['cm', 'Centimetres'],
+          ['mm', 'Millimetres'],
+        ],
+        (v) => (this.locationImportUnit = v),
+      ),
+    );
+
+    // Drag and drop a file anywhere on the card.
+    const hasFiles = (e: DragEvent) => !!e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files');
+    dropTarget.addEventListener('dragover', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dropTarget.classList.add('drop-target');
+    });
+    dropTarget.addEventListener('dragleave', () => dropTarget.classList.remove('drop-target'));
+    dropTarget.addEventListener('drop', (e) => {
+      dropTarget.classList.remove('drop-target');
+      const f = e.dataTransfer?.files?.[0];
+      if (!f) return;
+      e.preventDefault();
+      start(f);
+    });
+    return row;
   }
 
   /**
@@ -1213,7 +1310,9 @@ export class Landing {
       const size = `${(sc.boundsMax.x - sc.boundsMin.x).toFixed(1)}×${(sc.boundsMax.z - sc.boundsMin.z).toFixed(1)}m`;
       const info = document.createElement('span');
       info.className = 'scan-info';
-      info.textContent = `📍 Location Scan: ${Math.round(sc.triangles / 1000)}k tris (${size})`;
+      const tris = sc.triangles < 1000 ? `${sc.triangles}` : `${Math.round(sc.triangles / 1000)}k`;
+      const from = sc.source?.fileName ? `, from ${sc.source.fileName}` : '';
+      info.textContent = `📍 Location Scan: ${tris} tris (${size}${from})`;
       scanRow.appendChild(info);
 
       const scanBtnWrap = document.createElement('div');
@@ -1259,6 +1358,7 @@ export class Landing {
       }
     }
     envCard.appendChild(scanRow);
+    if (this.cb.onImportLocation) envCard.appendChild(this.buildLocationImportRow(sceneId, !!scene.scan, envCard));
 
     const splatRow = document.createElement('div');
     splatRow.className = 'cam-edit';

@@ -329,6 +329,18 @@ body {
   gap: 12px;
 }
 
+/* A file dragged over a card that accepts drops (location import). */
+.manager-card.drop-target {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px var(--accent-blue-glow);
+}
+
+.location-import {
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
 .manager-card .card-title {
   display: flex;
   align-items: center;

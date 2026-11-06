@@ -3,7 +3,7 @@
 // No backend — everything stays on the device.
 // ---------------------------------------------------------------------------
 
-import { collectBlobRefs, createScene, isSceneData, normalizeScene, uid, type SceneData } from './model.ts';
+import { collectBlobRefs, createScene, isSceneData, normalizeScene, uid, type SceneData, type ScanSourceFile } from './model.ts';
 import {
   createSyntheticLocationScan,
   downloadFloorplan,
@@ -507,6 +507,33 @@ export class Persistence {
     this.saveNow(scene);
     this.storageReportCache = null;
     return { scan, scene };
+  }
+
+  /**
+   * Attaches an imported location to a scene: stores the geometry, then looks the
+   * scene up (the live object when it is the current scene, as attachSyntheticScan
+   * does, so an undo or restore during the write is neither overwritten nor
+   * missed), replaces its scan and saves. The previous scan blob is kept until the
+   * next launch so undo can bring it back. Resolves null when the scene is gone.
+   */
+  async attachImportedScan(
+    id: string,
+    scan: LocationScan,
+    source: ScanSourceFile | null,
+    getLive?: () => SceneData | null,
+  ): Promise<{ scene: SceneData; scanSaved: boolean } | null> {
+    const scanSaved = await this.scans.putScan(scan);
+    const live = getLive?.() ?? null;
+    const scene = live && live.id === id ? live : this.loadScene(id);
+    if (!scene) return null;
+    scene.scan = summarizeScan(scan);
+    if (source) scene.scan.source = source;
+    // A new location starts in its default mode, not the old scan's Hidden.
+    delete scene.locationMode;
+    normalizeScene(scene);
+    this.saveNow(scene);
+    this.storageReportCache = null;
+    return { scene, scanSaved };
   }
 
   /**
