@@ -4,7 +4,7 @@ How SetView gets from today to letting a user scan a location, bring it into a s
 
 ## Status
 
-- **Phase 0 is implemented** on branch `p0/make-existing-honest` ([PR #1](https://github.com/Somnora/Set-View/pull/1)). 498 unit tests pass, typecheck and build are clean, and nine headless smoke pages pass. Nothing has been checked on a headset yet.
+- **Phase 0 is implemented** on branch `p0/make-existing-honest` ([PR #1](https://github.com/Somnora/Set-View/pull/1)). 498 unit tests pass, typecheck and build are clean, nine headless smoke pages pass, and the S12 Ghost check passes in a headed desktop run. Nothing has been checked on a headset yet.
 - **Phases 1 to 4 have not started.** Several Phase 1 items depend on the answers from the probe page (spikes S1 to S7), so running `test/xr-probe.html` on a Quest 3 is the next gate. P1.1 (ingest core) and P1.5 (LAN drop box) do not depend on the probe.
 - **Before building any Phase 1 to 4 item, read its review notes** in [Review corrections](#review-corrections). An independent review found design problems the item text below does not yet reflect.
 - File and line references are as of commit `cd82a8e`, before Phase 0. Phase 0 moved many of them, so find each site by its content before editing.
@@ -76,7 +76,7 @@ Implemented in PR #1. The headset checks are in the PR's test plan and in `test/
 | **P0.4** Request plane-detection; Scan Room accepts planes or meshes | Done. Scan Room waits for the auto-realign fade and for the floor estimate before capturing. |
 | **P0.5** Room capture becomes an explicit, once-per-session action | Done. A reference-space reset also re-queues actor and camera anchors. Provisional until spike S6 runs. |
 | **P0.6** Normalize scan labels; floors, walls and unlabeled meshes cannot be grabbed | Done. Label strings are provisional until spike S1 runs. |
-| **P0.7** Location display: Ghost stays see-through, mode persists, visible in preview | Done, with per-mode materials instead of the needsUpdate toggle, and wireframe wires keyed by mesh index. The S12 headed repro has not been run. |
+| **P0.7** Location display: Ghost stays see-through, mode persists, visible in preview | Done, with per-mode materials instead of the needsUpdate toggle, and wireframe wires keyed by mesh index. S12 confirmed it in a headed desktop run (`test/ghost-opacity-smoke.html`, 2026-11-06): on `cd82a8e` Ghost after Solid or a Camera View pass, and Wireframe after Solid, draw fully opaque; with the fix every case matches the same mode drawn fresh. |
 | **P0.8** Scene import and export keep what the user did | Done. |
 | **P0.9** Errors and storage use visible on the 2D page | Done. Banners also show over the desktop preview. |
 | **P0.10** New scenes start empty (no LED horseshoe) | Done. Approved by the owner on 2026-11-05. Existing scenes are untouched. |
@@ -528,7 +528,7 @@ Run these before building the items they gate. The P0.0 probe page answers S1 to
 - **S9** (sets P2.3 and P2.6 defaults): wall-endpoint precision with controller trigger versus hand pinch at 1 m and 3 m on Quest 3 and Galaxy XR. Do gamepad.hapticActuators pulses from spatialFeedback.ts fire for short snap ticks in both browsers?
 - **S10** (gates P3.2 and the MSAA decision): Spark 2.4.0 SparkRenderer plus SplatMesh inside SetView's own renderer.xr session on Quest 3, with antialias:true (main.ts:308) and the per-frame 1024 Camera View RTT. Does it hang (an untested variant of issue #400)? What frame time and P95 come out at 150k, 300k and 500k LoD splats with 4 actors? What changes with antialias:false, splats hidden in the RTT, or autoUpdate=false plus manual update()?
 - **S11** (gates P3.4): Quest persistent anchors on Browser 154. Does requestPersistentHandle succeed? Does restorePersistentAnchor survive an app restart, a reboot and a Space Setup re-run? What is the real slot count, does it count across origins, and do blank '' handles appear?
-- **S12** (desktop, cheap, before shipping P0.7): confirm in a headed desktop run that Ghost renders opaque after a Solid or Camera View pass (the three r180 OPAQUE define), so the fix is validated against a real repro.
+- **S12** (desktop, cheap, before shipping P0.7): confirm in a headed desktop run that Ghost renders opaque after a Solid or Camera View pass (the three r180 OPAQUE define), so the fix is validated against a real repro. **Done 2026-11-06** with `test/ghost-opacity-smoke.html`: it fails on `cd82a8e` exactly as described and passes with P0.7.
 
 ## Decisions for the owner
 
