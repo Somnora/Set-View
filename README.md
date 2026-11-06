@@ -136,6 +136,7 @@ src/
   scanStore.ts    IndexedDB blob store for scan geometry
   blobStore.ts    IndexedDB store for imported originals (Photo mode)
   locationImport.ts  Parses imported mesh files with three's loaders
+  idbOpen.ts      IndexedDB open with a time limit that is not final (late opens are used)
   input.ts        Controllers + hands input routing & edge detection
   actors.ts       Humanoid meshes, scale, floor-locking, stance joints, walk cycle
   lights.ts       In-app VR lighting rig rendering & gizmos

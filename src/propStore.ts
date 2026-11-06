@@ -7,6 +7,7 @@
 //   - Custom asset metadata registry (dimensions, vertex count, file size)
 // ---------------------------------------------------------------------------
 
+import { IdbConnection, type IdbState, type StoreOptions } from './idbOpen.ts';
 import type { PropCategory, PropDimensions } from './props.ts';
 
 export interface CustomPropAsset {
@@ -44,43 +45,65 @@ const STORE_NAME = 'custom_props';
 
 export class PropStore {
   onError: (msg: string) => void = () => {};
+  /** Notified when props held in memory reach storage after a late open. */
+  onNotice: (msg: string) => void = () => {};
 
-  private dbPromise: Promise<IDBDatabase | null> | null = null;
+  /** Session cache of assets, and the fallback when IndexedDB is not open. */
   private memory = new Map<string, CustomPropAsset>();
+  /** Ids in `memory` that never reached IndexedDB; written when it opens. */
+  private held = new Set<string>();
   private blobUrlCache = new Map<string, string>();
+  private readonly conn: IdbConnection;
+
+  constructor(opts: StoreOptions = {}) {
+    this.conn = new IdbConnection({
+      name: DB_NAME,
+      version: DB_VERSION,
+      upgrade: (db) => {
+        if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      },
+      onOpen: (db) => this.saveHeld(db),
+      timeoutMs: opts.openTimeoutMs,
+      factory: opts.indexedDB,
+    });
+  }
+
+  /** 'open' when assets can be read; see ScanStore.storageState. */
+  get storageState(): IdbState {
+    return this.conn.state;
+  }
+
+  whenStorageOpens(): Promise<boolean> {
+    return this.conn.whenOpen();
+  }
+
+  /** Writes the props held in memory once the database opens (late or reopened). */
+  private saveHeld(db: IDBDatabase): void {
+    const assets = [...this.held].map((id) => this.memory.get(id)).filter((a): a is CustomPropAsset => !!a);
+    if (assets.length === 0) return;
+    let reported = false; // a failed request fires both onerror and onabort
+    const failed = () => {
+      if (reported) return;
+      reported = true;
+      this.onError('storage opened, but saving the props held in memory failed (storage full?)');
+    };
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      for (const a of assets) store.put(a);
+      tx.oncomplete = () => {
+        for (const a of assets) if (this.memory.get(a.id) === a) this.held.delete(a.id);
+        const n = assets.length;
+        this.onNotice(`storage opened: ${n === 1 ? 'the custom prop' : `${n} custom props`} held in memory ${n === 1 ? 'is' : 'are'} now saved on this device`);
+      };
+      tx.onerror = tx.onabort = failed;
+    } catch {
+      failed();
+    }
+  }
 
   private open(): Promise<IDBDatabase | null> {
-    if (this.dbPromise) return this.dbPromise;
-    this.dbPromise = new Promise((resolve) => {
-      if (typeof indexedDB === 'undefined') {
-        resolve(null);
-        return;
-      }
-      try {
-        const watchdog = setTimeout(() => resolve(null), 4000);
-        const done = (db: IDBDatabase | null) => {
-          clearTimeout(watchdog);
-          resolve(db);
-        };
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = () => {
-          if (!req.result.objectStoreNames.contains(STORE_NAME)) {
-            req.result.createObjectStore(STORE_NAME, { keyPath: 'id' });
-          }
-        };
-        req.onsuccess = () => {
-          req.result.onclose = () => {
-            this.dbPromise = null;
-          };
-          done(req.result);
-        };
-        req.onerror = () => done(null);
-        req.onblocked = () => done(null);
-      } catch {
-        resolve(null);
-      }
-    });
-    return this.dbPromise;
+    return this.conn.get();
   }
 
   /** Saves a custom 3D model asset. */
@@ -88,7 +111,12 @@ export class PropStore {
     const db = await this.open();
     if (!db) {
       this.memory.set(asset.id, asset);
-      this.onError('Prop kept in session memory only (IndexedDB storage unavailable)');
+      this.held.add(asset.id);
+      this.onError(
+        this.conn.state === 'waiting'
+          ? 'storage is slow to open: the prop is held in memory and saved when it opens'
+          : 'Prop kept in session memory only (IndexedDB storage unavailable)',
+      );
       return false;
     }
     return new Promise((resolve) => {
@@ -97,15 +125,18 @@ export class PropStore {
         tx.objectStore(STORE_NAME).put(asset);
         tx.oncomplete = () => {
           this.memory.set(asset.id, asset);
+          this.held.delete(asset.id);
           resolve(true);
         };
         tx.onerror = tx.onabort = () => {
           this.memory.set(asset.id, asset);
+          this.held.add(asset.id);
           this.onError('Failed saving prop to IndexedDB, fallback to memory');
           resolve(false);
         };
       } catch {
         this.memory.set(asset.id, asset);
+        this.held.add(asset.id);
         resolve(false);
       }
     });
@@ -138,6 +169,7 @@ export class PropStore {
   /** Deletes a custom asset from storage. */
   async deleteAsset(id: string): Promise<void> {
     this.memory.delete(id);
+    this.held.delete(id);
     const cachedUrl = this.blobUrlCache.get(id);
     if (cachedUrl) {
       URL.revokeObjectURL(cachedUrl);
@@ -265,6 +297,7 @@ export class PropStore {
     }
     this.blobUrlCache.clear();
     this.memory.clear();
+    this.held.clear();
   }
 }
 
