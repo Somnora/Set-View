@@ -37,6 +37,13 @@ export class ScanStore {
    *  under its id (every capture, import and duplicate gets a fresh one), so a size
    *  stays valid. */
   private sizeCache = new Map<string, number>();
+  /**
+   * Ids written by this page. The launch prune never deletes them: it decides
+   * what is referenced from the scenes saved when it starts, so a scan captured
+   * or imported while it is still running would otherwise be deleted before
+   * any saved scene points at it.
+   */
+  private writtenThisSession = new Set<string>();
 
   private open(): Promise<IDBDatabase | null> {
     if (this.dbPromise) return this.dbPromise;
@@ -81,6 +88,7 @@ export class ScanStore {
     // full read and decode of a fresh capture). Valid on every path below: the
     // blob lands in IndexedDB or in the memory fallback under this same id.
     this.sizeCache.set(scan.id, estimateScanSizeBytes(scan));
+    this.writtenThisSession.add(scan.id);
     const db = await this.open();
     if (!db) {
       this.memory.set(scan.id, scan);
@@ -183,13 +191,14 @@ export class ScanStore {
    * Deletes blobs not referenced by any scene. Run once at app start:
    * replaced or abandoned scans (e.g. re-scan then undo, deleted scenes) are left
    * behind deliberately during the session so undo keeps working, and swept
-   * here on the next launch.
+   * here on the next launch. Blobs written during this session are never
+   * pruned (see writtenThisSession).
    */
   async pruneOrphans(referencedIds: ReadonlySet<string>): Promise<number> {
     const ids = await this.listScanIds();
     let removed = 0;
     for (const id of ids) {
-      if (!referencedIds.has(id)) {
+      if (!referencedIds.has(id) && !this.writtenThisSession.has(id)) {
         await this.deleteScan(id);
         removed++;
       }

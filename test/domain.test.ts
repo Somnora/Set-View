@@ -7486,13 +7486,18 @@ async function scanStoreFallback(): Promise<void> {
   assert.equal(await store.getScan('scan-1'), scan);
   assert.deepEqual(await store.listScanIds(), ['scan-1']);
 
-  // Prune keeps referenced ids, removes orphans.
+  // Prune keeps referenced ids, removes orphans left by an earlier session, and
+  // never removes a scan written in this one (the launch prune can still be
+  // running when a scan is captured or imported).
   const other = { ...makeScan(), id: 'scan-2' };
-  await store.putScan(other);
+  (store as unknown as { memory: Map<string, LocationScan> }).memory.set('scan-2', other); // as if from an earlier session
+  const fresh = { ...makeScan(), id: 'scan-3' };
+  await store.putScan(fresh);
   const removed = await store.pruneOrphans(new Set(['scan-1']));
   assert.equal(removed, 1);
   assert.equal(await store.getScan('scan-2'), null);
   assert.equal((await store.getScan('scan-1'))?.id, 'scan-1');
+  assert.equal((await store.getScan('scan-3'))?.id, 'scan-3', 'written this session: never pruned');
 
   await store.deleteScan('scan-1');
   assert.equal(await store.getScan('scan-1'), null);
@@ -14529,8 +14534,18 @@ async function p1BlobStoreTest(): Promise<void> {
   assert.equal(await store.getTotalBytes(), 5);
   const kept = await store.putBlob({ id: 'blob-kept', data: new Blob(['abc']), format: 'obj' });
   assert.equal(kept.id, 'blob-kept');
-  assert.equal(await store.pruneOrphans(new Set(['blob-kept'])), 1);
-  assert.equal(await store.hasBlob(put.id), false);
+  // An original left by an earlier session and referenced by no scene.
+  (store as unknown as { memory: Map<string, unknown> }).memory.set('blob-old', {
+    id: 'blob-old',
+    data: new Blob(['old']),
+    format: 'glb',
+    name: '',
+    size: 3,
+    createdAt: 0,
+  });
+  assert.equal(await store.pruneOrphans(new Set(['blob-kept'])), 1, 'only the earlier-session orphan goes');
+  assert.equal(await store.hasBlob('blob-old'), false);
+  assert.equal(await store.hasBlob(put.id), true, 'written this session: never pruned, referenced or not');
   assert.equal(await store.hasBlob('blob-kept'), true);
   await store.deleteBlob('blob-kept');
   assert.equal(await store.getBlob('blob-kept'), null);
@@ -14563,7 +14578,17 @@ async function p1BlobStoreTest(): Promise<void> {
     const p = new Persistence();
     p.onError = () => {};
     const used = await p.blobs.putBlob({ data: new Uint8Array(8), format: 'glb' });
-    const orphan = await p.blobs.putBlob({ data: new Uint8Array(4), format: 'glb' });
+    const orphan = { id: 'blob-orphan' }; // left by an earlier session
+    (p.blobs as unknown as { memory: Map<string, unknown> }).memory.set(orphan.id, {
+      id: orphan.id,
+      data: new Blob([new Uint8Array(4)]),
+      format: 'glb',
+      name: '',
+      size: 4,
+      createdAt: 0,
+    });
+    // Imported while the launch prune runs: not yet referenced by any saved scene.
+    const inFlight = await p.blobs.putBlob({ data: new Uint8Array(2), format: 'glb' });
     const scene = createScene('with original');
     scene.scan = {
       ...summarizeScan({ version: 1, id: 'scan-x', capturedAt: 1, meshes: [] }),
@@ -14577,8 +14602,9 @@ async function p1BlobStoreTest(): Promise<void> {
     await p.pruneOrphanScans();
     assert.equal(await p.blobs.hasBlob(used.id), true, 'a referenced original survives');
     assert.equal(await p.blobs.hasBlob(orphan.id), false, 'an unreferenced original is swept at launch');
+    assert.equal(await p.blobs.hasBlob(inFlight.id), true, 'one written while the prune ran survives');
     const report = await p.storageReport(0);
-    assert.equal(report.blobBytes, 8);
+    assert.equal(report.blobBytes, 10);
   } finally {
     if (original) Object.defineProperty(globalThis, 'localStorage', original);
     else delete (globalThis as { localStorage?: unknown }).localStorage;

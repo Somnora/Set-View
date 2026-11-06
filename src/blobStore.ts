@@ -61,6 +61,13 @@ export class BlobStore {
   private dbPromise: Promise<IDBDatabase | null> | null = null;
   /** Fallback when IndexedDB is unavailable (session lifetime only). */
   private memory = new Map<string, BlobRecord>();
+  /**
+   * Ids written by this page. The launch prune never deletes them: it decides
+   * what is referenced from the scenes saved when it starts, so an original
+   * imported while it is still running would otherwise be deleted before any
+   * saved scene points at it (seen in the headed import smoke).
+   */
+  private writtenThisSession = new Set<string>();
 
   private open(): Promise<IDBDatabase | null> {
     if (this.dbPromise) return this.dbPromise;
@@ -115,6 +122,7 @@ export class BlobStore {
       size: data.size,
       createdAt: Date.now(),
     };
+    this.writtenThisSession.add(rec.id);
     const db = await this.open();
     if (!db) {
       this.memory.set(rec.id, rec);
@@ -161,7 +169,8 @@ export class BlobStore {
     if (!rec) return null;
     try {
       return await rec.data.arrayBuffer();
-    } catch {
+    } catch (e) {
+      console.warn('[setview] reading a stored original failed', e);
       return null;
     }
   }
@@ -222,11 +231,12 @@ export class BlobStore {
   /**
    * Deletes blobs no scene references. Run once at app start, never mid-session:
    * undo can bring back a scene state that references a replaced original.
+   * Blobs written during this session are never pruned (see writtenThisSession).
    */
   async pruneOrphans(referencedIds: ReadonlySet<string>): Promise<number> {
     let removed = 0;
     for (const m of await this.listMeta()) {
-      if (!referencedIds.has(m.id)) {
+      if (!referencedIds.has(m.id) && !this.writtenThisSession.has(m.id)) {
         await this.deleteBlob(m.id);
         removed++;
       }
