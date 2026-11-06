@@ -64,6 +64,47 @@ export function transformPositions(positions: Float32Array, m: ArrayLike<number>
   }
 }
 
+/**
+ * Sanitizes raw position and index buffers: rejects a mesh with any non-finite
+ * coordinate or fewer than 3 vertices, and drops triangles whose indices are
+ * out of range or degenerate (repeated vertex). Null when nothing valid is left.
+ * Positions are returned as-is (not copied); indices are a new array only when
+ * some triangle was dropped. Shared by headset capture and file import.
+ */
+export function sanitizeMeshBuffers(
+  rawPositions: Float32Array,
+  rawIndices: Uint32Array,
+): { positions: Float32Array; indices: Uint32Array } | null {
+  const vertCount = Math.floor(rawPositions.length / 3);
+  if (vertCount < 3) return null;
+  for (let i = 0; i < rawPositions.length; i++) {
+    if (!Number.isFinite(rawPositions[i])) return null;
+  }
+  const triCount = Math.floor(rawIndices.length / 3);
+  const valid = (t: number): boolean => {
+    const i0 = rawIndices[t * 3];
+    const i1 = rawIndices[t * 3 + 1];
+    const i2 = rawIndices[t * 3 + 2];
+    return i0 < vertCount && i1 < vertCount && i2 < vertCount && i0 !== i1 && i1 !== i2 && i0 !== i2;
+  };
+  // Two passes (count, then fill) so large imports never grow a JS number array.
+  let kept = 0;
+  for (let t = 0; t < triCount; t++) if (valid(t)) kept++;
+  if (kept === 0) return null;
+  if (kept === triCount && rawIndices.length === triCount * 3) {
+    return { positions: rawPositions, indices: rawIndices };
+  }
+  const indices = new Uint32Array(kept * 3);
+  let o = 0;
+  for (let t = 0; t < triCount; t++) {
+    if (!valid(t)) continue;
+    indices[o++] = rawIndices[t * 3];
+    indices[o++] = rawIndices[t * 3 + 1];
+    indices[o++] = rawIndices[t * 3 + 2];
+  }
+  return { positions: rawPositions, indices };
+}
+
 // --- furniture placement (movable labeled meshes) ---------------------------
 
 /** The platform's whole-room mesh label (the room shell, never movable). */

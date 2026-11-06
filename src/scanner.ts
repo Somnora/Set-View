@@ -11,7 +11,7 @@
 import * as THREE from 'three';
 import { uid } from './model.ts';
 import type { LocationScan, ScanMeshData } from './scan.ts';
-import { GLOBAL_MESH_LABEL, normalizeSemanticLabel, transformPositions } from './scan.ts';
+import { GLOBAL_MESH_LABEL, normalizeSemanticLabel, sanitizeMeshBuffers, transformPositions } from './scan.ts';
 
 const _meshMatrix = new THREE.Matrix4();
 
@@ -26,41 +26,6 @@ interface XRPlaneLike {
 /** Structural interface for extended XRFrame with plane detection. */
 interface XRFrameExtended extends Omit<XRFrame, 'detectedPlanes'> {
   detectedPlanes?: Set<XRPlaneLike>;
-}
-
-/** Sanitizes raw position and index buffers, rejecting non-finite values and out of bounds indices. */
-function sanitizeMeshBuffers(
-  rawPositions: Float32Array,
-  rawIndices: Uint32Array,
-): { positions: Float32Array; indices: Uint32Array } | null {
-  const vertCount = Math.floor(rawPositions.length / 3);
-  if (vertCount < 3) return null;
-
-  // Validate all coordinates are finite numbers
-  for (let i = 0; i < rawPositions.length; i++) {
-    if (!Number.isFinite(rawPositions[i])) return null;
-  }
-
-  // Filter valid triangles whose indices are strictly within bounds and non-degenerate
-  const validTriIndices: number[] = [];
-  const triCount = Math.floor(rawIndices.length / 3);
-
-  for (let t = 0; t < triCount; t++) {
-    const i0 = rawIndices[t * 3];
-    const i1 = rawIndices[t * 3 + 1];
-    const i2 = rawIndices[t * 3 + 2];
-
-    if (i0 < vertCount && i1 < vertCount && i2 < vertCount && i0 !== i1 && i1 !== i2 && i0 !== i2) {
-      validTriIndices.push(i0, i1, i2);
-    }
-  }
-
-  if (validTriIndices.length < 3) return null;
-
-  return {
-    positions: rawPositions,
-    indices: new Uint32Array(validTriIndices),
-  };
 }
 
 /** Converts a 2D/3D polygon from XRPlane into a triangulated ScanMeshData. */

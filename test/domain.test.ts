@@ -608,6 +608,10 @@ import {
 } from '../src/gaussianSplat.ts';
 import { SPLAT_BUDGET_STEP, stepSplatBudget } from '../src/performanceGovernor.ts';
 import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
+import * as ingest from '../src/sceneImport.ts';
+import { sanitizeMeshBuffers } from '../src/scan.ts';
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
 
 
 let passed = 0;
@@ -14205,6 +14209,247 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
   });
 
   if (!hadDocument) delete g.document;
+}
+
+// --- P1 ingest (P1.1) ---
+{
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const bytes = (...b: number[]) => new Uint8Array(b);
+
+  test('P1.1: sniffSceneFile identifies formats by magic bytes, not names', () => {
+    assert.equal(ingest.sniffSceneFile(enc('glTF\x02\x00\x00\x00')), 'glb');
+    assert.equal(ingest.sniffSceneFile(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0)), 'png');
+    assert.equal(ingest.sniffSceneFile(bytes(0xff, 0xd8, 0xff, 0xe0)), 'jpeg');
+    assert.equal(ingest.sniffSceneFile(bytes(0x50, 0x4b, 0x03, 0x04, 0)), 'zip');
+    assert.equal(ingest.sniffSceneFile(enc('Kaydara FBX Binary  \x00\x1a\x00')), 'fbx');
+    assert.equal(ingest.sniffSceneFile(enc('; FBX 7.4.0 project file\n')), 'fbx');
+    assert.equal(ingest.sniffSceneFile(enc('NGSP\x02\x00\x00\x00')), 'spz');
+    assert.equal(ingest.sniffSceneFile(bytes(0x1f, 0x8b, 0x08, 0)), 'spz');
+    assert.equal(ingest.sniffSceneFile(new Uint8Array(0)), 'unknown');
+    assert.equal(ingest.sniffSceneFile(enc('hello, this is just a note\n')), 'unknown');
+  });
+
+  test('P1.1: sniffSceneFile tells PLY meshes, points and Gaussian splats apart', () => {
+    const mesh = 'ply\nformat binary_little_endian 1.0\nelement vertex 8\nproperty float x\nproperty float y\nproperty float z\nelement face 12\nproperty list uchar uint vertex_indices\nend_header\n';
+    const points = 'ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n';
+    const gs =
+      'ply\r\nformat binary_little_endian 1.0\r\nelement vertex 100\r\nproperty float x\r\nproperty float y\r\nproperty float z\r\n' +
+      'property float f_dc_0\r\nproperty float opacity\r\nproperty float scale_0\r\nproperty float rot_0\r\nend_header\r\n';
+    const compressed = 'ply\nformat binary_little_endian 1.0\nelement chunk 4\nproperty float min_x\nelement vertex 1024\nproperty uint packed_position\nend_header\n';
+    assert.equal(ingest.sniffSceneFile(enc(mesh)), 'ply-mesh');
+    assert.equal(ingest.sniffSceneFile(enc(points)), 'ply-points');
+    assert.equal(ingest.sniffSceneFile(enc(gs)), 'ply-3dgs');
+    assert.equal(ingest.sniffSceneFile(enc(compressed)), 'ply-3dgs-compressed');
+    const h = ingest.parsePlyHeader(enc(mesh))!;
+    assert.equal(h.format, 'binary_little_endian');
+    assert.deepEqual(h.elements.map((e) => [e.name, e.count]), [['vertex', 8], ['face', 12]]);
+    assert.equal(h.headerBytes, mesh.length);
+    assert.equal(ingest.parsePlyHeader(enc('plyx')), null);
+  });
+
+  test('P1.1: sniffSceneFile reads JSON kinds, OBJ text and headerless .splat', () => {
+    const sample = new Uint8Array(probeFs.readFileSync(new URL('./sample_scene.setview.json', import.meta.url)));
+    assert.equal(ingest.sniffSceneFile(sample.subarray(0, ingest.SNIFF_BYTES), sample.length), 'setview-json');
+    assert.equal(ingest.sniffSceneFile(enc('{"asset":{"version":"2.0"},"meshes":[]}')), 'gltf-json');
+    assert.equal(ingest.sniffSceneFile(enc('{"hello":1}')), 'unknown');
+    assert.equal(ingest.sniffSceneFile(enc('# Polycam\nmtllib a.mtl\no room\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n')), 'obj');
+    // Two plausible 32-byte splat records.
+    const splat = new Uint8Array(64);
+    const dv = new DataView(splat.buffer);
+    for (let r = 0; r < 2; r++) {
+      dv.setFloat32(r * 32, 1.5, true);
+      dv.setFloat32(r * 32 + 4, 0.2, true);
+      dv.setFloat32(r * 32 + 8, -3, true);
+      for (let i = 0; i < 3; i++) dv.setFloat32(r * 32 + 12 + i * 4, 0.01, true);
+      splat[r * 32 + 24] = 200;
+    }
+    assert.equal(ingest.sniffSceneFile(splat, 64), 'splat');
+    assert.equal(ingest.sniffSceneFile(splat, 65), 'unknown', 'not a multiple of 32 bytes');
+    // Random-looking binary that fails the splat plausibility check.
+    const junk = new Uint8Array(64).fill(0xff);
+    assert.equal(ingest.sniffSceneFile(junk, 64), 'unknown');
+  });
+
+  test('P1.1: locationImportRefusal accepts meshes and explains everything else', () => {
+    for (const k of ['glb', 'obj', 'fbx', 'ply-mesh'] as const) assert.equal(ingest.locationImportRefusal(k), null);
+    for (const k of ['ply-3dgs', 'ply-3dgs-compressed', 'spz', 'splat'] as const) {
+      assert.match(ingest.locationImportRefusal(k)!, /splat/i);
+    }
+    assert.match(ingest.locationImportRefusal('setview-json')!, /Import Scene/);
+    assert.match(ingest.locationImportRefusal('ply-points')!, /no faces/);
+    assert.match(ingest.locationImportRefusal('unknown')!, /not recognised/);
+    assert.ok(ingest.describeSceneFileKind('glb').includes('.glb'));
+  });
+
+  const apply = (m: ArrayLike<number>, x: number, y: number, z: number) => [
+    m[0] * x + m[4] * y + m[8] * z + m[12],
+    m[1] * x + m[5] * y + m[9] * z + m[13],
+    m[2] * x + m[6] * y + m[10] * z + m[14],
+  ];
+
+  test('P1.1: conventionMatrix maps RDF and Z-up sources into y-up as proper rotations', () => {
+    assert.deepEqual(apply(ingest.conventionMatrix('RUB'), 1, 2, 3), [1, 2, 3]);
+    assert.deepEqual(apply(ingest.conventionMatrix('RDF'), 1, 2, 3), [1, -2, -3]);
+    const z = ingest.conventionMatrix('ZUP');
+    assert.deepEqual(apply(z, 0, 0, 1), [0, 1, 0], 'Z-up up is y-up up');
+    assert.deepEqual(apply(z, 0, 1, 0), [0, 0, -1], 'Z-up forward is -Z forward');
+    for (const c of ['RUB', 'RDF', 'ZUP'] as const) {
+      const m = ingest.conventionMatrix(c);
+      const det =
+        m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2]) + m[8] * (m[1] * m[6] - m[5] * m[2]);
+      approx(det, 1, 1e-12);
+    }
+    const t = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 5, 6, 7, 1];
+    assert.deepEqual(apply(ingest.multiplyMat4(t, ingest.conventionMatrix('RDF')), 1, 1, 1), [6, 5, 6]);
+  });
+
+  test('P1.1: buildLocationScanFromParts bakes matrices, recentres to the floor and reports the transform', () => {
+    const tri = new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const moved = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 2, -4, 1];
+    const r = ingest.buildLocationScanFromParts(
+      [
+        { positions: tri, indices: new Uint32Array([0, 1, 2]) },
+        { positions: tri, indices: new Uint16Array([0, 2, 1]), matrix: moved },
+      ],
+      { id: 'imp-1', capturedAt: 5 },
+    );
+    assert.ok(r.scan && !r.error);
+    assert.equal(r.scan!.id, 'imp-1');
+    assert.equal(r.scan!.meshes.length, 2);
+    assert.equal(r.stats.triangles, 2);
+    assert.deepEqual(r.scan!.meshes[1].indices, new Uint32Array([0, 2, 1]));
+    assert.equal(tri[0], 0, 'input positions are not mutated');
+    const sum = summarizeScan(r.scan!);
+    approx(sum.boundsMin.y, 0, 1e-6);
+    approx(sum.boundsMin.x + sum.boundsMax.x, 0, 1e-6);
+    approx(sum.boundsMin.z + sum.boundsMax.z, 0, 1e-6);
+    // The reported transform takes source-root points to where the scan put them.
+    const p = r.scan!.meshes[1].positions;
+    const q = apply(r.sourceTransform, 10 + 1, 2, -4);
+    approx(p[3], q[0], 1e-5);
+    approx(p[4], q[1], 1e-5);
+    approx(p[5], q[2], 1e-5);
+    assert.deepEqual([r.sourceBoundsMin.x, r.sourceBoundsMax.x], [0, 11]);
+    for (const m of r.scan!.meshes) {
+      assert.equal(m.label, ingest.IMPORTED_MESH_LABEL);
+      assert.equal(isMovableScanMesh(m.label), false, 'imported geometry is static');
+    }
+  });
+
+  test('P1.1: buildLocationScanFromParts handles non-indexed parts, units, axes and keepCoordinates', () => {
+    // A non-indexed quad (two triangles) in centimetres, Z-up.
+    const soup = new Float32Array([0, 0, 100, 200, 0, 100, 0, 300, 100, 200, 0, 100, 200, 300, 100, 0, 300, 100]);
+    const r = ingest.buildLocationScanFromParts([{ positions: soup, indices: null }], {
+      unitScale: ingest.UNIT_SCALE.cm,
+      convention: 'ZUP',
+      keepCoordinates: true,
+    });
+    assert.equal(r.stats.triangles, 2);
+    assert.deepEqual(Array.from(r.scan!.meshes[0].indices), [0, 1, 2, 3, 4, 5]);
+    const p = r.scan!.meshes[0].positions;
+    // Z-up (0, 300 cm forward, 100 cm up) -> y-up (0, 1 m up, -3 m forward).
+    approx(p[6], 0, 1e-6);
+    approx(p[7], 1, 1e-6);
+    approx(p[8], -3, 1e-6);
+  });
+
+  test('P1.1: buildLocationScanFromParts drops bad parts with a warning and refuses empty or oversized input', () => {
+    const good = { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]), indices: new Uint32Array([0, 1, 2]) };
+    const nan = { positions: new Float32Array([0, 0, 0, NaN, 0, 0, 0, 0, 1]), indices: new Uint32Array([0, 1, 2]) };
+    const degenerate = { positions: good.positions, indices: new Uint32Array([0, 0, 1]) };
+    const r = ingest.buildLocationScanFromParts([good, nan, degenerate]);
+    assert.equal(r.scan!.meshes.length, 1);
+    assert.equal(r.stats.droppedParts, 2);
+    assert.match(r.warnings[0], /2 parts/);
+    const none = ingest.buildLocationScanFromParts([nan]);
+    assert.equal(none.scan, null);
+    assert.match(none.error!, /no usable triangles/);
+    const many = ingest.buildLocationScanFromParts(Array.from({ length: 1025 }, () => good));
+    assert.equal(many.scan, null);
+    assert.match(many.error!, /1024 separate meshes/);
+  });
+
+  test('P1.1: sanitizeMeshBuffers keeps valid buffers as-is and filters bad triangles without a number array', () => {
+    const pos = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0]);
+    const ok = new Uint32Array([0, 1, 2, 1, 3, 2]);
+    assert.equal(sanitizeMeshBuffers(pos, ok)!.indices, ok, 'nothing dropped: same array back');
+    const mixed = new Uint32Array([0, 1, 2, 0, 0, 1, 1, 9, 2, 1, 3, 2]);
+    assert.deepEqual(Array.from(sanitizeMeshBuffers(pos, mixed)!.indices), [0, 1, 2, 1, 3, 2]);
+    assert.equal(sanitizeMeshBuffers(pos, new Uint32Array([0, 0, 0])), null);
+    assert.equal(sanitizeMeshBuffers(new Float32Array([0, 0, 0, 1, 0, 0]), ok), null, 'fewer than 3 vertices');
+    assert.equal(sanitizeMeshBuffers(new Float32Array([0, 0, 0, 1, 0, Infinity, 0, 1, 0]), new Uint32Array([0, 1, 2])), null);
+  });
+
+  test('P1.1: guessUnitScale and checkImportBudget', () => {
+    const z = { x: 0, y: 0, z: 0 };
+    assert.equal(ingest.guessUnitScale(z, { x: 6, y: 3, z: 5 }).unit, 'm');
+    assert.equal(ingest.guessUnitScale(z, { x: 600, y: 280, z: 500 }).unit, 'cm');
+    assert.equal(ingest.guessUnitScale(z, { x: 6000, y: 2800, z: 5000 }).unit, 'mm');
+    assert.equal(ingest.guessUnitScale(z, { x: 6000, y: 2800, z: 5000 }).scale, 0.001);
+    assert.equal(ingest.checkImportBudget({ triangles: 120_000, vertices: 60_000, meshes: 1 }).level, 'ok');
+    assert.equal(ingest.checkImportBudget({ triangles: 400_000, vertices: 200_000, meshes: 1 }).level, 'warn');
+    const big = ingest.checkImportBudget({ triangles: 900_000, vertices: 450_000, meshes: 1 });
+    assert.equal(big.level, 'reject');
+    assert.match(big.reason, /900k triangles/);
+  });
+
+  test('P1.1: detectCaptureApp and the license reminder', () => {
+    assert.equal(ingest.detectCaptureApp('Polycam glTF exporter', null), 'polycam');
+    assert.equal(ingest.detectCaptureApp(null, 'Scaniverse 2026-11-01.glb'), 'scaniverse');
+    assert.equal(ingest.detectCaptureApp('Khronos glTF Blender I/O', 'room.glb'), 'unknown');
+    assert.match(ingest.captureLicenseNote('scaniverse')!, /no commercial rights/);
+    assert.equal(ingest.captureLicenseNote('unknown'), null);
+  });
+
+  // Round trip: SetView's own scan exports, parsed by three's loaders, rebuilt by the ingest core.
+  const partsFromThree = (root: THREE.Object3D): ingest.ImportMeshPart[] => {
+    root.updateMatrixWorld(true);
+    const parts: ingest.ImportMeshPart[] = [];
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const g = mesh.geometry as THREE.BufferGeometry;
+      const pos = g.getAttribute('position');
+      parts.push({
+        positions: new Float32Array(pos.array as ArrayLike<number>),
+        indices: g.index ? new Uint32Array(g.index.array as ArrayLike<number>) : null,
+        matrix: mesh.matrixWorld.elements,
+      });
+    });
+    return parts;
+  };
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+  const roomSum = summarizeScan(room);
+  const extent = (s: { boundsMin: { x: number; y: number; z: number }; boundsMax: { x: number; y: number; z: number } }) => [
+    s.boundsMax.x - s.boundsMin.x,
+    s.boundsMax.y - s.boundsMin.y,
+    s.boundsMax.z - s.boundsMin.z,
+  ];
+
+  test('P1.1: OBJ round trip (exportScanAsObj -> OBJLoader.parse -> buildLocationScanFromParts)', () => {
+    const { obj } = exportScanAsObj(room);
+    assert.equal(ingest.sniffSceneFile(enc(obj)), 'obj');
+    const r = ingest.buildLocationScanFromParts(partsFromThree(new OBJLoader().parse(obj)));
+    assert.ok(r.scan);
+    assert.equal(r.stats.triangles, roomSum.triangles);
+    const a = extent(summarizeScan(r.scan!));
+    const b = extent(roomSum);
+    for (let i = 0; i < 3; i++) approx(a[i], b[i], 1e-3);
+    approx(summarizeScan(r.scan!).boundsMin.y, 0, 1e-6);
+  });
+
+  test('P1.1: binary PLY round trip (exportScanAsPly -> PLYLoader.parse -> buildLocationScanFromParts)', () => {
+    const ply = exportScanAsPly(room, true) as Uint8Array;
+    assert.equal(ingest.sniffSceneFile(ply.subarray(0, ingest.SNIFF_BYTES), ply.length), 'ply-mesh');
+    const buf = ply.buffer.slice(ply.byteOffset, ply.byteOffset + ply.byteLength) as ArrayBuffer;
+    const geom = new PLYLoader().parse(buf);
+    const r = ingest.buildLocationScanFromParts(partsFromThree(new THREE.Mesh(geom)));
+    assert.ok(r.scan);
+    assert.equal(r.stats.triangles, roomSum.triangles);
+    const a = extent(summarizeScan(r.scan!));
+    const b = extent(roomSum);
+    for (let i = 0; i < 3; i++) approx(a[i], b[i], 1e-3);
+  });
 }
 
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
