@@ -125,6 +125,24 @@ body {
   color: var(--text-secondary);
 }
 
+/* Save, storage and import banners. Fixed on the body, outside #landing, so they
+   stay in view over the desktop preview: above its bar (z-index 100) and below
+   the studio modals (z-index 1000 and up). */
+.banners {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(720px, calc(100vw - 32px));
+  z-index: 200;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.banners > div {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
 /* Action Buttons */
 #landing button.enter {
   width: 100%;
@@ -162,7 +180,8 @@ body {
   flex-wrap: wrap;
 }
 
-#landing button.small {
+#landing button.small,
+.banners button.small {
   padding: 8px 14px;
   font-size: 13px;
   font-weight: 600;
@@ -175,7 +194,8 @@ body {
   backdrop-filter: blur(8px);
 }
 
-#landing button.small:hover {
+#landing button.small:hover,
+.banners button.small:hover {
   background: var(--bg-card-hover);
   border-color: var(--border-accent);
   color: #ffffff;
@@ -478,6 +498,30 @@ body {
   position: fixed;
   inset: 0;
   pointer-events: none;
+}
+
+/* Studio modals mount inside #overlay during an AR session with dom-overlay
+   (on the 2D page they mount on body). #overlay stays click-through so the
+   AR view keeps its input; each full-screen modal root takes input back.
+   Keep this list in sync with STUDIO_MODAL_ROOT_CLASSES in ui.ts. */
+#overlay > .ai-modal-overlay,
+#overlay > .collab-modal-overlay,
+#overlay > .props-modal-overlay,
+#overlay > .livelink-modal-overlay,
+#overlay > .actor-studio-overlay,
+#overlay > .grip-studio-overlay,
+#overlay > .splat-modal-overlay,
+#overlay > .perf-modal-overlay,
+#overlay > .dailies-modal-overlay,
+#overlay > .dmx-modal-overlay,
+#overlay > .icvfx-modal-overlay,
+#overlay > .acoustics-modal-overlay,
+#overlay > .solar-modal-overlay,
+#overlay > .screenplay-modal-overlay,
+#overlay > .profiler-modal-overlay,
+#overlay > .comfort-modal-overlay,
+#overlay > .dressing-modal-overlay {
+  pointer-events: auto;
 }
 
 #overlay .note-dialog {

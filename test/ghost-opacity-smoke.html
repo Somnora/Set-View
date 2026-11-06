@@ -1,0 +1,240 @@
+<!doctype html>
+<!-- Spike S12 (roadmap P0.7): Ghost and Wireframe must stay see-through over
+     passthrough after anything has drawn the scan Solid.
+
+     three r180 decides '#define OPAQUE' (alpha forced to 1) from
+     material.transparent when it builds a material's shader, and only rebuilds
+     when material.version changes. Before P0.7 one shared material per color
+     had its transparent flag flipped on every mode change, so once a Solid
+     draw built the shader (Solid mode, or the Camera View pass, which forces
+     Solid every frame) Ghost and Wireframe drew fully opaque.
+
+     This page drives the real LocationRenderer through those sequences into a
+     render target cleared to alpha 0 (what passthrough shows through) and
+     reads the alpha back. Each case uses a fresh LocationRenderer, so its
+     materials and their shaders are new. The order in "Ghost with Camera View
+     open" matches the app's frame loop: the Camera View pass, then the eyes.
+
+     PASS: Solid and the Camera View monitor are opaque; Ghost and Wireframe
+     drawn fresh are see-through, and every case with history matches its
+     fresh control. On the pre-P0.7 code (cd82a8e) the "Ghost after Solid",
+     "after a Camera View pass", "Camera View open" and "Wireframe after
+     Solid" cases come out fully opaque.
+
+     The tiles draw each result over a checkerboard standing in for
+     passthrough: where it shows through, the wearer would see the real room.
+     Headed (vite.http.config.ts): http://localhost:5174/test/ghost-opacity-smoke.html -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ghost opacity smoke</title>
+    <style>
+      body { margin: 0; padding: 48px 12px 12px; background: #1d1f24; color: #d8dbe2; font: 13px system-ui, sans-serif; }
+      #cases { display: flex; flex-wrap: wrap; gap: 14px; }
+      .case { width: 256px; }
+      .case canvas {
+        display: block; width: 256px; height: 256px;
+        background: repeating-conic-gradient(#4a6 0 25%, #c84 0 50%) 0 0 / 32px 32px;
+      }
+      .case .name { font-weight: 600; margin: 6px 0 2px; }
+      .case .ok { color: #9f6; }
+      .case .bad { color: #f66; }
+    </style>
+  </head>
+  <body>
+    <pre id="out" style="position:fixed;top:4px;left:12px;right:12px;margin:0;z-index:99;color:#9f6;white-space:pre-wrap">running…</pre>
+    <div id="cases"></div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { LocationRenderer } from '../src/location.ts';
+      import { createSyntheticLocationScan } from '../src/scanExporters.ts';
+
+      const out = document.getElementById('out');
+      const report = (ok, msg) => {
+        out.textContent = `GHOST-OPACITY-SMOKE ${ok ? 'PASS' : 'FAIL'} | ${msg}`;
+        out.style.color = ok ? '#9f6' : '#f66';
+      };
+
+      const SIZE = 256;
+      // A covered pixel counts as opaque at alpha 255. Ghost (0.35) needs about
+      // 14 stacked surfaces to round up to 255, so a see-through mode should have
+      // almost none; the bug makes every covered pixel 255.
+      const SEE_THROUGH_MAX_OPAQUE_SHARE = 0.1;
+      /** Fresh Wireframe: single wires are 217, only stacked wires reach 255. */
+      const WIRE_MAX_OPAQUE_SHARE = 0.6;
+      /** A case with history may differ from its fresh control by this much. */
+      const CONTROL_TOLERANCE = 0.02;
+      const OPAQUE_MIN_OPAQUE_SHARE = 0.95;
+      const MIN_COVERAGE = 0.02;
+
+      try {
+        // Same flags as the app's renderer (main.ts).
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(SIZE, SIZE, false);
+        renderer.setClearColor(0x000000, 0);
+        // Stand-ins for the eye buffer (composited over passthrough by alpha)
+        // and the 1024 Camera View render target.
+        const eyes = new THREE.WebGLRenderTarget(SIZE, SIZE);
+        const monitor = new THREE.WebGLRenderTarget(SIZE, SIZE);
+        const camera = new THREE.PerspectiveCamera(75, 1, 0.05, 50);
+        camera.position.set(0.6, 1.5, 1.4);
+        camera.lookAt(-0.8, 0.8, -2.5);
+        const scan = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+        const pixels = new Uint8Array(SIZE * SIZE * 4);
+
+        const draw = (scene, target) => {
+          renderer.setRenderTarget(target);
+          renderer.clear();
+          renderer.render(scene, camera);
+          renderer.setRenderTarget(null);
+        };
+        const measure = (target) => {
+          renderer.readRenderTargetPixels(target, 0, 0, SIZE, SIZE, pixels);
+          let covered = 0;
+          let opaque = 0;
+          for (let i = 3; i < pixels.length; i += 4) {
+            const a = pixels[i];
+            if (a === 0) continue;
+            covered++;
+            if (a === 255) opaque++;
+          }
+          return { coverage: covered / (SIZE * SIZE), opaqueShare: covered ? opaque / covered : 0 };
+        };
+        // Copies the last measured target into a tile, flipped upright and
+        // un-premultiplied, so the checkerboard shows through by alpha.
+        const tile = (name, stats, expect, ok) => {
+          const wrap = document.createElement('div');
+          wrap.className = 'case';
+          const canvas = document.createElement('canvas');
+          canvas.width = canvas.height = SIZE;
+          const img = new ImageData(SIZE, SIZE);
+          for (let y = 0; y < SIZE; y++) {
+            for (let x = 0; x < SIZE; x++) {
+              const s = ((SIZE - 1 - y) * SIZE + x) * 4;
+              const d = (y * SIZE + x) * 4;
+              const a = pixels[s + 3];
+              const k = a ? 255 / a : 0;
+              img.data[d] = Math.min(255, pixels[s] * k);
+              img.data[d + 1] = Math.min(255, pixels[s + 1] * k);
+              img.data[d + 2] = Math.min(255, pixels[s + 2] * k);
+              img.data[d + 3] = a;
+            }
+          }
+          canvas.getContext('2d').putImageData(img, 0, 0);
+          const label = document.createElement('div');
+          label.innerHTML =
+            `<div class="name">${name}</div>` +
+            `<div class="${ok ? 'ok' : 'bad'}">${ok ? 'as expected' : 'WRONG'}: ${expect}</div>` +
+            `<div>opaque ${(stats.opaqueShare * 100).toFixed(1)}% of ${(stats.coverage * 100).toFixed(0)}% covered</div>`;
+          wrap.append(canvas, label);
+          document.getElementById('cases').append(wrap);
+        };
+
+        const cases = [
+          { name: 'Solid', expect: 'opaque', target: eyes, run: (loc, scene) => { loc.setMode('solid'); draw(scene, eyes); } },
+          { name: 'Ghost, fresh', expect: 'see-through', target: eyes, run: (loc, scene) => { loc.setMode('ghost'); draw(scene, eyes); } },
+          {
+            name: 'Ghost after Solid',
+            expect: 'see-through',
+            control: 'Ghost, fresh',
+            target: eyes,
+            run: (loc, scene) => {
+              loc.setMode('solid');
+              draw(scene, eyes);
+              loc.setMode('ghost');
+              draw(scene, eyes);
+            },
+          },
+          {
+            name: 'Camera View monitor (scan hidden)',
+            expect: 'opaque',
+            target: monitor,
+            run: (loc, scene) => {
+              loc.setMode('hidden');
+              loc.beginCameraPass();
+              try { draw(scene, monitor); } finally { loc.endCameraPass(); }
+            },
+          },
+          {
+            name: 'Ghost after a Camera View pass',
+            expect: 'see-through',
+            control: 'Ghost, fresh',
+            target: eyes,
+            run: (loc, scene) => {
+              loc.setMode('hidden');
+              loc.beginCameraPass();
+              try { draw(scene, monitor); } finally { loc.endCameraPass(); }
+              loc.setMode('ghost');
+              draw(scene, eyes);
+            },
+          },
+          {
+            name: 'Ghost with Camera View open',
+            expect: 'see-through',
+            control: 'Ghost, fresh',
+            target: eyes,
+            run: (loc, scene) => {
+              loc.setMode('ghost');
+              for (let f = 0; f < 3; f++) {
+                loc.beginCameraPass();
+                try { draw(scene, monitor); } finally { loc.endCameraPass(); }
+                draw(scene, eyes);
+              }
+            },
+          },
+          {
+            name: 'Wireframe, fresh',
+            expect: 'see-through',
+            target: eyes,
+            run: (loc, scene) => { loc.setMode('wireframe'); draw(scene, eyes); },
+          },
+          {
+            name: 'Wireframe after Solid',
+            expect: 'see-through',
+            control: 'Wireframe, fresh',
+            target: eyes,
+            run: (loc, scene) => {
+              loc.setMode('solid');
+              draw(scene, eyes);
+              loc.setMode('wireframe');
+              draw(scene, eyes);
+            },
+          },
+        ];
+
+        const notes = [];
+        const seen = new Map();
+        let allOk = true;
+        for (const c of cases) {
+          const scene = new THREE.Scene();
+          scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 2.5));
+          const loc = new LocationRenderer();
+          scene.add(loc.group);
+          loc.setScan(scan);
+          c.run(loc, scene);
+          const stats = measure(c.target);
+          seen.set(c.name, stats);
+          // A case with history must match the same mode drawn fresh. Wires that
+          // overlap round up to 255 (four stacked lines at 0.85 do), so
+          // Wireframe's own baseline is well above zero; the bug drives every
+          // covered pixel to 255.
+          const control = c.control ? seen.get(c.control) : null;
+          const ok =
+            stats.coverage >= MIN_COVERAGE &&
+            (c.expect === 'opaque'
+              ? stats.opaqueShare >= OPAQUE_MIN_OPAQUE_SHARE
+              : control
+                ? stats.opaqueShare <= control.opaqueShare + CONTROL_TOLERANCE
+                : stats.opaqueShare <= (c.name.startsWith('Wireframe') ? WIRE_MAX_OPAQUE_SHARE : SEE_THROUGH_MAX_OPAQUE_SHARE));
+          allOk &&= ok;
+          tile(c.name, stats, c.expect, ok);
+          notes.push(`${c.name}: ${ok ? 'ok' : 'WRONG'} (opaque ${(stats.opaqueShare * 100).toFixed(1)}%)`);
+          loc.setScan(null);
+        }
+        report(allOk, notes.join(' | '));
+      } catch (e) {
+        report(false, e.message);
+      }
+    </script>
+  </body>
+</html>

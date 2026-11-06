@@ -15,6 +15,7 @@ import {
   normalizeGovernorConfig,
   RollingFrameStats,
   SessionFrameLedger,
+  stepSplatBudget,
   VSYNC_MISS_TOLERANCE,
   type FrameMetrics,
   type GovernorConfig,
@@ -301,14 +302,17 @@ export class XRPerformanceGovernor {
 
     // 3. Gaussian Splat Budget LOD Throttling
     if (this.config.enableLODThrottling && splatRenderer) {
-      this.currentSplatBudget = calculateAdaptiveLODBudget(
-        this.baseSplatBudget,
-        avgMs,
-        targetFrameTimeMs,
-        5000,
-        350000,
+      // The raw adaptive budget follows the rolling average and so moves almost every
+      // frame; stepSplatBudget holds it until it has moved more than one step. The
+      // renderer is only told when the value differs from what it already has, so a
+      // steady budget costs a getter call per frame and never a mesh rebuild.
+      this.currentSplatBudget = stepSplatBudget(
+        this.currentSplatBudget,
+        calculateAdaptiveLODBudget(this.baseSplatBudget, avgMs, targetFrameTimeMs, 5000, 350000),
       );
-      splatRenderer.setSplatBudget(this.currentSplatBudget);
+      if (splatRenderer.getSplatBudget() !== this.currentSplatBudget) {
+        splatRenderer.setSplatBudget(this.currentSplatBudget);
+      }
     }
 
     // 4. Volumetric Step Count Throttling

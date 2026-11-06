@@ -7,6 +7,12 @@
 import * as THREE from 'three';
 import { makeLabel, type Label } from './ui.ts';
 import type { PlaceArm } from './wheel.ts';
+import {
+  roomCaptureRefusal,
+  scanCapability,
+  type RoomCaptureRefusal,
+  type ScanCapability,
+} from './scan.ts';
 
 export interface SupportReport {
   secureContext: boolean;
@@ -39,6 +45,8 @@ export interface XRFeatureFlags {
   handTracking: boolean;
   domOverlay: boolean;
   meshDetection: boolean;
+  /** WebXR plane-detection granted (the Android XR scan path). */
+  planeDetection: boolean;
   referenceSpace: 'local-floor' | 'local';
 }
 
@@ -51,6 +59,9 @@ export interface HitInfo {
 
 type LogFn = (msg: string) => void;
 
+/** Outcome of a Space Setup request; `error` feeds roomCaptureMessage. */
+export type RoomCaptureResult = { ok: true } | { ok: false; error: RoomCaptureRefusal | string };
+
 export class SessionManager {
   session: XRSession | null = null;
   features: XRFeatureFlags = {
@@ -59,8 +70,21 @@ export class SessionManager {
     handTracking: false,
     domOverlay: false,
     meshDetection: false,
+    planeDetection: false,
     referenceSpace: 'local',
   };
+  /** XRSession.enabledFeatures as the browser reported it ([] when it didn't). */
+  enabledFeatures: readonly string[] = [];
+  /** False when the browser omitted enabledFeatures: optional features are then unknown, not absent. */
+  featuresReported = false;
+  /** initiateRoomCapture may run once per XRSession (WebXR spec); reset in start(). */
+  roomCaptureUsed = false;
+  /** The platform rejected room capture with NotSupportedError; reset in start(). */
+  roomCaptureUnsupported = false;
+  /** The reference space jumped (pose discontinuity, e.g. after Space Setup). */
+  onReferenceSpaceReset: () => void = () => {};
+  /** XRSession visibility changed ('visible' again after system UI such as Space Setup). */
+  onVisibilityChange: (state: XRVisibilityState) => void = () => {};
 
   /** Reticle object lives in true world space (scene root, not contentRoot). */
   readonly reticle: THREE.Group;
@@ -88,26 +112,99 @@ export class SessionManager {
   async start(overlayRoot: HTMLElement, onEnd: () => void): Promise<void> {
     const init: XRSessionInit = {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['anchors', 'hand-tracking', 'dom-overlay', 'local-floor', 'mesh-detection'],
+      optionalFeatures: [
+        'anchors',
+        'hand-tracking',
+        'dom-overlay',
+        'local-floor',
+        'mesh-detection',
+        // Android XR exposes planes but not meshes; Scan Room falls back to them.
+        'plane-detection',
+      ],
       domOverlay: { root: overlayRoot },
     };
     const session = await navigator.xr!.requestSession('immersive-ar', init);
     this.session = session;
+    // The full 'end' handler is attached only after the awaits below. A session
+    // that ends during them, or a setSession that throws, must not leave
+    // this.session set: the 2D page would then act as if AR were still live
+    // (studios mounting into the hidden #overlay). onEnd is not called for a
+    // start that fails: startAR is still running and reports the failure.
+    let ended = false;
+    session.addEventListener(
+      'end',
+      () => {
+        ended = true;
+        if (this.session === session) this.session = null;
+      },
+      { once: true },
+    );
+    try {
+      await this.startSession(session);
+    } catch (e) {
+      this.abandonStart(session, ended);
+      throw e;
+    }
+    if (ended) {
+      this.abandonStart(session, true);
+      throw new Error('the XR session ended while it was starting');
+    }
+
+    session.addEventListener('end', () => {
+      this.viewerHitSource = null;
+      this.controllerHitSources.clear();
+      this.session = null;
+      this.reticle.visible = false;
+      onEnd();
+    });
+
+    // '?' = the browser did not report enabledFeatures, so the flag is unknown.
+    const flag = (on: boolean) => (!this.featuresReported ? '?' : on ? 'yes' : 'no');
+    this.log(
+      `session started · ref=${this.features.referenceSpace}` +
+        ` · anchors=${this.features.anchors ? 'yes' : 'no'} · overlay=${this.features.domOverlay ? 'yes' : 'no'}` +
+        ` · mesh=${flag(this.features.meshDetection)} · planes=${flag(this.features.planeDetection)}`,
+    );
+  }
+
+  /** Undoes a start() that failed after requestSession, so no stale session stays set. */
+  private abandonStart(session: XRSession, ended: boolean): void {
+    if (this.session === session) this.session = null;
+    this.viewerHitSource = null;
+    this.controllerHitSources.clear();
+    this.reticle.visible = false;
+    if (!ended) {
+      try {
+        void session.end().catch(() => {});
+      } catch {
+        /* already ending */
+      }
+    }
+  }
+
+  /** The part of start() after requestSession: features, renderer binding, hit-test sources. */
+  private async startSession(session: XRSession): Promise<void> {
     // Fresh session: clear a stuck anchor-failure latch from a prior session.
     // features.anchors is set optimistically below; without this reset, one
     // transient createAnchor failure would disable anchoring for the lifetime
     // of this SessionManager (it's reused across sessions), silently killing
     // drift resistance on every later session until a page reload.
     this.anchorsBroken = false;
+    this.roomCaptureUsed = false;
+    this.roomCaptureUnsupported = false;
 
     const enabled: string[] = (session as unknown as { enabledFeatures?: string[] }).enabledFeatures ?? [];
     const has = (f: string) => enabled.includes(f);
+    this.enabledFeatures = enabled;
+    // hit-test is required, so a real report is never empty.
+    this.featuresReported = enabled.length > 0;
     this.features = {
       hitTest: enabled.length ? has('hit-test') : true, // required, so present if session started
       anchors: enabled.length ? has('anchors') : true, // optimistic; first failure flips anchorsBroken
       handTracking: has('hand-tracking'),
       domOverlay: enabled.length ? has('dom-overlay') : !!session.domOverlayState,
       meshDetection: has('mesh-detection'),
+      planeDetection: has('plane-detection'),
       referenceSpace: 'local',
     };
 
@@ -125,10 +222,12 @@ export class SessionManager {
     if (refSpace) {
       refSpace.addEventListener('reset', () => {
         this.log('⚠ reference space RESET (pose discontinuity — expect content jump)');
+        this.onReferenceSpaceReset();
       });
     }
     session.addEventListener('visibilitychange', () => {
       this.log(`session visibility: ${session.visibilityState}`);
+      this.onVisibilityChange(session.visibilityState);
     });
 
     // Gaze fallback hit-test source.
@@ -148,36 +247,48 @@ export class SessionManager {
       }
     });
     for (const src of Array.from(session.inputSources)) this.addControllerHitSource(src);
+  }
 
-    session.addEventListener('end', () => {
-      this.viewerHitSource = null;
-      this.controllerHitSources.clear();
-      this.session = null;
-      this.reticle.visible = false;
-      onEnd();
+  /** Whether Scan Room can run in this session, and from which sources. */
+  scanCapability(): ScanCapability {
+    return scanCapability({ enabledFeatures: this.enabledFeatures, reported: this.featuresReported });
+  }
+
+  /** Why Space Setup can't be requested right now, or null when it can. */
+  roomCaptureRefusal(): RoomCaptureRefusal | null {
+    const s = this.session;
+    return roomCaptureRefusal({
+      hasSession: !!s,
+      // A NotSupportedError means the API is a stub here: 'not available', not 'used'.
+      hasApi: !!s && typeof s.initiateRoomCapture === 'function' && !this.roomCaptureUnsupported,
+      enabledFeatures: this.enabledFeatures,
+      used: this.roomCaptureUsed,
     });
-
-    this.log(
-      `session started · ref=${this.features.referenceSpace}` +
-        ` · anchors=${this.features.anchors ? 'yes' : 'no'} · overlay=${this.features.domOverlay ? 'yes' : 'no'}` +
-        ` · mesh=${this.features.meshDetection ? 'yes' : 'no'}`,
-    );
   }
 
   /**
-   * Asks the OS to (re)run room capture (Space Setup). The platform may only
-   * honor this once per session and may ignore it if the room is already set
-   * up. Resolves false when unavailable.
+   * Asks the OS to run room capture (Space Setup). Only an explicit user
+   * action may call this: it works once per session, needs plane-detection,
+   * may reset tracking and wipe anchors (Meta disabled the automatic call in
+   * IWSDK for that reason), and is a stub in Chrome. Refuses without calling
+   * the platform when roomCaptureRefusal() says so.
    */
-  async requestRoomCapture(): Promise<boolean> {
-    const s = this.session;
-    if (!s || typeof s.initiateRoomCapture !== 'function') return false;
+  async requestRoomCapture(): Promise<RoomCaptureResult> {
+    const refusal = this.roomCaptureRefusal();
+    if (refusal) return { ok: false, error: refusal };
+    const s = this.session!;
+    // Spent even if it rejects: the platform counts the call, and a retry
+    // would only come back as InvalidStateError.
+    this.roomCaptureUsed = true;
     try {
-      await s.initiateRoomCapture();
-      return true;
+      await s.initiateRoomCapture!();
+      return { ok: true };
     } catch (e) {
-      this.log(`room capture request failed: ${(e as Error).message}`);
-      return false;
+      const name = (e as { name?: unknown } | null)?.name;
+      const error = typeof name === 'string' && name ? name : 'Error';
+      if (error === 'NotSupportedError') this.roomCaptureUnsupported = true;
+      this.log(`room capture request failed: ${error}: ${(e as Error)?.message ?? e}`);
+      return { ok: false, error };
     }
   }
 

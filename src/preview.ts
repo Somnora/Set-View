@@ -10,13 +10,17 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { aspectValue, computeFocusDistance, computeVillageLayout, createAtmosphereConfig, type SceneData } from './model.ts';
+import type { LocationDisplayMode } from './model.ts';
 import { classifyShotSize, vFovDeg } from './lens.ts';
 import { buildCameraTimeline, buildTimeline, sampleCameraTimeline, sampleTimeline } from './timeline.ts';
 import type { KeyframeSystem } from './keyframes.ts';
 import { generateDawStemManifest } from './audioCues.ts';
-import { openAiAnalysisModal, openDailiesVideoStudioModal } from './ui.ts';
+import { openAiAnalysisModal, openDailiesVideoStudioModal, STUDIO_MODAL_ROOT_CLASSES } from './ui.ts';
 import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
 import { VolumetricManager } from './volumetrics.ts';
+
+/** Matches any open studio, library or exporter modal (they mount on body here). */
+const STUDIO_MODAL_SELECTOR = STUDIO_MODAL_ROOT_CLASSES.map((c) => `.${c}`).join(', ');
 
 export class DesktopPreview {
   /** True while the preview owns the renderer's animation loop. */
@@ -33,6 +37,10 @@ export class DesktopPreview {
   onOpenWebXRProfiler?: () => void;
   onOpenVRComfort?: () => void;
   onOpenSetDressing?: () => void;
+  /** Current scan display mode, or null when the scene has no scan (no button). */
+  getLocationMode?: () => LocationDisplayMode | null;
+  /** Advances the scan display mode (Hidden, Ghost, Solid, Wireframe). */
+  onCycleLocationMode?: () => void;
 
 
   private renderer: THREE.WebGLRenderer;
@@ -65,6 +73,7 @@ export class DesktopPreview {
   private lensBtn: HTMLButtonElement | null = null;
   private loopBtn: HTMLButtonElement | null = null;
   private rateBtn: HTMLButtonElement | null = null;
+  private roomBtn: HTMLButtonElement | null = null;
   private scrub: HTMLInputElement | null = null;
   private clock: HTMLSpanElement | null = null;
   private letterbox: [HTMLDivElement, HTMLDivElement] | null = null;
@@ -163,6 +172,7 @@ export class DesktopPreview {
 
     this.bar?.remove();
     this.bar = null;
+    this.roomBtn = null;
     if (this.letterbox) {
       this.letterbox[0].remove();
       this.letterbox[1].remove();
@@ -343,6 +353,12 @@ export class DesktopPreview {
       return b;
     };
     this.lensBtn = btn('View: Orbit', () => this.cycleLens());
+    if (this.onCycleLocationMode && this.getLocationMode?.()) {
+      this.roomBtn = btn(this.roomLabel(), () => {
+        this.onCycleLocationMode?.();
+        if (this.roomBtn) this.roomBtn.textContent = this.roomLabel();
+      });
+    }
     btn('|< -1F', () => { this.keyframes.stepFrames(-1); this.syncBar(); });
     this.playBtn = btn('▶ Play', () => this.togglePlay());
     btn('+1F >|', () => { this.keyframes.stepFrames(1); this.syncBar(); });
@@ -490,6 +506,11 @@ export class DesktopPreview {
     }
   }
 
+  private roomLabel(): string {
+    const mode = this.getLocationMode?.() ?? 'hidden';
+    return `Room: ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`;
+  }
+
   /** Orbit → CAM A → CAM B → Video Village (if 2+ cams) → Orbit. */
   private cycleLens(): void {
     const s = this.sceneData;
@@ -530,6 +551,20 @@ export class DesktopPreview {
   }
 
   private onKey(e: KeyboardEvent): void {
+    // The shortcuts are for the timeline, not for typing: a studio opened from
+    // the toolbar mounts over the preview, and Space and the arrows were
+    // swallowed in its fields while i, o and l moved the in and out points.
+    // The scrub bar is the preview's own control and keeps the shortcuts.
+    const t = e.target as HTMLElement | null;
+    if (
+      t &&
+      t !== this.scrub &&
+      (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)
+    )
+      return;
+    // Nothing reaches the timeline behind an open studio either (Escape would
+    // close the preview under it).
+    if (document.querySelector(STUDIO_MODAL_SELECTOR)) return;
     if (e.key === 'Escape') {
       this.close();
     } else if (e.key === ' ') {

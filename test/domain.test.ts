@@ -83,6 +83,15 @@ import {
   type PropData,
 } from '../src/props.ts';
 import {
+  getBuiltinPropDefinition,
+  PROP_GRID_STEP_M,
+  PROP_SETTLE_ABOVE_M,
+  PROP_SETTLE_RADIUS_M,
+  resolvePropSourceType,
+  settlePropY,
+  snapPropToGrid,
+} from '../src/props.ts';
+import {
   calculateBeamLuminance,
   calculateVolumetricAttenuation,
   createAtmosphereConfig,
@@ -172,6 +181,18 @@ import {
   wheelHit,
   wheelMenu,
 } from '../src/wheel.ts';
+import {
+  SUBMENU_IDS,
+  submenuForSector,
+  WHEEL_PROP_PRESETS,
+  WHEEL_SECTOR_HANDLERS,
+  wheelPropPreset,
+  wheelSectorRoute,
+  type WheelContext,
+  type WheelPath,
+} from '../src/wheel.ts';
+import { readFileSync } from 'node:fs';
+import { PROP_SPAWN_HIT_BELOW_EYE_M, PROP_SPAWN_HIT_MAX_M, propSpawnHitUsable } from '../src/props.ts';
 import { floorCorrection, newFloorEstimate, observeFloorHit } from '../src/floor.ts';
 import {
   buildShotList,
@@ -194,7 +215,20 @@ import {
   transformPositions,
   type LocationScan,
 } from '../src/scan.ts';
+import { MOVABLE_SCAN_LABELS, normalizeSemanticLabel, UNLABELED_SCAN_LABEL } from '../src/scan.ts';
+import { LocationRenderer } from '../src/location.ts';
+import { scanCapability } from '../src/scan.ts';
+import { roomCaptureMessage, roomCaptureRefusal } from '../src/scan.ts';
+import { floorSettled, FLOOR_MIN_HITS, FLOOR_SETTLE_MS } from '../src/floor.ts';
+import { floorCorrectionFromScan } from '../src/floor.ts';
+import { scanFloorY, translateScanY } from '../src/scan.ts';
+import { ActorManager, type ActorObject } from '../src/actors.ts';
+import { CameraSystem, type CamObject } from '../src/cameraView.ts';
+import { ViewManager } from '../src/views.ts';
+import { isLocationDisplayMode, LOCATION_DISPLAY_MODES } from '../src/model.ts';
 import { estimateScanSizeBytes, ScanStore } from '../src/scanStore.ts';
+import { IdbConnection } from '../src/idbOpen.ts';
+import { asFactory, FakeIndexedDb } from './fake-indexeddb.ts';
 import {
   calculateMeshAABB,
   calculateMeshNormals,
@@ -222,6 +256,7 @@ import {
 } from '../src/timecode.ts';
 import { createTakeRecord, TakeLibrary, type TakeRecord } from '../src/dailies.ts';
 import { locomotionAmount, rotateOffsetAboutPivot, snapTurnAngle } from '../src/locomotion.ts';
+import { locomotionSuppressed, type LocomotionState } from '../src/locomotion.ts';
 import {
   containScale,
   fileExtensionFor,
@@ -237,6 +272,7 @@ import {
 } from '../src/recording.ts';
 import { buildAiShotAnalysisPrompt, renderFloorplanSvg } from '../src/exporters.ts';
 import { simulateAiShotAnalysis } from '../src/ui.ts';
+import { bannerEvictionIndex } from '../src/ui.ts';
 import {
   COLLAB_ROLES,
   generateRoomCode,
@@ -525,6 +561,17 @@ import {
   normalizeVRComfortConfig,
 } from '../src/comfortEngine.ts';
 import {
+  carryAiScatterIntoConfig,
+  createDefaultAiConfig,
+  embeddedGeminiKey,
+  GEMINI_KEY_MIGRATED_FLAG,
+  GEMINI_KEY_STORAGE_KEY,
+  migrateEmbeddedGeminiKey,
+  readDeviceGeminiKey,
+  writeDeviceGeminiKey,
+  type KeyValueStore,
+} from '../src/setDressingEngine.ts';
+import {
   type GeminiAiSceneMutation,
   type ScatterTheme,
   type SetDressingManifest,
@@ -537,6 +584,7 @@ import {
   detectSemanticRegions,
   generatePoissonScatter2D,
   generateSetDressingDeckHtml,
+  generateThemeScatter,
   generateSetDressingManifestCsv,
   isSetDressingConfig,
   normalizeSetDressingConfig,
@@ -544,6 +592,25 @@ import {
   parseGeminiAiResponse,
   simulatePhysicsImpulseSettling,
 } from '../src/setDressingEngine.ts';
+import * as xrProbe from './xr-probe-core.ts';
+import * as probeFs from 'node:fs';
+import {
+  buildSceneFile,
+  decodeSceneFileBytes,
+  formatBytes,
+  formatStorageLine,
+  parseSceneFile,
+  Persistence,
+} from '../src/persistence.ts';
+import {
+  COMPRESSED_PLY_MESSAGE,
+  MAX_INLINE_SPLATS,
+  SPLAT_HEADER_SNIFF_BYTES,
+  sniffSplatFile,
+  splatImportRefusal,
+} from '../src/gaussianSplat.ts';
+import { SPLAT_BUDGET_STEP, stepSplatBudget } from '../src/performanceGovernor.ts';
+import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
 
 
 let passed = 0;
@@ -2276,12 +2343,13 @@ test('wheel: sub-wheels carry live values and hands get a Mark button', () => {
   assert.ok(cap.sectors.some((s) => s.id === 'exit'), 'hands must be able to exit AR');
 });
 
-test('wheel: placement arming cycles Off, Actor, Cam, Light, Prop and the Place sector shows it', () => {
+test('wheel: placement arming cycles Off, Actor, Cam, Prop and the Place sector shows it', () => {
+  // P0.11: Light is out of the cycle until lights can be placed.
   assert.equal(nextPlaceMode('none'), 'actor');
   assert.equal(nextPlaceMode('actor'), 'camera');
-  assert.equal(nextPlaceMode('camera'), 'light');
-  assert.equal(nextPlaceMode('light'), 'prop');
+  assert.equal(nextPlaceMode('camera'), 'prop');
   assert.equal(nextPlaceMode('prop'), 'none');
+  assert.equal(nextPlaceMode('light'), 'none');
   const label = (placeMode: 'none' | 'actor' | 'camera' | 'light' | 'prop') =>
     wheelMenu({ ...WHEEL_BASE, mode: 'block', placeMode }, 'root').sectors.find((s) => s.id === 'wheel-place')
       ?.label ?? '';
@@ -7448,6 +7516,186 @@ async function propStoreFallback(): Promise<void> {
   assert.equal(await store.getAsset('asset-custom-1'), null);
 }
 
+// Storage fallback is temporary (review 2026-11-06). Before, one IndexedDB open
+// slower than 4 s made the stores memory-only for the whole session: a late
+// open was ignored, scans saved earlier read as missing (and the app said to
+// Remove them), and new ones were lost on reload. A fake IndexedDB whose open
+// can be held back acts out the slow first load.
+const settleSoon = async (check: () => boolean, ms = 2000): Promise<void> => {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error('timed out waiting for the store');
+    await new Promise((r) => setTimeout(r, 2));
+  }
+};
+
+async function storageLateOpenTest(): Promise<void> {
+  const conn = (idb: FakeIndexedDb | null, extra: { onOpen?: () => void; timeoutMs?: number } = {}) =>
+    new IdbConnection({
+      name: 'late-open-test',
+      version: 1,
+      upgrade: (db) => {
+        if (!db.objectStoreNames.contains('s')) db.createObjectStore('s');
+      },
+      onOpen: extra.onOpen,
+      timeoutMs: extra.timeoutMs ?? 20,
+      factory: idb ? asFactory(idb) : null,
+    });
+
+  // The connection: a slow open falls back for now, keeps running, and is used once it opens.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    let opened = 0;
+    const c = conn(idb, { onOpen: () => opened++ });
+    assert.equal(await c.get(), null, 'past the limit the caller gets null and falls back');
+    assert.equal(c.state, 'waiting');
+    const t0 = Date.now();
+    assert.equal(await c.get(), null);
+    assert.ok(Date.now() - t0 < 15, 'a later call does not wait out the limit again');
+    assert.equal(idb.opens, 1, 'the one open request is kept, not abandoned');
+    const opening = c.whenOpen();
+    idb.release();
+    assert.equal(await opening, true);
+    assert.equal(c.state, 'open');
+    assert.equal(opened, 1, 'onOpen runs for a late open');
+    assert.ok(await c.get(), 'every later call gets the database');
+  }
+  // Blocked by another tab: fall back at once instead of after the limit, adopt the open when it succeeds.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    const c = conn(idb, { timeoutMs: 10_000 });
+    const first = c.get();
+    idb.block();
+    assert.equal(await first, null);
+    assert.equal(c.state, 'waiting');
+    idb.release();
+    assert.equal(await c.whenOpen(), true);
+  }
+  // A failed open is tried again on the next call; so is a connection the browser closed.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    const c = conn(idb, { timeoutMs: 10_000 });
+    const first = c.get();
+    idb.fail();
+    assert.equal(await first, null);
+    assert.equal(c.state, 'closed');
+    const db1 = await c.get();
+    assert.ok(db1, 'the next call opens again');
+    assert.equal(idb.opens, 2);
+    idb.evict();
+    assert.equal(c.state, 'closed', 'onclose (eviction) drops the connection');
+    const db2 = await c.get();
+    assert.ok(db2 && db2 !== db1, 'and the next call reopens');
+  }
+  // No IndexedDB at all.
+  {
+    const c = conn(null);
+    assert.equal(await c.get(), null);
+    assert.equal(c.state, 'unavailable');
+    assert.equal(await c.whenOpen(), false);
+  }
+  passed++;
+  console.log('  ✓ Storage: a slow IndexedDB open falls back for now and is used once it opens (blocked, failed, closed, none)');
+
+  // ScanStore across two sessions, the second with storage slow to open.
+  {
+    const idb = new FakeIndexedDb();
+    const opts = { indexedDB: asFactory(idb), openTimeoutMs: 20 };
+    const earlier = new ScanStore(opts);
+    const saved = { ...makeScan(), id: 'scan-saved' };
+    assert.equal(await earlier.putScan(saved), true, 'session 1: storage is fine');
+
+    idb.hold();
+    const store = new ScanStore(opts);
+    const warnings: string[] = [];
+    const notices: string[] = [];
+    store.onError = (m) => warnings.push(m);
+    store.onNotice = (m) => notices.push(m);
+    assert.equal(await store.getScan('scan-saved'), null, 'not readable before storage opens');
+    assert.equal(store.storageState, 'waiting', 'so the app can tell slow storage from a missing scan');
+    const fresh = { ...makeScan(), id: 'scan-new' };
+    assert.equal(await store.putScan(fresh), false);
+    assert.match(warnings[0] ?? '', /held in memory and saved when it opens/);
+    const dropped = { ...makeScan(), id: 'scan-dropped' };
+    await store.putScan(dropped);
+    await store.deleteScan('scan-dropped');
+    // The launch prune sees only memory while storage is closed, so it cannot
+    // delete a saved scan (scan-saved is referenced by no scene here).
+    assert.equal(await store.pruneOrphans(new Set(['scan-new'])), 0);
+
+    const opening = store.whenStorageOpens();
+    idb.release();
+    assert.equal(await opening, true);
+    assert.equal(store.storageState, 'open');
+    assert.equal((await store.getScan('scan-saved'))?.id, 'scan-saved', 'the scan saved earlier loads once storage opens');
+    await settleSoon(() => notices.length > 0);
+    assert.match(notices[0], /the scan held in memory is now saved/);
+    const rows = idb.rows('setview', 'scans');
+    assert.ok(rows.has('scan-new'), 'the scan held in memory was written to storage');
+    assert.ok(rows.has('scan-saved'), 'the prune that ran while storage was closed deleted nothing');
+    assert.equal(rows.has('scan-dropped'), false, 'a held scan deleted before the open is not written');
+    assert.equal((store as unknown as { memory: Map<string, unknown> }).memory.size, 0, 'and memory is freed');
+
+    const later = new ScanStore(opts);
+    const back = await later.getScan('scan-new');
+    assert.deepEqual(back?.meshes[0].positions, fresh.meshes[0].positions, 'session 3 reads it back');
+    assert.equal(later.storageState, 'open');
+  }
+  // Without IndexedDB nothing changes: memory only, and the state says so.
+  {
+    const store = new ScanStore({ indexedDB: null });
+    let warned = '';
+    store.onError = (m) => (warned = m);
+    assert.equal(await store.putScan(makeScan()), false);
+    assert.match(warned, /storage unavailable/);
+    assert.equal(store.storageState, 'unavailable');
+    assert.equal(await store.whenStorageOpens(), false);
+  }
+  passed++;
+  console.log('  ✓ Storage: ScanStore loads saved scans and saves held ones when storage opens late');
+
+  // PropStore: memory doubles as its cache, so only puts that missed storage are written later.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    const props = new PropStore({ indexedDB: asFactory(idb), openTimeoutMs: 20 });
+    const warnings: string[] = [];
+    const notices: string[] = [];
+    props.onError = (m) => warnings.push(m);
+    props.onNotice = (m) => notices.push(m);
+    const asset = (id: string) => ({
+      id,
+      name: 'Console',
+      fileName: 'console.glb',
+      fileType: 'glb' as const,
+      category: 'custom' as const,
+      sizeBytes: 4,
+      uploadedAt: 1,
+      dimensions: { width: 1, height: 1, depth: 1 },
+      buffer: new ArrayBuffer(4),
+    });
+    assert.equal(await props.putAsset(asset('asset-late')), false);
+    assert.match(warnings[0] ?? '', /held in memory and saved when it opens/);
+    await props.putAsset(asset('asset-gone'));
+    await props.deleteAsset('asset-gone');
+    idb.release();
+    assert.equal(await props.whenStorageOpens(), true);
+    await settleSoon(() => notices.length > 0);
+    assert.match(notices[0], /the custom prop held in memory is now saved/);
+    const rows = idb.rows('setview_assets', 'custom_props');
+    assert.ok(rows.has('asset-late'));
+    assert.equal(rows.has('asset-gone'), false);
+    assert.equal((await props.listAssets()).length, 1);
+    const later = new PropStore({ indexedDB: asFactory(idb), openTimeoutMs: 20 });
+    assert.equal((await later.getAsset('asset-late'))?.fileName, 'console.glb', 'a later session reads it back');
+  }
+  passed++;
+  console.log('  ✓ Storage: PropStore saves props held in memory when storage opens late');
+}
+
 // ============================================================================
 // --- Performance Governor & Spatial Interaction Tests -----------------------
 // ============================================================================
@@ -9461,7 +9709,7 @@ test('icvfx: generateOpenUsdLedVolume export generation', () => {
 test('icvfx: multi-user collaboration patch sync', () => {
   const scene = createScene('ICVFX Stage Test');
   assert.ok(scene.icvfx);
-  assert.equal(scene.icvfx.enabled, true);
+  assert.equal(scene.icvfx.enabled, false); // P0.10: new scenes start without the LED volume
 
   // Collab patch: icvfx_update
   const newConfig = createLedVolumeConfig('commercial_180');
@@ -11007,6 +11255,67 @@ test('Set Dressing Engine: Semantic Region Detection from Stage & Furniture Prop
   assert.equal(tableReg?.bounds.min.y, 0.8);
 });
 
+test('R9: wall regions follow the wall on the floor (x and z), not its height (y)', () => {
+  // The four perimeter walls the 3DGS Studio writes into scene.architecture on
+  // Save & Apply (gaussianSplat.ts): floor positions in x and z, y = floor.
+  // Wall regions used to read y as z, so every wall became the same 0.4 m strip
+  // through z = 0 and wall props were scattered down the middle of the room.
+  const corners = { minX: -3, maxX: 3, minZ: -2.5, maxZ: 2.5 };
+  const walls = [
+    createWallData({ name: 'North Wall', start: { x: corners.minX, y: 0, z: corners.minZ }, end: { x: corners.maxX, y: 0, z: corners.minZ }, heightM: 2.8 }),
+    createWallData({ name: 'East Wall', start: { x: corners.maxX, y: 0, z: corners.minZ }, end: { x: corners.maxX, y: 0, z: corners.maxZ }, heightM: 2.8 }),
+    createWallData({ name: 'South Wall', start: { x: corners.maxX, y: 0, z: corners.maxZ }, end: { x: corners.minX, y: 0, z: corners.maxZ }, heightM: 2.8 }),
+    createWallData({ name: 'West Wall', start: { x: corners.minX, y: 0, z: corners.maxZ }, end: { x: corners.minX, y: 0, z: corners.minZ }, heightM: 2.8 }),
+  ];
+  const scene = createScene('R9 walls');
+  scene.architecture = createArchitecturalSet('Splat walls', walls);
+
+  const regions = detectSemanticRegions(scene);
+  const wallRegions = regions.filter((r) => r.type === 'wall');
+  assert.equal(wallRegions.length, 4);
+  assert.equal(regions.filter((r) => r.type === 'perimeter').length, 0, 'real walls replace the stage perimeter');
+  for (const w of walls) {
+    const r = wallRegions.find((x) => x.anchorEntityId === w.id);
+    assert.ok(r, `a region for ${w.name}`);
+    const b = r!.bounds;
+    for (const p of [w.start, w.end]) {
+      assert.ok(b.min.x <= p.x && p.x <= b.max.x, `${w.name}: x ${p.x} inside [${b.min.x}, ${b.max.x}]`);
+      assert.ok(b.min.z <= p.z && p.z <= b.max.z, `${w.name}: z ${p.z} inside [${b.min.z}, ${b.max.z}]`);
+    }
+    // A padded band around the baseline, not the whole room.
+    const across = Math.min(b.max.x - b.min.x, b.max.z - b.min.z);
+    assert.ok(across < 0.5, `${w.name}: band ${across} m across`);
+    assert.equal(b.min.y, 0);
+    assert.equal(b.max.y, 2.8);
+  }
+
+  // End to end: props scattered for the north wall land along the north wall.
+  const north = wallRegions.find((r) => r.anchorEntityId === walls[0].id)!;
+  const items = generateThemeScatter('film_noir_office', north, {
+    theme: 'film_noir_office',
+    density: 'dense',
+    minDistanceM: 0.3,
+    seed: 9,
+    alignToWalls: true,
+    enablePhysicsSettling: false,
+    groundY: 0,
+    maxItems: 12,
+  });
+  assert.ok(items.length > 0);
+  for (const it of items) {
+    assert.ok(Math.abs(it.position.z - corners.minZ) <= 0.25, `${it.name} at z ${it.position.z}, north wall at ${corners.minZ}`);
+  }
+});
+
+test('R9: a wall on a raised floor gets a region from its base to its top', () => {
+  const scene = createScene('R9 raised');
+  const w = createWallData({ start: { x: 0, y: 0.6, z: 1 }, end: { x: 0, y: 0.6, z: 4 }, heightM: 2.4 });
+  scene.architecture = createArchitecturalSet('Riser', [w]);
+  const r = detectSemanticRegions(scene).find((x) => x.anchorEntityId === w.id)!;
+  assert.ok(r.bounds.min.z <= 1 && r.bounds.max.z >= 4, 'spans the wall along z');
+  assert.ok(Math.abs(r.bounds.min.y - 0.6) < 1e-9 && Math.abs(r.bounds.max.y - 3.0) < 1e-9, `y [${r.bounds.min.y}, ${r.bounds.max.y}]`);
+});
+
 test('Set Dressing Engine: Impulse Physics Settling & Overlap Resolution', () => {
   const overlappingItems: SettledPropItem[] = [
     {
@@ -11331,16 +11640,2831 @@ test('Set Dressing Engine: Spatial Contextual Actions', () => {
   assert.ok(setDressingActions.some((a) => a.actionType === 'set_dressing_quick_scatter'));
 });
 
-void Promise.all([scanStoreFallback(), propStoreFallback()]).then(
+// --- P0 probe ---
+// Pure half of the XR capability probe (test/xr-probe-core.ts). The page itself
+// (test/xr-probe.html + xr-probe.ts) only runs on a headset.
+
+const PROBE_QUEST_UA =
+  'Mozilla/5.0 (X11; Linux x86_64; Quest 3) AppleWebKit/537.36 (KHTML, like Gecko) OculusBrowser/154.1.0.18.52 SamsungBrowser/4.0 Chrome/140.0.0.0 VR Safari/537.36';
+const PROBE_ANDROID_UA =
+  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36';
+
+function probeSessionFixture(): xrProbe.SessionRecord {
+  const s = xrProbe.createSessionRecord('2026-11-05T10:00:00.000Z', {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['anchors', 'plane-detection', 'mesh-detection'],
+  });
+  s.enabledFeatures = ['hit-test', 'local-floor', 'anchors', 'plane-detection'];
+  s.spaceSetup = 'yes';
+  s.domOverlayState = 'null';
+  s.referenceSpace = 'local-floor';
+  s.hitTest = { source: 'ok', framesTested: 100, framesWithHit: 80, firstHitAt: 250 };
+  s.detection.planes.setTicks = 2;
+  s.detection.planes.firstSetAt = 0;
+  s.detection.meshes.setTicks = 2;
+  s.detection.meshes.firstSetAt = 0;
+  s.geometry.push({
+    t: 0,
+    planes: xrProbe.summarizePlanes([
+      { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+      { semanticLabel: 'floor', orientation: 'horizontal', polygon: { length: 6 } },
+    ]),
+    meshes: xrProbe.summarizeMeshes([{ semanticLabel: 'global mesh', vertices: new Float32Array(300), indices: new Uint32Array(600) }]),
+  });
+  s.geometry.push({
+    t: 1000,
+    planes: xrProbe.summarizePlanes([
+      { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+      { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+    ]),
+    meshes: xrProbe.summarizeMeshes([{ semanticLabel: 'global mesh', vertices: new Float32Array(900), indices: new Uint32Array(1200) }]),
+  });
+  s.events.push({ t: 500, type: 'visibility', detail: 'visible-blurred' }, { t: 900, type: 'reset', detail: '' });
+  return s;
+}
+
+test('P0 probe: byte heads, labels and counts are reported raw', () => {
+  const glb = [0x67, 0x6c, 0x54, 0x46, 0x02, 0x00, 0x00, 0x00, 0xff, 0xff];
+  assert.equal(xrProbe.hexHead(glb), '67 6c 54 46 02 00 00 00');
+  assert.equal(xrProbe.asciiHead(glb), 'glTF....');
+  assert.equal(xrProbe.hexHead([1, 2, 3]), '01 02 03');
+  assert.equal(xrProbe.hexHead([]), '');
+  assert.equal(xrProbe.asciiHead(new Uint8Array([0x50, 0x4c, 0x59, 0x0a])), 'PLY.');
+  assert.equal(xrProbe.labelKey(null), '(none)');
+  assert.equal(xrProbe.labelKey(undefined), '(none)');
+  assert.equal(xrProbe.labelKey(''), '(empty)');
+  assert.equal(xrProbe.labelKey(' wall '), ' wall ', 'raw strings are kept exactly, never trimmed');
+  assert.equal(xrProbe.labelKey(7), '(number)');
+  assert.equal(xrProbe.formatCounts({ floor: 1, wall: 4, ceiling: 1 }), 'wall x4, ceiling x1, floor x1');
+  assert.equal(xrProbe.formatCounts({}), 'none');
+  assert.equal(xrProbe.fmtBytes(512), '512 B');
+  assert.equal(xrProbe.fmtBytes(2048), '2.0 KB');
+  assert.equal(xrProbe.fmtBytes(null), 'unknown');
+  approx(xrProbe.distance3([0, 0, 0], [3, 4, 0]) ?? -1, 5);
+  assert.equal(xrProbe.distance3(null, [1, 1, 1]), null);
+});
+
+test('P0 probe: pushCapped keeps the earliest entries and the newest', () => {
+  const list: number[] = [];
+  for (let i = 1; i <= 8; i++) xrProbe.pushCapped(list, i, 5, 2);
+  assert.deepEqual(list, [1, 2, 6, 7, 8]);
+  const one: number[] = [];
+  for (let i = 1; i <= 4; i++) xrProbe.pushCapped(one, i, 3, 10);
+  assert.deepEqual(one, [1, 2, 4], 'keepHead larger than max still leaves room for the newest');
+  const none: number[] = [];
+  xrProbe.pushCapped(none, 1, 0);
+  assert.deepEqual(none, []);
+});
+
+test('P0 probe: plane and mesh summaries count raw labels and sizes', () => {
+  const planes = xrProbe.summarizePlanes([
+    { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } },
+    { semanticLabel: null, orientation: 'horizontal', polygon: { length: 7 } },
+    { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 5 } },
+    { semanticLabel: 'floor', orientation: 'horizontal', polygon: null },
+  ]);
+  assert.equal(planes.count, 4);
+  assert.deepEqual(planes.labels, { wall: 2, '(none)': 1, floor: 1 });
+  assert.deepEqual(planes.orientations, { vertical: 2, horizontal: 2 });
+  assert.deepEqual(planes.perPlane, [
+    ['(none)', 'horizontal', 7],
+    ['floor', 'horizontal', -1],
+    ['wall', 'vertical', 5],
+    ['wall', 'vertical', 4],
+  ]);
+  const many = xrProbe.summarizePlanes(Array.from({ length: 70 }, () => ({ semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } })));
+  assert.equal(many.count, 70);
+  assert.equal(many.perPlane.length, xrProbe.MAX_PER_ITEM);
+
+  const meshes = xrProbe.summarizeMeshes([
+    { semanticLabel: 'table', vertices: new Float32Array(24 * 3), indices: new Uint32Array(36) },
+    { semanticLabel: 'global mesh', vertices: new Float32Array(1000 * 3), indices: new Uint32Array(5400) },
+    { semanticLabel: undefined, vertices: null, indices: null },
+  ]);
+  assert.equal(meshes.count, 3);
+  assert.equal(meshes.totalVertices, 1024);
+  assert.equal(meshes.totalIndices, 5436);
+  assert.deepEqual(meshes.labels, { table: 1, 'global mesh': 1, '(none)': 1 });
+  assert.deepEqual(meshes.perMesh[0], ['global mesh', 1000, 5400], 'largest mesh first');
+  assert.deepEqual(meshes.perMesh[2], ['(none)', 0, 0]);
+});
+
+test('P0 probe: geometry signature ignores set order and catches changes', () => {
+  const a = { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } };
+  const b = { semanticLabel: 'floor', orientation: 'horizontal', polygon: { length: 6 } };
+  const m = { semanticLabel: 'global mesh', vertices: new Float32Array(9), indices: new Uint32Array(3) };
+  const s1 = xrProbe.geometrySignature(xrProbe.summarizePlanes([a, b]), xrProbe.summarizeMeshes([m]));
+  const s2 = xrProbe.geometrySignature(xrProbe.summarizePlanes([b, a]), xrProbe.summarizeMeshes([m]));
+  assert.equal(s1, s2);
+  const grown = { ...b, polygon: { length: 9 } };
+  assert.notEqual(xrProbe.geometrySignature(xrProbe.summarizePlanes([a, grown]), xrProbe.summarizeMeshes([m])), s1);
+  assert.notEqual(
+    xrProbe.geometrySignature(null, xrProbe.summarizeMeshes([m])),
+    xrProbe.geometrySignature(xrProbe.summarizePlanes([]), xrProbe.summarizeMeshes([m])),
+    'feature missing and nothing detected are different answers',
+  );
+});
+
+test('P0 probe: room-capture rejections are classified by DOMException name', () => {
+  assert.equal(xrProbe.classifyRejection(new DOMException('no planes', 'NotSupportedError')), 'NotSupportedError');
+  assert.equal(xrProbe.classifyRejection(new DOMException('twice', 'InvalidStateError')), 'InvalidStateError');
+  assert.equal(xrProbe.classifyRejection(new DOMException('failed', 'OperationError')), 'OperationError');
+  assert.equal(xrProbe.classifyRejection(new TypeError('x')), 'other:TypeError');
+  assert.equal(xrProbe.classifyRejection('boom'), 'other:Error');
+  assert.equal(xrProbe.errorText(new DOMException('twice', 'InvalidStateError')), 'InvalidStateError: twice');
+  assert.equal(xrProbe.errorText(undefined), 'Error: undefined');
+});
+
+test('P0 probe: user agent parsing, device slug and report file name', () => {
+  const quest = xrProbe.parseUserAgent(PROBE_QUEST_UA);
+  assert.equal(quest.browser, 'quest-browser');
+  assert.equal(quest.major, 154);
+  assert.equal(quest.model, 'Quest 3');
+  assert.equal(xrProbe.suggestDeviceSlug(PROBE_QUEST_UA), 'quest-3-browser-154');
+  assert.equal(xrProbe.parseUserAgent(PROBE_QUEST_UA.replace('Quest 3', 'Quest 3S')).model, 'Quest 3S');
+  const android = xrProbe.parseUserAgent(PROBE_ANDROID_UA);
+  assert.equal(android.browser, 'chrome');
+  assert.equal(android.major, 147);
+  assert.equal(android.android, true);
+  assert.equal(android.model, null);
+  assert.equal(xrProbe.suggestDeviceSlug(PROBE_ANDROID_UA), 'android-chrome-147');
+  assert.equal(xrProbe.suggestDeviceSlug('Mozilla/5.0 (Macintosh) Gecko/20100101 Firefox/140.0'), 'unknown-browser');
+  assert.equal(xrProbe.slugify('  Quest 3 / Browser 154!! '), 'quest-3-browser-154');
+  assert.equal(xrProbe.slugify('***'), 'device');
+  const long = xrProbe.slugify(`${'a'.repeat(47)} b`);
+  assert.ok(long.length <= 48 && !long.endsWith('-'));
+  assert.equal(xrProbe.reportFileName('Quest 3 browser 154', new Date(2026, 10, 5)), '2026-11-05-quest-3-browser-154.json');
+});
+
+test('P0 probe: stored report round-trips and rejects anything else', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://192.168.1.2:5173/test/xr-probe.html');
+  assert.equal(r.device, 'quest-3-browser-154');
+  assert.deepEqual(Object.keys(r.observations).sort(), xrProbe.OBSERVATIONS.map((o) => o.id).sort());
+  r.sessions.push(probeSessionFixture());
+  r.observations.permissionPrompt = 'no';
+  const back = xrProbe.parseStoredReport(JSON.stringify(r));
+  assert.deepEqual(back, r);
+  assert.equal(xrProbe.parseStoredReport(null), null);
+  assert.equal(xrProbe.parseStoredReport('{not json'), null);
+  assert.equal(xrProbe.parseStoredReport(JSON.stringify({ ...r, version: xrProbe.PROBE_VERSION + 1 })), null);
+  assert.equal(xrProbe.parseStoredReport(JSON.stringify({ ...r, probe: 'something-else' })), null);
+  assert.equal(xrProbe.parseStoredReport(JSON.stringify({ ...r, sessions: 'x' })), null);
+  const partial = JSON.parse(JSON.stringify(r)) as Record<string, unknown>;
+  delete partial.notes;
+  delete partial.observations;
+  const filled = xrProbe.parseStoredReport(JSON.stringify(partial));
+  assert.ok(filled);
+  assert.equal(filled.notes, '');
+  assert.equal(filled.observations.keyboardShown, '');
+});
+
+test('P0 probe: summary answers the spike questions from a session', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/test/xr-probe.html');
+  const none = xrProbe.summarizeReport(r);
+  assert.equal(none.find((row) => row.id === 'session')?.answer, 'no AR session yet');
+  assert.equal(none.find((row) => row.id === 'files')?.answer, 'no files picked');
+
+  const failed = xrProbe.createSessionRecord('2026-11-05T10:05:00.000Z', { requiredFeatures: ['hit-test'], optionalFeatures: [] });
+  failed.requestError = 'NotSupportedError: nope';
+  const s = probeSessionFixture();
+  s.roomCapture = {
+    calledAt: 2000,
+    outcome: 'InvalidStateError',
+    message: 'InvalidStateError: already captured',
+    settledAt: 2100,
+    anchorBefore: { tracked: true, pos: [0, 0, 0] },
+    anchorAfter: { tracked: true, pos: [0, 0, 0] },
+    anchorLater: { tracked: false, pos: null },
+    anchorMovedM: null,
+    maxFrameGapMs: 14,
+    resetsDuring: 0,
+    visibilityDuring: [],
+    planesBefore: 2,
+    planesAfter: 2,
+    meshesBefore: 1,
+    meshesAfter: 1,
+  };
+  r.sessions.push(s, failed); // the later failed request must not hide the real session
+  r.files.push(
+    { name: 'room.glb', type: '', size: 10, lastModified: 0, byteLength: 10, head: '67 6c 54 46', ascii: 'glTF', ms: 1, error: null },
+    { name: 'scan.spz', type: '', size: 99, lastModified: 0, byteLength: null, head: null, ascii: null, ms: 1, error: 'NotReadableError: denied' },
+  );
+  r.observations.spaceSetupLaunched = 'yes';
+  assert.equal(xrProbe.latestSession(r), s);
+  const rows = xrProbe.summarizeReport(r);
+  const answer = (id: string) => rows.find((row) => row.id === id)?.answer ?? '<missing>';
+  assert.equal(answer('plane-detection'), 'yes');
+  assert.equal(answer('mesh-detection'), 'no');
+  assert.equal(answer('dom-overlay'), 'null');
+  assert.equal(answer('plane-labels'), 'wall x2, floor x1; first set after 0.0 s, first non-empty after 0.0 s');
+  assert.equal(answer('mesh-labels'), 'global mesh x1; first set after 0.0 s, first non-empty after 0.0 s');
+  assert.equal(answer('global-mesh'), '300 vertices, 1200 indices (400 triangles)');
+  assert.deepEqual(xrProbe.largestGlobalMesh(s.geometry), [300, 1200]);
+  assert.match(answer('hit-test'), /^80\/100 frames had a hit; first hit after 0\.3 s$/);
+  assert.match(answer('room-capture'), /^InvalidStateError/);
+  assert.match(answer('room-capture'), /3 s later NOT tracked/);
+  assert.equal(answer('space-setup'), 'yes');
+  assert.equal(answer('keyboard'), 'not run');
+  assert.equal(answer('keyboard-seen'), 'not recorded');
+  assert.equal(answer('visibility'), 'visible-blurred');
+  assert.equal(answer('resets'), '1');
+  assert.match(answer('files'), /^1\/2 read OK; failed: scan\.spz \(NotReadableError: denied\)/);
+
+  s.enabledFeatures = null;
+  assert.equal(
+    xrProbe.summarizeReport(r).find((row) => row.id === 'plane-detection')?.answer,
+    'unknown (enabledFeatures not exposed)',
+  );
+  r.sessions = [failed];
+  assert.match(xrProbe.summarizeReport(r).find((row) => row.id === 'session')?.answer ?? '', /^requestSession failed/);
+});
+
+test('P0 probe: panel buttons hit-test', () => {
+  for (const b of xrProbe.PANEL_BUTTONS) {
+    assert.ok(b.x >= 0 && b.y >= 0 && b.x + b.w <= xrProbe.PANEL_W && b.y + b.h <= xrProbe.PANEL_H, `${b.id} inside panel`);
+    const u = (b.x + b.w / 2) / xrProbe.PANEL_W;
+    const v = 1 - (b.y + b.h / 2) / xrProbe.PANEL_H;
+    const [px, py] = xrProbe.uvToPanelPx(u, v);
+    assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, px, py)?.id, b.id);
+  }
+  const [cx, cy] = xrProbe.uvToPanelPx(0.5, 0.5);
+  assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, cx, cy), null, 'the text area is not a button');
+  assert.equal(xrProbe.buttonAt(xrProbe.PANEL_BUTTONS, 260, 580), null, 'the gap between buttons is not a button');
+  assert.equal(xrProbe.describeRoomCapture(null), 'not run');
+  assert.equal(xrProbe.describeKeyboard(null), 'not run');
+});
+
+test('P0 probe: panel text wraps by columns and splits words longer than a row', () => {
+  assert.deepEqual(xrProbe.wrapColumns('short line', 20), ['short line']);
+  assert.deepEqual(xrProbe.wrapColumns('aaaa bbbb cccc dddd', 10), ['aaaa bbbb', '  cccc', '  dddd']);
+  const long = xrProbe.wrapColumns(`x: ${'a,'.repeat(20)}`, 12);
+  for (const row of long) assert.ok(row.length <= 12, `"${row}" is longer than 12`);
+  assert.equal(long.map((r, i) => (i ? r.slice(2) : r)).join(''), `x: ${'a,'.repeat(20)}`, 'a split word loses no characters');
+  assert.equal(long[0].length, 12, 'a word longer than a row starts on the current row');
+  // 2 lines into 3 rows: both get a first row, the spare row goes to the top line, the cut line ends in '...'.
+  const rows = xrProbe.layoutPanelText(['aaaa bbbb cccc dddd', 'eeee ffff gggg'], 10, 3);
+  assert.deepEqual(rows, ['aaaa bbbb', '  cccc...', 'eeee ff...']);
+  assert.deepEqual(xrProbe.layoutPanelText(['a', 'b', 'c'], 10, 2), ['a', 'b'], 'more lines than rows: the last lines go');
+});
+
+test('P0 probe: realistic Quest status text keeps every line on the panel', () => {
+  assert.ok(
+    xrProbe.PANEL_TEXT_TOP + xrProbe.PANEL_TEXT_ROWS * xrProbe.PANEL_ROW_PX <= xrProbe.PANEL_FLASH_Y,
+    'status rows stop above the flash line',
+  );
+  assert.ok(xrProbe.PANEL_FLASH_Y + 30 <= Math.min(...xrProbe.PANEL_BUTTONS.map((b) => b.y)), 'the flash line clears the buttons');
+  const s = probeSessionFixture();
+  s.enabledFeatures = ['viewer', 'local', 'local-floor', 'hit-test', 'anchors', 'hand-tracking', 'mesh-detection', 'plane-detection', 'dom-overlay'];
+  const profiles = '[oculus-touch-v3,oculus-touch-v2,oculus-touch,generic-trigger-squeeze-thumbstick]';
+  s.inputSources = [`left tracked-pointer gamepad ${profiles}`, `right tracked-pointer gamepad ${profiles}`];
+  s.keyboard = {
+    at: 4000,
+    focusError: null,
+    activeIsInput: true,
+    visibility: ['visible-blurred', 'visible'],
+    inputEvents: 3,
+    typed: 'ok',
+    endedBy: 'enter',
+  };
+  s.roomCapture = {
+    calledAt: 9000,
+    outcome: 'resolved',
+    message: null,
+    settledAt: 21400,
+    anchorBefore: { tracked: true, pos: [0, 0, 0] },
+    anchorAfter: { tracked: false, pos: null },
+    anchorLater: { tracked: false, pos: null },
+    anchorMovedM: null,
+    maxFrameGapMs: 12345,
+    resetsDuring: 1,
+    visibilityDuring: ['hidden', 'visible-blurred', 'visible'],
+    planesBefore: 12,
+    planesAfter: 14,
+    meshesBefore: 9,
+    meshesAfter: 11,
+  };
+  const labels = ['wall', 'wall', 'wall', 'wall', 'floor', 'ceiling', 'door frame', 'window frame', 'table', 'couch', 'wall art', 'other'];
+  s.geometry.push({
+    t: 12000,
+    planes: xrProbe.summarizePlanes(labels.map((l) => ({ semanticLabel: l, orientation: 'vertical', polygon: { length: 4 } }))),
+    meshes: xrProbe.summarizeMeshes(
+      ['global mesh', 'table', 'table', 'couch', 'storage', 'bed', 'screen', 'lamp', 'plant'].map((l) => ({
+        semanticLabel: l,
+        vertices: new Float32Array(l === 'global mesh' ? 3 * 41234 : 24),
+        indices: new Uint32Array(l === 'global mesh' ? 3 * 80123 : 36),
+      })),
+    ),
+  });
+  s.ticks.push({ t: 12000, fps: 72, gapMaxMs: 19, planes: 12, meshes: 9, hit: [-0.123, 0.001, -1.456], head: [0, 1.6, 0], anchor: 0, vis: 'visible', saveMs: 1.2 });
+  s.events.push(
+    { t: 9000, type: 'room-capture', detail: 'calling initiateRoomCapture()' },
+    { t: 21400, type: 'room-capture', detail: 'resolved' },
+    { t: 24500, type: 'room-capture', detail: 'follow-up: anchor NOT tracked' },
+  );
+  const lines = xrProbe.panelLines(s, 25_000);
+  const cols = xrProbe.PANEL_TEXT_COLS;
+  const unbudgeted = lines.reduce((n, l) => n + Math.min(xrProbe.PANEL_ROWS_PER_LINE, xrProbe.wrapColumns(l, cols).length), 0);
+  assert.ok(unbudgeted > xrProbe.PANEL_TEXT_ROWS, `the fixture needs more rows (${unbudgeted}) than the panel has without a budget`);
+  const rows = xrProbe.layoutPanelText(lines, cols, xrProbe.PANEL_TEXT_ROWS);
+  assert.ok(rows.length <= xrProbe.PANEL_TEXT_ROWS, `${rows.length} rows`);
+  for (const row of rows) assert.ok(row.length <= cols, `"${row}" is wider than ${cols} columns`);
+  const prefixes = ['t ', 'planes:', 'meshes:', 'global mesh:', 'viewer hit-test:', 'sentinel anchor:', 'keyboard:', 'room capture:', 'enabledFeatures:', 'domOverlayState:', 'inputs:'];
+  for (const p of prefixes) assert.equal(rows.filter((r) => r.startsWith(p)).length, 1, `"${p}" line is on the panel`);
+  assert.equal(rows.filter((r) => r.startsWith('event: ')).length, 3, 'the three recent events are on the panel');
+  const rc = rows.findIndex((r) => r.startsWith('room capture:'));
+  let rcEnd = rc + 1;
+  while (rcEnd < rows.length && rows[rcEnd].startsWith('  ')) rcEnd++;
+  const rcText = rows
+    .slice(rc, rcEnd)
+    .map((r) => r.trim())
+    .join(' ');
+  assert.match(rcText, /^room capture: resolved; settled after 12\.4 s; anchor before tracked, after NOT tracked/);
+  assert.ok(rcText.includes('3 s later NOT'), `room capture keeps its anchor follow-up: ${rcText}`);
+  assert.match(rows.find((r) => r.startsWith('inputs:')) ?? '', /^inputs: left tracked-pointer gamepad \| right tracked-pointer gamepad$/);
+});
+
+test('P0 probe: detected-geometry reads keep polling after undefined, null and throws', () => {
+  const stat = xrProbe.createDetectionStat();
+  const planes = new Set([{ semanticLabel: 'floor' }]);
+  const attr = 'frame.detectedPlanes';
+  const notReady = () => {
+    throw new DOMException('not ready', 'InvalidStateError');
+  };
+  assert.deepEqual(xrProbe.readDetection(stat, 1000, () => undefined, attr), { set: null, event: null }, 'a first undefined read only means "not yet"');
+  assert.equal(xrProbe.readDetection(stat, 2000, () => null, attr).set, null);
+  assert.deepEqual(xrProbe.readDetection(stat, 3000, notReady, attr), {
+    set: null,
+    event: 'frame.detectedPlanes threw InvalidStateError: not ready; still polling',
+  });
+  assert.equal(xrProbe.readDetection(stat, 3500, notReady, attr).event, null, 'a repeated throw is counted, not logged again');
+  assert.deepEqual(xrProbe.readDetection(stat, 4000, () => planes, attr), {
+    set: planes,
+    event: 'frame.detectedPlanes first returned a set after 4 tick(s) without one',
+  });
+  assert.deepEqual(xrProbe.readDetection(stat, 5000, () => planes, attr), { set: planes, event: null });
+  assert.equal(xrProbe.readDetection(stat, 6000, () => undefined, attr).event, 'frame.detectedPlanes was undefined again after returning a set');
+  assert.equal(xrProbe.readDetection(stat, 7000, () => undefined, attr).event, null);
+  assert.deepEqual(stat, {
+    skipped: null,
+    setTicks: 2,
+    missingTicks: 4,
+    throwTicks: 2,
+    dropoutTicks: 2,
+    firstSetAt: 4000,
+    error: 'InvalidStateError: not ready',
+  });
+
+  const off = xrProbe.createDetectionStat();
+  off.skipped = 'mesh-detection not in enabledFeatures';
+  let called = false;
+  const r = xrProbe.readDetection(off, 1000, () => ((called = true), planes), 'frame.detectedMeshes');
+  assert.deepEqual(r, { set: null, event: null });
+  assert.equal(called, false, 'a feature known to be off is not read');
+
+  assert.equal(xrProbe.detectionSkipReason(null, 'plane-detection', true), null, 'enabledFeatures not exposed: keep polling');
+  assert.equal(xrProbe.detectionSkipReason(['hit-test', 'plane-detection'], 'plane-detection', true), null);
+  assert.equal(xrProbe.detectionSkipReason(['hit-test'], 'plane-detection', true), 'plane-detection not in enabledFeatures');
+  assert.equal(xrProbe.detectionSkipReason(['hit-test'], 'mesh-detection', false), 'mesh-detection not in enabledFeatures (not requested)');
+});
+
+test('P0 probe: summary reports late or missing geometry instead of a false platform answer', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/test/xr-probe.html');
+  const s = probeSessionFixture();
+  const wall = { semanticLabel: 'wall', orientation: 'vertical', polygon: { length: 4 } };
+  s.geometry = [
+    { t: 2000, planes: xrProbe.summarizePlanes([]), meshes: null },
+    { t: 3000, planes: xrProbe.summarizePlanes([wall]), meshes: null },
+  ];
+  s.detection.planes = { skipped: null, setTicks: 9, missingTicks: 1, throwTicks: 0, dropoutTicks: 0, firstSetAt: 2000, error: null };
+  s.detection.meshes = { ...xrProbe.createDetectionStat(), missingTicks: 5 };
+  r.sessions.push(s);
+  const answer = (id: string) => xrProbe.summarizeReport(r).find((row) => row.id === id)?.answer ?? '<missing>';
+  assert.equal(answer('plane-labels'), 'wall x1; first set after 2.0 s, first non-empty after 3.0 s; undefined or null on 1 tick(s)');
+  assert.equal(answer('mesh-labels'), 'frame.detectedMeshes never returned a set: undefined or null on 5 tick(s)');
+  assert.equal(answer('global-mesh'), 'not seen');
+  const lines = xrProbe.panelLines(s, 12_000);
+  assert.ok(lines.includes('planes: 1  wall x1'));
+  assert.ok(lines.includes('meshes: no set yet (5 missing, 0 threw)'));
+
+  s.detection.meshes = { ...xrProbe.createDetectionStat(), throwTicks: 3, error: 'NotSupportedError: x' };
+  assert.equal(answer('mesh-labels'), 'frame.detectedMeshes never returned a set: threw on 3 tick(s), first NotSupportedError: x');
+  s.detection.meshes = { ...xrProbe.createDetectionStat(), skipped: 'mesh-detection not in enabledFeatures' };
+  assert.equal(answer('mesh-labels'), 'not polled: mesh-detection not in enabledFeatures');
+  assert.ok(xrProbe.panelLines(s, 1).includes('meshes: not polled (mesh-detection not in enabledFeatures)'));
+  s.detection.meshes = xrProbe.createDetectionStat();
+  assert.equal(answer('mesh-labels'), 'not sampled');
+  s.detection.planes.dropoutTicks = 1;
+  assert.match(answer('plane-labels'), /; 1 of those after the first set$/);
+});
+
+test('P0 probe: hit-test is S5 only for a Quest session with Space Setup cleared; S7 and S11 are partial', () => {
+  const quest = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/test/xr-probe.html');
+  let rows = xrProbe.summarizeReport(quest);
+  const row = (id: string) => rows.find((x) => x.id === id);
+  assert.match(row('hit-test-no-space-setup')?.answer ?? '', /^no session marked "Space Setup: no" yet/, 'S5 row shows even with no session');
+  assert.equal(row('storage')?.spike, 'S7 (partial)');
+  assert.match(row('storage')?.question ?? '', /IndexedDB is not probed/);
+  assert.equal(row('persistent-anchors')?.spike, 'S11 (partial)');
+  assert.match(row('persistent-anchors')?.question ?? '', /API presence only/);
+
+  quest.sessions.push(probeSessionFixture()); // Space Setup done
+  rows = xrProbe.summarizeReport(quest);
+  assert.equal(row('space-setup-before')?.answer, 'yes');
+  assert.equal(row('hit-test')?.spike, '', 'a Quest session with Space Setup done does not answer S5');
+  assert.match(row('hit-test')?.question ?? '', /Space Setup before this session: yes/);
+  assert.ok(!rows.some((x) => x.spike === 'S7' || x.spike === 'S11' || x.spike.includes('S5/') || x.spike.includes('/S5')));
+
+  const cleared = probeSessionFixture();
+  cleared.spaceSetup = 'no';
+  cleared.startedAt = '2026-11-05T09:00:00.000Z';
+  cleared.hitTest = { source: 'ok', framesTested: 50, framesWithHit: 10, firstHitAt: 1200 };
+  quest.sessions.unshift(cleared); // the S5 run first, the main run last
+  rows = xrProbe.summarizeReport(quest);
+  assert.equal(row('hit-test')?.spike, '', 'the summary still describes the latest session');
+  assert.equal(row('hit-test-no-space-setup')?.answer, '10/50 frames had a hit; first hit after 1.2 s (session started 2026-11-05T09:00:00.000Z)');
+  const lastCleared = probeSessionFixture();
+  lastCleared.spaceSetup = 'no';
+  quest.sessions.push(lastCleared);
+  rows = xrProbe.summarizeReport(quest);
+  assert.equal(row('hit-test')?.spike, 'S5');
+
+  const android = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_ANDROID_UA, 'https://x/test/xr-probe.html');
+  android.sessions.push(probeSessionFixture());
+  rows = xrProbe.summarizeReport(android);
+  assert.equal(row('hit-test')?.spike, 'S2');
+  assert.equal(row('hit-test-no-space-setup')?.answer, 'n/a (S5 is a Quest 3 question)');
+});
+
+test('P0 probe: copy has no em dashes and the probe stays out of src', () => {
+  const r = xrProbe.createReport('2026-11-05T10:00:00.000Z', PROBE_QUEST_UA, 'https://x/');
+  r.sessions.push(probeSessionFixture());
+  const copy = [
+    ...xrProbe.OBSERVATIONS.map((o) => o.question),
+    ...xrProbe.PANEL_BUTTONS.map((b) => b.label),
+    ...xrProbe.summarizeReport(r).flatMap((row) => [row.question, row.answer]),
+    ...xrProbe.panelLines(r.sessions[0], 1000),
+  ];
+  for (const text of copy) assert.ok(!text.includes('—'), `em dash in "${text}"`);
+  const srcDir = new URL('../src/', import.meta.url);
+  for (const name of probeFs.readdirSync(srcDir)) {
+    if (!name.endsWith('.ts')) continue;
+    const text = probeFs.readFileSync(new URL(name, srcDir), 'utf8');
+    assert.ok(!text.includes('xr-probe'), `src/${name} must not reference the probe`);
+  }
+  const core = probeFs.readFileSync(new URL('./xr-probe-core.ts', import.meta.url), 'utf8');
+  assert.ok(!/^\s*import\s/m.test(core), 'xr-probe-core.ts imports nothing');
+  const page = probeFs.readFileSync(new URL('./xr-probe.ts', import.meta.url), 'utf8');
+  const specifiers = Array.from(page.matchAll(/^\s*import[^'"]*['"]([^'"]+)['"]/gm), (m) => m[1]);
+  assert.deepEqual(specifiers, ['three', './xr-probe-core.ts'], 'xr-probe.ts imports only three and its core');
+});
+
+// --- P0 scan ---
+
+test('P0.6 normalizeSemanticLabel: folds platform spellings onto canonical labels', () => {
+  const table: [string | null | undefined, string][] = [
+    ['door frame', 'door'],
+    ['Door Frame', 'door'],
+    ['window frame', 'window'],
+    ['invisible wall face', 'window'],
+    ['storage', 'shelf'],
+    ['wall_face', 'wall'],
+    ['  WALL FACE ', 'wall'],
+    ['walls', 'wall'],
+    ['Sofa', 'couch'],
+    ['global mesh', 'global mesh'],
+    ['Global_Mesh', 'global mesh'],
+    ['table', 'table'],
+    ['wall art', 'wall art'],
+    ['', UNLABELED_SCAN_LABEL],
+    ['   ', UNLABELED_SCAN_LABEL],
+    [null, UNLABELED_SCAN_LABEL],
+    [undefined, UNLABELED_SCAN_LABEL],
+  ];
+  for (const [raw, want] of table) {
+    assert.equal(normalizeSemanticLabel(raw), want, `normalize(${JSON.stringify(raw)})`);
+    // Idempotent: stored scans can be normalized again on load.
+    assert.equal(normalizeSemanticLabel(normalizeSemanticLabel(raw)), want);
+  }
+});
+
+test('P0.6 isMovableScanMesh: only bounded furniture is grabbable', () => {
+  for (const label of MOVABLE_SCAN_LABELS) assert.equal(isMovableScanMesh(label), true, label);
+  for (const label of ['Couch', 'storage', 'Sofa', 'other']) assert.equal(isMovableScanMesh(label), true, label);
+  for (const label of [
+    'floor',
+    'ceiling',
+    'wall',
+    'walls',
+    'wall face',
+    'door',
+    'door frame',
+    'window',
+    'window frame',
+    'invisible wall face',
+    'wall art',
+    'global mesh',
+    'unlabeled',
+    '',
+  ]) {
+    assert.equal(isMovableScanMesh(label), false, label);
+  }
+  // Every label the synthetic test room emits.
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk', 'chair', 'bed', 'shelf', 'screen']);
+  const shell = new Set(['floor', 'ceiling', 'walls', 'door', 'window']);
+  for (const m of room.meshes) assert.equal(isMovableScanMesh(m.label), !shell.has(m.label), m.label);
+});
+
+test('P0.6 LocationRenderer: the synthetic room shell is never a grab target', () => {
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+  const loc = new LocationRenderer();
+  loc.setScan(room);
+  loc.setMode('ghost');
+  const grabbed = loc.furnitureTargets().map((o) => room.meshes[o.userData.scanMeshIndex as number].label);
+  assert.deepEqual([...grabbed].sort(), ['couch', 'desk', 'table']);
+  for (const label of ['floor', 'ceiling', 'walls', 'door', 'window']) assert.ok(!grabbed.includes(label), label);
+});
+
+test('P0.4 scanCapability: meshes, planes, both, neither, or unreported', () => {
+  const questLike = ['hit-test', 'local-floor', 'anchors', 'hand-tracking', 'dom-overlay', 'mesh-detection', 'plane-detection'];
+  assert.deepEqual(scanCapability({ enabledFeatures: questLike, reported: true }).sources, ['meshes', 'planes']);
+  const questMeshOnly = questLike.filter((f) => f !== 'plane-detection');
+  const q = scanCapability({ enabledFeatures: questMeshOnly, reported: true });
+  assert.equal(q.canScan, true);
+  assert.deepEqual(q.sources, ['meshes']);
+  // Android XR Chrome: planes but no Scene Mesh. Used to dead-end with 'needs a Quest 3'.
+  const androidXrLike = ['hit-test', 'local-floor', 'anchors', 'plane-detection'];
+  const a = scanCapability({ enabledFeatures: androidXrLike, reported: true });
+  assert.equal(a.canScan, true);
+  assert.deepEqual(a.sources, ['planes']);
+  const neither = scanCapability({ enabledFeatures: ['hit-test', 'local-floor'], reported: true });
+  assert.equal(neither.canScan, false);
+  assert.deepEqual(neither.sources, []);
+  assert.ok(neither.reason.length > 0);
+  // Browser omitted enabledFeatures: unknown, so try both instead of refusing.
+  const unknown = scanCapability({ enabledFeatures: [], reported: false });
+  assert.equal(unknown.canScan, true);
+  assert.deepEqual(unknown.sources, ['meshes', 'planes']);
+});
+
+test('P0.4 floorSettled: scan capture waits for the floor estimate', () => {
+  const e = newFloorEstimate();
+  assert.equal(floorSettled(e, 1.6, 0), false, 'no evidence yet');
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(e, 0.02, 1000 + i);
+  assert.equal(floorSettled(e, 1.6, 1000 + FLOOR_SETTLE_MS - 1), false, 'inside the settle window');
+  assert.equal(floorSettled(e, 1.6, 1000 + FLOOR_SETTLE_MS), true, 'plausible floor, nothing to correct');
+
+  const low = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(low, -0.4, 1000 + i);
+  const t = 1000 + FLOOR_SETTLE_MS;
+  assert.notEqual(floorCorrection(low, 1.3, t), null);
+  assert.equal(floorSettled(low, 1.3, t), false, 'a re-base is about to happen');
+  low.committed = true; // what the loop does when it applies the correction
+  assert.equal(floorSettled(low, 1.3, t), true);
+
+  // A correction the estimator declines (implausible eye height) counts as settled.
+  const odd = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(odd, -0.4, 1000 + i);
+  assert.equal(floorCorrection(odd, 3.5, t), null);
+  assert.equal(floorSettled(odd, 3.5, t), true);
+});
+
+test('P0.4 ViewManager.fading: realign stays shifted until the fade applies it', () => {
+  const root = new THREE.Group();
+  const views = new ViewManager(root, new THREE.PerspectiveCamera());
+  views.glide(0.5, -0.25);
+  assert.equal(views.isShifted, true);
+  assert.equal(views.fading, false);
+  views.realign();
+  // This window is what used to cancel an auto-realigned scan on the next frame.
+  assert.equal(views.fading, true);
+  assert.equal(views.isShifted, true);
+  views.update(performance.now() + 1000);
+  assert.equal(views.fading, false);
+  assert.equal(views.isShifted, false);
+  assert.equal(root.position.x, 0);
+  assert.equal(root.position.z, 0);
+});
+
+test('P0.5 roomCaptureMessage: platform errors and refusals map to user text', () => {
+  assert.match(roomCaptureMessage('NotSupportedError'), /Quest Settings/);
+  assert.match(roomCaptureMessage('InvalidStateError'), /already used this session/);
+  assert.equal(roomCaptureMessage('already-used'), roomCaptureMessage('InvalidStateError'));
+  assert.match(roomCaptureMessage('OperationError'), /did not finish/);
+  assert.equal(roomCaptureMessage('unsupported'), roomCaptureMessage('NotSupportedError'));
+  assert.match(roomCaptureMessage('no-plane-detection'), /plane detection/);
+  assert.match(roomCaptureMessage('no-session'), /AR session/);
+  assert.match(roomCaptureMessage('AbortError'), /AbortError/);
+  assert.match(roomCaptureMessage(''), /unknown error/);
+  for (const name of ['NotSupportedError', 'InvalidStateError', 'OperationError', 'no-plane-detection', 'x']) {
+    // The wrist debug tail shows ~40 characters; the subject must lead.
+    assert.ok(roomCaptureMessage(name).startsWith('Space Setup'), name);
+  }
+});
+
+test('P0.5 roomCaptureRefusal: once per session, plane-detection required', () => {
+  const planes = ['hit-test', 'local-floor', 'mesh-detection', 'plane-detection'];
+  const base = { hasSession: true, hasApi: true, enabledFeatures: planes, used: false };
+  assert.equal(roomCaptureRefusal(base), null);
+  assert.equal(roomCaptureRefusal({ ...base, hasSession: false }), 'no-session');
+  assert.equal(roomCaptureRefusal({ ...base, hasApi: false }), 'unsupported');
+  assert.equal(
+    roomCaptureRefusal({ ...base, enabledFeatures: ['hit-test', 'mesh-detection'] }),
+    'no-plane-detection',
+  );
+  // Unreported features are not a grant: the spec rejects without plane-detection.
+  assert.equal(roomCaptureRefusal({ ...base, enabledFeatures: [] }), 'no-plane-detection');
+  assert.equal(roomCaptureRefusal({ ...base, used: true }), 'already-used');
+});
+
+/** Two tables (same label) plus a static floor, for the P0.7 renderer tests. */
+function twoTableScan(): LocationScan {
+  const quad = (x: number, z: number, y: number) =>
+    new Float32Array([x - 0.5, y, z - 0.5, x + 0.5, y, z - 0.5, x + 0.5, y, z + 0.5, x - 0.5, y, z + 0.5]);
+  const idx = () => new Uint32Array([0, 1, 2, 0, 2, 3]);
+  return {
+    version: 1,
+    id: 'p07',
+    capturedAt: 1,
+    meshes: [
+      { label: 'floor', positions: quad(0, 0, 0), indices: idx() },
+      { label: 'table', positions: quad(2, 3, 0.7), indices: idx() },
+      { label: 'table', positions: quad(-2, 1, 0.7), indices: idx() },
+    ],
+  };
+}
+
+function scanMeshes(loc: LocationRenderer): THREE.Mesh[] {
+  const out: THREE.Mesh[] = [];
+  loc.group.traverse((o) => {
+    if ((o as THREE.Mesh).isMesh && o.name.startsWith('scan:')) out.push(o as THREE.Mesh);
+  });
+  return out;
+}
+
+function scanWires(loc: LocationRenderer): THREE.LineSegments[] {
+  const out: THREE.LineSegments[] = [];
+  loc.group.traverse((o) => {
+    if ((o as THREE.LineSegments).isLineSegments && o.name.startsWith('scan-wire:')) out.push(o as THREE.LineSegments);
+  });
+  return out;
+}
+
+test('P0.7 LocationRenderer: Ghost and Wireframe stay translucent after a Solid compile', () => {
+  const loc = new LocationRenderer();
+  loc.setScan(twoTableScan());
+  loc.setMode('solid');
+  const seen = new Map<THREE.Material, { transparent: boolean; version: number }>();
+  const record = () => {
+    for (const m of scanMeshes(loc)) {
+      const mat = m.material as THREE.MeshLambertMaterial;
+      const prior = seen.get(mat);
+      // three bakes '#define OPAQUE' into a program compiled while transparent
+      // is false; a material whose flag later flips keeps drawing at alpha 1.
+      if (prior) assert.equal(mat.transparent, prior.transparent, 'a material flipped its transparent flag');
+      else seen.set(mat, { transparent: mat.transparent, version: mat.version });
+    }
+  };
+  for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, false);
+  record();
+  loc.setMode('ghost');
+  for (const m of scanMeshes(loc)) {
+    const mat = m.material as THREE.MeshLambertMaterial;
+    assert.equal(mat.transparent, true);
+    assert.equal(mat.opacity, 0.35);
+    assert.equal(mat.depthWrite, false);
+    assert.equal(mat.wireframe, false);
+  }
+  record();
+  // The Camera View pass forces Solid every frame and restores the mode.
+  for (let frame = 0; frame < 3; frame++) {
+    loc.beginCameraPass();
+    for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, false);
+    record();
+    loc.endCameraPass();
+    for (const m of scanMeshes(loc)) assert.equal((m.material as THREE.Material).transparent, true);
+    record();
+  }
+  loc.setMode('wireframe');
+  for (const m of scanMeshes(loc)) {
+    const mat = m.material as THREE.MeshLambertMaterial;
+    assert.equal(mat.transparent, true);
+    assert.equal(mat.wireframe, true);
+    assert.equal(mat.opacity, 0.85);
+  }
+  record();
+  loc.setMode('solid');
+  record();
+  // No mode switch or camera pass forces a shader recompile (version bump).
+  for (const [mat, { version }] of seen) assert.equal(mat.version, version);
+});
+
+test('P0.7 LocationRenderer: wire overlay is lazy, keyed by mesh index, and follows furniture', () => {
+  const loc = new LocationRenderer();
+  const scan = twoTableScan();
+  loc.setScan(scan);
+  loc.setMode('ghost');
+  assert.equal(scanWires(loc).length, 0, 'no edge geometry until Wireframe is first shown');
+  loc.setMode('wireframe');
+  const wires = scanWires(loc);
+  assert.equal(wires.length, scan.meshes.length);
+  const meshes = scanMeshes(loc);
+  for (const w of wires) {
+    assert.ok(meshes.includes(w.parent as THREE.Mesh), 'wire is parented to its own mesh');
+    assert.equal(w.visible, true);
+  }
+  // Two tables share a label: each must still get its own overlay.
+  const [t1, t2] = loc.furnitureTargets();
+  const wireOf = (o: THREE.Object3D) => o.children.find((c) => (c as THREE.LineSegments).isLineSegments)!;
+  assert.notEqual(wireOf(t1), wireOf(t2));
+  assert.equal(wireOf(t1).name, `scan-wire:${t1.userData.scanMeshIndex}`);
+
+  const worldOf = (o: THREE.Object3D) => {
+    o.updateWorldMatrix(true, false);
+    return new THREE.Vector3().setFromMatrixPosition(o.matrixWorld);
+  };
+  loc.applyPlacements([{ meshIndex: 2, dx: 1, dz: -1, rotY: Math.PI / 2 }]);
+  const placed = loc.furnitureTargets().find((m) => m.userData.scanMeshIndex === 2)!;
+  assert.ok(worldOf(wireOf(placed)).distanceTo(worldOf(placed)) < 1e-9);
+  approx(worldOf(placed).x, -1);
+  approx(worldOf(placed).z, 0);
+  // A carry then commitFurniture: the overlay stays on the piece.
+  placed.position.set(4, 0.3, 4);
+  placed.rotation.set(0.1, 0.5, 0);
+  loc.commitFurniture(placed);
+  assert.ok(worldOf(wireOf(placed)).distanceTo(worldOf(placed)) < 1e-9);
+  approx(worldOf(wireOf(placed)).x, 4);
+  // Reloading the same scan with no placements puts both back as captured.
+  loc.applyPlacements(undefined);
+  approx(worldOf(wireOf(placed)).x, -2);
+  approx(worldOf(wireOf(placed)).z, 1);
+
+  // Hidden hides the overlay; Ghost hides it again too (overlay flag off).
+  loc.setMode('ghost');
+  for (const w of scanWires(loc)) assert.equal(w.visible, false);
+  loc.setWireframeOverlay(true);
+  for (const w of scanWires(loc)) assert.equal(w.visible, true);
+  loc.setMode('hidden');
+  for (const w of scanWires(loc)) assert.equal(w.visible, false);
+});
+
+test('P0.7 LocationRenderer: wires never steal a furniture raycast; setScan(null) clears all', () => {
+  const loc = new LocationRenderer();
+  loc.setScan(twoTableScan());
+  loc.setMode('wireframe');
+  // The fixture quads wind facing down (front side), so aim up from below.
+  const rc = new THREE.Raycaster(new THREE.Vector3(2, -1, 3), new THREE.Vector3(0, 1, 0));
+  loc.group.updateMatrixWorld(true);
+  const hits = rc.intersectObjects(loc.furnitureTargets(), true);
+  assert.ok(hits.length > 0);
+  for (const h of hits) assert.equal(typeof h.object.userData.scanMeshIndex, 'number');
+
+  loc.setScan(null);
+  assert.equal(loc.hasScan, false);
+  assert.equal(scanMeshes(loc).length, 0);
+  assert.equal(scanWires(loc).length, 0);
+  assert.equal(loc.group.visible, false);
+});
+
+test('P0.7 locationMode: validated, defaults to ghost with a scan, survives a round-trip', () => {
+  for (const m of LOCATION_DISPLAY_MODES) assert.equal(isLocationDisplayMode(m), true, m);
+  assert.equal(isLocationDisplayMode('neon'), false);
+  assert.equal(isLocationDisplayMode(undefined), false);
+
+  const withScan = () => {
+    const s = createScene('loc mode');
+    s.scan = { id: 'b', capturedAt: 1, vertices: 3, triangles: 1, boundsMin: { x: 0, y: 0, z: 0 }, boundsMax: { x: 1, y: 1, z: 1 } };
+    return s;
+  };
+  assert.equal(normalizeScene(withScan()).locationMode, 'ghost', 'a reloaded scan is visible, not hidden');
+  assert.equal(normalizeScene(createScene('no scan')).locationMode, undefined);
+
+  const solid = withScan();
+  solid.locationMode = 'solid';
+  const back = normalizeScene(JSON.parse(JSON.stringify(solid)));
+  assert.equal(back.locationMode, 'solid');
+
+  const bad = withScan() as unknown as Record<string, unknown>;
+  bad.locationMode = 'neon';
+  assert.equal(isSceneData(bad), true, 'a bad view preference does not fail an import');
+  assert.equal(normalizeScene(bad as unknown as ReturnType<typeof createScene>).locationMode, 'ghost');
+});
+
+test('P0.6 normalizeSemanticLabel: edge separators normalize idempotently', () => {
+  const table: [string, string][] = [
+    ['table_', 'table'],
+    ['_wall_face', 'wall'],
+    ['door-frame-', 'door'],
+    ['-Window_Frame ', 'window'],
+    ['__', UNLABELED_SCAN_LABEL],
+  ];
+  for (const [raw, want] of table) {
+    assert.equal(normalizeSemanticLabel(raw), want, `normalize(${JSON.stringify(raw)})`);
+    assert.equal(normalizeSemanticLabel(normalizeSemanticLabel(raw)), want);
+  }
+  assert.equal(isMovableScanMesh('table_'), true);
+});
+
+test('P0.4 scanFloorY / translateScanY: the labelled floor only', () => {
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+  approx(scanFloorY(room)!, -0.05); // the synthetic floor slab is 5 cm thick
+  translateScanY(room, 0.4);
+  approx(scanFloorY(room)!, 0.35);
+  approx(summarizeScan(room).boundsMin.y, 0.35);
+  // Raw platform spellings count once normalized.
+  const raw: LocationScan = {
+    version: 1,
+    id: 'f',
+    capturedAt: 1,
+    meshes: [
+      { label: 'global mesh', positions: new Float32Array([0, -1.2, 0, 1, -1.2, 0, 0, -1.2, 1]), indices: new Uint32Array([0, 1, 2]) },
+      { label: 'Floor', positions: new Float32Array([0, -0.4, 0, 1, -0.41, 0, 0, -0.4, 1]), indices: new Uint32Array([0, 1, 2]) },
+    ],
+  };
+  // The unlabelled -1.2 m surface (a phantom under a glossy floor) is ignored.
+  approx(scanFloorY(raw)!, -0.41);
+  raw.meshes.pop();
+  assert.equal(scanFloorY(raw), null, 'no labelled floor, no evidence');
+  assert.equal(scanFloorY({ version: 1, id: 'e', capturedAt: 1, meshes: [] }), null);
+});
+
+test('P0.4 floorCorrectionFromScan: a scan taken before the hits re-based still fixes the floor', () => {
+  // The review case: hits only landed on a desk, so the estimate settled
+  // without correcting, and Scan Room then froze it.
+  const desk = newFloorEstimate();
+  for (let i = 0; i < FLOOR_MIN_HITS; i++) observeFloorHit(desk, 0.72, 1000 + i);
+  const t = 1000 + FLOOR_SETTLE_MS;
+  assert.equal(floorSettled(desk, 1.25, t), true);
+  assert.equal(floorCorrection(desk, 1.25, t), null);
+  // The scan's floor sits 0.4 m below the scene origin: re-base by -0.4.
+  approx(floorCorrectionFromScan(desk, -0.4, 1.25)!, -0.4);
+  // After the caller lifts the scan and commits, nothing more happens.
+  const lifted = createSyntheticLocationScan(6, 5, 2.8, []);
+  translateScanY(lifted, -0.35); // floor top at -0.35, slab bottom at -0.40
+  const fix = floorCorrectionFromScan(desk, scanFloorY(lifted), 1.25)!;
+  approx(fix, -0.4);
+  translateScanY(lifted, -fix);
+  approx(scanFloorY(lifted)!, 0);
+  assert.equal(floorCorrectionFromScan(desk, scanFloorY(lifted), 1.25), null, 'a re-based scan is plausible');
+  desk.committed = true;
+  assert.equal(floorCorrectionFromScan(desk, -0.4, 1.25), null, 'committed is final');
+
+  const fresh = newFloorEstimate(); // no hits at all (the 5 s cap)
+  approx(floorCorrectionFromScan(fresh, -0.5, 1.1)!, -0.5);
+  assert.equal(floorCorrectionFromScan(fresh, -0.1, 1.6), null, 'within tolerance');
+  assert.equal(floorCorrectionFromScan(fresh, 0.3, 1.6), null, 'one-directional');
+  assert.equal(floorCorrectionFromScan(fresh, null, 1.6), null, 'no labelled floor');
+  assert.equal(floorCorrectionFromScan(fresh, Number.NaN, 1.6), null);
+  assert.equal(floorCorrectionFromScan(fresh, -2.0, 1.6), null, 'implausible eye height (3.6 m)');
+});
+
+test('P0.5 reanchor: a stale createAnchor result is deleted, never assigned over a newer one', () => {
+  // A thenable that resolves when the test says so, keeping the test synchronous.
+  type Fake = { name: string; deleted: boolean; delete(): void };
+  const pending: ((a: Fake | null) => void)[] = [];
+  const session = {
+    createAnchor: () => ({ then: (cb: (a: Fake | null) => void) => void pending.push(cb) }),
+  };
+  const fake = (name: string): Fake => ({ name, deleted: false, delete() { this.deleted = true; } });
+  const run = (reanchor: (obj: never, frame: never) => void, obj: { data: { id: string } }) => {
+    pending.length = 0;
+    const self = { session, objects: new Map([[obj.data.id, obj]]) };
+    reanchor.call(self, obj as never, {} as never);
+    reanchor.call(self, obj as never, {} as never); // a second queue one frame later
+    const a1 = fake('A1');
+    const a2 = fake('A2');
+    pending[1](a2);
+    pending[0](a1); // the older request lands last
+    assert.equal((obj as unknown as { anchor: Fake }).anchor, a2);
+    assert.equal(a1.deleted, true, 'the stale anchor is released, not leaked');
+    assert.equal(a2.deleted, false);
+    // A removed object still releases a late anchor.
+    reanchor.call(self, obj as never, {} as never);
+    self.objects.clear();
+    const a3 = fake('A3');
+    pending[2](a3);
+    assert.equal(a3.deleted, true);
+  };
+  const actor = { data: { id: 'act', position: { x: 0, y: 0, z: 0 } }, anchor: null } as unknown as ActorObject;
+  run(ActorManager.prototype.reanchor as never, actor as never);
+  const cam = { data: { id: 'cam', position: { x: 1, y: 1.5, z: 0 } }, anchor: null } as unknown as CamObject;
+  run(CameraSystem.prototype.reanchor as never, cam as never);
+});
+
+test('P0.6 LocationRenderer: a placement saved on a now-static piece still renders, ungrabbable', () => {
+  const quad = (x: number, z: number, y: number) =>
+    new Float32Array([x - 0.5, y, z - 0.5, x + 0.5, y, z - 0.5, x + 0.5, y, z + 0.5, x - 0.5, y, z + 0.5]);
+  const idx = () => new Uint32Array([0, 1, 2, 0, 2, 3]);
+  const scan: LocationScan = {
+    version: 1,
+    id: 'p06',
+    capturedAt: 1,
+    meshes: [
+      { label: 'wall art', positions: quad(2, 3, 1.5), indices: idx() }, // grabbable before P0.6
+      { label: 'table', positions: quad(-2, 1, 0.7), indices: idx() },
+    ],
+  };
+  const loc = new LocationRenderer();
+  loc.setScan(scan);
+  loc.setMode('ghost');
+  const art = scanMeshes(loc)[0];
+  assert.equal(art.name, 'scan:wall art');
+  assert.ok(!loc.furnitureTargets().includes(art), 'static pieces are not grab targets');
+  const worldVertex = (mesh: THREE.Mesh, i: number) => {
+    mesh.updateWorldMatrix(true, false);
+    return new THREE.Vector3().fromBufferAttribute(mesh.geometry.getAttribute('position') as THREE.BufferAttribute, i).applyMatrix4(mesh.matrixWorld);
+  };
+  const placement = { meshIndex: 0, dx: 1, dz: -0.5, rotY: Math.PI / 2 };
+  loc.applyPlacements([placement, { meshIndex: 1, dx: 0.5, dz: 0, rotY: 0 }]);
+  // Same transform the furniture path gives: yaw about the footprint center
+  // (2, 3), then move by (dx, dz). Vertex 0 = (1.5, 1.5, 2.5): offset (-0.5, -0.5)
+  // yawed 90 degrees is (-0.5, 0.5), so it lands at (2 + 1 - 0.5, 3 - 0.5 + 0.5).
+  const v = worldVertex(art, 0);
+  approx(v.x, 2.5);
+  approx(v.y, 1.5);
+  approx(v.z, 3);
+  // The footprint center itself moves by exactly (dx, dz).
+  art.updateWorldMatrix(true, false);
+  const c = new THREE.Vector3(2, 0, 3).applyMatrix4(art.matrixWorld);
+  approx(c.x, 3);
+  approx(c.z, 2.5);
+  // The table keeps the furniture path.
+  const table = loc.furnitureTargets()[0];
+  approx(table.position.x, -1.5);
+  // Undo back to no placements: as captured again.
+  loc.applyPlacements(undefined);
+  const back = worldVertex(art, 0);
+  approx(back.x, 1.5);
+  approx(back.z, 2.5);
+  assert.equal(art.rotation.y, 0);
+});
+
+test('P0.7 locationMode: removing the scan drops the mode, so the next scan starts in Ghost', () => {
+  const s = createScene('loc mode removed');
+  s.scan = { id: 'b', capturedAt: 1, vertices: 3, triangles: 1, boundsMin: { x: 0, y: 0, z: 0 }, boundsMax: { x: 1, y: 1, z: 1 } };
+  s.locationMode = 'hidden';
+  assert.equal(normalizeScene(s).locationMode, 'hidden', 'kept while the scan exists');
+  s.scan = null; // Remove scan
+  const reloaded = normalizeScene(JSON.parse(JSON.stringify(s)));
+  assert.equal(reloaded.locationMode, undefined);
+  // Add Test Room on that scene.
+  reloaded.scan = summarizeScan(createSyntheticLocationScan(6, 5, 2.8, ['couch']));
+  assert.equal(normalizeScene(reloaded).locationMode, 'ghost');
+});
+
+// --- P0 data ---
+
+/** Minimal synchronous Storage for exercising Persistence in Node. */
+class P0MemoryStorage {
+  private map = new Map<string, string>();
+  failWrites = false;
+  get length(): number {
+    return this.map.size;
+  }
+  key(i: number): string | null {
+    return [...this.map.keys()][i] ?? null;
+  }
+  getItem(k: string): string | null {
+    return this.map.get(k) ?? null;
+  }
+  setItem(k: string, v: string): void {
+    if (this.failWrites) throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    this.map.set(k, String(v));
+  }
+  removeItem(k: string): void {
+    this.map.delete(k);
+  }
+  clear(): void {
+    this.map.clear();
+  }
+}
+
+/** Installs the shim for the duration of fn only (synchronous, so no other test sees it). */
+function withP0MemoryStorage(fn: (storage: P0MemoryStorage) => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const storage = new P0MemoryStorage();
+  Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true, writable: true });
+  try {
+    fn(storage);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+}
+
+/** A scene carrying the synthetic room scan with two moved pieces and one stale placement. */
+function p0SceneWithMovedFurniture(): { scene: SceneData; scan: LocationScan } {
+  const scan = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table', 'desk']);
+  const scene = createScene('Furniture Round Trip');
+  scene.scan = summarizeScan(scan);
+  const last = scan.meshes.length - 1;
+  scene.scan.furniture = [
+    { meshIndex: last, dx: 0.75, dz: -0.5, rotY: 0.4 },
+    { meshIndex: last - 1, dx: -1.25, dz: 0.3, rotY: -1.1 },
+    { meshIndex: scan.meshes.length + 3, dx: 1, dz: 1, rotY: 0 }, // points past the mesh list
+  ];
+  return { scene, scan };
+}
+
+test('P0.8: furniture placements survive export then import, and mesh order is stable', () => {
+  const { scene, scan } = p0SceneWithMovedFurniture();
+  const text = JSON.stringify(buildSceneFile(scene, scan), null, 2);
+  const parsed = parseSceneFile(text);
+  assert.ok(parsed, 'an exported scene must parse back');
+  const imported = parsed.scene;
+  assert.notEqual(imported.id, scene.id); // a fresh id never clobbers the source scene
+  assert.ok(imported.name.endsWith('(imported)'));
+  assert.equal(parsed.scanDropped, false);
+  assert.ok(parsed.scan && imported.scan);
+  assert.equal(imported.scan.id, parsed.scan.id);
+  assert.notEqual(parsed.scan.id, scan.id); // fresh blob id
+  // The two in-range placements come back unchanged; the stale one is dropped.
+  assert.deepEqual(imported.scan.furniture, scene.scan!.furniture!.slice(0, 2));
+  // Placements index meshes, so the codec must keep mesh order and contents.
+  assert.equal(parsed.scan.meshes.length, scan.meshes.length);
+  for (let i = 0; i < scan.meshes.length; i++) {
+    assert.equal(parsed.scan.meshes[i].label, scan.meshes[i].label);
+    assert.deepEqual(Array.from(parsed.scan.meshes[i].positions), Array.from(scan.meshes[i].positions));
+    assert.deepEqual(Array.from(parsed.scan.meshes[i].indices), Array.from(scan.meshes[i].indices));
+  }
+  // The base64 never rides along into the scene that gets saved.
+  assert.equal('scanData' in imported, false);
+
+  // ...and the placements persist through a save and reload (in-memory Storage shim).
+  withP0MemoryStorage(() => {
+    const p = new Persistence();
+    assert.equal(p.saveNow(imported), true);
+    const reloaded = p.loadScene(imported.id);
+    assert.ok(reloaded?.scan);
+    assert.deepEqual(reloaded.scan.furniture, imported.scan!.furniture);
+  });
+});
+
+test('P0.8: an import with a summary but no geometry drops the scan instead of dangling', () => {
+  const { scene } = p0SceneWithMovedFurniture();
+  const parsed = parseSceneFile(JSON.stringify(buildSceneFile(scene, null)));
+  assert.ok(parsed);
+  assert.equal(parsed.scan, null);
+  assert.equal(parsed.scene.scan, null);
+  assert.equal(parsed.scanDropped, true);
+  assert.equal(parseSceneFile('{"name":"not a scene"}'), null);
+  assert.equal(parseSceneFile('not json at all'), null);
+});
+
+test('P0.8: a null or empty file read is "blocked", not "corrupt"', () => {
+  assert.equal(decodeSceneFileBytes(null), null);
+  assert.equal(decodeSceneFileBytes(undefined), null);
+  assert.equal(decodeSceneFileBytes(new ArrayBuffer(0)), null);
+  const bytes = new TextEncoder().encode('{"a":"é"}');
+  assert.equal(decodeSceneFileBytes(bytes.buffer as ArrayBuffer), '{"a":"é"}');
+});
+
+// Async: run from the final Promise.all, so its result is part of the reported total
+// (test() does not await, so it would print a check mark before any assertion ran).
+async function p0ImportReadsTest(): Promise<void> {
+  const p = new Persistence();
+  const blocked = {
+    name: 'scene.setview.json',
+    size: 2048,
+    arrayBuffer: () => Promise.reject(new Error('NotReadableError')),
+  } as unknown as File;
+  const r1 = await p.importScene(blocked);
+  assert.equal(r1.ok, false);
+  if (!r1.ok) {
+    assert.equal(r1.reason, 'blocked');
+    assert.ok(r1.message.includes('blocked'));
+  }
+  const empty = { name: 'empty.json', size: 0, arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) } as unknown as File;
+  const r2 = await p.importScene(empty);
+  assert.equal(r2.ok === false && r2.reason, 'blocked');
+  const notScene = {
+    name: 'other.json',
+    size: 16,
+    arrayBuffer: () => Promise.resolve(new TextEncoder().encode('{"hello":1}').buffer),
+  } as unknown as File;
+  const r3 = await p.importScene(notScene);
+  assert.equal(r3.ok === false && r3.reason, 'invalid');
+  // P0.9: Node has no navigator.storage, and the request is made once per page.
+  assert.equal(await p.requestPersistentStorage(), 'unsupported');
+  assert.equal(await p.requestPersistentStorage(), 'already-asked');
+}
+
+/** Async: Add Test Room looks up the live scene after the scan blob is written. */
+async function p0SyntheticScanLiveTest(): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: new P0MemoryStorage(), configurable: true, writable: true });
+  try {
+    const p = new Persistence();
+    p.onError = () => {}; // the Node scan store is memory-only and says so
+    const before = createScene('Test Room');
+    assert.equal(p.saveNow(before), true);
+    let live: SceneData = before;
+    const pending = p.attachSyntheticScan(before.id, () => live);
+    // An undo or restore replaces the live object while the blob write is pending.
+    const restored = normalizeScene(JSON.parse(JSON.stringify(before)) as SceneData);
+    live = restored;
+    const res = await pending;
+    assert.ok(res);
+    assert.equal(res.scene, restored, 'the scan goes onto the scene that is live now');
+    assert.equal(before.scan, null, 'the replaced object is not written');
+    assert.equal(restored.scan?.id, res.scan.id);
+    assert.equal(p.loadScene(before.id)?.scan?.id, res.scan.id);
+    // A scene that is not live gets the stored copy.
+    const other = createScene('Other');
+    assert.equal(p.saveNow(other), true);
+    const res2 = await p.attachSyntheticScan(other.id, () => live);
+    assert.ok(res2 && res2.scene !== live);
+    assert.equal(p.loadScene(other.id)?.scan?.id, res2.scan.id);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+}
+
+test('P0.8: after a failed save, Export hands out the in-memory scene, not the stale stored copy', () => {
+  withP0MemoryStorage((storage) => {
+    const p = new Persistence();
+    const errors: string[] = [];
+    p.onError = (m) => errors.push(m);
+    const scene = createScene('Quota Victim');
+    assert.equal(p.saveNow(scene), true);
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim');
+
+    scene.name = 'Quota Victim (edited)';
+    storage.failWrites = true;
+    assert.equal(p.saveNow(scene), false);
+    assert.equal(errors.length, 1);
+    const storedCopy = JSON.parse(storage.getItem(`setview.scene.${scene.id}`) ?? '{}') as { name?: string };
+    assert.equal(storedCopy.name, 'Quota Victim'); // storage holds the old copy
+    assert.equal(p.loadScene(scene.id)?.name, 'Quota Victim (edited)'); // reopening gets the newer one
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
+
+    // A scene that never saved at all (e.g. a failed import) can still be exported.
+    const neverSaved = createScene('Never Saved');
+    assert.equal(p.saveNow(neverSaved), false);
+    assert.equal(storage.getItem(`setview.scene.${neverSaved.id}`), null);
+    assert.equal(p.sceneForExport(neverSaved.id), neverSaved);
+
+    // The live scene always wins for its own id; other ids fall through.
+    const live = createScene('Live');
+    assert.equal(p.sceneForExport(live.id, live), live);
+    assert.equal(p.sceneForExport(scene.id, live)?.name, 'Quota Victim (edited)');
+
+    // Once a save succeeds again, export reads storage as before.
+    storage.failWrites = false;
+    assert.equal(p.saveNow(scene), true);
+    assert.equal(p.sceneForExport(scene.id)?.name, 'Quota Victim (edited)');
+    assert.notEqual(p.sceneForExport(scene.id), scene); // a fresh load, not the cached object
+  });
+});
+
+test('P0.8: a scene whose save failed gets a landing row (with Export), and reopening it keeps the edits', () => {
+  withP0MemoryStorage((storage) => {
+    const p = new Persistence();
+    p.onError = () => {};
+    const stored = createScene('Stored');
+    assert.equal(p.saveNow(stored), true);
+    assert.deepEqual(
+      p.listScenesForLanding(stored).map((e) => [e.name, !!e.unsaved]),
+      [['Stored', false]],
+    );
+
+    // An import (or New, or Dup) that does not fit never reaches the index...
+    storage.failWrites = true;
+    const imported = createScene('Big Import (imported)');
+    assert.equal(p.saveNow(imported), false);
+    assert.equal(p.listScenes().some((e) => e.id === imported.id), false);
+    // ...but the landing still lists it, flagged, so its Export button exists.
+    const rows = p.listScenesForLanding(imported);
+    const row = rows.find((e) => e.id === imported.id);
+    assert.ok(row, 'the failed import has a landing row');
+    assert.equal(row.unsaved, true);
+    assert.equal(row.name, 'Big Import (imported)');
+    assert.equal(rows.find((e) => e.id === stored.id)?.unsaved, undefined);
+    assert.equal(p.sceneForExport(imported.id), imported);
+
+    // A stored scene whose later save failed: the row shows the in-memory name.
+    stored.name = 'Stored (edited)';
+    assert.equal(p.saveNow(stored), false);
+    const storedRow = p.listScenesForLanding(imported).find((e) => e.id === stored.id);
+    assert.equal(storedRow?.name, 'Stored (edited)');
+    assert.equal(storedRow?.unsaved, true);
+
+    // Re-opening it after switching away gets the edits, not the stale stored copy,
+    // as a clone the caller may edit; Export then hands out that reopened copy.
+    const reopened = p.loadScene(stored.id);
+    assert.equal(reopened?.name, 'Stored (edited)');
+    assert.notEqual(reopened, stored);
+    reopened!.name = 'Stored (edited again)';
+    assert.equal(stored.name, 'Stored (edited)', 'editing the reopened copy does not touch the cache');
+    assert.equal(p.sceneForExport(stored.id, reopened)?.name, 'Stored (edited again)');
+    // Landing edits on a non-current scene go through loadScene too.
+    assert.equal(p.renameScene(imported.id, 'Renamed Import'), false);
+    assert.equal(p.listScenesForLanding(stored).find((e) => e.id === imported.id)?.name, 'Renamed Import');
+
+    // The live scene is listed even when the index lacks it and no save was tried.
+    const orphanLive = createScene('Live Only');
+    assert.equal(p.listScenesForLanding(orphanLive).find((e) => e.id === orphanLive.id)?.unsaved, true);
+
+    // Once saves work again the flag clears; deleting drops the in-memory copy.
+    storage.failWrites = false;
+    assert.equal(p.saveNow(reopened!), true);
+    assert.equal(p.listScenesForLanding(reopened).find((e) => e.id === stored.id)?.unsaved, undefined);
+    assert.equal(p.loadScene(stored.id)?.name, 'Stored (edited again)');
+    p.deleteScene(imported.id);
+    assert.equal(p.listScenesForLanding(reopened).some((e) => e.id === imported.id), false);
+    assert.equal(p.loadScene(imported.id), null);
+  });
+});
+
+test('P0.9: a save failure before onError is wired (first-run scene) is held, then delivered', () => {
+  withP0MemoryStorage((storage) => {
+    storage.failWrites = true;
+    const p = new Persistence();
+    const first = p.loadCurrentOrCreate(); // main.ts runs this before wiring onError
+    assert.equal(p.listScenesForLanding(first)[0]?.unsaved, true);
+    const got: string[] = [];
+    p.onError = (m) => got.push(m);
+    assert.equal(got.length, 1);
+    assert.ok(got[0].includes('storage full'));
+    // Later failures go straight to the handler; nothing is delivered twice.
+    p.saveNow(first);
+    assert.equal(got.length, 2);
+    p.onError = (m) => got.push(`second: ${m}`);
+    assert.equal(got.length, 2);
+  });
+});
+
+test('P0.9: storage line formatting', () => {
+  const MB = 1024 * 1024;
+  assert.equal(formatBytes(512), '512 B');
+  assert.equal(formatBytes(1536), '1.5 KB');
+  assert.equal(formatBytes(5 * MB), '5.0 MB');
+  assert.equal(formatBytes(2 * 1024 * MB), '2.00 GB');
+  assert.equal(formatBytes(Number.NaN), '?');
+  const full = formatStorageLine({
+    usageBytes: 12 * MB,
+    quotaBytes: 2 * 1024 * MB,
+    persisted: false,
+    sceneBytes: 1.5 * MB,
+    scanBytes: 3 * MB,
+  });
+  assert.ok(full.startsWith('Storage: scenes 1.5 MB, scans 3.0 MB'));
+  assert.ok(full.includes('browser total 12.0 MB of 2.00 GB'));
+  assert.ok(full.includes('not persistent'));
+  const bare = formatStorageLine({ usageBytes: null, quotaBytes: null, persisted: null, sceneBytes: 0, scanBytes: 0 });
+  assert.equal(bare, 'Storage: scenes 0 B, scans 0 B');
+  assert.ok(!/[\u2014\u2013]/.test(full), 'no em or en dashes in UI copy');
+});
+
+test('P0.10: new scenes start without the LED volume; saved scenes keep their own flag', () => {
+  const fresh = createScene('Empty Stage');
+  assert.equal(fresh.icvfx?.enabled, false);
+  assert.ok((fresh.icvfx?.walls.length ?? 0) > 0, 'the preset is still there to switch on');
+
+  const legacy = createScene('Pre-ICVFX Scene');
+  delete legacy.icvfx;
+  assert.equal(normalizeScene(legacy).icvfx?.enabled, false);
+
+  const saved = createScene('Saved With LED');
+  saved.icvfx!.enabled = true;
+  const reloaded = normalizeScene(JSON.parse(JSON.stringify(saved)) as SceneData);
+  assert.equal(reloaded.icvfx?.enabled, true);
+});
+
+/** Builds a binary little-endian PLY from a header body and per-vertex writer. */
+function p0BinaryPly(
+  props: string[],
+  count: number,
+  stride: number,
+  write: (view: DataView, base: number, i: number) => void,
+): Uint8Array {
+  const header =
+    'ply\nformat binary_little_endian 1.0\n' +
+    `element vertex ${count}\n` +
+    props.map((p) => `property ${p}\n`).join('') +
+    'end_header\n';
+  const head = new TextEncoder().encode(header);
+  const out = new Uint8Array(head.length + count * stride);
+  out.set(head, 0);
+  const view = new DataView(out.buffer, head.length);
+  for (let i = 0; i < count; i++) write(view, i * stride, i);
+  return out;
+}
+
+test('P0.14: a ushort PLY property has a 2-byte stride', () => {
+  // x y z float, ushort flags, float opacity: 18 bytes per vertex. The old 4-byte
+  // ushort stride read 20, misplaced every field after it and dropped a vertex.
+  const ply = p0BinaryPly(['float x', 'float y', 'float z', 'ushort flags', 'float opacity'], 2, 18, (v, b, i) => {
+    v.setFloat32(b, 1 + i * 3, true);
+    v.setFloat32(b + 4, 2 + i * 3, true);
+    v.setFloat32(b + 8, 3 + i * 3, true);
+    v.setUint16(b + 12, 7 + i, true);
+    v.setFloat32(b + 14, i === 0 ? 0.25 : 0.75, true);
+  });
+  const cloud = parseGaussianPly(ply);
+  assert.equal(cloud.splatCount, 2);
+  assert.deepEqual(cloud.splats[1].position, { x: 4, y: 5, z: 6 });
+  approx(cloud.splats[0].opacity, 0.25, 1e-6); // no 3DGS layout: linear opacity stays linear
+  approx(cloud.splats[1].opacity, 0.75, 1e-6);
+});
+
+test('P0.14: 3DGS-layout opacity is always a logit (0.5 reads 0.622)', () => {
+  const props = ['x', 'y', 'z', 'f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3'];
+  const ascii =
+    'ply\nformat ascii 1.0\nelement vertex 1\n' +
+    props.map((p) => `property float ${p}\n`).join('') +
+    'end_header\n' +
+    '0 0 0 0 0 0 0.5 -3 -3 -3 1 0 0 0\n';
+  approx(parseGaussianPly(ascii).splats[0].opacity, 1 / (1 + Math.exp(-0.5)), 1e-4);
+  approx(parseGaussianPly(ascii).splats[0].opacity, 0.6225, 1e-3);
+  const bin = p0BinaryPly(props.map((p) => `float ${p}`), 1, 56, (v, b) => {
+    const vals = [0, 0, 0, 0, 0, 0, 0.5, -3, -3, -3, 1, 0, 0, 0];
+    vals.forEach((x, k) => v.setFloat32(b + k * 4, x, true));
+  });
+  approx(parseGaussianPly(bin).splats[0].opacity, 0.6225, 1e-3);
+});
+
+test('P0.14: compressed and pre-vertex PLY layouts are refused with a message', () => {
+  const compressedHeader =
+    'ply\nformat binary_little_endian 1.0\n' +
+    'element chunk 1\nproperty float min_x\nproperty float max_x\n' +
+    'element vertex 256\nproperty uint packed_position\nproperty uint packed_rotation\n' +
+    'property uint packed_scale\nproperty uint packed_color\nend_header\n';
+  const bytes = new Uint8Array(compressedHeader.length + 8 + 256 * 16);
+  bytes.set(new TextEncoder().encode(compressedHeader), 0);
+  const sniff = sniffSplatFile('room.compressed.ply', bytes.length, bytes);
+  assert.equal(sniff.ok, false);
+  if (!sniff.ok) assert.equal(sniff.message, COMPRESSED_PLY_MESSAGE);
+  assert.throws(() => parseGaussianPly(bytes), /compressed PLY/);
+
+  const preVertex =
+    'ply\nformat ascii 1.0\nelement camera 1\nproperty float fx\n' +
+    'element vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n500\n1 2 3\n';
+  assert.throws(() => parseGaussianPly(preVertex), /element "camera" comes before the vertex data/);
+});
+
+test('P0.14: the header sniff returns the splat count without the body', () => {
+  // Header only: the body of a 1.2M-splat capture is never read or parsed.
+  const header =
+    'ply\nformat binary_little_endian 1.0\nelement vertex 1200000\n' +
+    ['x', 'y', 'z', 'opacity', 'scale_0', 'rot_0'].map((p) => `property float ${p}\n`).join('') +
+    'end_header\n';
+  const head = new TextEncoder().encode(header);
+  const sniff = sniffSplatFile('capture.ply', head.length + 1200000 * 24, head);
+  assert.deepEqual(sniff, { ok: true, format: 'ply', splatCount: 1200000 });
+  assert.ok(SPLAT_HEADER_SNIFF_BYTES >= head.length);
+
+  assert.deepEqual(sniffSplatFile('cloud.splat', 32 * 20000, null), { ok: true, format: 'splat', splatCount: 20000 });
+  assert.equal(sniffSplatFile('cloud.splat', 33, null).ok, false);
+  assert.equal(sniffSplatFile('notes.ply', 10, new TextEncoder().encode('hello there')).ok, false);
+  assert.equal(sniffSplatFile('broken.ply', 0, null).ok, false);
+
+  // Size guard: the cap applies to the scene's total.
+  assert.equal(splatImportRefusal(MAX_INLINE_SPLATS), null);
+  assert.equal(splatImportRefusal(4000, 8000), null);
+  const refusal = splatImportRefusal(1200000);
+  assert.ok(refusal && refusal.startsWith('Too large for now'));
+  assert.ok(refusal.includes('mesh export') && refusal.includes('splat locations'));
+  assert.ok(splatImportRefusal(10000, 6000)?.includes('already in this scene'));
+  assert.ok(!/[\u2014\u2013]/.test(refusal), 'no em or en dashes in UI copy');
+});
+
+test('P0.14: voxel downsampling keeps splats 12.8 m apart separate', () => {
+  const splat = (z: number): GaussianSplat => ({
+    position: { x: 0.01, y: 0.01, z },
+    scale: { x: 0.01, y: 0.01, z: 0.01 },
+    rotation: { x: 0, y: 0, z: 0, w: 1 },
+    color: { r: 0.5, g: 0.5, b: 0.5 },
+    opacity: 1,
+  });
+  const out = voxelDownsampleSplats([splat(0.01), splat(12.81)], 0.05);
+  assert.equal(out.length, 2);
+  const zs = out.map((s) => s.position.z).sort((a, b) => a - b);
+  approx(zs[0], 0.01, 1e-9);
+  approx(zs[1], 12.81, 1e-9);
+  // Far apart on every axis and on both sides of the origin.
+  assert.equal(voxelDownsampleSplats([splat(-300.01), splat(300.01), splat(-300.02)], 0.05).length, 2);
+});
+
+test('P0.14: the splat budget only moves past a full step and snaps to it', () => {
+  assert.equal(stepSplatBudget(100000, 102000), 100000);
+  assert.equal(stepSplatBudget(100000, 105000), 100000); // exactly one step: hold
+  assert.equal(stepSplatBudget(100000, 94999), 95000);
+  assert.equal(stepSplatBudget(100000, 72400), 70000);
+  assert.equal(stepSplatBudget(100000, Number.NaN), 100000);
+  // Jitter around a value or a step boundary never flips the budget.
+  let b = 100000;
+  for (let i = 0; i < 100; i++) b = stepSplatBudget(b, i % 2 ? 97400 : 97600);
+  assert.equal(b, 100000);
+  assert.equal(stepSplatBudget(100000, 77777) % SPLAT_BUDGET_STEP, 0);
+});
+
+test('P0.14: the governor only pushes a splat budget change, not one per frame', () => {
+  let budget = 100000;
+  const pushes: number[] = [];
+  const fakeSplats = {
+    getSplatBudget: () => budget,
+    setSplatBudget: (n: number) => {
+      pushes.push(n);
+      budget = n;
+    },
+  } as unknown as GaussianSplatRenderer;
+  const governor = new XRPerformanceGovernor();
+  let t = 0;
+  for (let i = 0; i < 400; i++) {
+    t += i % 2 ? 16 : 17.5; // over a 72 fps budget, with jitter
+    governor.beginFrame(t);
+    governor.endFrame(undefined, fakeSplats, null, t);
+  }
+  assert.ok(pushes.length >= 1, 'an overloaded frame rate lowers the budget');
+  assert.ok(pushes.length <= 4, `expected a handful of budget changes, got ${pushes.length}`);
+  assert.ok(budget < 100000);
+  assert.ok(pushes.every((n) => n % SPLAT_BUDGET_STEP === 0));
+});
+
+test('P0.14: the splat renderer rebuilds only when the drawn count changes, and frees the old material', () => {
+  const renderer = new GaussianSplatRenderer();
+  renderer.setCloud(generateSyntheticScoutSplatCloud('Budget', 300));
+  const meshOf = () => renderer.group.children.find((c) => (c as THREE.InstancedMesh).isInstancedMesh) as THREE.InstancedMesh;
+  const first = meshOf();
+  assert.ok(first);
+  let disposed = false;
+  (first.material as THREE.Material).addEventListener('dispose', () => {
+    disposed = true;
+  });
+  // three frees an InstancedMesh's instanceMatrix GPU buffer only on its 'dispose' event.
+  let meshDisposed = false;
+  first.addEventListener('dispose', () => {
+    meshDisposed = true;
+  });
+  // Budgets above the cloud size draw the same 300 splats: no rebuild.
+  renderer.setSplatBudget(5000);
+  renderer.setSplatBudget(250000);
+  assert.equal(meshOf(), first);
+  assert.equal(disposed, false);
+  // Below the cloud size the drawn count changes: rebuild, and the old material is released.
+  renderer.setSplatBudget(150);
+  const second = meshOf();
+  assert.notEqual(second, first);
+  assert.equal(second.count, 150);
+  assert.equal(disposed, true);
+  assert.equal(meshDisposed, true, 'the old InstancedMesh is disposed on rebuild');
+  let lastDisposed = false;
+  second.addEventListener('dispose', () => {
+    lastDisposed = true;
+  });
+  renderer.dispose();
+  assert.equal(lastDisposed, true, 'dispose() releases the current InstancedMesh');
+});
+
+// --- P0 studios ---
+
+/** In-memory Web Storage stand-in for the per-device key helpers. */
+function p0MemStore(init: Record<string, string> = {}): KeyValueStore & { map: Map<string, string> } {
+  const map = new Map(Object.entries(init));
+  return {
+    map,
+    getItem: (k) => map.get(k) ?? null,
+    setItem: (k, v) => {
+      map.set(k, String(v));
+    },
+    removeItem: (k) => {
+      map.delete(k);
+    },
+  };
+}
+
+/** A stored scene as an older build wrote it: Gemini key inside setDressing.aiConfig. */
+function p0SceneJsonWithKey(name: string, key: string): string {
+  const raw = JSON.parse(JSON.stringify(createScene(name)));
+  raw.setDressing.aiConfig.apiKey = key;
+  return JSON.stringify(raw);
+}
+
+test('P0.15 Gemini key: normalizeScene drops an embedded apiKey, so the export JSON never carries it', () => {
+  const stored = JSON.parse(p0SceneJsonWithKey('keyed', 'AIzaSy-LEAK-1'));
+  stored.setDressing.aiConfig.model = 'gemini-2.5-pro';
+  assert.ok(isSceneData(stored), 'a scene with an embedded key still loads');
+  // persistence.loadScene/exportScene path: normalizeScene, then JSON.stringify.
+  const exported = JSON.stringify(normalizeScene(stored), null, 2);
+  assert.ok(!exported.includes('apiKey'));
+  assert.ok(!exported.includes('AIzaSy-LEAK-1'));
+  // The rest of the AI config survives.
+  assert.equal(JSON.parse(exported).setDressing.aiConfig.model, 'gemini-2.5-pro');
+  // New scenes and default configs have no key field at all.
+  assert.ok(!JSON.stringify(createScene('fresh')).includes('apiKey'));
+  assert.ok(!('apiKey' in createDefaultAiConfig({ apiKey: 'x' } as unknown as Parameters<typeof createDefaultAiConfig>[0])));
+});
+
+test('P0.15 Gemini key: set_dressing_update patches carry no key, sent or received', () => {
+  const leaky = JSON.parse(p0SceneJsonWithKey('patch', 'AIzaSy-LEAK-2')).setDressing;
+  // Sender: main.ts broadcasts normalizeSetDressingConfig(config).
+  const sent = { type: 'set_dressing_update' as const, config: normalizeSetDressingConfig(leaky) };
+  assert.ok(!JSON.stringify(sent).includes('apiKey'));
+  // Receiver: even a patch from an older peer that still embeds a key is stripped.
+  const scene = createScene('receiver');
+  assert.equal(applyScenePatch(scene, { type: 'set_dressing_update', config: leaky }), true);
+  assert.ok(!JSON.stringify(scene).includes('apiKey'));
+  assert.ok(!JSON.stringify(scene).includes('AIzaSy-LEAK-2'));
+});
+
+test('P0.15 Gemini key: per-device read/write trims, clears on empty, and survives refusing storage', () => {
+  const store = p0MemStore();
+  assert.equal(readDeviceGeminiKey(store), '');
+  assert.equal(writeDeviceGeminiKey(store, '  AIzaSy-DEVICE  '), true);
+  assert.equal(store.map.get(GEMINI_KEY_STORAGE_KEY), 'AIzaSy-DEVICE');
+  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-DEVICE');
+  assert.equal(writeDeviceGeminiKey(store, '   '), true);
+  assert.equal(store.map.has(GEMINI_KEY_STORAGE_KEY), false);
+  // No storage at all (blocked accessor) and storage that throws on every call.
+  assert.equal(readDeviceGeminiKey(null), '');
+  assert.equal(writeDeviceGeminiKey(null, 'k'), false);
+  const throwing: KeyValueStore = {
+    getItem: () => {
+      throw new Error('SecurityError');
+    },
+    setItem: () => {
+      throw new Error('QuotaExceededError');
+    },
+    removeItem: () => {
+      throw new Error('SecurityError');
+    },
+  };
+  assert.equal(readDeviceGeminiKey(throwing), '');
+  assert.equal(writeDeviceGeminiKey(throwing, 'k'), false);
+});
+
+test('P0.15 Gemini key: embeddedGeminiKey reads only a real string key from raw scene JSON', () => {
+  assert.equal(embeddedGeminiKey(p0SceneJsonWithKey('a', ' AIzaSy-RAW ')), 'AIzaSy-RAW');
+  assert.equal(embeddedGeminiKey(JSON.stringify(createScene('none'))), '');
+  assert.equal(embeddedGeminiKey('{"setDressing":{"aiConfig":{"apiKey":42}}}'), '');
+  assert.equal(embeddedGeminiKey('{not json'), '');
+  assert.equal(embeddedGeminiKey('null'), '');
+  assert.equal(embeddedGeminiKey(null), '');
+});
+
+test('P0.15 Gemini key: one device key, shared with AI Shot Analysis', () => {
+  // The name AI Shot Analysis already stored its key under: one key per device,
+  // and a device that set it there needs no re-entry in Set Dressing.
+  assert.equal(GEMINI_KEY_STORAGE_KEY, 'setview_gemini_api_key');
+  const store = p0MemStore({ setview_gemini_api_key: 'AIzaSy-SHOTS' });
+  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-SHOTS');
+});
+
+test('P0.15 Gemini key: migration moves the first embedded key once and strips every stored scene', () => {
+  const p0Scene = (name: string, key?: string, updatedAt = 1000): string => {
+    const raw = JSON.parse(key === undefined ? JSON.stringify(createScene(name)) : p0SceneJsonWithKey(name, key));
+    raw.updatedAt = updatedAt;
+    return JSON.stringify(raw);
+  };
+  const keys = ['s.none', 's.first', 's.second', 's.emptyField'];
+  const store = p0MemStore({
+    's.none': p0Scene('no key', undefined, 4000),
+    's.first': p0Scene('newest keyed', 'AIzaSy-FIRST', 3000),
+    's.second': p0Scene('older keyed', 'AIzaSy-SECOND', 2000),
+    's.emptyField': p0Scene('old default', '', 1000), // older builds wrote apiKey: ''
+  });
+  const before = new Map(keys.map((k) => [k, store.map.get(k)!]));
+  assert.equal(migrateEmbeddedGeminiKey(store, keys), true);
+  assert.equal(readDeviceGeminiKey(store), 'AIzaSy-FIRST', 'the most recent scene\'s key wins');
+  assert.equal(store.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
+  for (const k of keys) {
+    const raw = store.map.get(k)!;
+    assert.ok(!raw.includes('apiKey'), `${k} no longer holds the key field`);
+    // Everything else is kept, updatedAt included, so the scene list order holds.
+    const was = JSON.parse(before.get(k)!);
+    delete was.setDressing.aiConfig.apiKey;
+    assert.deepEqual(JSON.parse(raw), was);
+  }
+  assert.equal(store.map.get('s.none'), before.get('s.none'), 'a scene without the field is not rewritten');
+
+  // Once per device: a second run does nothing, even with a new keyed scene.
+  store.map.set('s.later', p0Scene('later', 'AIzaSy-LATER'));
+  writeDeviceGeminiKey(store, '');
+  assert.equal(migrateEmbeddedGeminiKey(store, ['s.later']), false);
+  assert.equal(readDeviceGeminiKey(store), '');
+  assert.ok(store.map.get('s.later')!.includes('AIzaSy-LATER'));
+
+  // A key the device already has is never replaced, and the scenes are still stripped.
+  const existing = p0MemStore({ [GEMINI_KEY_STORAGE_KEY]: 'AIzaSy-MINE', 's.x': p0Scene('x', 'AIzaSy-OTHER') });
+  assert.equal(migrateEmbeddedGeminiKey(existing, ['s.x']), false);
+  assert.equal(readDeviceGeminiKey(existing), 'AIzaSy-MINE');
+  assert.ok(!existing.map.get('s.x')!.includes('AIzaSy-OTHER'));
+  assert.equal(existing.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
+
+  // Nothing to move: flag set, no key written, malformed and missing scenes left alone.
+  const empty = p0MemStore({ 's.bad': '{bad "apiKey"', 's.plain': p0Scene('k') });
+  assert.equal(migrateEmbeddedGeminiKey(empty, ['s.missing', 's.bad', 's.plain']), false);
+  assert.equal(empty.map.has(GEMINI_KEY_STORAGE_KEY), false);
+  assert.equal(empty.map.get('s.bad'), '{bad "apiKey"');
+  assert.equal(empty.map.get(GEMINI_KEY_MIGRATED_FLAG), '1');
+});
+
+test('P0.15 Gemini key: a move that storage refuses keeps the scene key and retries next boot', () => {
+  const base = p0MemStore({ 's.k': p0SceneJsonWithKey('k', 'AIzaSy-ONLY') });
+  const refusing: KeyValueStore = {
+    getItem: (k) => base.getItem(k),
+    setItem: (k, v) => {
+      if (k === GEMINI_KEY_STORAGE_KEY) throw new Error('QuotaExceededError');
+      base.setItem(k, v);
+    },
+    removeItem: (k) => base.removeItem(k),
+  };
+  assert.equal(migrateEmbeddedGeminiKey(refusing, ['s.k']), false);
+  assert.ok(base.map.get('s.k')!.includes('AIzaSy-ONLY'), 'the only copy of the key is not stripped');
+  assert.equal(base.map.has(GEMINI_KEY_MIGRATED_FLAG), false, 'flag left unset so the next boot retries');
+  // Next boot, storage has room again.
+  assert.equal(migrateEmbeddedGeminiKey(base, ['s.k']), true);
+  assert.equal(readDeviceGeminiKey(base), 'AIzaSy-ONLY');
+  assert.ok(!base.map.get('s.k')!.includes('apiKey'));
+
+  // No storage, or storage that throws on read: no throw, nothing moved.
+  assert.equal(migrateEmbeddedGeminiKey(null, ['s.k']), false);
+  const reader: KeyValueStore = {
+    getItem: () => {
+      throw new Error('SecurityError');
+    },
+    setItem: () => {},
+    removeItem: () => {},
+  };
+  assert.equal(migrateEmbeddedGeminiKey(reader, ['s.k']), false);
+});
+
+test('P0.15 Set Dressing: an applied AI scatter survives the modal Save (no stale overwrite)', () => {
+  const scene = normalizeScene(createScene('ai scatter'));
+  // The modal's staged working copy, with one unsaved tweak made before the AI ran.
+  const staged = normalizeSetDressingConfig(scene.setDressing);
+  staged.scatterConfig.seed = 987654;
+  staged.aiConfig.model = 'gemini-2.5-pro';
+  assert.equal(staged.settledItems.length, 0);
+
+  const mutations = parseDeterministicNlCommand('scatter cyberpunk alley props', scene);
+  assert.ok(mutations.some((m) => m.action === 'scatter_theme'));
+  applyAiMutationsToScene(scene, mutations);
+  const aiItems = scene.setDressing!.settledItems;
+  assert.ok(aiItems.length > 0, 'AI scatter placed items');
+
+  carryAiScatterIntoConfig(staged, scene.setDressing!);
+  // Save writes the staged copy over the scene, as onSaveConfig does.
+  scene.setDressing = staged;
+  assert.equal(scene.setDressing.activeTheme, 'cyberpunk_alley');
+  assert.deepEqual(
+    scene.setDressing.settledItems.map((i) => i.id),
+    aiItems.map((i) => i.id),
+  );
+  // Staged edits unrelated to the scatter are kept.
+  assert.equal(scene.setDressing.scatterConfig.seed, 987654);
+  assert.equal(scene.setDressing.aiConfig.model, 'gemini-2.5-pro');
+  // The copy is independent of the scene's arrays, and carrying onto itself is a no-op.
+  assert.notEqual(staged.settledItems, aiItems);
+  carryAiScatterIntoConfig(staged, staged);
+  assert.equal(staged.settledItems.length, aiItems.length);
+});
+
+test('P0.13 Splat studio save as one undo step: History restores the previous cloud count', () => {
+  // main.ts now commits the studio with markDirty (history.record) instead of
+  // loadScene (history.reset). This pins the contract that path relies on.
+  const scene = normalizeScene(createScene('splat undo'));
+  const h = new History();
+  h.reset(scene);
+  createActor(scene, { x: 1, y: 0, z: 0 }, 0); // an earlier edit (adds itself to the scene)
+  h.record(scene);
+  scene.gaussianClouds = [generateSyntheticScoutSplatCloud('scout', 200)];
+  scene.activeSplatCloudId = scene.gaussianClouds[0].id;
+  h.record(scene);
+  const undone = h.undo()!;
+  assert.equal(undone.gaussianClouds?.length ?? 0, 0, 'undo removes the imported cloud');
+  assert.equal(undone.actors.length, 1, 'the edit before the import is still there');
+  assert.ok(h.canUndo, 'earlier history survives the studio save');
+});
+
+// --- P0 props-build ---
+
+test('P0.2: a prop with a customModelKey is an IndexedDB model (create, normalize, migrate)', () => {
+  // createPropData infers the loader from the key (the Prop Library used to pass only the key).
+  const created = createPropData('custom-asset-abc', 'Upload', { x: 0, y: 0, z: 0 }, { customModelKey: 'custom-asset-abc' });
+  assert.equal(created.sourceType, 'indexeddb');
+  assert.equal(created.customModelKey, 'custom-asset-abc');
+  assert.equal(createPropData('directors_chair').sourceType, 'builtin', 'no key: catalog prop stays builtin');
+  assert.equal(
+    createPropData('x', undefined, undefined, { customModelKey: 'k', sourceType: 'builtin' }).sourceType,
+    'indexeddb',
+    'an explicit builtin with a key is the old bug, not a choice',
+  );
+
+  // Saved scenes from before the fix are repaired on load.
+  const migrated = normalizePropData({
+    id: 'p1',
+    assetId: 'custom-asset-abc',
+    name: 'Old upload',
+    position: { x: 1, y: 0, z: 2 },
+    rotationY: 0,
+    sourceType: 'builtin',
+    customModelKey: 'custom-asset-abc',
+  });
+  assert.equal(migrated?.sourceType, 'indexeddb');
+  assert.equal(normalizePropData({ id: 'p2', assetId: 'a', customModelKey: 'k' })?.sourceType, 'indexeddb');
+  assert.equal(normalizePropData({ id: 'p3', assetId: 'apple_box_full' })?.sourceType, 'builtin');
+  assert.equal(normalizePropData({ id: 'p4', assetId: 'apple_box_full', sourceType: 'bogus' })?.sourceType, 'builtin');
+
+  // Through the scene normalizer, which is what a load or import runs.
+  const scene = createScene('P0.2 migrate');
+  (scene as unknown as { props: unknown[] }).props = [
+    { id: 'p5', assetId: 'custom-asset-x', name: 'U', position: { x: 0, y: 0, z: 0 }, rotationY: 0, sourceType: 'builtin', customModelKey: 'custom-asset-x' },
+  ];
+  assert.equal(normalizeScene(scene).props?.[0].sourceType, 'indexeddb');
+
+  // The resolver itself: other explicit loaders are kept, empty keys ignored.
+  assert.equal(resolvePropSourceType('procedural', 'k'), 'procedural');
+  assert.equal(resolvePropSourceType('custom_url', 'k'), 'custom_url');
+  assert.equal(resolvePropSourceType(undefined, ''), 'builtin');
+  assert.equal(resolvePropSourceType(undefined, undefined, 'procedural'), 'procedural');
+});
+
+test('P0.3: every Props sub-wheel preset spawns its own catalog prop', () => {
+  const ring = wheelMenu({ ...WHEEL_BASE, mode: 'block' }, 'props');
+  const presetIds = ring.sectors.map((s) => s.id).filter((id) => id.startsWith('prop-') && id !== 'prop-library');
+  assert.equal(presetIds.length, 7);
+  const assets = presetIds.map((id) => {
+    const assetId = wheelPropPreset(id);
+    assert.ok(assetId, `${id} has no preset`);
+    assert.ok(getBuiltinPropDefinition(assetId), `${id} -> ${assetId} is not a catalog prop`);
+    return assetId;
+  });
+  assert.equal(new Set(assets).size, assets.length, 'presets must not collapse onto one prop');
+  assert.deepEqual(Object.keys(WHEEL_PROP_PRESETS).sort(), [...presetIds].sort(), 'no preset without a sector');
+  assert.equal(wheelPropPreset('prop-chair'), 'directors_chair');
+  assert.equal(wheelPropPreset('prop-library'), null, 'the library opens a modal, not a preset');
+  assert.equal(wheelPropPreset('constructor'), null, 'own keys only');
+});
+
+/** Every ring a user can actually reach from the root, in each state that changes the rings. */
+function reachableWheelMenus(): { where: string; menu: ReturnType<typeof wheelMenu> }[] {
+  const out: { where: string; menu: ReturnType<typeof wheelMenu> }[] = [];
+  for (const mode of ['block', 'dress'] as const) {
+    for (const placeMode of ['none', 'actor', 'camera', 'prop'] as const) {
+      for (const hasScan of [true, false]) {
+        const ctx: WheelContext = { ...WHEEL_BASE, mode, placeMode, hasScan };
+        const seen = new Set<WheelPath>();
+        const queue: WheelPath[] = ['root'];
+        while (queue.length) {
+          const path = queue.shift()!;
+          if (seen.has(path)) continue;
+          seen.add(path);
+          const menu = wheelMenu(ctx, path);
+          out.push({ where: `${mode}/${placeMode}/${hasScan ? 'scan' : 'noscan'}/${path}`, menu });
+          for (const s of menu.sectors) if (s.submenu) queue.push(s.submenu);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+test('P0.11: every reachable sector has a handler; submenu openers resolve via SUBMENU_IDS', () => {
+  const reachableIds = new Set<string>();
+  for (const { where, menu } of reachableWheelMenus()) {
+    for (const s of [...menu.sectors, menu.hub]) {
+      reachableIds.add(s.id);
+      const route = wheelSectorRoute(s.id);
+      assert.ok(route, `${where}: "${s.id}" has no handler`);
+      if ('submenu' in s && s.submenu) {
+        assert.equal(SUBMENU_IDS[s.id], s.submenu, `${where}: ${s.id} not in SUBMENU_IDS`);
+        assert.equal(submenuForSector(s.id), s.submenu);
+        assert.equal(route, 'nav');
+      }
+      if (route === 'nav') assert.ok(s.id === 'wheel-back' || submenuForSector(s.id), `${where}: nav ${s.id}`);
+      if (route === 'prop') assert.ok(wheelPropPreset(s.id), `${where}: prop ${s.id}`);
+      assert.ok(!/^light-|^sub-light$|^wheel-more$/.test(s.id), `${where}: dead sector ${s.id} is reachable`);
+    }
+  }
+  // The table has no stale rows: every entry is a sector some ring can show.
+  for (const id of Object.keys(WHEEL_SECTOR_HANDLERS)) assert.ok(reachableIds.has(id), `unreachable handler row ${id}`);
+  for (const id of Object.keys(SUBMENU_IDS)) assert.ok(reachableIds.has(id), `unreachable submenu opener ${id}`);
+  assert.ok(reachableIds.has('sub-stance'), 'Stance sub-wheel is reachable');
+  assert.equal(wheelSectorRoute('toString'), null, 'own keys only');
+
+  // Re-align now lives on the Block root (it used to exist only on the wrist).
+  const blockRoot = wheelMenu({ ...WHEEL_BASE, mode: 'block' }, 'root');
+  assert.ok(blockRoot.sectors.some((s) => s.id === 'resetview'));
+  assert.ok(!blockRoot.sectors.some((s) => s.id === 'sub-light'));
+
+  // main.ts must actually handle every id it is routed: a case label inside
+  // onWheelPress's own switch ('wheel') or inside onWristPress ('wrist'), not
+  // just somewhere in the file (a smartwatch or radial switch would not run).
+  const mainSrc = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const bodies = { wheel: mainMethodBody(mainSrc, 'onWheelPress'), wrist: mainMethodBody(mainSrc, 'onWristPress') };
+  for (const [id, route] of Object.entries(WHEEL_SECTOR_HANDLERS)) {
+    if (route === 'wheel' || route === 'wrist') {
+      assert.ok(bodies[route].includes(`case '${id}':`), `main.ts ${route} switch has no case for "${id}"`);
+    }
+  }
+});
+
+/**
+ * The source of one App method in main.ts: from `  private <name>(` to its
+ * closing brace (class members sit at two spaces, method bodies deeper, so the
+ * first line that is exactly "  }" closes it).
+ */
+function mainMethodBody(src: string, name: string): string {
+  const start = src.indexOf(`\n  private ${name}(`);
+  assert.ok(start >= 0, `main.ts has no method ${name}`);
+  const end = src.indexOf('\n  }\n', start);
+  assert.ok(end > start, `main.ts ${name} has no closing brace`);
+  return src.slice(start, end);
+}
+
+test('P0.11: every action the headset radial can show has a handler (no "executed" no-ops)', () => {
+  const mainSrc = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const body = mainMethodBody(mainSrc, 'handleContextQuickAction');
+  // The entity types main.ts actually opens the radial for.
+  const shown = [...new Set([...mainSrc.matchAll(/contextualRadial\.show\(\s*'([a-z_]+)'/g)].map((m) => m[1]))].sort();
+  assert.deepEqual(shown, ['actor', 'camera', 'prop']);
+  for (const type of shown) {
+    const actions = generateEntityContextActions(type as 'actor' | 'camera' | 'prop', `${type}-1`);
+    assert.ok(actions.length >= 4, `${type}: ${actions.length} actions`);
+    for (const a of actions) {
+      assert.ok(body.includes(`case '${a.actionType}':`), `${type} radial "${a.label}" (${a.actionType}) has no handler`);
+    }
+  }
+  assert.ok(!/Quick action executed/.test(body), 'the fallback must not claim an action ran');
+});
+
+test('P0.3: a spawn uses the pointed hit only when it is a surface within reach', () => {
+  const eye = { x: 0, y: 1.6, z: 0 };
+  assert.equal(propSpawnHitUsable({ x: 0, y: 0, z: -1.5 }, eye), true, 'floor in front');
+  assert.equal(propSpawnHitUsable({ x: 0.3, y: 0.75, z: -1 }, eye), true, 'table top');
+  // Ray through the parked wheel: a wall at chest height, a floor far away.
+  assert.equal(propSpawnHitUsable({ x: 0, y: 1.4, z: -2.5 }, eye), false, 'wall at chest height');
+  assert.equal(propSpawnHitUsable({ x: 0, y: 0, z: -6 }, eye), false, 'floor 6 m away');
+  // Boundaries are inclusive.
+  assert.equal(propSpawnHitUsable({ x: PROP_SPAWN_HIT_MAX_M, y: 0, z: 0 }, eye), true);
+  assert.equal(propSpawnHitUsable({ x: PROP_SPAWN_HIT_MAX_M + 0.01, y: 0, z: 0 }, eye), false);
+  assert.equal(propSpawnHitUsable({ x: 0, y: eye.y - PROP_SPAWN_HIT_BELOW_EYE_M, z: -1 }, eye), true);
+  assert.equal(propSpawnHitUsable({ x: 0, y: eye.y - PROP_SPAWN_HIT_BELOW_EYE_M + 0.01, z: -1 }, eye), false);
+});
+
+test('P0.11: the Place cycle never arms Light, and the guide chips follow it', () => {
+  let m: 'none' | 'actor' | 'camera' | 'light' | 'prop' = 'none';
+  const visited: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    m = nextPlaceMode(m);
+    visited.push(m);
+  }
+  assert.deepEqual(visited, ['actor', 'camera', 'prop', 'none']);
+  const camX = guideItems({ mode: 'full', placeMode: 'camera', eyesMode: false, interaction: 'block' }).find(
+    (i) => i.hand === 'left' && i.anchor === 'lower',
+  );
+  assert.ok(camX && /prop/i.test(camX.label) && !/light/i.test(camX.label), `X chip: ${camX?.label}`);
+  const propTrig = guideItems({ mode: 'full', placeMode: 'prop', eyesMode: false, interaction: 'block' }).find(
+    (i) => i.anchor === 'trigger',
+  );
+  assert.ok(propTrig && /prop/i.test(propTrig.label), `trigger chip: ${propTrig?.label}`);
+});
+
+test('P0.12: any carry or non-Full view suppresses glide', () => {
+  const idle: LocomotionState = {
+    viewMode: 'full',
+    draggingActor: false,
+    draggingCamera: false,
+    draggingProp: false,
+    draggingFurniture: false,
+    miniGrabbing: false,
+  };
+  assert.equal(locomotionSuppressed(idle), false, 'free to glide');
+  for (const k of ['draggingActor', 'draggingCamera', 'draggingProp', 'draggingFurniture', 'miniGrabbing'] as const) {
+    assert.equal(locomotionSuppressed({ ...idle, [k]: true }), true, k);
+  }
+  assert.equal(locomotionSuppressed({ ...idle, viewMode: 'mini' }), true);
+  assert.equal(locomotionSuppressed({ ...idle, viewMode: 'camera' }), true);
+});
+
+test('P0.12: a released prop settles on the surface under it, else the floor', () => {
+  const carried = { x: 1, y: 1.2, z: -2 };
+  assert.equal(settlePropY(carried, null), 0, 'no hit: floor');
+  // A table top straight under the prop: rest on it.
+  assert.equal(settlePropY(carried, { x: 1.1, y: 0.74, z: -2.05 }), 0.74);
+  // The ray ended on a far wall or floor: not under the prop, so the floor.
+  assert.equal(settlePropY(carried, { x: 4, y: 1.5, z: -6 }), 0);
+  assert.equal(settlePropY(carried, { x: 1.5, y: 0.74, z: -2 }), 0, '0.5 m away is not under it');
+  // Radius boundary is inclusive.
+  assert.equal(settlePropY(carried, { x: 1 + PROP_SETTLE_RADIUS_M, y: 0.5, z: -2 }), 0.5);
+  assert.equal(settlePropY(carried, { x: 1 + PROP_SETTLE_RADIUS_M + 0.01, y: 0.5, z: -2 }), 0);
+  // Never jumps up onto something well above its base; a little (tracking noise) is fine.
+  const low = { x: 0, y: 0.5, z: 0 };
+  assert.equal(settlePropY(low, { x: 0, y: 0.5 + PROP_SETTLE_ABOVE_M, z: 0 }), 0.5 + PROP_SETTLE_ABOVE_M);
+  assert.equal(settlePropY(low, { x: 0, y: 0.75, z: 0 }), 0, 'surface above the base: floor instead');
+});
+
+test('P0.11: Snap to Grid moves a prop to the nearest grid point on the floor plane only', () => {
+  const p = createPropData('apple_box_full', 'Box', { x: 1.234, y: 0.5, z: -0.36 }, { rotationY: 0.7 });
+  const snapped = snapPropToGrid(p);
+  assert.equal(PROP_GRID_STEP_M, 0.1);
+  approx(snapped.position.x, 1.2, 1e-9);
+  approx(snapped.position.z, -0.4, 1e-9);
+  assert.equal(snapped.position.y, 0.5, 'height untouched');
+  assert.equal(snapped.rotationY, 0.7, 'heading untouched');
+  assert.equal(p.position.x, 1.234, 'input not mutated');
+  const coarse = snapPropToGrid(p, 0.5);
+  approx(coarse.position.x, 1.0, 1e-9);
+  approx(coarse.position.z, -0.5, 1e-9);
+});
+
+// Runtime checks of the prop loader and PropsManager with real three.js objects.
+// propRenderer / propsManager import ui.ts (canvas labels), so they need a
+// document stub, installed only for this block; GLTFLoader also reads `self`.
+async function testAsyncPropsBuild(name: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    console.error(`  ✗ ${name}`);
+    throw e;
+  }
+}
+
+/** A minimal binary glTF: `json` without `buffers`, plus one BIN chunk. */
+function p0MakeGlb(json: Record<string, unknown>, bin: Uint8Array): ArrayBuffer {
+  const binPad = new Uint8Array(Math.ceil(bin.length / 4) * 4);
+  binPad.set(bin);
+  const full = { asset: { version: '2.0' }, ...json, buffers: [{ byteLength: binPad.length }] };
+  const raw = new TextEncoder().encode(JSON.stringify(full));
+  const jb = new Uint8Array(Math.ceil(raw.length / 4) * 4).fill(0x20);
+  jb.set(raw);
+  const total = 12 + 8 + jb.length + 8 + binPad.length;
+  const out = new ArrayBuffer(total);
+  const dv = new DataView(out);
+  dv.setUint32(0, 0x46546c67, true); // 'glTF'
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, total, true);
+  dv.setUint32(12, jb.length, true);
+  dv.setUint32(16, 0x4e4f534a, true); // JSON
+  new Uint8Array(out, 20, jb.length).set(jb);
+  dv.setUint32(20 + jb.length, binPad.length, true);
+  dv.setUint32(24 + jb.length, 0x004e4942, true); // BIN
+  new Uint8Array(out, 28 + jb.length, binPad.length).set(binPad);
+  return out;
+}
+
+{
+  const g = globalThis as unknown as Record<string, unknown>;
+  const hadDocument = 'document' in g;
+  const hadSelf = 'self' in g;
+  const noop: unknown = new Proxy(function () {}, {
+    get: (_t, k) => (k === 'measureText' ? () => ({ width: 10 }) : noop),
+    apply: () => noop,
+    set: () => true,
+  });
+  if (!hadDocument) g.document = { createElement: () => ({ width: 0, height: 0, getContext: () => noop, style: {} }) };
+  if (!hadSelf) g.self = globalThis;
+
+  const { globalPropStore } = await import('../src/propStore.ts');
+  const { globalPropRenderer } = await import('../src/propRenderer.ts');
+  const { PropsManager } = await import('../src/propsManager.ts');
+
+  // One triangle, base at y = 2 (normalization grounds it), 1 m tall.
+  const tri = new Uint8Array(new Float32Array([0, 2, 0, 1, 2, 0, 0, 3, 0]).buffer);
+  const triAccessor = { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 2, 0], max: [1, 3, 0] };
+  // A metallic red PBR material and a punctual light whose node also holds a child mesh.
+  const litGlb = p0MakeGlb(
+    {
+      extensionsUsed: ['KHR_lights_punctual'],
+      extensions: { KHR_lights_punctual: { lights: [{ type: 'point', intensity: 5 }] } },
+      scene: 0,
+      scenes: [{ nodes: [0, 1] }],
+      nodes: [{ mesh: 0 }, { extensions: { KHR_lights_punctual: { light: 0 } }, children: [2] }, { mesh: 0, translation: [2, 0, 0] }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }] }],
+      materials: [{ pbrMetallicRoughness: { baseColorFactor: [1, 0, 0, 1], metallicFactor: 1 } }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: tri.length }],
+      accessors: [triAccessor],
+    },
+    tri,
+  );
+  // Declares an embedded (bufferView) base-colour image. Node cannot decode
+  // images, so it fails the way a refused blob: fetch would on a headset.
+  const texBin = new Uint8Array(tri.length + 8);
+  texBin.set(tri);
+  const texturedGlb = p0MakeGlb(
+    {
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ mesh: 0 }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }] }],
+      materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }],
+      textures: [{ source: 0 }],
+      images: [{ bufferView: 1, mimeType: 'image/png' }],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: tri.length },
+        { buffer: 0, byteOffset: tri.length, byteLength: 8 },
+      ],
+      accessors: [triAccessor],
+    },
+    texBin,
+  );
+  const put = (id: string, fileType: string, buffer: ArrayBuffer) =>
+    globalPropStore.putAsset({
+      id,
+      name: id,
+      fileName: `${id}.${fileType}`,
+      fileType: fileType as 'glb',
+      category: 'custom',
+      dimensions: { width: 1, height: 1, depth: 1 },
+      sizeBytes: buffer.byteLength,
+      uploadedAt: 0,
+      buffer,
+    });
+  const quietStore = globalPropStore.onError;
+  globalPropStore.onError = () => {};
+  await put('p0-lit', 'glb', litGlb);
+  await put('p0-textured', 'glb', texturedGlb);
+  await put('p0-obj', 'obj', new TextEncoder().encode('v 0 1 0\nv 1 1 0\nv 0 2 0\nf 1 2 3\n').buffer as ArrayBuffer);
+  await put('p0-usdz', 'usdz', new ArrayBuffer(8));
+  await put('p0-broken', 'glb', new TextEncoder().encode('not a model').buffer as ArrayBuffer);
+  globalPropStore.onError = quietStore;
+
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  globalPropRenderer.onLoadError = (key, err) => errors.push(`${key}: ${(err as Error).message}`);
+  globalPropRenderer.onLoadWarning = (key, message) => warnings.push(`${key}: ${message}`);
+  const uploaded = (key: string) => createPropData(key, key, { x: 0, y: 0, z: 0 }, { customModelKey: key, sourceType: 'builtin' });
+  const meshesOf = (o: THREE.Object3D) => {
+    const out: THREE.Mesh[] = [];
+    o.traverse((c) => {
+      if ((c as THREE.Mesh).isMesh) out.push(c as THREE.Mesh);
+    });
+    return out;
+  };
+  const isPlaceholderBox = (o: THREE.Object3D) => meshesOf(o).some((m) => m.geometry.type === 'BoxGeometry');
+
+  await testAsyncPropsBuild('P0.2: an uploaded GLB renders as its model: grounded, flat Lambert, no lights of its own', async () => {
+    const g = await globalPropRenderer.createPropMesh(uploaded('p0-lit'));
+    assert.ok(!isPlaceholderBox(g), 'the model, not the placeholder box');
+    const meshes = meshesOf(g);
+    assert.equal(meshes.length, 2, 'the mesh under the light node survives');
+    let lights = 0;
+    g.traverse((o) => {
+      if ((o as THREE.Light).isLight) lights++;
+    });
+    assert.equal(lights, 0, 'KHR_lights_punctual lights are stripped');
+    for (const m of meshes) {
+      const mat = m.material as THREE.MeshLambertMaterial;
+      assert.equal(mat.type, 'MeshLambertMaterial');
+      approx(mat.color.r, 1, 1e-6);
+      approx(mat.color.g, 0, 1e-6);
+    }
+    g.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(g);
+    approx(box.min.y, 0, 1e-6);
+    approx(box.max.y, 1, 1e-6);
+    approx(box.max.x - box.min.x, 3, 1e-6);
+  });
+
+  await testAsyncPropsBuild('P0.2: OBJ loads as Lambert; bad, unsupported and missing uploads fall back to a box and report', async () => {
+    errors.length = 0;
+    const obj = await globalPropRenderer.createPropMesh(uploaded('p0-obj'));
+    assert.ok(!isPlaceholderBox(obj));
+    assert.ok(meshesOf(obj).every((m) => (m.material as THREE.Material).type === 'MeshLambertMaterial'));
+    for (const key of ['p0-usdz', 'p0-broken', 'p0-missing']) {
+      assert.ok(isPlaceholderBox(await globalPropRenderer.createPropMesh(uploaded(key))), `${key} shows the box`);
+    }
+    assert.equal(errors.length, 3, errors.join(' | '));
+    assert.match(errors[0], /unsupported model type "usdz"/);
+    assert.match(errors[1], /could not read/);
+    assert.match(errors[2], /not found/);
+  });
+
+  await testAsyncPropsBuild('P0.2: a GLB whose textures all fail shows untextured and says so', async () => {
+    warnings.length = 0;
+    errors.length = 0;
+    const logged: unknown[] = [];
+    const consoleError = console.error;
+    console.error = (...a: unknown[]) => logged.push(a[0]);
+    let g: THREE.Group;
+    try {
+      g = await globalPropRenderer.createPropMesh(uploaded('p0-textured'));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.ok(!isPlaceholderBox(g), 'geometry still shown');
+    assert.equal(errors.length, 0);
+    assert.equal(warnings.length, 1, warnings.join(' | '));
+    assert.match(warnings[0], /textures did not load/);
+    assert.ok(logged.some((m) => /load texture/i.test(String(m))), 'GLTFLoader only console.errors it');
+  });
+
+  await testAsyncPropsBuild('P0.12: prop picking ignores the hidden selection box; late builds and same-scene rebuilds are tracked', async () => {
+    const settle = async (done: () => boolean) => {
+      for (let i = 0; i < 200 && !done(); i++) await new Promise((r) => setTimeout(r, 0));
+      assert.ok(done(), 'builds did not land');
+    };
+    const scene = createScene('P0 props runtime');
+    const mgr = new PropsManager({} as never, scene);
+    let changes = 0;
+    mgr.onObjectsChanged = () => changes++;
+
+    // A ray 0.5 m beside the box misses; one at it hits and walks up to the prop id.
+    const box = await mgr.addProp('apple_box_full', { x: 0, y: 0, z: -2 });
+    assert.ok(box);
+    assert.ok(changes >= 1, 'a landed build reports itself');
+    mgr.setSelected(box.data.id); // the selection box is a LineSegments child of the root
+    mgr.group.updateMatrixWorld(true);
+    const half = new THREE.Box3().setFromObject(box.contentGroup).getSize(new THREE.Vector3()).multiplyScalar(0.5);
+    const rc = new THREE.Raycaster();
+    rc.camera = new THREE.PerspectiveCamera(); // as main.ts sets it (sprite labels)
+    rc.set(new THREE.Vector3(half.x + 0.5, 0.1, 0), new THREE.Vector3(0, 0, -1));
+    assert.equal(rc.intersectObjects(mgr.raycastTargets(), true).length, 0, 'near miss must not pick the prop');
+    rc.set(new THREE.Vector3(0, 0.1, 0), new THREE.Vector3(0, 0, -1));
+    const hits = rc.intersectObjects(mgr.raycastTargets(), true);
+    assert.ok(hits.length > 0, 'direct ray picks the prop');
+    let o: THREE.Object3D | null = hits[0].object;
+    while (o && typeof o.userData.propId !== 'string') o = o.parent;
+    assert.equal(o?.userData.propId, box.data.id);
+
+    // An uploaded model lands after setScene returns; the change hook fires then.
+    const up = await mgr.addProp('p0-lit', { x: 1, y: 0, z: -2 }, { customModelKey: 'p0-lit' });
+    assert.ok(up);
+    mgr.setSelected(up.data.id);
+    mgr.setScene(scene); // same scene: what undo-free remote patches do
+    const afterSync = changes;
+    await settle(() => mgr.all().length === 2);
+    assert.ok(changes > afterSync, 'late build bumps the caches');
+    assert.equal(mgr.getSelected()?.data.id, up.data.id, 'same-scene re-apply keeps the highlight');
+    assert.equal(mgr.group.children.length, 2, 'no ghost roots');
+
+    // A remote patch re-applies the same scene while an add is still loading:
+    // the add follows the rebuild instead of resolving null.
+    const pending = mgr.addProp('p0-lit', { x: 2, y: 0, z: -2 }, { customModelKey: 'p0-lit' });
+    mgr.setScene(scene);
+    const added = await pending;
+    assert.ok(added, 'add survives a same-scene rebuild');
+    await settle(() => mgr.all().length === 3);
+    assert.equal(mgr.get(added.data.id), added);
+    assert.equal(scene.props?.filter((p) => p.id === added.data.id).length, 1);
+    assert.equal(mgr.group.children.length, 3, 'one root per prop');
+
+    // A different scene loaded mid-load: the add is dropped.
+    const dropped = mgr.addProp('apple_box_full', { x: 0, y: 0, z: 0 });
+    mgr.setScene(createScene('Other'));
+    assert.equal(await dropped, null);
+    assert.equal(mgr.all().length, 0);
+    assert.equal(mgr.group.children.length, 0);
+  });
+
+  globalPropRenderer.onLoadError = undefined;
+  globalPropRenderer.onLoadWarning = undefined;
+  if (!hadDocument) delete g.document;
+  if (!hadSelf) delete g.self;
+}
+
+// --- P0 integration props-render ---
+{
+  const g = globalThis as unknown as Record<string, unknown>;
+  const hadDocument = 'document' in g;
+  const hadSelf = 'self' in g;
+  const noop: unknown = new Proxy(function () {}, {
+    get: (_t, k) => (k === 'measureText' ? () => ({ width: 10 }) : noop),
+    apply: () => noop,
+    set: () => true,
+  });
+  if (!hadDocument) g.document = { createElement: () => ({ width: 0, height: 0, getContext: () => noop, style: {} }) };
+  if (!hadSelf) g.self = globalThis;
+
+  const { globalPropStore } = await import('../src/propStore.ts');
+  const { countModelTriangles, disposeModelTree, EXACT_PICK_MAX_TRIANGLES, flattenModelForBudget, globalPropRenderer } =
+    await import('../src/propRenderer.ts');
+  const { PropsManager } = await import('../src/propsManager.ts');
+
+  const disposed = new Set<object>();
+  const watch = <T extends object>(x: T): T => {
+    (x as unknown as THREE.EventDispatcher<{ dispose: object }>).addEventListener('dispose', () => disposed.add(x));
+    return x;
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  const meshesIn = (o: THREE.Object3D) => {
+    const out: THREE.Mesh[] = [];
+    o.traverse((c) => {
+      if ((c as THREE.Mesh).isMesh) out.push(c as THREE.Mesh);
+    });
+    return out;
+  };
+
+  test('P0 integration: disposeModelTree frees every texture slot a flattened upload keeps', () => {
+    const map = watch(new THREE.Texture());
+    const emissiveMap = watch(new THREE.Texture());
+    const alphaMap = watch(new THREE.Texture());
+    const normalMap = watch(new THREE.Texture());
+    const geo = watch(new THREE.BufferGeometry());
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ map, emissiveMap, alphaMap, normalMap })));
+    flattenModelForBudget(root);
+    const lambert = watch((root.children[0] as THREE.Mesh).material as THREE.MeshLambertMaterial);
+    assert.equal(lambert.emissiveMap, emissiveMap, 'the emissive map is kept on the Lambert copy');
+    assert.ok(disposed.has(normalMap) && !disposed.has(emissiveMap), 'flatten frees only what it drops');
+    const label = new THREE.Sprite(watch(new THREE.SpriteMaterial({ map: watch(new THREE.Texture()) })));
+    const labelMap = label.material.map!;
+    watch(label.geometry);
+    root.add(label);
+    disposeModelTree(root);
+    for (const x of [map, emissiveMap, alphaMap, geo, lambert, labelMap, label.material]) assert.ok(disposed.has(x));
+    assert.ok(!disposed.has(label.geometry), "three's shared sprite quad is left alone");
+  });
+
+  test('P0 integration: countModelTriangles counts indexed, plain and instanced meshes only', () => {
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1))); // 12, indexed
+    const plain = new THREE.BufferGeometry();
+    plain.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(9 * 3), 3));
+    root.add(new THREE.Mesh(plain)); // 3
+    root.add(new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial(), 4)); // 48
+    root.add(new THREE.LineSegments(new THREE.BoxGeometry(1, 1, 1)));
+    assert.equal(countModelTriangles(root), 12 + 3 + 48);
+  });
+
+  // `count` copies of one triangle spanning x 0..1, y 0..1 at z = 0, facing +Z.
+  const triangles = (count: number) => {
+    const pos = new Float32Array(count * 9);
+    for (let i = 0; i < count; i++) pos.set([0, 0, 0, 1, 0, 0, 0, 1, 0], i * 9);
+    return p0MakeGlb(
+      {
+        scene: 0,
+        scenes: [{ nodes: [0] }],
+        nodes: [{ mesh: 0 }],
+        meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+        bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: pos.byteLength }],
+        accessors: [{ bufferView: 0, componentType: 5126, count: count * 3, type: 'VEC3', min: [0, 0, 0], max: [1, 1, 0] }],
+      },
+      new Uint8Array(pos.buffer),
+    );
+  };
+  const put = (id: string, buffer: ArrayBuffer) =>
+    globalPropStore.putAsset({
+      id,
+      name: id,
+      fileName: `${id}.glb`,
+      fileType: 'glb',
+      category: 'custom',
+      dimensions: { width: 1, height: 1, depth: 1 },
+      sizeBytes: buffer.byteLength,
+      uploadedAt: 0,
+      buffer,
+    });
+  const quietStore = globalPropStore.onError;
+  globalPropStore.onError = () => {};
+  await put('p0i-small', triangles(1));
+  await put('p0i-heavy', triangles(EXACT_PICK_MAX_TRIANGLES + 1));
+  await put('p0i-del', triangles(1));
+  globalPropStore.onError = quietStore;
+
+  const errors: string[] = [];
+  globalPropRenderer.onLoadError = (key, err) => errors.push(`${key}: ${(err as Error).message}`);
+  const uploaded = (key: string) => createPropData(key, key, { x: 0, y: 0, z: 0 }, { customModelKey: key, sourceType: 'indexeddb' });
+  const isBox = (o: THREE.Object3D) => meshesIn(o).some((m) => m.geometry.type === 'BoxGeometry');
+  const loader = (globalPropRenderer as unknown as { gltfLoader: { parseAsync: (...a: unknown[]) => Promise<unknown> } })
+    .gltfLoader;
+  const parseAsync = loader.parseAsync;
+  let parses = 0;
+  loader.parseAsync = (...a: unknown[]) => {
+    parses++;
+    return parseAsync.apply(loader, a);
+  };
+
+  await testAsyncPropsBuild('P0 integration: copies of an upload share one parse; the last release frees it', async () => {
+    const [a, b] = await Promise.all([
+      globalPropRenderer.createPropMesh(uploaded('p0i-small')),
+      globalPropRenderer.createPropMesh(uploaded('p0i-small')),
+    ]);
+    assert.equal(parses, 1, 'two copies, one parse');
+    const geo = watch(meshesIn(a)[0].geometry);
+    const mat = watch(meshesIn(a)[0].material as THREE.Material);
+    assert.equal(meshesIn(b)[0].geometry, geo, 'resources are shared');
+    assert.notEqual(meshesIn(b)[0], meshesIn(a)[0], 'each prop has its own node');
+    globalPropRenderer.disposeProp(a);
+    await tick();
+    assert.ok(!disposed.has(geo), 'still used by the other copy');
+    // What setScene does: release every prop, then rebuild them in the same task.
+    globalPropRenderer.disposeProp(b);
+    const c = await globalPropRenderer.createPropMesh(uploaded('p0i-small'));
+    await tick();
+    assert.equal(parses, 1, 'a rebuild does not parse again');
+    assert.equal(meshesIn(c)[0].geometry, geo);
+    assert.ok(!disposed.has(geo) && !disposed.has(mat));
+    globalPropRenderer.disposeProp(c);
+    await tick();
+    assert.ok(disposed.has(geo) && disposed.has(mat), 'freed once no prop uses it');
+    const d = await globalPropRenderer.createPropMesh(uploaded('p0i-small'));
+    assert.equal(parses, 2, 'a freed model parses afresh');
+    assert.notEqual(meshesIn(d)[0].geometry, geo);
+    globalPropRenderer.disposeProp(d);
+    await tick();
+  });
+
+  await testAsyncPropsBuild('P0 integration: PropsManager rebuilds reuse the parsed upload and release it on removal', async () => {
+    parses = 0;
+    const scene = createScene('P0 integration props');
+    const mgr = new PropsManager({} as never, scene);
+    const one = await mgr.addProp('p0i-small', { x: 0, y: 0, z: -2 }, { customModelKey: 'p0i-small' });
+    const two = await mgr.addProp('p0i-small', { x: 1, y: 0, z: -2 }, { customModelKey: 'p0i-small' });
+    assert.ok(one && two);
+    assert.equal(parses, 1);
+    const geo = watch(meshesIn(one.contentGroup)[0].geometry);
+    const ring = watch(one.footprintRing!.geometry);
+    mgr.setScene(scene); // undo, redo and remote patches all land here
+    for (let i = 0; i < 50 && mgr.all().length < 2; i++) await tick();
+    assert.equal(mgr.all().length, 2);
+    await tick();
+    assert.equal(parses, 1, 'no re-parse on rebuild');
+    assert.ok(disposed.has(ring), 'per-prop helpers are still freed');
+    assert.ok(!disposed.has(geo), 'the shared model is not');
+    assert.equal(meshesIn(mgr.all()[0].contentGroup)[0].geometry, geo);
+    for (const o of mgr.all()) mgr.removeProp(o.data.id);
+    await tick();
+    assert.ok(disposed.has(geo), 'freed with the last prop');
+  });
+
+  await testAsyncPropsBuild('P0 integration: failures are not cached; a deleted upload is re-checked', async () => {
+    errors.length = 0;
+    assert.ok(isBox(await globalPropRenderer.createPropMesh(uploaded('p0i-late'))));
+    await put('p0i-late', triangles(1));
+    assert.ok(!isBox(await globalPropRenderer.createPropMesh(uploaded('p0i-late'))), 'imported later, then shown');
+    assert.equal(errors.length, 1);
+
+    const live = await globalPropRenderer.createPropMesh(uploaded('p0i-del'));
+    const geo = watch(meshesIn(live)[0].geometry);
+    await globalPropStore.deleteAsset('p0i-del');
+    assert.ok(isBox(await globalPropRenderer.createPropMesh(uploaded('p0i-del'))), 'a deleted upload is not served from cache');
+    assert.match(errors[1], /not found/);
+    await tick();
+    assert.ok(!disposed.has(geo), 'the prop still showing it keeps it');
+    globalPropRenderer.disposeProp(live);
+    await tick();
+    assert.ok(disposed.has(geo));
+  });
+
+  await testAsyncPropsBuild('P0 integration: a heavy upload is picked by its bounds box, not its triangles', async () => {
+    const small = await globalPropRenderer.createPropMesh(uploaded('p0i-small'));
+    assert.ok(!meshesIn(small).some((m) => m.name === 'prop_pick_box'), 'light models keep exact picking');
+    globalPropRenderer.disposeProp(small);
+
+    const mgr = new PropsManager({} as never, createScene('P0 integration pick'));
+    const heavy = await mgr.addProp('p0i-heavy', { x: 0, y: 0, z: -2 }, { customModelKey: 'p0i-heavy' });
+    assert.ok(heavy);
+    const pick = meshesIn(heavy.contentGroup).find((m) => m.name === 'prop_pick_box');
+    assert.ok(pick, 'a pick box is added');
+    assert.equal((pick.material as THREE.Material).visible, false, 'never rendered');
+    const model = meshesIn(heavy.contentGroup).find((m) => m !== pick)!;
+    assert.equal((model.material as THREE.Material).visible, true, 'the model still renders');
+    mgr.group.updateMatrixWorld(true);
+    const rc = new THREE.Raycaster();
+    rc.set(new THREE.Vector3(0, 0.3, 0), new THREE.Vector3(0, 0, -1));
+    const hits = rc.intersectObjects(mgr.raycastTargets(), true);
+    assert.equal(hits.length, 1, 'only the box is tested');
+    assert.equal(hits[0].object, pick);
+    let o: THREE.Object3D | null = hits[0].object;
+    while (o && typeof o.userData.propId !== 'string') o = o.parent;
+    assert.equal(o?.userData.propId, heavy.data.id);
+    rc.set(new THREE.Vector3(2, 0.3, 0), new THREE.Vector3(0, 0, -1));
+    assert.equal(rc.intersectObjects(mgr.raycastTargets(), true).length, 0, 'a ray beside it misses');
+    mgr.clear();
+  });
+
+  loader.parseAsync = parseAsync;
+  globalPropRenderer.onLoadError = undefined;
+  if (!hadDocument) delete g.document;
+  if (!hadSelf) delete g.self;
+}
+
+// --- P0 integration ui-data ---
+// Landing banner cap, the shared autosave timer, and the scan size cache.
+
+async function p0iTestAsync(name: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    console.error(`  ✗ ${name}`);
+    throw e;
+  }
+}
+
+/** Installs a window whose timers run only when the test calls runTimers (sync, like withP0MemoryStorage). */
+function withP0iFakeTimers(fn: (runTimers: () => number) => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const timers = new Map<number, () => void>();
+  let nextId = 1;
+  const fake = {
+    setTimeout: (cb: () => void) => {
+      const id = nextId++;
+      timers.set(id, cb);
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+  };
+  Object.defineProperty(globalThis, 'window', { value: fake, configurable: true, writable: true });
+  try {
+    fn(() => {
+      const due = [...timers.values()];
+      timers.clear();
+      for (const cb of due) cb();
+      return due.length;
+    });
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'window', original);
+    else delete (globalThis as { window?: unknown }).window;
+  }
+}
+
+test('P0 integration: the banner cap drops notices before an error with an Export action', () => {
+  const info = { error: false, action: false };
+  const err = { error: true, action: false };
+  const errExport = { error: true, action: true };
+  const warnAction = { error: false, action: true };
+  // Storage full, the import banner with Export, the persist notice, then prop-load failures.
+  assert.equal(bannerEvictionIndex([err, errExport, info, err, err]), 2);
+  assert.equal(bannerEvictionIndex([err, errExport, err, err, err]), 0, 'oldest of the same rank');
+  assert.equal(bannerEvictionIndex([errExport, warnAction, errExport, warnAction, errExport]), 1);
+  assert.equal(bannerEvictionIndex([errExport, errExport, errExport, errExport, errExport]), 0);
+  assert.equal(bannerEvictionIndex([errExport, errExport, errExport, errExport, info]), 4, 'a newer notice goes first');
+
+  // However many action-less banners arrive, the cap of 4 never drops the Export banner.
+  const shown = [{ key: 'storage-full', ...err }, { key: 'import', ...errExport }, { key: 'persist', ...info }];
+  for (let i = 0; i < 8; i++) {
+    shown.push({ key: `prop-load-${i}`, ...err });
+    while (shown.length > 4) shown.splice(bannerEvictionIndex(shown), 1);
+  }
+  assert.ok(shown.some((b) => b.key === 'import'));
+  assert.equal(shown.length, 4);
+});
+
+test("P0 integration: saving another scene writes the live scene's pending autosave instead of dropping it", () => {
+  withP0MemoryStorage(() => {
+    withP0iFakeTimers((runTimers) => {
+      const p = new Persistence();
+      const live = createScene('Live');
+      const other = createScene('Other');
+      assert.equal(p.saveNow(live), true);
+      assert.equal(p.saveNow(other), true);
+
+      // A prop placed on the live scene (debounced), then another scene's card saves.
+      live.name = 'Live edited';
+      p.markDirty(live);
+      assert.equal(p.loadScene(live.id)?.name, 'Live', 'not written until the timer fires');
+      other.name = 'Other edited';
+      assert.equal(p.updateScene(other), true);
+      assert.equal(p.loadScene(live.id)?.name, 'Live edited');
+      assert.equal(p.loadScene(other.id)?.name, 'Other edited');
+      const names = p.listScenes().map((e) => e.name);
+      assert.ok(names.includes('Live edited') && names.includes('Other edited'));
+      assert.equal(runTimers(), 0, 'the flushed save does not run again');
+
+      // The same scene: the timer is still cancelled, so a stale object cannot win.
+      live.name = 'Before undo';
+      p.markDirty(live);
+      const restored = normalizeScene(JSON.parse(JSON.stringify(live)) as SceneData);
+      restored.name = 'After undo';
+      assert.equal(p.saveNow(restored), true);
+      assert.equal(runTimers(), 0);
+      assert.equal(p.loadScene(live.id)?.name, 'After undo');
+
+      // A scene switch inside the window: the previous scene's pending save is written.
+      const next = createScene('Next');
+      restored.name = 'Live before switch';
+      p.markDirty(restored);
+      p.markDirty(next);
+      assert.equal(p.loadScene(live.id)?.name, 'Live before switch');
+      assert.equal(p.loadScene(next.id), null, 'the new scene is still debounced');
+      assert.equal(runTimers(), 1);
+      assert.equal(p.loadScene(next.id)?.name, 'Next');
+
+      // Deleting the scene with the pending save cancels it, so no later save brings it back.
+      p.markDirty(next);
+      p.deleteScene(next.id);
+      assert.equal(p.saveNow(createScene('Fresh')), true);
+      assert.equal(runTimers(), 0);
+      assert.equal(p.loadScene(next.id), null);
+      assert.ok(!p.listScenes().some((e) => e.id === next.id));
+    });
+  });
+});
+
+await p0iTestAsync('P0 integration: a scan this page wrote is sized without reading it back', async () => {
+  const store = new ScanStore();
+  store.onError = () => {}; // Node has no IndexedDB: memory fallback
+  const scan = createSyntheticLocationScan(4, 3, 2.6, ['table']);
+  await store.putScan(scan);
+  let reads = 0;
+  store.getScan = async () => {
+    reads++;
+    return null;
+  };
+  assert.equal(await store.getTotalStorageBytes(), estimateScanSizeBytes(scan));
+  assert.equal(reads, 0);
+});
+
+// --- P0 integration main-seams ---
+{
+  const g = globalThis as unknown as Record<string, unknown>;
+  const hadDocument = 'document' in g;
+  const noop: unknown = new Proxy(function () {}, {
+    get: (_t, k) => (k === 'measureText' ? () => ({ width: 10 }) : noop),
+    apply: () => noop,
+    set: () => true,
+  });
+  /** Root class of the studio modal the stub document reports as open, if any. */
+  let openModalClass: string | null = null;
+  if (!hadDocument) {
+    g.document = {
+      createElement: () => ({ width: 0, height: 0, getContext: () => noop, style: {} }),
+      querySelector: (sel: string) =>
+        openModalClass && sel.split(',').some((s) => s.trim() === `.${openModalClass}`) ? {} : null,
+    };
+  }
+  const { SessionManager } = await import('../src/session.ts');
+  const { DesktopPreview } = await import('../src/preview.ts');
+
+  const asyncTest = async (name: string, fn: () => Promise<void>): Promise<void> => {
+    try {
+      await fn();
+      passed++;
+      console.log(`  ✓ ${name}`);
+    } catch (e) {
+      console.error(`  ✗ ${name}`);
+      throw e;
+    }
+  };
+
+  /** Just enough of an XRSession for SessionManager.start. */
+  class P0iFakeSession extends EventTarget {
+    enabledFeatures = ['hit-test', 'local-floor', 'dom-overlay'];
+    inputSources: unknown[] = [];
+    visibilityState = 'visible';
+    endCalls = 0;
+    ended = false;
+    /** Runs inside requestReferenceSpace('viewer'), i.e. mid-start. */
+    duringStart: (() => void) | null = null;
+    fireEnd(): void {
+      if (this.ended) return;
+      this.ended = true;
+      this.dispatchEvent(new Event('end'));
+    }
+    async end(): Promise<void> {
+      this.endCalls++;
+      this.fireEnd();
+    }
+    async requestReferenceSpace(): Promise<object> {
+      this.duringStart?.();
+      return {};
+    }
+    async requestHitTestSource(): Promise<{ cancel(): void }> {
+      return { cancel() {} };
+    }
+  }
+  const fakeRenderer = (setSession: () => Promise<void>) =>
+    ({ xr: { setReferenceSpaceType: () => {}, setSession, getReferenceSpace: () => null } }) as never;
+  const navDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  let nextSession: P0iFakeSession | null = null;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { xr: { requestSession: async () => nextSession } },
+    configurable: true,
+    writable: true,
+  });
+  try {
+    await asyncTest('P0 integration: a start whose setSession fails leaves no session behind', async () => {
+      const s = (nextSession = new P0iFakeSession());
+      const mgr = new SessionManager(
+        fakeRenderer(async () => {
+          throw new Error('makeXRCompatible failed');
+        }),
+        () => {},
+      );
+      let onEnd = 0;
+      await assert.rejects(mgr.start({} as HTMLElement, () => onEnd++), /makeXRCompatible failed/);
+      // Studios on the 2D page decide where to mount from this.
+      assert.equal(mgr.session, null, 'no stale session after a failed start');
+      assert.equal(s.endCalls, 1, 'the half-started session is ended');
+      assert.equal(onEnd, 0, 'onEnd is for a session that started');
+    });
+
+    await asyncTest('P0 integration: a session that ends mid-start is reported as a failed start', async () => {
+      const s = (nextSession = new P0iFakeSession());
+      s.duringStart = () => s.fireEnd(); // the OS ends it between the awaits
+      const mgr = new SessionManager(fakeRenderer(async () => {}), () => {});
+      let onEnd = 0;
+      await assert.rejects(mgr.start({} as HTMLElement, () => onEnd++), /ended while it was starting/);
+      assert.equal(mgr.session, null);
+      assert.equal(s.endCalls, 0, 'an ended session is not ended again');
+      assert.equal(onEnd, 0);
+    });
+
+    await asyncTest('P0 integration: a normal start keeps the session until its end, then onEnd runs once', async () => {
+      const s = (nextSession = new P0iFakeSession());
+      const mgr = new SessionManager(fakeRenderer(async () => {}), () => {});
+      let onEnd = 0;
+      await mgr.start({} as HTMLElement, () => onEnd++);
+      assert.equal(mgr.session, s as unknown as XRSession);
+      assert.equal(mgr.features.domOverlay, true);
+      assert.equal(mgr.features.referenceSpace, 'local-floor');
+      s.fireEnd();
+      assert.equal(mgr.session, null);
+      assert.equal(onEnd, 1);
+    });
+  } finally {
+    if (navDesc) Object.defineProperty(globalThis, 'navigator', navDesc);
+    else delete g.navigator;
+  }
+
+  test('P0 integration: preview shortcuts leave typing and open studios alone', () => {
+    let toggles = 0;
+    let steps = 0;
+    let marks = 0;
+    let loops = 0;
+    const kf = {
+      playing: false,
+      play: () => toggles++,
+      pause: () => toggles++,
+      stepFrames: () => steps++,
+      setInPoint: () => marks++,
+      setOutPoint: () => marks++,
+      toggleLoop: () => loops++,
+    };
+    const preview = new DesktopPreview({} as never, new THREE.Scene(), new THREE.Group(), kf as never, []);
+    const p = preview as unknown as { onKey(e: KeyboardEvent): void; close(): void; scrub: unknown };
+    let closes = 0;
+    p.close = () => closes++;
+    const press = (key: string, target: unknown): boolean => {
+      let prevented = false;
+      p.onKey({ key, shiftKey: false, target, preventDefault: () => (prevented = true) } as unknown as KeyboardEvent);
+      return prevented;
+    };
+    const keys = [' ', 'ArrowLeft', 'ArrowRight', 'i', 'o', 'l', 'Escape'];
+    // A studio's prompt, a text input, a contenteditable: typing is not a shortcut.
+    for (const t of [
+      { tagName: 'TEXTAREA', isContentEditable: false },
+      { tagName: 'INPUT', isContentEditable: false },
+      { tagName: 'SELECT', isContentEditable: false },
+      { tagName: 'DIV', isContentEditable: true },
+    ]) {
+      for (const k of keys) assert.equal(press(k, t), false, `"${k}" in ${t.tagName} keeps its default`);
+    }
+    assert.equal(toggles + steps + marks + loops + closes, 0, 'typing drives nothing behind the field');
+
+    // A studio open over the preview: no key reaches the timeline or closes the preview.
+    const canvas = { tagName: 'CANVAS', isContentEditable: false };
+    for (const cls of ['dressing-modal-overlay', 'screenplay-modal-overlay', 'props-modal-overlay']) {
+      openModalClass = cls;
+      for (const k of keys) press(k, canvas);
+    }
+    openModalClass = null;
+    assert.equal(toggles + steps + marks + loops + closes, 0, 'nothing behind an open studio');
+
+    // No studio and no field: the shortcuts still work, the scrub bar included.
+    assert.equal(press(' ', canvas), true);
+    assert.equal(toggles, 1);
+    press('l', canvas);
+    assert.equal(loops, 1);
+    const scrub = { tagName: 'INPUT', isContentEditable: false };
+    p.scrub = scrub;
+    assert.equal(press('ArrowRight', scrub), true, "the preview's own scrub bar keeps the arrows");
+    assert.equal(steps, 1);
+    press('Escape', canvas);
+    assert.equal(closes, 1);
+  });
+
+  test('P0 integration: furniture from a replaced scan is no longer owned (no ghost on release)', () => {
+    const loc = new LocationRenderer();
+    loc.setScan(createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']));
+    loc.setMode('ghost');
+    const [couch] = loc.furnitureTargets();
+    assert.equal(loc.ownsFurniture(couch), true);
+    // A hidden scan still owns its pieces: a release then puts the couch back.
+    loc.setMode('hidden');
+    assert.equal(loc.ownsFurniture(couch), true, 'ownership does not depend on the display mode');
+    loc.setMode('ghost');
+    const ray = new THREE.Group();
+    ray.attach(couch); // grip carry
+    loc.setScan(createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']));
+    assert.equal(couch.parent, null, 'the new scan took the carried couch off the ray');
+    assert.equal(loc.ownsFurniture(couch), false, 'so a release must not attach it again');
+    assert.ok(loc.furnitureTargets().length > 0);
+    for (const m of loc.furnitureTargets()) assert.equal(loc.ownsFurniture(m), true);
+    loc.setScan(null);
+    assert.equal(loc.ownsFurniture(couch), false);
+    assert.equal(loc.ownsFurniture(new THREE.Mesh()), false);
+  });
+
+  test('P0 integration: main.ts seams end a carry before a rebuild and key hover on the mode', () => {
+    const src = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+    const before = (body: string, first: string, then: string, what: string) => {
+      const a = body.indexOf(first);
+      const b = body.indexOf(then, a);
+      assert.ok(a >= 0 && b > a, what);
+    };
+    // A rebuild disposes what is in hand: the carry ends first.
+    before(
+      mainMethodBody(src, 'openSetDressingDialog'),
+      'if (this.draggedProp) this.cancelActiveManipulation();',
+      'this.props.setScene(this.sceneData);',
+      'AI mutate ends a prop carry before props.setScene',
+    );
+    before(
+      mainMethodBody(src, 'openScreenplayStudioDialog'),
+      'if (this.draggedCamera) this.cancelActiveManipulation();',
+      'this.cams.setScene(this.sceneData);',
+      'coverage cameras end a camera carry before cams.setScene',
+    );
+    before(
+      mainMethodBody(src, 'updatePendingScan'),
+      'if (this.draggedFurniture) this.cancelActiveManipulation();',
+      'this.location.setScan(scan);',
+      'a scan capture ends a furniture carry before setScan',
+    );
+    before(
+      mainMethodBody(src, 'syncLocation'),
+      'if (this.draggedFurniture) this.cancelActiveManipulation();',
+      'this.location.setScan(scan);',
+      'a late scan load ends a furniture carry before setScan',
+    );
+    // A disowned piece is never re-attached.
+    for (const m of ['onSqueezeUp', 'cancelActiveManipulation']) {
+      before(mainMethodBody(src, m), 'ownsFurniture(mesh)', 'this.location.group.attach(mesh)', `${m} checks ownership`);
+    }
+    // The hover list is rebuilt when the mode changes, not only the content.
+    assert.match(
+      mainMethodBody(src, 'updateHover'),
+      /this\.hoverTargetsMode !== this\.interactionMode/,
+      'hover cache keyed on interactionMode',
+    );
+    // A session object a failed start left behind does not count as AR.
+    assert.match(mainMethodBody(src, 'inXRSession'), /this\.renderer\.xr\.isPresenting/);
+    assert.match(mainMethodBody(src, 'modalHost'), /if \(!this\.inXRSession\(\)\) return document\.body;/);
+    // Prop load failures: one banner key, reported once per model and scene.
+    assert.ok(!src.includes('prop-load-${key}'), 'no per-model banner keys');
+    assert.match(src, /if \(this\.reportedPropLoadErrors\.has\(key\)\) return;/);
+    assert.match(src, /if \(this\.reportedPropLoadWarnings\.has\(key\)\) return;/);
+    assert.match(mainMethodBody(src, 'loadScene'), /this\.reportedPropLoadErrors\.clear\(\);/);
+    // The carried-piece spin turns about world up in the ray's frame;
+    // rotateOnWorldAxis (which assumes an unrotated parent) is only the
+    // fallback for a piece with no parent.
+    const spin = src.indexOf('held.quaternion.premultiply(_qSpin);');
+    const toParent = src.indexOf('parent.getWorldQuaternion(_qParentInv).invert();');
+    assert.ok(toParent > 0 && spin > toParent, 'spin axis taken into the parent frame');
+    const fallback = src.indexOf('held.rotateOnWorldAxis(_up');
+    assert.ok(fallback > spin && fallback - spin < 200, 'rotateOnWorldAxis only as the parentless fallback');
+    assert.equal(src.indexOf('held.rotateOnWorldAxis(_up', fallback + 1), -1);
+  });
+
+  test('P0 integration: the carried spin formula gives pure world yaw under a pitched ray', () => {
+    // Mirrors the stick branch in main.ts: world up taken into the parent frame.
+    const ray = new THREE.Group();
+    ray.position.set(0.2, 1.2, -0.3);
+    ray.rotation.set(-Math.PI / 6, 0.4, 0.15, 'YXZ');
+    const scene = new THREE.Group();
+    scene.add(ray);
+    const held = new THREE.Group();
+    held.position.set(0, 1.5, -2);
+    held.rotation.y = 0.2;
+    scene.add(held);
+    scene.updateMatrixWorld(true);
+    ray.attach(held);
+    const start = held.getWorldPosition(new THREE.Vector3());
+    const qInv = new THREE.Quaternion();
+    const qSpin = new THREE.Quaternion();
+    const axis = new THREE.Vector3();
+    const up = new THREE.Vector3(0, 1, 0);
+    for (let i = 0; i < 30; i++) {
+      held.parent!.getWorldQuaternion(qInv).invert();
+      axis.copy(up).applyQuaternion(qInv);
+      qSpin.setFromAxisAngle(axis, Math.PI / 60);
+      held.quaternion.premultiply(qSpin);
+    }
+    scene.attach(held);
+    const e = new THREE.Euler().setFromQuaternion(held.quaternion, 'YXZ');
+    approx(e.x, 0, 1e-6);
+    approx(e.z, 0, 1e-6);
+    approx(e.y, 0.2 + Math.PI / 2, 1e-6);
+    approx(held.getWorldPosition(new THREE.Vector3()).distanceTo(start), 0, 1e-9);
+  });
+
+  if (!hadDocument) delete g.document;
+}
+
+void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()])
+  .then(() => storageLateOpenTest())
+  .then(
 
   () => {
-    passed += 2;
+    passed += 4;
     console.log('  ✓ ScanStore: memory fallback contract (put/get/list/prune/delete + warning)');
     console.log('  ✓ PropStore: memory fallback contract (save/get/list/delete + warning)');
+    console.log('  ✓ P0.8: importScene tells a blocked read apart from a file that is not a scene');
+    console.log('  ✓ P0.8: Add Test Room attaches to the scene that is live after the scan write');
     console.log(`\n${passed} tests passed`);
   },
   (e) => {
-    console.error('  ✗ Stores: memory fallback contract');
+    console.error('  ✗ async tests (store fallbacks, P0.8 import read, P0.8 test room)');
     throw e;
   },
 );

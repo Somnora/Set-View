@@ -93,9 +93,14 @@ export interface GeminiAiSceneMutation {
   explanation: string;
 }
 
-/** Gemini AI Omni Set Director configuration and model settings. */
+/**
+ * Gemini AI Omni Set Director configuration and model settings. Deliberately
+ * holds NO API key: this config lives in SceneData, which is autosaved,
+ * exported and sent to collab peers. The key is a per-device setting (see
+ * readDeviceGeminiKey below), and normalizing a config drops any key an older
+ * build embedded.
+ */
 export interface GeminiAiConfig {
-  apiKey?: string;
   model: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-lite';
   systemInstruction?: string;
   temperature: number;
@@ -786,10 +791,13 @@ export function detectSemanticRegions(
   // 3. Wall / Perimeter Regions
   if (sceneData?.architecture?.walls && sceneData.architecture.walls.length > 0) {
     for (const w of sceneData.architecture.walls) {
+      // WallData baselines are scene-space Vec3: x and z on the floor, y is the
+      // floor height under the wall (same reading as calculateWallBoundingBox).
       const minX = Math.min(w.start.x, w.end.x);
       const maxX = Math.max(w.start.x, w.end.x);
-      const minZ = Math.min(w.start.y, w.end.y);
-      const maxZ = Math.max(w.start.y, w.end.y);
+      const minZ = Math.min(w.start.z, w.end.z);
+      const maxZ = Math.max(w.start.z, w.end.z);
+      const baseY = Math.min(w.start.y, w.end.y);
 
       regions.push({
         id: `region_wall_${w.id}`,
@@ -797,8 +805,8 @@ export function detectSemanticRegions(
         type: 'wall',
         anchorEntityId: w.id,
         bounds: {
-          min: { x: minX - 0.2, y: 0, z: minZ - 0.2 },
-          max: { x: maxX + 0.2, y: w.heightM || 3.0, z: maxZ + 0.2 },
+          min: { x: minX - 0.2, y: baseY, z: minZ - 0.2 },
+          max: { x: maxX + 0.2, y: baseY + (w.heightM || 3.0), z: maxZ + 0.2 },
         },
       });
     }
@@ -1759,8 +1767,10 @@ export function createDefaultScatterConfig(
 export function createDefaultAiConfig(
   partial?: Partial<GeminiAiConfig>,
 ): GeminiAiConfig {
+  // Builds a fresh object from the known fields only, so an `apiKey` that an
+  // older build stored in the scene is dropped here (and therefore by
+  // normalizeSetDressingConfig and normalizeScene).
   return {
-    apiKey: partial?.apiKey ?? '',
     model: partial?.model ?? 'gemini-2.5-flash',
     systemInstruction: partial?.systemInstruction ?? 'You are the Virtual Set Director for SetView.',
     temperature: partial?.temperature ?? 0.4,
@@ -1797,4 +1807,148 @@ export function normalizeSetDressingConfig(val: unknown): SetDressingConfig {
   if (!val || typeof val !== 'object') return createSetDressingConfig();
   const raw = val as Partial<SetDressingConfig>;
   return createSetDressingConfig(raw);
+}
+
+/**
+ * Copies what an applied AI 'scatter_theme' mutation changed in the scene's
+ * config (theme, density, regions, settled items) into a staged copy, such as
+ * the Set Dressing modal's working config. Without it the modal's next save
+ * writes the pre-AI scatter back over the AI result. Everything else in the
+ * staged copy (seed, spacing, physics, model choice) is left as staged.
+ */
+export function carryAiScatterIntoConfig(staged: SetDressingConfig, applied: SetDressingConfig): void {
+  if (staged === applied) return;
+  staged.activeTheme = applied.activeTheme;
+  staged.scatterConfig.theme = applied.scatterConfig.theme;
+  staged.scatterConfig.density = applied.scatterConfig.density;
+  staged.regions = [...applied.regions];
+  staged.settledItems = [...applied.settledItems];
+}
+
+// ---------------------------------------------------------------------------
+// Per-device Gemini API key (never part of scene data)
+// ---------------------------------------------------------------------------
+
+/**
+ * localStorage key holding this device's Gemini API key. It is the name AI Shot
+ * Analysis already stored its key under, so Set Dressing and AI Shot Analysis
+ * share one key and a device that set it there needs no re-entry.
+ */
+export const GEMINI_KEY_STORAGE_KEY = 'setview_gemini_api_key';
+/** Set once the one-time move of a scene-embedded key has run on this device. */
+export const GEMINI_KEY_MIGRATED_FLAG = 'setview.geminiApiKeyMigrated';
+
+/**
+ * The slice of the Web Storage API the key helpers need. Passing it in keeps
+ * this module DOM-free; callers hand over window.localStorage, or null when
+ * the browser refuses storage access.
+ */
+export interface KeyValueStore {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/** This device's Gemini API key, or '' when none is set or storage is unavailable. */
+export function readDeviceGeminiKey(store: KeyValueStore | null | undefined): string {
+  if (!store) return '';
+  try {
+    return (store.getItem(GEMINI_KEY_STORAGE_KEY) ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Stores (or, for an empty value, clears) this device's Gemini API key.
+ * Returns false when storage refused the write (private mode, quota, policy).
+ */
+export function writeDeviceGeminiKey(store: KeyValueStore | null | undefined, key: string): boolean {
+  if (!store) return false;
+  const k = key.trim();
+  try {
+    if (k) store.setItem(GEMINI_KEY_STORAGE_KEY, k);
+    else store.removeItem(GEMINI_KEY_STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parses raw scene JSON once for an embedded Gemini key. Returns the key
+ * ('' when the field holds no usable string) and the same JSON without the
+ * field, or null when the scene has no such field or is malformed. Scenes
+ * without the text "apiKey" are skipped without parsing.
+ */
+function splitEmbeddedGeminiKey(rawSceneJson: string | null | undefined): { key: string; stripped: string } | null {
+  if (!rawSceneJson || !rawSceneJson.includes('"apiKey"')) return null;
+  try {
+    const parsed = JSON.parse(rawSceneJson) as {
+      setDressing?: { aiConfig?: { apiKey?: unknown } };
+    } | null;
+    const ai = parsed?.setDressing?.aiConfig;
+    if (!ai || typeof ai !== 'object' || !Object.prototype.hasOwnProperty.call(ai, 'apiKey')) return null;
+    const key = typeof ai.apiKey === 'string' ? ai.apiKey.trim() : '';
+    delete ai.apiKey;
+    return { key, stripped: JSON.stringify(parsed) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The Gemini key an older build embedded in a stored scene
+ * (setDressing.aiConfig.apiKey), read from the raw scene JSON before
+ * normalizeScene drops it. '' when absent or the JSON is malformed.
+ */
+export function embeddedGeminiKey(rawSceneJson: string | null | undefined): string {
+  return splitEmbeddedGeminiKey(rawSceneJson)?.key ?? '';
+}
+
+/**
+ * One-time move of a scene-embedded Gemini key into the per-device setting,
+ * then removal of the key from every stored scene. `sceneStorageKeys` are the
+ * storage keys of the stored scenes in `store`, most recently edited first:
+ * the first embedded key found wins, and a key the device already has is
+ * never overwritten. Each scene that embeds a key field is rewritten without
+ * it (everything else, updatedAt included, is kept); a non-empty key is only
+ * removed once the device holds a key, so a failed move never loses the
+ * user's only copy. Runs once per device: a flag records it, and is left unset
+ * when a key was found but could not be stored, so the next boot retries.
+ * Returns true when a key was moved.
+ */
+export function migrateEmbeddedGeminiKey(
+  store: KeyValueStore | null | undefined,
+  sceneStorageKeys: Iterable<string>,
+): boolean {
+  if (!store) return false;
+  try {
+    if (store.getItem(GEMINI_KEY_MIGRATED_FLAG) === '1') return false;
+    let deviceHasKey = !!readDeviceGeminiKey(store);
+    let moved = false;
+    let stranded = false;
+    for (const storageKey of sceneStorageKeys) {
+      const split = splitEmbeddedGeminiKey(store.getItem(storageKey));
+      if (!split) continue;
+      if (!deviceHasKey && split.key) {
+        moved = writeDeviceGeminiKey(store, split.key);
+        deviceHasKey = moved;
+      }
+      // An empty field (the old default) holds nothing to lose and is always dropped.
+      if (split.key && !deviceHasKey) {
+        stranded = true;
+        continue;
+      }
+      try {
+        store.setItem(storageKey, split.stripped);
+      } catch {
+        // A smaller value rarely fails; normalizeScene drops the key on the next save anyway.
+      }
+    }
+    if (!stranded) store.setItem(GEMINI_KEY_MIGRATED_FLAG, '1');
+    return moved;
+  } catch {
+    return false;
+  }
 }

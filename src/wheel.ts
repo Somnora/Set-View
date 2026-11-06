@@ -20,17 +20,13 @@ export type InteractionMode = 'block' | 'dress';
  */
 export type PlaceArm = 'none' | 'actor' | 'camera' | 'light' | 'prop';
 
-/** The Place tool cycle (wheel sector and the X button step through it). */
+/**
+ * The Place tool cycle (wheel sector and the X button step through it):
+ * Off, Actor, Cam, Prop. 'light' stays in PlaceArm but is out of the cycle:
+ * nothing places a light yet, so arming it would be a dead tool.
+ */
 export function nextPlaceMode(mode: PlaceArm): PlaceArm {
-  return mode === 'none'
-    ? 'actor'
-    : mode === 'actor'
-      ? 'camera'
-      : mode === 'camera'
-        ? 'light'
-        : mode === 'light'
-          ? 'prop'
-          : 'none';
+  return mode === 'none' ? 'actor' : mode === 'actor' ? 'camera' : mode === 'camera' ? 'prop' : 'none';
 }
 
 /** Menu levels: the root ring, or one of the sub-wheels. */
@@ -109,8 +105,8 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
         { id: 'wheel-view', label: `View:\n${viewLabel}` },
         { id: 'sub-capture', label: 'Camera ▸', submenu: 'capture' },
         { id: 'sub-edit', label: 'Edit ▸', submenu: 'edit' },
-        { id: 'sub-light', label: 'Light ▸', submenu: 'light' },
-        { id: 'wheel-more', label: 'More' },
+        { id: 'resetview', label: 'Re-align' },
+        { id: 'help', label: 'Help ?' },
       ],
     };
   }
@@ -129,7 +125,7 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
       { id: 'wheel-view', label: `View:\n${viewLabel}` },
       { id: 'sub-capture', label: 'Camera ▸', submenu: 'capture' },
       { id: 'sub-edit', label: 'Edit ▸', submenu: 'edit' },
-      { id: 'wheel-more', label: 'More' },
+      { id: 'help', label: 'Help ?' },
     ],
   };
 }
@@ -164,7 +160,6 @@ const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelS
     { id: 'delete', label: 'Delete' },
     { id: 'sub-props', label: 'Props ▸', submenu: 'props' },
     { id: 'sub-stance', label: 'Stance ▸', submenu: 'stance' },
-    { id: 'sub-light', label: 'Light ▸', submenu: 'light' },
   ],
   stance: () => [
     { id: 'stance', label: 'Cycle\nStance' },
@@ -176,6 +171,8 @@ const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelS
     { id: 'h-preset-185', label: "6'1\"\n1.85m" },
     { id: 'h-preset-200', label: "6'7\"\n2.00m" },
   ],
+  // Parked: no sector opens this ring (and SUBMENU_IDS has no entry for it)
+  // until lights can be placed and its light-* actions get handlers.
   light: (ctx) => [
     { id: 'light-kelvin', label: `Temp\n${ctx.activeLightKelvin ?? 5600}K` },
     { id: 'light-dim', label: 'Dim −' },
@@ -194,6 +191,123 @@ const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelS
     { id: 'prop-library', label: 'Prop\nLibrary 📦' },
   ],
 };
+
+// --- press routing (main.ts dispatches through these tables) -------------------
+
+/** Sector ids that open a sub-wheel, and the ring each one opens. */
+export const SUBMENU_IDS: Readonly<Record<string, Exclude<WheelPath, 'root'>>> = {
+  'sub-lens': 'lens',
+  'sub-marks': 'marks',
+  'sub-capture': 'capture',
+  'sub-edit': 'edit',
+  'sub-stance': 'stance',
+  'sub-props': 'props',
+};
+
+/** Props sub-wheel presets: sector id to BUILTIN_PROPS id (props.ts). */
+export const WHEEL_PROP_PRESETS: Readonly<Record<string, string>> = {
+  'prop-chair': 'directors_chair',
+  'prop-applebox': 'apple_box_full',
+  'prop-cstand': 'c_stand_with_arm',
+  'prop-slate': 'film_slate_clapper',
+  'prop-desk': 'production_desk',
+  'prop-lamp': 'practical_floor_lamp',
+  'prop-greenscreen': 'green_screen_frame',
+};
+
+/**
+ * Who handles a press on each sector (or hub) id:
+ *   nav   - changes the wheel path (SUBMENU_IDS, or Back to root)
+ *   wheel - handled by main.ts onWheelPress itself
+ *   wrist - forwarded verbatim to the wrist-panel handler (onWristPress)
+ *   prop  - spawns WHEEL_PROP_PRESETS[id]
+ * Every id a reachable ring can show must have an entry; the domain tests
+ * walk the rings to enforce it, so a sector can't silently do nothing.
+ */
+export type WheelSectorRoute = 'nav' | 'wheel' | 'wrist' | 'prop';
+
+export const WHEEL_SECTOR_HANDLERS: Readonly<Record<string, WheelSectorRoute>> = {
+  // Hub
+  'wheel-mode': 'wheel',
+  'wheel-back': 'nav',
+  // Sub-wheel openers
+  'sub-lens': 'nav',
+  'sub-marks': 'nav',
+  'sub-capture': 'nav',
+  'sub-edit': 'nav',
+  'sub-stance': 'nav',
+  'sub-props': 'nav',
+  // Root rings
+  'wheel-place': 'wheel',
+  'wheel-view': 'wheel',
+  resetview: 'wrist',
+  help: 'wrist',
+  scan: 'wrist',
+  location: 'wrist',
+  'splat-studio': 'wrist',
+  // Lens
+  'focal-down': 'wheel',
+  'focal-up': 'wheel',
+  tstop: 'wrist',
+  format: 'wrist',
+  aspect: 'wrist',
+  framelines: 'wrist',
+  dof: 'wrist',
+  // Marks
+  mark: 'wheel',
+  play: 'wrist',
+  stop: 'wrist',
+  clearkf: 'wrist',
+  'pace-slow': 'wrist',
+  'pace-fast': 'wrist',
+  // Camera
+  capture: 'wrist',
+  record: 'wrist',
+  exit: 'wrist',
+  // Edit
+  undo: 'wrist',
+  redo: 'wrist',
+  dup: 'wrist',
+  delete: 'wrist',
+  // Stance
+  stance: 'wrist',
+  'height-down': 'wrist',
+  'height-up': 'wrist',
+  'h-preset-150': 'wrist',
+  'h-preset-165': 'wrist',
+  'h-preset-175': 'wrist',
+  'h-preset-185': 'wrist',
+  'h-preset-200': 'wrist',
+  // Props
+  'prop-chair': 'prop',
+  'prop-applebox': 'prop',
+  'prop-cstand': 'prop',
+  'prop-slate': 'prop',
+  'prop-desk': 'prop',
+  'prop-lamp': 'prop',
+  'prop-greenscreen': 'prop',
+  'prop-library': 'wrist',
+};
+
+// Own-key lookups: a plain object index would also "find" inherited names such
+// as 'constructor' for an unexpected id.
+const own = <T>(table: Readonly<Record<string, T>>, id: string): T | null =>
+  Object.prototype.hasOwnProperty.call(table, id) ? table[id] : null;
+
+/** Route for a pressed sector or hub id; null means no handler exists. */
+export function wheelSectorRoute(id: string): WheelSectorRoute | null {
+  return own(WHEEL_SECTOR_HANDLERS, id);
+}
+
+/** Ring a sub-wheel opener leads to, or null for any other id. */
+export function submenuForSector(id: string): Exclude<WheelPath, 'root'> | null {
+  return own(SUBMENU_IDS, id);
+}
+
+/** Catalog asset id for a Props sub-wheel preset sector, or null. */
+export function wheelPropPreset(id: string): string | null {
+  return own(WHEEL_PROP_PRESETS, id);
+}
 
 // --- ring geometry -----------------------------------------------------------
 

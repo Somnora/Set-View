@@ -1,0 +1,192 @@
+<!doctype html>
+<!-- SetView XR capability probe (roadmap P0.0). Test-only page: nothing in src/
+     loads it and it loads nothing from src/. Logic lives in xr-probe.ts, pure
+     helpers and the report format in xr-probe-core.ts.
+
+     Run: `npm run dev`, then open https://<mac-lan-ip>:5173/test/xr-probe.html
+     in the headset browser (accept the self-signed certificate). Procedure and
+     report format: test/device-reports/README.md. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SetView XR probe</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0e1219;
+        --panel: #161c27;
+        --line: #2a3446;
+        --text: #e6e9ef;
+        --muted: #9aa4b5;
+        --accent: #8ab4ff;
+        --warn: #ffd166;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 16px 16px 120px;
+        background: var(--bg);
+        color: var(--text);
+        font: 16px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+      }
+      h1 { margin: 0 0 4px; font-size: 24px; }
+      h2 { margin: 0 0 8px; font-size: 18px; color: var(--accent); }
+      p { margin: 6px 0; }
+      .lede, .hint { color: var(--muted); }
+      section {
+        margin: 16px 0;
+        padding: 14px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        max-width: 1100px;
+      }
+      button, select, input[type='text'], input[type='file'], textarea {
+        font: inherit;
+        color: var(--text);
+        background: #1f2a3d;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+      button { padding: 10px 16px; margin: 4px 6px 4px 0; cursor: pointer; min-height: 44px; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      button.primary { background: #2b4a7e; border-color: var(--accent); font-weight: 600; }
+      input[type='text'] { padding: 8px 10px; min-width: 260px; }
+      input[type='file'] { padding: 8px; max-width: 100%; }
+      label { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; }
+      label.obs { display: flex; justify-content: space-between; gap: 12px; margin: 6px 0; }
+      select { padding: 6px 8px; }
+      textarea { width: 100%; min-height: 90px; padding: 8px; }
+      code { color: var(--warn); }
+      .table-wrap { overflow-x: auto; }
+      table { border-collapse: collapse; width: 100%; font-size: 14px; }
+      th, td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+      th { color: var(--muted); font-weight: 600; }
+      pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; color: var(--muted); max-height: 360px; overflow-y: auto; }
+      #ar-status { color: var(--warn); }
+      #xr-overlay {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        padding: 8px 16px;
+        background: rgba(14, 18, 25, 0.92);
+        border-top: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      /* When dom-overlay is granted the root covers the AR view: keep it see-through.
+         Browsers without :xr-overlay drop this rule. */
+      #xr-overlay:xr-overlay { background: transparent; border: 0; align-items: flex-start; }
+      #xr-overlay:xr-overlay #overlay-status { background: rgba(14, 18, 25, 0.85); padding: 6px 10px; border-radius: 6px; }
+      /* Focusable but invisible: display:none and visibility:hidden cannot take focus. */
+      #kbd { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0.01; border: 0; padding: 0; }
+    </style>
+  </head>
+  <body>
+    <h1>SetView XR probe</h1>
+    <p class="lede">
+      Checks the platform claims the roadmap depends on, once per headset. Work through the sections in order; the
+      report saves itself in this browser after every step, survives a reload, and downloads as JSON at the end.
+    </p>
+
+    <section>
+      <h2>0. Device</h2>
+      <label>Device label <input id="device" type="text" autocomplete="off" spellcheck="false" /></label>
+      <p class="hint">Report file name: <code id="file-name"></code></p>
+    </section>
+
+    <section>
+      <h2>1. File picker (S4)</h2>
+      <p class="hint">
+        Pick one of each: .glb, .json, .obj, .ply, .fbx, .spz, .splat and a file with no extension. Each file is read
+        with <code>File.arrayBuffer()</code>; the table shows whether the bytes came back.
+      </p>
+      <input id="files" type="file" multiple />
+      <div class="table-wrap"><table id="file-table"></table></div>
+    </section>
+
+    <section>
+      <h2>2. Storage and API presence (S7 and S11, partial)</h2>
+      <p class="hint">Estimate and API checks run on load. Press the button once to record what <code>navigator.storage.persist()</code> returns.</p>
+      <p class="hint">
+        Partial answers only: the 100 to 300 MB LAN fetch into IndexedDB (rest of S7) and creating or restoring a
+        persistent anchor (rest of S11) are not probed here.
+      </p>
+      <button id="persist">Request persistent storage</button>
+      <pre id="env"></pre>
+    </section>
+
+    <section>
+      <h2>3. AR session (S1, S2, S3, S6; S5 on Quest)</h2>
+      <label><input id="opt-planes" type="checkbox" checked /> request plane-detection</label>
+      <label><input id="opt-meshes" type="checkbox" checked /> request mesh-detection</label>
+      <p>
+        <label
+          >Space Setup done for this room before Enter AR (Quest)
+          <select id="space-setup">
+            <option value="">not recorded</option>
+            <option value="yes">yes</option>
+            <option value="no">no (cleared, for S5)</option>
+            <option value="unsure">unsure</option>
+          </select>
+        </label>
+      </p>
+      <p class="hint">
+        Set this before each Enter AR; it is stored with that session. S1 needs a Quest session with Space Setup done;
+        S5 needs a separate Quest session with Space Setup cleared and this set to <code>no</code>.
+      </p>
+      <p>
+        <button id="enter" class="primary">Enter AR probe</button>
+        <span id="ar-status"></span>
+      </p>
+      <p class="hint">
+        In AR a status panel appears in front of you. Point a controller or hand ray at a panel button and pull the
+        trigger or pinch. Look around the room for about 30 seconds first so planes and meshes have time to arrive.
+        <b>Keyboard test</b> focuses a hidden text field: if a keyboard appears, type <code>ok</code> and press Enter.
+        <b>Run room capture</b> needs two presses within 4 s, runs once per session, and may launch Space Setup and
+        invalidate anchors, so do it last. <b>Exit AR</b> ends the session.
+      </p>
+    </section>
+
+    <section>
+      <h2>4. Observations (only you can see these)</h2>
+      <div id="observations"></div>
+      <p class="hint">Notes (anything else: prompts, error dialogs, how fast planes filled in, hit-test noise)</p>
+      <textarea id="notes" spellcheck="false"></textarea>
+    </section>
+
+    <section>
+      <h2>5. Summary</h2>
+      <div class="table-wrap"><table id="summary"></table></div>
+    </section>
+
+    <section>
+      <h2>6. Report</h2>
+      <button id="download" class="primary">Download JSON</button>
+      <button id="copy">Copy JSON</button>
+      <button id="show">Show JSON</button>
+      <button id="reset">Start a new report</button>
+      <textarea id="json" hidden readonly spellcheck="false" style="min-height: 320px; margin-top: 8px"></textarea>
+    </section>
+
+    <section>
+      <h2>Log (newest first)</h2>
+      <pre id="log"></pre>
+    </section>
+
+    <!-- dom-overlay root. Shown in AR only where the browser grants dom-overlay.
+         The keyboard probe input lives here so it is focusable in both cases. -->
+    <div id="xr-overlay">
+      <span id="overlay-status">DOM overlay root (shown in AR only when dom-overlay is granted)</span>
+      <button id="overlay-exit">Exit AR</button>
+      <input id="kbd" type="text" autocomplete="off" spellcheck="false" aria-label="keyboard probe" />
+    </div>
+
+    <script type="module" src="./xr-probe.ts"></script>
+  </body>
+</html>

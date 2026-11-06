@@ -27,6 +27,10 @@ export class ContextualRadialView {
   readonly group = new THREE.Group();
 
   private buttons: RadialButtonEntry[] = [];
+  /** Button meshes, kept in step with `buttons` so the per-frame raycast doesn't rebuild the list. */
+  private buttonMeshes: THREE.Mesh[] = [];
+  /** Reused raycast result array (handlePointer runs every frame while the ring shows). */
+  private readonly hits: THREE.Intersection[] = [];
   private activeEntityType: string | null = null;
   private activeEntityId: string | null = null;
   private hoveredButton: RadialButtonEntry | null = null;
@@ -66,8 +70,7 @@ export class ContextualRadialView {
       return;
     }
 
-    this.group.position.copy(worldPosition);
-    this.group.position.y += 0.35; // Position slightly above entity center
+    this.setAnchor(worldPosition);
 
     this.buildActionButtons(actions);
     this.group.visible = true;
@@ -100,6 +103,22 @@ export class ContextualRadialView {
     return this.activeEntityId;
   }
 
+  /** Returns the active entity type ('camera', 'actor', 'prop', ...), or null when hidden. */
+  public getActiveEntityType(): string | null {
+    return this.activeEntityType;
+  }
+
+  /**
+   * Re-places the arc for its entity, given the entity's WORLD position (the
+   * group lives in the scene root, not under contentRoot). Call per frame while
+   * visible so the ring stays on its target through glide, snap-turn and
+   * teleport. Copies into the existing position: no allocation.
+   */
+  public setAnchor(worldPosition: THREE.Vector3): void {
+    this.group.position.copy(worldPosition);
+    this.group.position.y += 0.35; // Position slightly above entity center
+  }
+
   private clearButtons(): void {
     for (const btn of this.buttons) {
       this.group.remove(btn.mesh);
@@ -108,6 +127,7 @@ export class ContextualRadialView {
       btn.texture.dispose();
     }
     this.buttons = [];
+    this.buttonMeshes = [];
   }
 
   private buildActionButtons(actions: ContextQuickAction[]): void {
@@ -151,6 +171,7 @@ export class ContextualRadialView {
       };
 
       this.buttons.push(entry);
+      this.buttonMeshes.push(mesh);
     }
   }
 
@@ -203,8 +224,8 @@ export class ContextualRadialView {
   public handlePointer(raycaster: THREE.Raycaster, isClick: boolean): ContextQuickAction | null {
     if (!this.group.visible || this.buttons.length === 0) return null;
 
-    const meshes = this.buttons.map((b) => b.mesh);
-    const intersects = raycaster.intersectObjects(meshes, false);
+    this.hits.length = 0;
+    const intersects = raycaster.intersectObjects(this.buttonMeshes, false, this.hits);
 
     if (intersects.length > 0) {
       const hitMesh = intersects[0].object as THREE.Mesh;

@@ -5,9 +5,12 @@
 //
 // Everything degrades gracefully: if IndexedDB is unavailable (private mode,
 // storage pressure) an in-memory Map keeps the current session working and
-// the caller summary still round-trips through file export.
+// the caller summary still round-trips through file export. When IndexedDB is
+// only slow to open, the scans held in memory are written to it once it opens
+// (idbOpen.ts), and callers can tell "storage not open" from "scan missing".
 // ---------------------------------------------------------------------------
 
+import { IdbConnection, type IdbState, type StoreOptions } from './idbOpen.ts';
 import { isLocationScan, type LocationScan } from './scan.ts';
 
 const DB_NAME = 'setview';
@@ -29,53 +32,87 @@ export function estimateScanSizeBytes(scan: LocationScan): number {
 export class ScanStore {
   /** Notified on storage failures so the UI can warn (headsets have no console). */
   onError: (msg: string) => void = () => {};
+  /** Notified when scans held in memory reach storage after a late open. */
+  onNotice: (msg: string) => void = () => {};
 
-  private dbPromise: Promise<IDBDatabase | null> | null = null;
-  /** Fallback when IndexedDB is unavailable (session lifetime only). */
+  /** Fallback when IndexedDB is unavailable or not open yet. Everything in it is
+   *  written to IndexedDB when the database opens, then dropped from here. */
   private memory = new Map<string, LocationScan>();
+  /** Sizes already measured by putScan or getTotalStorageBytes. A blob never changes
+   *  under its id (every capture, import and duplicate gets a fresh one), so a size
+   *  stays valid. */
+  private sizeCache = new Map<string, number>();
+
+  private readonly conn: IdbConnection;
+
+  constructor(opts: StoreOptions = {}) {
+    this.conn = new IdbConnection({
+      name: DB_NAME,
+      version: DB_VERSION,
+      upgrade: (db) => {
+        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+      },
+      onOpen: (db) => this.saveHeld(db),
+      timeoutMs: opts.openTimeoutMs,
+      factory: opts.indexedDB,
+    });
+  }
 
   private open(): Promise<IDBDatabase | null> {
-    if (this.dbPromise) return this.dbPromise;
-    this.dbPromise = new Promise((resolve) => {
-      if (typeof indexedDB === 'undefined') {
-        resolve(null);
-        return;
-      }
-      try {
-        // Watchdog: some environments (observed: headless Chrome on macOS)
-        // never fire ANY event on the open request. A hung open must degrade
-        // to the memory fallback, not wedge every scan load/save forever.
-        const watchdog = setTimeout(() => resolve(null), 4000);
-        const done = (db: IDBDatabase | null) => {
-          clearTimeout(watchdog);
-          resolve(db);
-        };
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = () => {
-          if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE);
-        };
-        req.onsuccess = () => {
-          // If the DB dies mid-session (eviction), fall back to memory.
-          req.result.onclose = () => {
-            this.dbPromise = null;
-          };
-          done(req.result);
-        };
-        req.onerror = () => done(null);
-        req.onblocked = () => done(null);
-      } catch {
-        resolve(null);
-      }
-    });
-    return this.dbPromise;
+    return this.conn.get();
+  }
+
+  /** 'open' when scans can be read. Anything else means a null from getScan is
+   *  not proof the scan is gone: storage is slow, failed, or absent. */
+  get storageState(): IdbState {
+    return this.conn.state;
+  }
+
+  /** Resolves true once storage opens (at once when open), false when it cannot. */
+  whenStorageOpens(): Promise<boolean> {
+    return this.conn.whenOpen();
+  }
+
+  /** Writes the scans held in memory once the database opens (late or reopened). */
+  private saveHeld(db: IDBDatabase): void {
+    const held = [...this.memory.values()];
+    if (held.length === 0) return;
+    let reported = false; // a failed request fires both onerror and onabort
+    const failed = () => {
+      if (reported) return;
+      reported = true;
+      this.onError('storage opened, but saving the scans held in memory failed (storage full?); Export the scene to keep them');
+    };
+    try {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      for (const scan of held) store.put(scan, scan.id);
+      tx.oncomplete = () => {
+        for (const scan of held) if (this.memory.get(scan.id) === scan) this.memory.delete(scan.id);
+        const n = held.length;
+        this.onNotice(`storage opened: ${n === 1 ? 'the scan' : `${n} scans`} held in memory ${n === 1 ? 'is' : 'are'} now saved on this device`);
+      };
+      tx.onerror = tx.onabort = failed;
+    } catch {
+      failed();
+    }
   }
 
   /** Stores a scan under its id. Resolves false (and fires onError) on failure. */
   async putScan(scan: LocationScan): Promise<boolean> {
+    // Measured now, while the scan is in hand, so getTotalStorageBytes never reads
+    // a blob this page wrote back from IndexedDB just to size it (in AR that is a
+    // full read and decode of a fresh capture). Valid on every path below: the
+    // blob lands in IndexedDB or in the memory fallback under this same id.
+    this.sizeCache.set(scan.id, estimateScanSizeBytes(scan));
     const db = await this.open();
     if (!db) {
       this.memory.set(scan.id, scan);
-      this.onError('scan kept in memory only (storage unavailable); Export the scene to keep it');
+      this.onError(
+        this.conn.state === 'waiting'
+          ? 'storage is slow to open: the scan is held in memory and saved when it opens (Export the scene to be safe)'
+          : 'scan kept in memory only (storage unavailable); Export the scene to keep it',
+      );
       return false;
     }
     return new Promise((resolve) => {
@@ -154,12 +191,18 @@ export class ScanStore {
     return scan ? estimateScanSizeBytes(scan) : 0;
   }
 
-  /** Returns total approximate byte size of all scans in storage. */
+  /** Returns total approximate byte size of all scans in storage. A blob this page
+   *  did not write is read once to measure it; later calls only list the ids. */
   async getTotalStorageBytes(): Promise<number> {
     const ids = await this.listScanIds();
     let total = 0;
     for (const id of ids) {
-      total += await this.getScanSizeBytes(id);
+      let size = this.sizeCache.get(id);
+      if (size === undefined) {
+        size = await this.getScanSizeBytes(id);
+        if (size > 0) this.sizeCache.set(id, size);
+      }
+      total += size;
     }
     return total;
   }

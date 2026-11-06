@@ -29,9 +29,9 @@ import { classifyCameraMove } from './timeline.ts';
 import { History } from './history.ts';
 import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
-import { summarizeScan } from './scan.ts';
+import { roomCaptureMessage, scanFloorY, summarizeScan, translateScanY, type ScanSource } from './scan.ts';
 import { captureScanFromFrame } from './scanner.ts';
-import { LocationRenderer } from './location.ts';
+import { LocationRenderer, type LocationMode } from './location.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
@@ -51,8 +51,15 @@ import {
   type WheelPath,
 } from './wheel.ts';
 import { WheelPanel } from './wheelView.ts';
-import { floorCorrection, newFloorEstimate, observeFloorHit } from './floor.ts';
+import {
+  floorCorrection,
+  floorCorrectionFromScan,
+  floorSettled,
+  newFloorEstimate,
+  observeFloorHit,
+} from './floor.ts';
 import { Persistence } from './persistence.ts';
+import { formatStorageLine } from './persistence.ts';
 import {
   buildWristPanel,
   DebugLog,
@@ -106,6 +113,12 @@ interface ComfortReachTarget {
 import { WebXRProfilerRuntime } from './webxrProfiler.ts';
 import { SpatialComfortRenderer } from './comfortRenderer.ts';
 import { SetDressingRenderer } from './setDressingRenderer.ts';
+import {
+  applyAiMutationsToScene,
+  migrateEmbeddedGeminiKey,
+  normalizeSetDressingConfig,
+} from './setDressingEngine.ts';
+import { STUDIO_MODAL_ROOT_CLASSES } from './ui.ts';
 import { AnimaticVideoRenderer } from './animaticVideoRenderer.ts';
 
 import { ViewfinderRig } from './viewfinder.ts';
@@ -126,6 +139,11 @@ import { WebRtcCollabSession } from './network.ts';
 import { CollabAvatarManager } from './avatars.ts';
 import { openCollabModal, openPropsLibraryModal } from './ui.ts';
 import { PropsManager, type PropObject } from './propsManager.ts';
+import { globalPropRenderer } from './propRenderer.ts';
+import { getBuiltinPropDefinition, propSpawnHitUsable, settlePropY, snapPropToGrid } from './props.ts';
+import { locomotionSuppressed, type LocomotionState } from './locomotion.ts';
+import { quatYaw } from './scan.ts';
+import { submenuForSector, wheelPropPreset, wheelSectorRoute } from './wheel.ts';
 import { globalPropStore } from './propStore.ts';
 import { LiveLinkStreamer } from './liveLinkStreamer.ts';
 import { DmxStreamer } from './dmxStreamer.ts';
@@ -155,11 +173,24 @@ const WHEEL_FRONT_POS = new THREE.Vector3(0, -0.05, -0.5);
 const _pt = new THREE.Vector3();
 // Reused for the world → scene-space re-basing at scan capture.
 const _worldToScene = new THREE.Matrix4();
+// Reused by the post-reset anchor check (anchorPosition writes into it).
+const _anchorProbe = new THREE.Vector3();
 // Reused each frame for locomotion basis vectors (no per-frame allocation).
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
 const _tip = new THREE.Vector3();
+// Reused by the carried-piece stick spin (world up taken into the ray's frame).
+const _qParentInv = new THREE.Quaternion();
+const _qSpin = new THREE.Quaternion();
+const _spinAxis = new THREE.Vector3();
+// Reused for the contextual radial's per-frame follow of its target.
+const _radialPos = new THREE.Vector3();
+
+/** Wheel / Prop Library props with no live hit land this far ahead of you (m). */
+const PROP_SPAWN_AHEAD_M = 1.2;
+/** How long a load error or warning holds the wrist status line (ms). */
+const STATUS_NOTE_MS = 6000;
 
 /** Smooth-glide speed (m/s) for thumbstick locomotion through the set. */
 const LOCOMOTION_SPEED = 1.8;
@@ -170,8 +201,14 @@ const SNAP_TURN_RAD = Math.PI / 6; // 30°
 
 /** Give the platform this long to surface tracked meshes before giving up. */
 const SCAN_TIMEOUT_MS = 30_000;
-/** If nothing is tracked after this long, ask the OS to run room capture. */
-const SCAN_ROOM_CAPTURE_AFTER_MS = 2_000;
+/** If nothing is tracked after this long, say what to do about it (once). */
+const SCAN_HINT_AFTER_MS = 5_000;
+/** Run Space Setup needs a second press within this window (anchor warning). */
+const SPACE_SETUP_CONFIRM_MS = 5_000;
+/** Longest a scan waits for the floor estimate to settle before capturing anyway. */
+const SCAN_FLOOR_WAIT_MS = 5_000;
+/** After a tracking reset or Space Setup, anchors get this long to report before re-anchoring. */
+const ANCHOR_RECHECK_GRACE_MS = 1_000;
 
 /** What the pointer ray is over ('furniture' id = scan mesh index as string). */
 type Hover = { kind: 'actor' | 'camera' | 'furniture' | 'prop'; id: string } | null;
@@ -223,8 +260,6 @@ class App {
   private wheel = new WheelPanel();
   /** Current wheel menu level; resets to root whenever the wheel hides. */
   private wheelPath: WheelPath = 'root';
-  /** Wheel "More" pins the detailed wrist panel open under the wheel. */
-  private panelPinned = false;
   private wheelShown = false;
   /** Menu button popped the wheel to a head-anchored spot in front of you. */
   private wheelInFront = false;
@@ -235,6 +270,24 @@ class App {
   private tipOnWheel = false;
   /** Placement is an ARMED tool, off by default — a bare pinch never places. */
   private placeMode: PlaceArm = 'none';
+  /** Catalog id Place: Prop drops: the last Props sub-wheel preset picked. */
+  private lastPropPreset = 'directors_chair';
+  /**
+   * A message the wrist status line keeps showing until `until` (ms,
+   * performance.now) instead of the selection summary refreshWristState writes,
+   * which otherwise replaced a load error the moment the spawn path selected
+   * the prop.
+   */
+  private statusNote: { text: string; until: number } | null = null;
+  /** Reused every frame for the glide gate (no per-frame allocation). */
+  private readonly locoState: LocomotionState = {
+    viewMode: 'full',
+    draggingActor: false,
+    draggingCamera: false,
+    draggingProp: false,
+    draggingFurniture: false,
+    miniGrabbing: false,
+  };
   private selectedActorId: string | null = null;
   private selectedPropId: string | null = null;
   private hover: Hover = null;
@@ -258,8 +311,26 @@ class App {
   private notesVisible = true;
   private pendingReanchorActors: ActorObject[] = [];
   private pendingReanchorCams: CamObject[] = [];
-  /** Non-null while waiting for the platform's Scene Mesh to capture. */
-  private pendingScan: { startedAt: number; roomCaptureRequested: boolean } | null = null;
+  /** Non-null while waiting for the platform's room data to capture. */
+  private pendingScan: {
+    /** Clock start (loop time), or -1 to (re)start it on the next frame. */
+    startedAt: number;
+    /** Scan Room re-aligned first; capture waits until that fade has applied. */
+    awaitingRealign: boolean;
+    sources: ScanSource[];
+    floorHinted: boolean;
+    hinted: boolean;
+  } | null = null;
+  /** First 'Run Space Setup' press arms it; a second press before this time runs it. */
+  private spaceSetupConfirmUntil = 0;
+  /** Session whose Space Setup request is still in flight (OS flow open). */
+  private spaceSetupSession: XRSession | null = null;
+  /**
+   * Armed by a reference-space reset or a finished Space Setup; recheckAnchors
+   * re-anchors only what lost its anchor. `due` is loop time, -1 = start the
+   * grace window on the next frame.
+   */
+  private anchorRecheck: { due: number; shiftHinted: boolean } | null = null;
   /** Blob id currently loaded into the location renderer. */
   private displayedScanId: string | null = null;
   /** Invalidates stale async scan-blob loads (scene switches, undo). */
@@ -282,6 +353,13 @@ class App {
   private readonly comfortTargetBuffer: ComfortReachTarget[] = [];
   private hoverTargets: THREE.Object3D[] = [];
   private hoverTargetsVersion = -1;
+  /** The mode hoverTargets was built for: Block and Dress grab different things. */
+  private hoverTargetsMode: InteractionMode | null = null;
+  /** Uploaded prop models already reported as not shown / incomplete in this scene.
+   *  Every props.setScene (undo, redo, remote patch, AI edit) rebuilds them and
+   *  fails the same way again; each key is reported once until the scene changes. */
+  private readonly reportedPropLoadErrors = new Set<string>();
+  private readonly reportedPropLoadWarnings = new Set<string>();
 
   // Multi-user WebRTC collaborative session
   private collabSession: WebRtcCollabSession;
@@ -326,11 +404,18 @@ class App {
     this.scene3.add(this.camera); // so head-attached children render
     this.scene3.add(this.contentRoot);
 
+    this.migrateGeminiKeyOnce();
     this.sceneData = this.persistence.loadCurrentOrCreate();
     // Sprite raycasting (name labels, note cards) requires raycaster.camera.
     this.raycaster.camera = this.camera;
 
     this.session = new SessionManager(this.renderer, (m) => this.debug.log(m));
+    this.session.onReferenceSpaceReset = () => this.onReferenceSpaceReset();
+    this.session.onVisibilityChange = (state) => {
+      // Back from system UI (Space Setup, the OS menu): the scan's timeout
+      // restarts instead of expiring for time spent outside the app.
+      if (state === 'visible' && this.pendingScan) this.pendingScan.startedAt = -1;
+    };
     this.scene3.add(this.session.reticle);
 
     this.input = new InputManager(this.renderer, this.scene3);
@@ -338,6 +423,38 @@ class App {
     this.contentRoot.add(this.actors.group);
     this.props = new PropsManager(this.session, this.sceneData);
     this.contentRoot.add(this.props.group);
+    // An uploaded model can finish loading frames after setScene (undo, redo,
+    // remote patch, scene load): refresh the hover and Camera View caches then.
+    this.props.onObjectsChanged = () => {
+      this.contentVersion++;
+    };
+    // An uploaded model that can't be shown falls back to a box: say why, once
+    // per model and scene. Rebuilds would otherwise bring back a dismissed
+    // banner and retake the wrist line after every undo or peer edit.
+    globalPropRenderer.onLoadError = (key, err) => {
+      if (this.reportedPropLoadErrors.has(key)) return;
+      this.reportedPropLoadErrors.add(key);
+      const reason = err instanceof Error ? err.message : String(err);
+      this.debug.log(`prop model ${key} failed to load, showing a box: ${reason}`);
+      this.noteStatus(`Prop model not shown: ${reason}`);
+      // The wrist is invisible on the 2D page, where uploads are placed from.
+      // One banner for all of them, so they never push the storage and import
+      // banners (and their Export button) out of the landing's few slots.
+      const n = this.reportedPropLoadErrors.size;
+      this.landing.showBanner(
+        n === 1
+          ? `An uploaded prop model could not be shown (a box stands in): ${reason}`
+          : `${n} uploaded prop models could not be shown (boxes stand in). Latest: ${reason}`,
+        'warn',
+        'prop-load',
+      );
+    };
+    globalPropRenderer.onLoadWarning = (key, message) => {
+      if (this.reportedPropLoadWarnings.has(key)) return;
+      this.reportedPropLoadWarnings.add(key);
+      this.debug.log(`prop model ${key}: ${message}`);
+      this.noteStatus(`Prop model: ${message}`);
+    };
     this.keyframes = new KeyframeSystem(this.sceneData, this.actors);
     this.contentRoot.add(this.keyframes.vizGroup);
     this.cams = new CameraSystem(this.sceneData, this.session, this.contentRoot);
@@ -359,6 +476,9 @@ class App {
       this.handleContextQuickAction(action, entityId, entityType),
     );
 
+    // Parked: TransformGizmo's ray input (onPointerDown/Move/Up) is not wired
+    // to any controller yet, so its handles could not be moved. Selection no
+    // longer attaches it (no inert handles in the headset); it stays hidden.
     this.gizmo = new TransformGizmo();
     this.scene3.add(this.gizmo.root);
     this.gizmo.events.onTransform = () => {
@@ -445,6 +565,10 @@ class App {
     this.preview.onOpenWebXRProfiler = () => this.openWebXRProfilerDialog();
     this.preview.onOpenVRComfort = () => this.openVRComfortDialog();
     this.preview.onOpenSetDressing = () => this.openSetDressingDialog();
+    // Room display toggle (the scan was invisible on desktop: no control, and
+    // the mode always came back Hidden).
+    this.preview.getLocationMode = () => (this.sceneData.scan ? this.location.mode : null);
+    this.preview.onCycleLocationMode = () => void this.cycleLocationMode();
 
     this.profilerRuntime = new WebXRProfilerRuntime(this.sceneData.profiler);
     this.comfortRenderer = new SpatialComfortRenderer(this.sceneData.comfort);
@@ -473,6 +597,12 @@ class App {
     this.performanceHud = new PerformanceHudOverlay(this.performanceGovernor, () => this.openPerformanceSettings());
 
     const overlayRoot = document.getElementById('overlay')!;
+    // A trigger or pinch on a DOM overlay control (a studio modal, the note
+    // editor, a HUD) should only click it. Without this the same press also
+    // fires an XR select, which places or selects in the world behind the
+    // dialog (WebXR DOM Overlays 'beforexrselect'). #overlay itself is
+    // pointer-events:none, so presses that hit no control still reach the world.
+    overlayRoot.addEventListener('beforexrselect', (e) => e.preventDefault());
     this.noteEditor = new NoteEditor(overlayRoot);
 
     this.wrist = buildWristPanel();
@@ -510,11 +640,24 @@ class App {
         if (this.sceneData.id === id) this.newScene('Scene 1');
         this.refreshLanding();
       },
-      onExport: (id) => void this.persistence.exportScene(id),
+      onExport: (id) => this.exportSceneFile(id),
       onImport: (file) => {
-        void this.persistence.importScene(file).then((data) => {
-          if (data) this.loadScene(data);
-          else this.debug.log('import failed: not a SetView scene JSON');
+        void this.persistence.importScene(file).then((res) => {
+          if (!res.ok) {
+            this.reportDataIssue(`import failed: ${res.message}`, 'import');
+            return;
+          }
+          this.loadScene(res.scene);
+          if (!res.saved) {
+            // The scene also gets a "Not saved" row with its own Export button.
+            const id = res.scene.id;
+            this.reportDataIssue(
+              `"${res.scene.name}" is open but could not be saved (storage full), so it will be gone after a reload. Export it now, or delete scenes you no longer need.`,
+              'import',
+              { label: 'Export', run: () => this.exportSceneFile(id) },
+            );
+          }
+          if (res.heavy) this.requestPersistentStorage();
         });
       },
       onRename: (id, name) => {
@@ -524,20 +667,21 @@ class App {
       },
       onExportFloorplan: (id) => this.persistence.exportFloorplan(id),
       onExportShotList: (id) => this.persistence.exportShotList(id),
+      // Landing entries only run outside a session, where modalHost() is body.
       onExportNleTimeline: (id) =>
         openNleExportModal(
           id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
-          document.getElementById('overlay')!,
+          this.modalHost() ?? document.body,
         ),
       onExportUe5Bridge: (id) =>
         openUe5ExportModal(
           id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
-          document.getElementById('overlay')!,
+          this.modalHost() ?? document.body,
         ),
       onAiShotAnalysis: (id) =>
         openAiAnalysisModal(
           id === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(id) ?? this.sceneData),
-          document.getElementById('overlay')!,
+          this.modalHost() ?? document.body,
         ),
       onRemoveScan: (id) => this.removeScan(id),
       onExportScanObj: (id) => void this.persistence.exportScanObj(id),
@@ -546,14 +690,22 @@ class App {
       onExportScanGeoJson: (id) => void this.persistence.exportScanGeoJson(id),
       onExportScanPackage: (id) => void this.persistence.exportScanPackage(id),
       onAddSyntheticScan: (id) => {
-        void this.persistence.attachSyntheticScan(id).then((scan) => {
-          if (scan && id === this.sceneData.id) {
-            this.sceneData = this.persistence.loadScene(id) ?? this.sceneData;
+        // The live scene is looked up after the scan blob is written, so an undo or
+        // restore landing during that await is not overwritten by an older object.
+        void this.persistence.attachSyntheticScan(id, () => this.sceneData).then((res) => {
+          // The scan was attached to the live scene object itself. Replacing
+          // this.sceneData with a reloaded copy (as before) left actors, props and
+          // cameras editing the old object while autosave wrote the new one.
+          // Mirrors removeScan: show it and make it undoable.
+          if (res && res.scene === this.sceneData) {
             this.syncLocation();
+            this.history.record(res.scene);
           }
           this.refreshLanding();
         });
       },
+      getStorageSummary: () => this.persistence.storageReport().then(formatStorageLine),
+      onSetLedVolumeEnabled: (sceneId, enabled) => this.setLedVolumeEnabled(sceneId, enabled),
       onPreview: (id) => this.openPreview(id),
       getScene: (id) =>
         id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id),
@@ -567,32 +719,15 @@ class App {
       onOpenLiveLink: () => this.openLiveLinkDialog(),
       onGaussianSplatStudio: (sceneId) => {
         const sc = sceneId === this.sceneData.id ? this.sceneData : (this.persistence.loadScene(sceneId) ?? this.sceneData);
-        openGaussianSplatStudioModal(
-          sc,
-          (updated) => {
-            if (sc.id === this.sceneData.id) {
-              this.sceneData = updated;
-              this.loadScene(this.sceneData);
-              this.persistence.saveNow(this.sceneData);
-              this.markDirty();
-            } else {
-              this.persistence.saveNow(updated);
-            }
-            this.refreshLanding();
-          },
-          document.getElementById('overlay')!,
-          (cloud) => {
-            if (sc.id === this.sceneData.id) {
-              this.splatRenderer.setCloud(cloud);
-            }
-          },
-        );
+        this.openSplatStudioDialog(sc);
       },
       onOpenDailiesStudio: (sceneId) => {
         const sc =
           sceneId === this.sceneData.id
             ? this.sceneData
             : (this.persistence.loadScene(sceneId) ?? this.sceneData);
+        const host = this.studioHost('Dailies Studio');
+        if (!host) return;
         openDailiesVideoStudioModal(
           sc,
           async (options, onProgress) => {
@@ -606,7 +741,7 @@ class App {
               sc.id === this.sceneData.id ? this.contentRoot : undefined,
             );
           },
-          document.getElementById('overlay') ?? document.body,
+          host,
         );
       },
       onOpenDmxBridge: (sceneId) => {
@@ -673,10 +808,20 @@ class App {
       setTimeout(() => this.openCollabDialog(), 300);
     }
 
+    // Save, storage and prop-library failures reach the debug log, the 3D wrist and
+    // a banner on the 2D landing page (the wrist is invisible there). A failed save
+    // also re-lists the scenes, so the scene shows a "Not saved" row with Export
+    // (in AR the hidden landing is not rebuilt per failed autosave; session end
+    // re-lists it). Failures raised before this point (the first-run save in
+    // loadCurrentOrCreate) were held by Persistence and are delivered here.
     this.persistence.onError = (m) => {
-      this.debug.log(m);
-      this.wrist.setStatus(m);
+      this.reportDataIssue(m);
+      if (!this.renderer.xr.isPresenting) this.refreshLanding();
     };
+    globalPropStore.onError = (m) => this.reportDataIssue(m);
+    // A store whose storage opened late has saved what it held in memory.
+    this.persistence.onNotice = (m) => this.reportStorageNotice(m);
+    globalPropStore.onNotice = (m) => this.reportStorageNotice(m);
 
     // Fires whichever way a take ends (wrist toggle, camera deleted, session
     // end, MAX_RECORD_S cap, encoder error) — the file is already downloading.
@@ -687,6 +832,7 @@ class App {
 
     this.wireSubsystems();
     this.loadScene(this.sceneData);
+    if (import.meta.env.DEV) this.installDevTestHooks();
     // ?preview auto-opens the desktop viewer on the current scene (also the
     // hook for the headless render smoke — see test notes in TESTING.md).
     if (new URLSearchParams(location.search).has('preview')) this.openPreview(this.sceneData.id);
@@ -803,7 +949,8 @@ class App {
       } else if (id === 'wheel') {
         this.toggleMenuInFront();
       } else if (id === 'ai') {
-        openAiAnalysisModal(this.sceneData);
+        const host = this.studioHost('AI Shot Analysis');
+        if (host) openAiAnalysisModal(this.sceneData, host);
       } else if (id === 'props') {
         void this.openPropsLibrary();
       }
@@ -853,6 +1000,25 @@ class App {
     this.refreshLanding();
   }
 
+  /** Turns a scene's LED volume on or off from the landing Scene card. */
+  private setLedVolumeEnabled(sceneId: string, enabled: boolean): void {
+    if (sceneId === this.sceneData.id) {
+      const icvfx = this.sceneData.icvfx;
+      if (!icvfx) return; // normalizeScene always fills it
+      icvfx.enabled = enabled;
+      this.icvfxRenderer.setConfig(icvfx);
+      this.collabSession.broadcastPatch({ type: 'icvfx_update', config: icvfx });
+      this.history.record(this.sceneData);
+      this.persistence.saveNow(this.sceneData);
+    } else {
+      const scene = this.persistence.loadScene(sceneId);
+      if (!scene?.icvfx) return;
+      scene.icvfx.enabled = enabled;
+      this.persistence.updateScene(scene);
+    }
+    this.refreshLanding();
+  }
+
   /**
    * Brings the location renderer in line with sceneData.scan, loading the
    * geometry blob from the store when it isn't already displayed. Async loads
@@ -865,20 +1031,41 @@ class App {
     if (!summary) {
       this.displayedScanId = null;
       this.location.setScan(null);
+      delete this.sceneData.locationMode; // the next scan starts in Ghost (normalizeScene)
       return;
     }
     if (summary.id === this.displayedScanId) {
       // Same geometry, possibly different furniture placements (undo/redo,
       // scene restore) — re-apply without reloading the blob.
       this.location.applyPlacements(summary.furniture);
+      // The display mode is a view preference, not an undoable edit: keep what
+      // is on screen, and write it back so a snapshot taken before the last
+      // mode change doesn't revert it on the next save.
+      this.sceneData.locationMode = this.location.mode;
       return;
     }
+    // New geometry (scene switch, reload, undo across a rescan): show it in the
+    // scene's saved mode, Ghost when it has none (normalizeScene's default).
+    this.location.setMode(this.sceneData.locationMode ?? 'ghost');
     void this.persistence.scans.getScan(summary.id).then((scan) => {
       if (token !== this.locationSyncToken) return; // superseded
+      // A carry started while the blob loaded holds a mesh setScan disposes.
+      if (this.draggedFurniture) this.cancelActiveManipulation();
       if (!scan) {
         this.displayedScanId = null;
         this.location.setScan(null);
-        this.debug.log('⚠ scan geometry missing for this scene (Remove scan on the landing page to clear)');
+        if (this.persistence.scans.storageState === 'open') {
+          this.debug.log('⚠ scan geometry missing for this scene (Remove scan on the landing page to clear)');
+          return;
+        }
+        // Not proof the scan is gone: storage has not opened (slow first load,
+        // or it failed). Load it when storage opens; never advise removing it.
+        this.debug.log('scan geometry not loaded yet: storage is slow to open (the scan loads when it does)');
+        void this.persistence.scans.whenStorageOpens().then((opened) => {
+          if (token !== this.locationSyncToken) return; // superseded
+          if (opened) this.syncLocation();
+          else this.debug.log('⚠ scan geometry not loaded: storage did not open. The scan is not removed; reload to try again');
+        });
         return;
       }
       this.displayedScanId = scan.id;
@@ -910,7 +1097,29 @@ class App {
     this.refreshLanding();
   }
 
-  /** Wrist "Scan Room": starts (or cancels) waiting for the platform mesh. */
+  /**
+   * Sets the scan display mode and remembers it on the scene, so a reload
+   * shows the scan the way it was left. A view preference: saved (debounced)
+   * but not recorded as an undo step.
+   */
+  private setLocationMode(mode: LocationMode): void {
+    this.location.setMode(mode);
+    this.contentVersion++; // hidden scans aren't grabbable: targets change
+    if (this.sceneData.locationMode !== mode) {
+      this.sceneData.locationMode = mode;
+      this.persistence.markDirty(this.sceneData);
+    }
+    this.refreshWristState();
+  }
+
+  /** Hidden, Ghost, Solid, Wireframe (wrist 'Loc:', wheel 'Room:', desktop preview). */
+  private cycleLocationMode(): LocationMode {
+    const next = this.location.cycleMode();
+    this.setLocationMode(next); // remember it on the scene
+    return next;
+  }
+
+  /** Wrist "Scan Room": starts (or cancels) waiting for the platform's room data. */
   private toggleScan(): void {
     if (this.pendingScan) {
       this.pendingScan = null;
@@ -919,29 +1128,66 @@ class App {
       return;
     }
     if (!this.session.session) return;
-    if (!this.session.features.meshDetection) {
-      this.debug.log('mesh detection unavailable — needs a Quest 3/3S-class device with Space Setup done');
+    // Meshes (Quest Scene Mesh) or planes (Android XR); unknown when the
+    // browser does not report enabledFeatures, in which case both are tried.
+    const cap = this.session.scanCapability();
+    if (!cap.canScan) {
+      this.debug.log(`scan unavailable: ${cap.reason}`);
       return;
     }
-    if (this.views.mode !== 'full' || this.views.isShifted) {
-      this.debug.log('scan needs Full view at true alignment — press Re-align first');
+    if (this.views.mode !== 'full') {
+      this.debug.log('scan needs Full view: switch to Full first');
       return;
     }
-    this.pendingScan = { startedAt: performance.now(), roomCaptureRequested: false };
-    this.debug.log('scanning — reading the room mesh…');
+    // Capture bakes the content transform into the geometry, so it must run at
+    // true registration. Re-align here instead of refusing. realign() applies
+    // behind a fade, so isShifted stays true for about half the fade; the scan
+    // waits for it in updatePendingScan rather than cancelling itself. A
+    // teleport still inside its fade (not applied yet) is replaced the same way.
+    const awaitingRealign = this.views.isShifted || this.views.fading;
+    if (awaitingRealign) this.views.realign();
+    this.pendingScan = {
+      startedAt: -1,
+      awaitingRealign,
+      sources: cap.sources,
+      floorHinted: false,
+      hinted: false,
+    };
+    this.debug.log(awaitingRealign ? 'scan: re-aligning first…' : `scanning: reading ${cap.sources.join(' + ')}…`);
     this.refreshWristState();
   }
 
-  /** Per-frame while a scan is pending: snapshot the Scene Mesh when tracked. */
+  /** Per-frame while a scan is pending: snapshot the room data when tracked. */
   private updatePendingScan(frame: XRFrame, time: number): void {
     const pending = this.pendingScan;
     if (!pending) return;
+    if (pending.awaitingRealign) {
+      if (this.views.fading) return; // realign queued behind the fade, not applied yet
+      pending.awaitingRealign = false;
+      pending.startedAt = -1;
+    }
     // Teleporting or leaving Full view mid-scan would bake that transform into
-    // the captured geometry — cancel instead of misregistering the room.
+    // the captured geometry: cancel instead of misregistering the room.
     if (this.views.mode !== 'full' || this.views.isShifted) {
       this.pendingScan = null;
-      this.debug.log('scan cancelled — view changed during capture (Re-align and rescan)');
+      this.debug.log('scan cancelled: view moved (Re-align, then rescan)');
       this.refreshWristState();
+      return;
+    }
+    // The timeout clock (re)starts on the first frame after the press, a
+    // realign, or a return to 'visible', and is held while system UI covers
+    // the session (no timing out mid Space Setup).
+    const visibility = this.session.session?.visibilityState;
+    if (pending.startedAt < 0 || (visibility !== undefined && visibility !== 'visible')) pending.startedAt = time;
+    const waited = time - pending.startedAt;
+    // Capture in a scene space the floor re-base (floor.ts) is about to move
+    // would leave the scan at the wrong height, so give the estimate its
+    // settle window first. Capped: without hit-test results it never settles.
+    if (!floorSettled(this.floorEst, this.lastViewerPos.y, time) && waited < SCAN_FLOOR_WAIT_MS) {
+      if (!pending.floorHinted) {
+        pending.floorHinted = true;
+        this.debug.log('scan: settling floor height, look at the floor');
+      }
       return;
     }
     const refSpace = this.renderer.xr.getReferenceSpace();
@@ -951,16 +1197,37 @@ class App {
     const scan = captureScanFromFrame(frame, refSpace, _worldToScene);
     if (scan) {
       this.pendingScan = null;
+      // The scan's labelled floor is direct evidence of the real floor. If the
+      // floor origin is too high and hits have not re-based yet (they only
+      // found a desk, or too few landed), re-base now and lift the scan by the
+      // same amount, so the room and the blocking land on the real floor
+      // together. Uncommitted means the floor offset is still 0, so scene y is
+      // reference-space y here.
+      const floorFix = floorCorrectionFromScan(this.floorEst, scanFloorY(scan), this.lastViewerPos.y);
+      if (floorFix !== null) {
+        translateScanY(scan, -floorFix);
+        this.views.setFloorOffset(floorFix);
+        this.debug.log(`⚠ floor origin was ${(-floorFix).toFixed(2)} m too high: re-based to the scanned floor`);
+      }
+      // Then freeze the estimate for the rest of the session: a later re-base
+      // would shift contentRoot under geometry captured in this scene space.
+      this.floorEst.committed = true;
       const summary = summarizeScan(scan);
       void this.persistence.scans.putScan(scan); // fire-and-forget; onError warns
       this.sceneData.scan = summary; // old blob (if any) stays until next-launch prune
       this.displayedScanId = scan.id;
       this.locationSyncToken++; // kill any in-flight stale load
+      // The capture can land seconds after the press (realign fade, floor
+      // settle) while a piece of the old room is in hand: end that carry
+      // before setScan disposes the mesh under it.
+      if (this.draggedFurniture) this.cancelActiveManipulation();
       this.location.setScan(scan);
-      this.location.setMode('ghost'); // show alignment over passthrough for confirmation
+      this.setLocationMode('ghost'); // show alignment over passthrough for confirmation
       this.contentVersion++; // fresh furniture raycast targets
       this.markDirty();
-      this.refreshLanding();
+      // Not rebuilt in AR: the landing is hidden (its storage line would read
+      // the just-captured scan back to size it); session end re-lists it.
+      if (!this.inXRSession()) this.refreshLanding();
       this.refreshWristState();
       this.debug.log(
         `✓ scanned ${scan.meshes.length} mesh${scan.meshes.length === 1 ? '' : 'es'} · ` +
@@ -969,21 +1236,155 @@ class App {
       );
       return;
     }
-    const waited = time - pending.startedAt;
-    if (!pending.roomCaptureRequested && waited > SCAN_ROOM_CAPTURE_AFTER_MS) {
-      pending.roomCaptureRequested = true;
-      this.debug.log('no room mesh yet — asking the system to run room capture…');
-      void this.session.requestRoomCapture().then((ok) => {
-        if (!ok && this.pendingScan) {
-          this.debug.log('room capture unavailable — run Space Setup in Quest Settings, then rescan');
-        }
-      });
+    // No automatic initiateRoomCapture here: it works once per session, needs
+    // plane-detection, can wipe anchors and is a stub in Chrome. Space Setup
+    // is the explicit wrist action (runSpaceSetup) instead.
+    const meshes = pending.sources.includes('meshes');
+    if (!pending.hinted && waited > SCAN_HINT_AFTER_MS) {
+      pending.hinted = true;
+      this.debug.log(
+        !meshes
+          ? 'no planes yet: look around at floor, walls and tables'
+          : this.session.roomCaptureRefusal() === null
+            ? 'no room data yet: Space Setup done? (wrist: Space Setup)'
+            : 'no room data yet: run Space Setup in Quest Settings',
+      );
     }
     if (waited > SCAN_TIMEOUT_MS) {
       this.pendingScan = null;
-      this.debug.log('scan timed out — finish Space Setup (Settings → Environment Setup) and retry');
+      this.debug.log(
+        meshes
+          ? 'scan timed out: run Space Setup in Quest Settings, then Scan Room again'
+          : 'scan timed out: no planes found, look around the room and rescan',
+      );
       this.refreshWristState();
     }
+  }
+
+  /**
+   * Arms a check of every actor and camera anchor (see recheckAnchors). Each
+   * new event restarts the grace window.
+   */
+  private scheduleAnchorRecheck(): void {
+    if (!this.session.session) return;
+    this.anchorRecheck = { due: -1, shiftHinted: false };
+  }
+
+  /**
+   * Runs once per frame, right after the anchor refresh, while a recheck is
+   * armed. Anchors are world-locked: after a reset a surviving anchor reports
+   * its pose in the new origin, and updateFromAnchors has already moved its
+   * object there. Re-anchoring it at its pre-reset scene coordinates would
+   * throw that away, so only objects whose anchor is gone (wiped by Space
+   * Setup, or never made) are re-anchored, where the scene has them. The grace
+   * window lets anchors that are only relocalizing report again first. While
+   * shifted it waits: anchors are created at scene coordinates read as
+   * reference-space ones, which only holds at true registration.
+   */
+  private recheckAnchors(frame: XRFrame, time: number): void {
+    const check = this.anchorRecheck;
+    if (!check) return;
+    if (check.due < 0) check.due = time + ANCHOR_RECHECK_GRACE_MS;
+    if (time < check.due) return;
+    if (this.views.isShifted) {
+      if (!check.shiftHinted) {
+        check.shiftHinted = true;
+        this.debug.log('tracking reset: Re-align to re-anchor');
+      }
+      return;
+    }
+    this.anchorRecheck = null;
+    if (!this.session.features.anchors) {
+      this.debug.log('tracking reset: check alignment to the room');
+      return;
+    }
+    let held = 0;
+    let lost = 0;
+    for (const obj of this.actors.all()) {
+      if (obj === this.draggedActor) continue; // its release re-anchors it
+      if (obj.anchor && this.session.anchorPosition(frame, obj.anchor, _anchorProbe)) {
+        held++;
+        continue;
+      }
+      if (!this.pendingReanchorActors.includes(obj)) this.pendingReanchorActors.push(obj);
+      lost++;
+    }
+    for (const obj of this.cams.all()) {
+      if (obj === this.draggedCamera) continue;
+      if (obj.anchor && this.session.anchorPosition(frame, obj.anchor, _anchorProbe)) {
+        held++;
+        continue;
+      }
+      if (!this.pendingReanchorCams.includes(obj)) this.pendingReanchorCams.push(obj);
+      lost++;
+    }
+    // The scan is not anchored: it stays at scene coordinates while anchored
+    // blocking holds to the real room, so alignment is worth a look either way.
+    this.debug.log(
+      lost > 0
+        ? `${lost} re-anchored: check alignment to the room`
+        : held > 0
+          ? 'anchors held: check scan alignment'
+          : 'tracking reset: check alignment to the room',
+    );
+  }
+
+  /**
+   * The tracking origin jumped (reference-space 'reset', for example after
+   * Space Setup or a recenter). The event fires before the first frame that
+   * uses the new origin, so the anchors are checked after that frame's
+   * refresh rather than re-created here (see recheckAnchors).
+   */
+  private onReferenceSpaceReset(): void {
+    this.scheduleAnchorRecheck();
+  }
+
+  /**
+   * Wrist 'Space Setup': asks the OS to run room capture, once per session
+   * and only with plane-detection. The first press only warns (it can reset
+   * tracking and wipe anchors); a second press within SPACE_SETUP_CONFIRM_MS
+   * runs it. Never called automatically.
+   */
+  private runSpaceSetup(): void {
+    if (!this.session.session) return;
+    if (this.spaceSetupSession === this.session.session) {
+      this.debug.log('Space Setup is already running');
+      return;
+    }
+    const refusal = this.session.roomCaptureRefusal();
+    if (refusal) {
+      this.spaceSetupConfirmUntil = 0;
+      this.debug.log(roomCaptureMessage(refusal));
+      this.refreshWristState();
+      return;
+    }
+    const now = performance.now();
+    if (now > this.spaceSetupConfirmUntil) {
+      this.spaceSetupConfirmUntil = now + SPACE_SETUP_CONFIRM_MS;
+      // The wrist tail shows ~40 characters: the instruction leads.
+      this.debug.log('Press again to run Space Setup (may reset anchors)');
+      this.refreshWristState();
+      return;
+    }
+    this.spaceSetupConfirmUntil = 0;
+    const session = this.session.session;
+    this.spaceSetupSession = session;
+    this.debug.log('Space Setup: follow the system prompts');
+    this.refreshWristState();
+    void this.session.requestRoomCapture().then((result) => {
+      if (this.spaceSetupSession === session) this.spaceSetupSession = null;
+      if (this.session.session !== session) return; // session ended during the OS flow
+      if (result.ok) {
+        // Room capture may have wiped anchors: re-anchor the ones that are
+        // gone once the next frames show which (survivors keep world-lock).
+        this.scheduleAnchorRecheck();
+        const quick = performance.now() - now < 1000;
+        this.debug.log(quick ? 'Space Setup returned at once: maybe nothing ran' : 'Space Setup done: now Scan Room');
+      } else {
+        this.debug.log(roomCaptureMessage(result.error));
+      }
+      this.refreshWristState();
+    });
   }
 
   /**
@@ -1026,7 +1427,7 @@ class App {
     if (data.dmxBridge) {
       this.dmxStreamer.setConfig(data.dmxBridge);
     }
-    this.icvfxRenderer.setConfig(data.icvfx || createLedVolumeConfig());
+    this.icvfxRenderer.setConfig(data.icvfx || createLedVolumeConfig('horseshoe_270', { enabled: false }));
     this.acousticsRenderer.setConfig(data.acoustics || createAcousticsConfig());
     this.solarRenderer.setConfig(data.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
     this.screenplayRenderer.setConfig(data.screenplay || createScreenplayConfig());
@@ -1046,10 +1447,15 @@ class App {
       // after a heavy one would be stuck at the heavy one's resolution forever. Reloading
       // the same scene (undo, restore, re-open) keeps it: the content is the same.
       this.performanceGovernor.clearKnownBadRenderScale();
+      // A different scene reports its own missing or broken prop models.
+      this.reportedPropLoadErrors.clear();
+      this.reportedPropLoadWarnings.clear();
     }
     this.selectedActorId = null;
     this.selectedPropId = null;
     this.hover = null;
+    // Its target is about to be disposed with the old scene.
+    this.contextualRadial.hide();
     // Reparent (not just null) any in-progress drag before setScene disposes
     // the old objects: a grip-dragged camera root lives under the controller,
     // and disposing it there would orphan a phantom gizmo on the controller.
@@ -1078,7 +1484,16 @@ class App {
    */
   private cancelActiveManipulation(): void {
     if (this.draggedCamera) this.cams.gizmoGroup.attach(this.draggedCamera.root);
-    if (this.draggedProp) this.contentRoot.attach(this.draggedProp.root);
+    if (this.draggedProp) {
+      // Back into the props group (removeProp / setScene only detach from
+      // there), and back to its last committed pose: a cancelled carry writes
+      // no data, so the visual must not keep the carried pose either.
+      const { root, data } = this.draggedProp;
+      this.props.group.attach(root);
+      root.position.set(data.position.x, data.position.y, data.position.z);
+      root.rotation.set(0, data.rotationY, 0);
+      root.scale.set(data.scale.x, data.scale.y, data.scale.z);
+    }
     this.draggedActor = null;
     this.draggedCamera = null;
     this.draggedProp = null;
@@ -1091,8 +1506,12 @@ class App {
       // or restore the scene, which re-applies the persisted placements.
       const mesh = this.draggedFurniture;
       this.draggedFurniture = null;
-      this.location.group.attach(mesh);
-      this.location.commitFurniture(mesh);
+      // A scan that replaced the room mid-carry already detached and disposed
+      // this mesh; attaching it again would leave an ungrabbable ghost.
+      if (this.location.ownsFurniture(mesh)) {
+        this.location.group.attach(mesh);
+        this.location.commitFurniture(mesh);
+      }
     }
     if (this.miniGrabbing) {
       this.views.miniGrabEnd();
@@ -1112,6 +1531,7 @@ class App {
     // contain the prop that was selected, leaving a dangling id behind.
     this.selectedPropId = null;
     this.hover = null;
+    this.contextualRadial.hide();
     this.cancelActiveManipulation();
     // Drop reanchor entries queued for the objects we're about to dispose —
     // otherwise the loop would create (and leak) anchors on detached objects.
@@ -1124,7 +1544,8 @@ class App {
       for (const obj of this.actors.all()) this.pendingReanchorActors.push(obj);
       for (const obj of this.cams.all()) this.pendingReanchorCams.push(obj);
     }
-    this.refreshLanding();
+    // The landing is hidden in AR and re-listed when the session ends.
+    if (!this.inXRSession()) this.refreshLanding();
     this.refreshWristState();
   }
 
@@ -1149,7 +1570,57 @@ class App {
   }
 
   private refreshLanding(): void {
-    this.landing.refreshScenes(this.persistence.listScenes(), this.sceneData.id);
+    // Includes scenes whose save failed (and the live scene if the index lacks it):
+    // they exist only in memory, and their row is where Export is.
+    this.landing.refreshScenes(this.persistence.listScenesForLanding(this.sceneData), this.sceneData.id);
+  }
+
+  /** Downloads a scene as .setview.json. The live scene is passed so Export hands out
+   *  what is in memory, not an older localStorage copy (or nothing) after a failed save. */
+  private exportSceneFile(id: string): void {
+    void this.persistence.exportScene(id, this.sceneData).then((ok) => {
+      if (!ok) this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
+    });
+  }
+
+  /**
+   * Surfaces a save, storage or import problem wherever the user is looking: the
+   * debug log (console and drift board), the 3D wrist status, and a landing banner
+   * on the 2D page. Banners sharing a key replace each other (default: the text).
+   */
+  /** Good news after a data warning (storage opened late and saved what it held). */
+  private reportStorageNotice(message: string): void {
+    this.debug.log(message);
+    this.wrist.setStatus(message);
+    this.landing.showBanner(message, 'info');
+  }
+
+  private reportDataIssue(message: string, key?: string, action?: { label: string; run: () => void }): void {
+    this.debug.log(message);
+    this.wrist.setStatus(message);
+    this.landing.showBanner(message, 'error', key, action);
+  }
+
+  /** On the first heavy import, asks once for persistent storage and says what the browser decided. */
+  private requestPersistentStorage(): void {
+    void this.persistence.requestPersistentStorage().then((outcome) => {
+      if (outcome === 'granted') {
+        this.debug.log('storage: persistent');
+        this.landing.showBanner(
+          'Browser storage is now persistent: SetView scenes, scans and props will not be cleared to free space.',
+          'info',
+          'persist',
+        );
+      } else if (outcome === 'denied') {
+        const m =
+          'The browser did not make storage persistent, so it may clear SetView data when space runs low. Export scenes you need to keep.';
+        this.debug.log(m);
+        this.landing.showBanner(m, 'warn', 'persist');
+      } else if (outcome === 'unsupported') {
+        this.debug.log('storage: persistence request unavailable in this browser');
+      }
+      if (outcome !== 'already-asked') this.refreshLanding();
+    });
   }
 
   /** Records an undo snapshot and schedules a debounced save. Call after every
@@ -1196,48 +1667,47 @@ class App {
     };
   }
 
-  /** Palm-wheel presses: menu navigation + actions (wheel.ts defines rings). */
+  /**
+   * Palm-wheel presses: menu navigation + actions (wheel.ts defines rings).
+   * Routing goes through wheel.ts's WHEEL_SECTOR_HANDLERS, which the domain
+   * tests check covers every sector a reachable ring can show.
+   */
   private onWheelPress(id: string): void {
-    switch (id) {
-      // Navigation.
-      case 'sub-lens':
-      case 'sub-marks':
-      case 'sub-capture':
-      case 'sub-edit':
-      case 'sub-props':
-        this.wheelPath = id.slice(4) as WheelPath;
-        break;
-      case 'wheel-back':
-        this.wheelPath = 'root';
-        break;
-      // Root actions.
-      case 'wheel-mode':
-        this.setInteractionMode(this.interactionMode === 'block' ? 'dress' : 'block');
-        break;
-      case 'wheel-place':
-        this.setPlaceMode(nextPlaceMode(this.placeMode));
-        break;
-      case 'wheel-view':
-        this.cycleView();
-        break;
-      case 'wheel-more':
-        this.panelPinned = !this.panelPinned;
-        break;
-      // Sub-wheel actions with no wrist-panel equivalent.
-      case 'focal-down':
-        this.cams.stepActiveFocal(-1);
-        break;
-      case 'focal-up':
-        this.cams.stepActiveFocal(1);
-        break;
-      case 'mark':
-        // The B button is unreachable on hand tracking — this is its home.
-        if (this.interactionMode === 'block') this.captureKeyframe();
-        break;
-      // Everything else is a wrist-panel action verbatim.
-      default:
-        this.onWristPress(id);
-        break;
+    const route = wheelSectorRoute(id);
+    if (route === 'nav') {
+      this.wheelPath = submenuForSector(id) ?? 'root'; // 'wheel-back' -> root
+    } else if (route === 'prop') {
+      const assetId = wheelPropPreset(id);
+      if (assetId) this.spawnWheelProp(assetId);
+    } else if (route === 'wrist') {
+      // A wrist-panel action verbatim.
+      this.onWristPress(id);
+    } else if (route === 'wheel') {
+      switch (id) {
+        // Root actions.
+        case 'wheel-mode':
+          this.setInteractionMode(this.interactionMode === 'block' ? 'dress' : 'block');
+          break;
+        case 'wheel-place':
+          this.setPlaceMode(nextPlaceMode(this.placeMode));
+          break;
+        case 'wheel-view':
+          this.cycleView();
+          break;
+        // Sub-wheel actions with no wrist-panel equivalent.
+        case 'focal-down':
+          this.cams.stepActiveFocal(-1);
+          break;
+        case 'focal-up':
+          this.cams.stepActiveFocal(1);
+          break;
+        case 'mark':
+          // The B button is unreachable on hand tracking — this is its home.
+          if (this.interactionMode === 'block') this.captureKeyframe();
+          break;
+      }
+    } else {
+      this.debug.log(`wheel: no handler for "${id}"`);
     }
     this.refreshWristState();
   }
@@ -1255,7 +1725,7 @@ class App {
     this.contentVersion++; // grab targets swap between furniture and actors/cams
     if (mode === 'dress' && this.location.hasScan && this.location.mode === 'hidden') {
       // Give the dresser something to grab — ghost the scan in.
-      this.location.setMode('ghost');
+      this.setLocationMode('ghost');
     }
     this.guide.refresh(this.guideCtx());
     this.debug.log(mode === 'dress' ? 'DRESS mode — move the set' : 'BLOCK mode — plan the shot');
@@ -1341,12 +1811,22 @@ class App {
           (this.selectedActorId ? this.sceneData.actors.find((a) => a.id === this.selectedActorId) : undefined) ??
           this.sceneData.actors[0];
         if (actor) {
-          openActorStudioModal(actor, this.sceneData, (updated) => {
-            Object.assign(actor, updated);
-            this.actors.rebuildVisual(actor.id);
-            this.persistence.saveNow(this.sceneData);
-            this.markDirty();
-          });
+          const host = this.studioHost('Actor Rig Studio');
+          if (!host) break;
+          openActorStudioModal(
+            actor,
+            this.sceneData,
+            (updated) => {
+              // Re-resolve: an undo while the studio was open replaces the scene's objects.
+              const live = this.sceneData.actors.find((a) => a.id === actor.id);
+              if (!live) return;
+              Object.assign(live, updated);
+              this.actors.rebuildVisual(live.id);
+              this.persistence.saveNow(this.sceneData);
+              this.markDirty();
+            },
+            host,
+          );
         } else {
           this.debug.log('No actor in scene: place an actor first');
         }
@@ -1355,34 +1835,34 @@ class App {
       case 'grip-rig': {
         const cam = this.cams.active?.data ?? this.sceneData.cameras[0];
         if (cam) {
-          openCameraGripModal(cam, this.sceneData, (updated) => {
-            Object.assign(cam, updated);
-            this.cams.refreshCamera(cam.id);
-            this.persistence.saveNow(this.sceneData);
-            this.markDirty();
-          });
+          const host = this.studioHost('Camera Grip Studio');
+          if (!host) break;
+          openCameraGripModal(
+            cam,
+            this.sceneData,
+            (updated) => {
+              // Re-resolve: an undo while the studio was open replaces the scene's objects.
+              const live = this.sceneData.cameras.find((c) => c.id === cam.id);
+              if (!live) return;
+              Object.assign(live, updated);
+              this.cams.refreshCamera(live.id);
+              this.persistence.saveNow(this.sceneData);
+              this.markDirty();
+            },
+            host,
+          );
         } else {
           this.debug.log('No camera in scene: place a camera first');
         }
         break;
       }
       case 'splat-studio': {
-        openGaussianSplatStudioModal(
-          this.sceneData,
-          (updated) => {
-            this.sceneData = updated;
-            this.loadScene(this.sceneData);
-            this.persistence.saveNow(this.sceneData);
-            this.markDirty();
-          },
-          document.getElementById('overlay')!,
-          (cloud) => {
-            this.splatRenderer.setCloud(cloud);
-          },
-        );
+        this.openSplatStudioDialog();
         break;
       }
       case 'dailies-studio': {
+        const host = this.studioHost('Dailies Studio');
+        if (!host) break;
         openDailiesVideoStudioModal(
           this.sceneData,
           async (options, onProgress) => {
@@ -1396,7 +1876,7 @@ class App {
               this.contentRoot,
             );
           },
-          document.getElementById('overlay') ?? document.body,
+          host,
         );
         break;
       }
@@ -1462,15 +1942,16 @@ class App {
       case 'scan':
         this.toggleScan();
         break;
+      case 'space-setup':
+        this.runSpaceSetup();
+        break;
       case 'location': {
         if (!this.location.hasScan) {
           this.debug.log('no location scan in this scene yet — press Scan Room');
           break;
         }
-        const mode = this.location.cycleMode();
-        this.contentVersion++; // hidden scans aren't grabbable — targets change
+        const mode = this.cycleLocationMode();
         this.debug.log(`location: ${mode}`);
-        this.refreshWristState();
         break;
       }
       case 'drift': {
@@ -1490,9 +1971,11 @@ class App {
       case 'record':
         this.toggleRecording();
         break;
-      case 'aianalysis':
-        openAiAnalysisModal(this.sceneData, document.getElementById('overlay')!);
+      case 'aianalysis': {
+        const host = this.studioHost('AI Shot Analysis');
+        if (host) openAiAnalysisModal(this.sceneData, host);
         break;
+      }
       case 'help':
         this.guideSticky = !this.guideSticky;
         this.guideAutoUntil = 0;
@@ -1524,31 +2007,8 @@ class App {
       case 'exit':
         void this.session.session?.end();
         break;
-      case 'prop-chair':
-      case 'prop-applebox':
-      case 'prop-cstand':
-      case 'prop-slate':
-      case 'prop-desk':
-      case 'prop-lamp':
-      case 'prop-greenscreen': {
-        const propAssetId = id.slice(5);
-        const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
-        const spawnPos = {
-          x: viewerLocal.x,
-          y: 0,
-          z: viewerLocal.z - 1.2,
-        };
-        void this.props.addProp(propAssetId, spawnPos).then((obj) => {
-          this.contentVersion++;
-          this.collabSession.broadcastPatch({
-            type: 'prop_add',
-            prop: obj.data,
-          });
-          this.debug.log(`spawned ${obj.data.name}`);
-          this.markDirty();
-        });
-        break;
-      }
+      // The Props sub-wheel presets (prop-chair ...) route through
+      // onWheelPress -> spawnWheelProp (wheel.ts WHEEL_PROP_PRESETS).
       case 'prop-library':
         void this.openPropsLibrary();
         break;
@@ -1599,15 +2059,17 @@ class App {
         obj.anchor = null;
         this.pendingReanchorCams.push(obj);
       }
+      this.anchorRecheck = null; // everything is re-anchored above
       this.lastTime = 0;
       // Every session opens planning the shot; Dress is an explicit switch.
       this.interactionMode = 'block';
-      this.panelPinned = false;
       this.wheelInFront = false; // wheel starts on the hand, Y parks it in front
       this.placeMode = 'none'; // placing is armed per use, never carried over
       // Fresh reference space, fresh floor evidence.
       this.floorEst = newFloorEstimate();
       this.views.setFloorOffset(0);
+      // Wrist labels that depend on this session's features (Space Setup).
+      this.refreshWristState();
       // Teach the controls up front: chips tethered to the controllers for the
       // first few seconds; the wrist "?" button brings them back anytime.
       this.guideSticky = false;
@@ -1643,6 +2105,7 @@ class App {
     this.pendingScan = null;
     this.noteEditor.close();
     this.persistence.saveNow(this.sceneData);
+    this.moveStudiosToPage();
     document.getElementById('overlay')!.hidden = true;
     this.landing.show(true);
     this.refreshLanding();
@@ -1678,6 +2141,14 @@ class App {
       return;
     }
     if (this.hover?.kind === 'camera') {
+      // Selecting a camera ends any actor or prop selection, as selectActor
+      // and selectProp do for each other: Delete / Dup without a hover fall
+      // back to the selected prop or actor, which must not be a stale one
+      // hidden behind the camera's ring.
+      this.selectedPropId = null;
+      this.props.setSelected(null);
+      this.selectedActorId = null;
+      this.actors.setSelected(null);
       this.cams.setActive(this.hover.id);
       const camObj = this.cams.active;
       if (camObj) {
@@ -1687,7 +2158,7 @@ class App {
           y: camObj.root.position.y,
           z: camObj.root.position.z,
         });
-        this.contextualRadial.show('camera', camObj.data.id, camObj.root.position, {
+        this.contextualRadial.show('camera', camObj.data.id, camObj.root.getWorldPosition(_radialPos), {
           name: camObj.data.name,
           focalLength: camObj.data.lensFocalLength,
         });
@@ -1727,18 +2198,23 @@ class App {
       this.debug.log(`placed ${obj.data.name} at head (${Math.round(obj.data.lensFocalLength)}mm)`);
       this.markDirty();
     } else if (this.placeMode === 'prop') {
+      // Drops the last Props sub-wheel preset (Director's Chair until one is picked).
       if (!this.session.lastHit) return;
       const local = this.contentRoot.worldToLocal(this.session.lastHit.point.clone());
-      void this.props.addProp('chair', { x: local.x, y: local.y, z: local.z }).then((obj) => {
-        this.contentVersion++;
-        this.selectProp(obj.data.id);
-        this.collabSession.broadcastPatch({
-          type: 'prop_add',
-          prop: obj.data,
+      const pos = { x: local.x, y: local.y, z: local.z };
+      void this.props
+        .addProp(this.lastPropPreset, pos, { rotationY: this.faceViewerYaw(pos) })
+        .then((obj) => {
+          if (!obj) return;
+          this.contentVersion++;
+          this.selectProp(obj.data.id);
+          this.collabSession.broadcastPatch({
+            type: 'prop_add',
+            prop: obj.data,
+          });
+          this.debug.log(`placed ${obj.data.name}`);
+          this.markDirty();
         });
-        this.debug.log(`placed ${obj.data.name}`);
-        this.markDirty();
-      });
     }
     // Hands place ONE per arm: stray pinches are constant on hand tracking,
     // so the tool disarms after each placement (the wheel is a glance away).
@@ -1768,8 +2244,9 @@ class App {
       const ray = this.input.raySpace(hand);
       if (obj && ray) {
         this.draggedProp = obj;
-        this.props.setSelected(obj.data.id);
-        this.selectedPropId = obj.data.id;
+        // Same as the actor path: what you carry is the selection (and no
+        // stale actor stays selected behind it).
+        this.selectProp(obj.data.id);
         ray.attach(obj.root);
         this.debug.log(`moving ${obj.data.name}`);
       }
@@ -1821,16 +2298,32 @@ class App {
     if (this.draggedProp) {
       const obj = this.draggedProp;
       this.draggedProp = null;
-      this.contentRoot.attach(obj.root);
+      // Back under the props group (content space), world pose kept.
+      this.props.group.attach(obj.root);
+      // Settle like released furniture (location.ts commitFurniture): pure
+      // yaw, no pitch/roll from the free carry, and down onto the real surface
+      // under the prop or the floor (props.ts settlePropY). The ray hit only
+      // counts when it is under the prop, not wherever the ray happens to end.
+      const q = obj.root.quaternion;
+      const rotY = quatYaw(q.x, q.y, q.z, q.w);
       const pos = obj.root.position;
-      const rotY = obj.root.rotation.y;
-      obj.data.position = { x: pos.x, y: pos.y, z: pos.z };
+      const hit = this.session.lastHit
+        ? this.props.group.worldToLocal(_pt.copy(this.session.lastHit.point))
+        : null;
+      obj.data.position = { x: pos.x, y: settlePropY(pos, hit), z: pos.z };
       obj.data.rotationY = rotY;
+      obj.data.rotationX = 0;
+      obj.data.rotationZ = 0;
+      obj.root.position.set(obj.data.position.x, obj.data.position.y, obj.data.position.z);
+      obj.root.rotation.set(0, rotY, 0);
+      obj.root.scale.set(obj.data.scale.x, obj.data.scale.y, obj.data.scale.z);
       this.collabSession.broadcastPatch({
         type: 'prop_move',
         propId: obj.data.id,
         position: obj.data.position,
         rotationY: rotY,
+        rotationX: 0,
+        rotationZ: 0,
       });
       this.markDirty();
     }
@@ -1848,6 +2341,8 @@ class App {
     if (this.draggedFurniture) {
       const mesh = this.draggedFurniture;
       this.draggedFurniture = null;
+      // Replaced by a new scan mid-carry: clear() already detached and disposed it.
+      if (!this.location.ownsFurniture(mesh)) return;
       this.location.group.attach(mesh); // back under contentRoot, world pose kept
       const placement = this.location.commitFurniture(mesh);
       if (placement && this.sceneData.scan) {
@@ -1912,63 +2407,137 @@ class App {
   }
 
   private selectActor(id: string | null): void {
+    if (id) {
+      // Selecting an actor ends any prop selection; otherwise Delete/Dup
+      // (which prefer a selected prop) would act on the stale prop.
+      this.selectedPropId = null;
+      this.props.setSelected(null);
+    }
     this.selectedActorId = id;
     this.actors.setSelected(id);
     if (id) {
       const actor = this.actors.get(id);
       if (actor) {
-        this.gizmo.attachActor(actor);
         globalSpatialFeedback.triggerHaptic('both', 'grab');
         globalSpatialFeedback.playSpatialSound('click', {
           x: actor.root.position.x,
           y: actor.root.position.y,
           z: actor.root.position.z,
         });
-        this.contextualRadial.show('actor', id, actor.root.position, {
+        this.contextualRadial.show('actor', id, actor.root.getWorldPosition(_radialPos), {
           stance: actor.data.stance,
           name: actor.data.name,
         });
       } else {
-        this.gizmo.detach();
         this.contextualRadial.hide();
       }
     } else {
-      if (this.gizmo.getTarget()?.kind === 'actor') {
-        this.gizmo.detach();
-      }
       this.contextualRadial.hide();
     }
     this.refreshWristState();
   }
 
   private selectProp(id: string | null): void {
+    if (id) {
+      // Selecting a prop ends any actor selection (mirror of selectActor), so
+      // Stance, Mark and the Delete / Dup fallback never act on a hidden one.
+      this.selectedActorId = null;
+      this.actors.setSelected(null);
+    }
     this.selectedPropId = id;
     this.props.setSelected(id);
     if (id) {
       const prop = this.props.get(id);
       if (prop) {
-        this.gizmo.attachProp(prop);
         globalSpatialFeedback.triggerHaptic('both', 'grab');
         globalSpatialFeedback.playSpatialSound('click', {
           x: prop.root.position.x,
           y: prop.root.position.y,
           z: prop.root.position.z,
         });
-        this.contextualRadial.show('prop', id, prop.root.position, {
+        this.contextualRadial.show('prop', id, prop.root.getWorldPosition(_radialPos), {
           name: prop.data.name,
           category: prop.data.category,
         });
       } else {
-        this.gizmo.detach();
         this.contextualRadial.hide();
       }
     } else {
-      if (this.gizmo.getTarget()?.kind === 'prop') {
-        this.gizmo.detach();
-      }
       this.contextualRadial.hide();
     }
     this.refreshWristState();
+  }
+
+  /**
+   * The object the contextual radial belongs to, so the loop can keep the ring
+   * on it as the set moves (glide, snap-turn, teleport) or the object is
+   * carried. Map lookups only: no allocation.
+   */
+  private radialTargetRoot(): THREE.Object3D | null {
+    const id = this.contextualRadial.getActiveEntityId();
+    if (!id) return null;
+    switch (this.contextualRadial.getActiveEntityType()) {
+      case 'actor':
+        return this.actors.get(id)?.root ?? null;
+      case 'prop':
+        return this.props.get(id)?.root ?? null;
+      case 'camera':
+        return this.cams.get(id)?.root ?? null;
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Where a prop from the wheel or the Prop Library lands, in content space:
+   * the live hit-test point when it is a plausible surface within reach
+   * (props.ts propSpawnHitUsable: not a far wall the ray hit through the
+   * wheel), otherwise PROP_SPAWN_AHEAD_M along your horizontal heading, on
+   * the floor.
+   */
+  private propSpawnPoint(): Vec3 {
+    const hit = this.session.session ? this.session.lastHit : null;
+    if (hit) {
+      const p = this.contentRoot.worldToLocal(hit.point.clone());
+      const eye = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
+      if (propSpawnHitUsable(p, eye)) return { x: p.x, y: p.y, z: p.z };
+    }
+    const ahead = new THREE.Vector3(0, 0, -1).applyQuaternion(this.lastViewerQuat);
+    ahead.y = 0;
+    if (ahead.lengthSq() < 1e-6) ahead.set(0, 0, -1); // looking straight down
+    ahead.normalize().multiplyScalar(PROP_SPAWN_AHEAD_M).add(this.lastViewerPos);
+    const p = this.contentRoot.worldToLocal(ahead);
+    return { x: p.x, y: 0, z: p.z };
+  }
+
+  /** Heading (rotationY) that turns a prop at `pos` (content space) to face the viewer. */
+  private faceViewerYaw(pos: Vec3): number {
+    const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
+    return Math.atan2(viewerLocal.x - pos.x, viewerLocal.z - pos.z);
+  }
+
+  /** Props sub-wheel preset: spawn that catalog prop where you look and select it. */
+  private spawnWheelProp(assetId: string): void {
+    // Place: Prop drops whatever preset was picked last.
+    this.lastPropPreset = assetId;
+    if (this.views.mode === 'mini') {
+      // The miniature is scaled: "where you look" maps far outside the set.
+      // Placing actors and cameras is Full-view only for the same reason.
+      this.debug.log('Props: switch to Full view to place one here');
+      return;
+    }
+    const pos = this.propSpawnPoint();
+    void this.props.addProp(assetId, pos, { rotationY: this.faceViewerYaw(pos) }).then((obj) => {
+      if (!obj) return;
+      this.contentVersion++;
+      this.selectProp(obj.data.id);
+      this.collabSession.broadcastPatch({
+        type: 'prop_add',
+        prop: obj.data,
+      });
+      this.debug.log(`spawned ${obj.data.name}`);
+      this.markDirty();
+    });
   }
 
   private deleteTarget(): void {
@@ -2039,6 +2608,9 @@ class App {
       void this.props.duplicateProp(propId).then((obj) => {
         if (obj) {
           this.contentVersion++;
+          // The manager already highlights the copy; make it the selection too,
+          // so the next Delete/Dup acts on what is shown selected.
+          this.selectProp(obj.data.id);
           this.collabSession.broadcastPatch({
             type: 'prop_add',
             prop: obj.data,
@@ -2050,18 +2622,7 @@ class App {
       return;
     }
     if (this.hover?.kind === 'camera') {
-      const data = duplicateCameraSetup(this.sceneData, this.hover.id);
-      if (!data) return;
-      const obj = this.cams.adopt(data);
-      this.contentVersion++;
-      if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
-      this.collabSession.broadcastPatch({
-        type: 'camera_add',
-        camera: data,
-      });
-      this.debug.log(`duplicated → ${data.name}`);
-      this.refreshWristState();
-      this.markDirty();
+      this.duplicateCamera(this.hover.id);
       return;
     }
     const id = this.hover?.kind === 'actor' ? this.hover.id : this.selectedActorId;
@@ -2081,6 +2642,22 @@ class App {
       actor: data,
     });
     this.debug.log(`duplicated → ${data.name}`);
+    this.markDirty();
+  }
+
+  /** Clones a camera setup a short step away (Dup on a hovered camera, or its radial). */
+  private duplicateCamera(id: string): void {
+    const data = duplicateCameraSetup(this.sceneData, id);
+    if (!data) return;
+    const obj = this.cams.adopt(data);
+    this.contentVersion++;
+    if (!this.views.isShifted) this.pendingReanchorCams.push(obj);
+    this.collabSession.broadcastPatch({
+      type: 'camera_add',
+      camera: data,
+    });
+    this.debug.log(`duplicated → ${data.name}`);
+    this.refreshWristState();
     this.markDirty();
   }
 
@@ -2283,7 +2860,13 @@ class App {
         ? 'placing off'
         : mode === 'actor'
           ? 'ARMED: pinch/trigger on the floor ring places an actor'
-          : 'ARMED: pinch/trigger places a camera at your head',
+          : mode === 'camera'
+            ? 'ARMED: pinch/trigger places a camera at your head'
+            : mode === 'prop'
+              ? `ARMED: pinch/trigger on the floor ring places a ${
+                  getBuiltinPropDefinition(this.lastPropPreset)?.name ?? 'prop'
+                } (Edit ▸ Props ▸ places another kind and makes it the default)`
+              : 'light placing is not available yet',
     );
     this.guide.refresh(this.guideCtx());
     this.refreshWristState();
@@ -2385,6 +2968,22 @@ class App {
     this.wrist.setToggle('redo', this.history.canRedo);
     this.wrist.setLabel('scan', this.pendingScan ? 'Scanning…' : 'Scan Room');
     this.wrist.setToggle('scan', this.pendingScan !== null);
+    const setupRunning = this.spaceSetupSession !== null && this.spaceSetupSession === this.session.session;
+    const setupArmed = performance.now() < this.spaceSetupConfirmUntil;
+    const setupRefusal = this.session.session ? this.session.roomCaptureRefusal() : null;
+    this.wrist.setLabel(
+      'space-setup',
+      setupRunning
+        ? 'Setting up…'
+        : setupRefusal === 'already-used'
+          ? 'Setup used'
+          : setupRefusal
+            ? 'Setup n/a'
+            : setupArmed
+              ? 'Confirm?'
+              : 'Space Setup',
+    );
+    this.wrist.setToggle('space-setup', setupRunning || setupArmed);
     const loc = this.location.mode;
     this.wrist.setLabel('location', `Loc: ${loc.charAt(0).toUpperCase()}${loc.slice(1)}`);
     this.wrist.setToggle('location', this.location.hasScan && loc !== 'hidden');
@@ -2395,7 +2994,26 @@ class App {
     this.wrist.setLabel('stance', selObj ? `Stance ▸ ${poseFor(selObj.data.stance).short}` : 'Stance ▸');
     const sel = selObj?.data.name ?? '—';
     const cam = this.cams.active;
+    if (this.statusNote && performance.now() < this.statusNote.until) {
+      this.wrist.setStatus(this.statusNote.text);
+      return;
+    }
+    this.statusNote = null;
     this.wrist.setStatus(`${sel}${cam ? ` · ${cam.data.name} ${Math.round(cam.data.lensFocalLength)}mm` : ''}`);
+  }
+
+  /**
+   * Shows `text` on the wrist status line for STATUS_NOTE_MS, through any
+   * refreshWristState in between, then hands the line back to the selection
+   * summary.
+   */
+  private noteStatus(text: string): void {
+    const note = { text, until: performance.now() + STATUS_NOTE_MS };
+    this.statusNote = note;
+    this.wrist.setStatus(text);
+    window.setTimeout(() => {
+      if (this.statusNote === note) this.refreshWristState();
+    }, STATUS_NOTE_MS + 50);
   }
 
   /** Everything that must not appear in the virtual camera's frame. Cached and
@@ -2507,6 +3125,13 @@ class App {
     // the ray as a fallback hover so a pinch can press the pointed-at sector
     // even when the occluded tip loses tracking; controllers by ray + trigger.
     const rc = this.input.raycaster(pointer, this.raycaster);
+    if (this.contextualRadial.isVisible()) {
+      // Keep the ring on its target: the set moves under glide, snap-turn and
+      // teleport, and a carried prop moves with the hand.
+      const target = this.radialTargetRoot();
+      if (target) this.contextualRadial.setAnchor(target.getWorldPosition(_radialPos));
+      else this.contextualRadial.hide(); // target gone (deleted, remote patch)
+    }
     this.contextualRadial.update(this.camera);
     if (rc) this.contextualRadial.handlePointer(rc, false);
 
@@ -2722,11 +3347,26 @@ class App {
         const rotY = this.draggedActor.data.rotationY - axes.x * dt * 3.0;
         this.actors.applyPose(this.draggedActor, this.draggedActor.data.position, rotY);
       }
-    } else if (this.draggedFurniture) {
-      // Yaw the carried piece about the world up-axis (same stick gesture as
-      // rotating a dragged actor); world axis so the ray-space parent doesn't
-      // skew the spin.
-      if (Math.abs(axes.x) > 0.15) this.draggedFurniture.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
+    } else if (this.draggedFurniture || this.draggedProp || this.draggedCamera) {
+      // Yaw the carried piece (scanned furniture, a prop or a camera) about the
+      // world up-axis (same stick gesture as rotating a dragged actor). Its
+      // parent is the controller ray, which pitches and rolls with the hand,
+      // and rotateOnWorldAxis assumes an unrotated parent: it would spin about
+      // the ray's own Y and give a carried camera roll and pitch. So world up
+      // is expressed in the parent's frame first. Being a branch of this
+      // chain, a carry also keeps the stick from snap-turning the set.
+      const held = this.draggedFurniture ?? this.draggedProp?.root ?? this.draggedCamera!.root;
+      if (Math.abs(axes.x) > 0.15) {
+        const parent = held.parent;
+        if (parent) {
+          parent.getWorldQuaternion(_qParentInv).invert();
+          _spinAxis.copy(_up).applyQuaternion(_qParentInv);
+          _qSpin.setFromAxisAngle(_spinAxis, -axes.x * dt * 3.0);
+          held.quaternion.premultiply(_qSpin);
+        } else {
+          held.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
+        }
+      }
     } else if (this.miniGrabbing) {
       const grip = this.input.gripSpace(pointer);
       if (grip)
@@ -2757,13 +3397,14 @@ class App {
     // Suppressed while manipulating so it never fights a drag/grab. The radial
     // deadzone gate keeps the hot path allocation-free when the stick is centered
     // (the common case) — locomotionAmount only runs on real input.
-    if (
-      this.views.mode === 'full' &&
-      !this.draggedActor &&
-      !this.draggedCamera &&
-      !this.draggedFurniture &&
-      !this.miniGrabbing
-    ) {
+    const loco = this.locoState;
+    loco.viewMode = this.views.mode;
+    loco.draggingActor = this.draggedActor !== null;
+    loco.draggingCamera = this.draggedCamera !== null;
+    loco.draggingProp = this.draggedProp !== null;
+    loco.draggingFurniture = this.draggedFurniture !== null;
+    loco.miniGrabbing = this.miniGrabbing;
+    if (!locomotionSuppressed(loco)) {
       const ls = this.input.axes('left');
       if (ls.x * ls.x + ls.y * ls.y > LOCOMOTION_DEADZONE * LOCOMOTION_DEADZONE) {
         const mv = locomotionAmount(ls.x, ls.y, LOCOMOTION_SPEED, dt, LOCOMOTION_DEADZONE);
@@ -2784,6 +3425,8 @@ class App {
     // Drift resistance: snap anchored content to tracked anchor positions.
     if (!this.keyframes.active) this.actors.updateFromAnchors(frame);
     this.cams.updateFromAnchors(frame, this.draggedCamera?.data.id ?? null);
+    // After a reset: survivors have just reported their new pose; re-anchor the rest.
+    if (this.anchorRecheck) this.recheckAnchors(frame, time);
 
     this.keyframes.tick(dt);
     this.views.update(time);
@@ -2947,6 +3590,11 @@ class App {
       this.wrist.setLabel('play', this.keyframes.playing ? '⏸ Pause' : '▶ Play');
       if (this.recorder.recording)
         this.wrist.setLabel('record', `⏺ ${recordingClock(this.recorder.elapsedS(time))}`);
+      // Expire an unconfirmed Space Setup press so the wrist stops saying 'Confirm?'.
+      if (this.spaceSetupConfirmUntil !== 0 && performance.now() > this.spaceSetupConfirmUntil) {
+        this.spaceSetupConfirmUntil = 0;
+        this.refreshWristState();
+      }
     }
 
     this.splatRenderer.update(this.camera);
@@ -2987,7 +3635,6 @@ class App {
       this.comfortRenderer.getIsVisible() ? this.comfortReachTargets() : undefined,
     );
     this.volumetrics.tick(dt, this.sceneData.atmosphere, this.sceneData.lights ?? [], this.camera);
-    this.gizmo.update(this.camera);
     this.renderer.render(this.scene3, this.camera);
     // See the non-XR path above: endFrame stamps its own clock so the begin->end span
     // is real CPU time rather than a zero delta against the frame-start timestamp.
@@ -2995,54 +3642,257 @@ class App {
     this.profilerRuntime.endFrame(this.renderer, time);
   }
 
+  // --- studio modals -----------------------------------------------------------------
+
+  /**
+   * Dev server only (the constructor calls this under import.meta.env.DEV,
+   * which vite build compiles to false, so production never installs it): a
+   * handle for the headed smokes such as test/studio-modal-smoke.html.
+   * Undo lives on the 3D wheel and wrist and rendered props live in the 3D
+   * scene, so a DOM-driven smoke cannot reach either without it.
+   */
+  private installDevTestHooks(): void {
+    const sent: string[] = [];
+    const collab = this.collabSession;
+    const broadcast = collab.broadcastPatch.bind(collab);
+    collab.broadcastPatch = (patch) => {
+      sent.push(JSON.stringify(patch));
+      broadcast(patch);
+    };
+    const splat = this.splatRenderer as unknown as { cloud?: { id: string } | null };
+    (window as unknown as { __setviewTest?: unknown }).__setviewTest = {
+      undo: () => this.undo(),
+      canUndo: () => this.history.canUndo,
+      renderedPropCount: () => this.props.all().length,
+      splatCloudId: () => splat.cloud?.id ?? null,
+      liveDmxEnabled: () => this.dmxStreamer.getConfig().enabled,
+      sentPatches: () => sent.slice(),
+    };
+  }
+
+  /**
+   * Where a DOM modal (studio, library, exporter) mounts. Outside an XR session
+   * (landing page, desktop preview, the Quest 2D page) that is document.body:
+   * #overlay is hidden there. Inside a session only the dom-overlay root is
+   * displayed, so it is #overlay when the session granted dom-overlay, and null
+   * otherwise, meaning the modal would be invisible and the caller must refuse.
+   */
+  private modalHost(): HTMLElement | null {
+    if (!this.inXRSession()) return document.body;
+    if (!this.session.features.domOverlay) return null;
+    return document.getElementById('overlay');
+  }
+
+  /**
+   * True while an XR session is live and presenting. Also checks three's
+   * isPresenting, so the 2D page is never treated as in-session because of a
+   * session object a failed start left behind.
+   */
+  private inXRSession(): boolean {
+    return !!this.session.session && this.renderer.xr.isPresenting;
+  }
+
+  /**
+   * modalHost() for a studio the user just asked for. In AR without dom-overlay
+   * it returns null after saying so where the user is looking (wheel hub, wrist
+   * status, debug log, haptic buzz) instead of opening an invisible modal: the
+   * same refusal openNoteEditor makes, made visible.
+   */
+  private studioHost(name: string): HTMLElement | null {
+    const host = this.modalHost();
+    if (host) return host;
+    const NOTICE_MS = 3000;
+    this.debug.log(`${name} needs dom-overlay, which this session lacks: open it on the 2D page`);
+    this.wheel.showHubNotice('2D page', 'open it there', NOTICE_MS);
+    // noteStatus holds the line through the refreshWristState every press makes,
+    // then hands it back to the selection summary.
+    this.noteStatus(`${name}: open this on the 2D page`);
+    globalSpatialFeedback.triggerHaptic('both', 'error');
+    globalSpatialFeedback.playSpatialSound('error');
+    return null;
+  }
+
+  /**
+   * A studio still open when the session ends sits in #overlay, which the 2D
+   * page hides. Move it to body so it stays visible and usable there, and its
+   * unsaved edits are neither lost nor brought back on the next AR entry. Its
+   * Save and Cancel still work: the callbacks do not depend on where it mounts.
+   */
+  private moveStudiosToPage(): void {
+    const overlayRoot = document.getElementById('overlay');
+    if (!overlayRoot) return;
+    for (const el of Array.from(overlayRoot.children)) {
+      if (STUDIO_MODAL_ROOT_CLASSES.some((cls) => el.classList.contains(cls))) document.body.appendChild(el);
+    }
+  }
+
+  /**
+   * Commits an edit made in a studio modal. Studios opened from the landing page
+   * can target a scene other than the live one: that scene is only saved, since
+   * the live renderers, collab peers and undo history belong to the current
+   * scene. For the current scene the edit is applied to this.sceneData itself
+   * (the modal may hold a stale object if an undo replaced the scene while it was
+   * open), pushed to the running subsystems by `applyLive`, saved, broadcast and
+   * recorded as one undo step.
+   */
+  private commitStudioEdit(
+    sc: SceneData,
+    mutate: (target: SceneData) => void,
+    applyLive?: () => void,
+    patch?: CollabScenePatch,
+  ): void {
+    if (sc.id !== this.sceneData.id) {
+      mutate(sc);
+      this.persistence.saveNow(sc);
+      this.refreshLanding();
+      return;
+    }
+    mutate(this.sceneData);
+    applyLive?.();
+    this.persistence.saveNow(this.sceneData);
+    if (patch) this.collabSession.broadcastPatch(patch);
+    this.markDirty();
+    // The landing page is hidden in AR and refreshed when the session ends.
+    if (!this.inXRSession()) this.refreshLanding();
+  }
+
+  /**
+   * Older builds kept the Gemini API key inside each scene's set-dressing
+   * config, so it was autosaved, exported and sent to collab peers. It is now a
+   * per-device setting and normalizeScene drops it from scenes. Runs once per
+   * device, before the first scene loads: moves the key from the most recently
+   * edited scene that has one into the device setting, then rewrites every
+   * stored scene without it, so no scene in storage still holds the key.
+   */
+  private migrateGeminiKeyOnce(): void {
+    let store: Storage | null = null;
+    try {
+      store = window.localStorage;
+    } catch {
+      return; // storage blocked: nothing stored to move, nowhere to put it
+    }
+    // Mirrors SCENE_PREFIX in persistence.ts. If that ever changes this finds
+    // nothing and the user re-enters the key once (the Set Dressing modal says so).
+    const prefix = 'setview.scene.';
+    const sceneKeys = this.persistence.listScenes().map((e) => prefix + e.id); // most recently updated first
+    if (migrateEmbeddedGeminiKey(store, sceneKeys)) {
+      this.debug.log('Gemini API key moved from scene data to a per-device setting');
+    }
+  }
+
+  /**
+   * props.setScene disposes and rebuilds every prop object (asynchronously) and
+   * clears PropsManager's own selection. Drop main's prop selection and prop
+   * hover with it, as loadScene and restoreScene do, so Delete and Duplicate
+   * never act on a prop that is gone, the radial does not linger on it, and the
+   * gizmo never drives a disposed root.
+   */
+  private dropPropSelectionForRebuild(): void {
+    if (this.hover?.kind === 'prop') this.hover = null;
+    if (this.selectedPropId) this.selectProp(null);
+    else if (this.gizmo.getTarget()?.kind === 'prop') this.gizmo.detach();
+  }
+
+  /** Points the splat renderer at the scene's active cloud and floorplan. */
+  private applySplatState(data: SceneData): void {
+    const clouds = data.gaussianClouds ?? [];
+    this.splatRenderer.setCloud(clouds.find((c) => c.id === data.activeSplatCloudId) ?? clouds[0] ?? null);
+    this.splatRenderer.setFloorplanOverlay(data.architecture ?? null);
+  }
+
+  private openSplatStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('3DGS Studio');
+    if (!host) return;
+    const sc = sceneToUse ?? this.sceneData;
+    // The studio replaces scene.architecture only when Extract Walls staged a
+    // new one; otherwise Save must not write this (possibly stale) copy back
+    // over an architecture changed meanwhile by an undo or a collab patch.
+    const architectureAtOpen = sc.architecture;
+    openGaussianSplatStudioModal(
+      sc,
+      (updated) => {
+        // A normal undo step. This used to run loadScene, whose history.reset
+        // wiped the whole undo stack on every save. Only the splat renderer
+        // reads these fields, so actors, cameras and their anchors stay put.
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.gaussianClouds = updated.gaussianClouds;
+            t.activeSplatCloudId = updated.activeSplatCloudId;
+            if (updated.architecture !== architectureAtOpen) t.architecture = updated.architecture;
+          },
+          () => this.applySplatState(this.sceneData),
+        );
+      },
+      host,
+      // Live preview while editing; Cancel sends the opening cloud back here.
+      (cloud) => {
+        if (sc.id === this.sceneData.id) this.splatRenderer.setCloud(cloud);
+      },
+    );
+  }
+
   private openPerformanceSettings(): void {
+    const host = this.studioHost('Performance Settings');
+    if (!host) return;
     openPerformanceSettingsModal(
       this.performanceGovernor,
       (cfg) => {
         this.debug.log(`Perf governor config updated: target ${cfg.targetFps} FPS`);
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openDmxBridgeDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('DMX Bridge');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openDmxBridgeStudioModal(
       sc,
       (config) => {
-        sc.dmxBridge = config;
-        this.dmxStreamer.setConfig(config);
-        this.persistence.saveNow(this.sceneData);
-        this.markDirty();
+        // Only the loaded scene reconfigures the live streamer (commitStudioEdit
+        // skips applyLive for any other scene). No collab patch, as before: rig
+        // control stays with whoever is at the console.
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.dmxBridge = config;
+          },
+          () => this.dmxStreamer.setConfig(config),
+        );
       },
       (patches) => {
-        sc.dmxPatches = patches;
-        this.persistence.saveNow(this.sceneData);
-        this.markDirty();
+        this.commitStudioEdit(sc, (t) => {
+          t.dmxPatches = patches;
+        });
       },
       (cue) => {
         this.debug.log(`Triggered DMX Cue: ${cue.name}`);
       },
-      this.dmxStreamer,
-      document.getElementById('overlay') ?? document.body,
+      // The studio's rig buttons and network edits act on this streamer at
+      // once, so it gets the live one only for the loaded scene. For another
+      // scene it previews on a private streamer that never transmits.
+      sc.id === this.sceneData.id ? this.dmxStreamer : undefined,
+      host,
     );
   }
 
   private openIcvfxStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('ICVFX Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openIcvfxStudioModal(
       sc,
       (config) => {
-        sc.icvfx = config;
-        if (sc.id === this.sceneData.id) {
-          this.icvfxRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'icvfx_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.icvfx = config;
+          },
+          () => this.icvfxRenderer.setConfig(config),
+          { type: 'icvfx_update', config },
+        );
       },
       () => {
         this.debug.log('Exported nDisplay configuration');
@@ -3050,25 +3900,25 @@ class App {
       () => {
         this.debug.log('Exported OpenUSD LED volume stage');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openAcousticsStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Acoustics Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openAcousticsStudioModal(
       sc,
       (config) => {
-        sc.acoustics = config;
-        if (sc.id === this.sceneData.id) {
-          this.acousticsRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'acoustics_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.acoustics = config;
+          },
+          () => this.acousticsRenderer.setConfig(config),
+          { type: 'acoustics_update', config },
+        );
       },
       () => {
         this.debug.log('Exported BWF sound report');
@@ -3076,25 +3926,25 @@ class App {
       () => {
         this.debug.log('Exported AES31-3 / iXML manifest');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openSolarStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Solar Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openSolarStudioModal(
       sc,
       (config) => {
-        sc.solar = config;
-        if (sc.id === this.sceneData.id) {
-          this.solarRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'solar_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.solar = config;
+          },
+          () => this.solarRenderer.setConfig(config),
+          { type: 'solar_update', config },
+        );
       },
       () => {
         this.debug.log('Exported solar tracking CSV');
@@ -3102,39 +3952,49 @@ class App {
       () => {
         this.debug.log('Exported standalone DP Sun-Report HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openScreenplayStudioDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Screenplay Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openScreenplayBreakdownModal(
       sc,
       (config) => {
-        sc.screenplay = config;
-        if (sc.id === this.sceneData.id) {
-          this.screenplayRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'screenplay_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.screenplay = config;
+          },
+          () => this.screenplayRenderer.setConfig(config),
+          { type: 'screenplay_update', config },
+        );
       },
       (coverage) => {
         const patch: CollabScenePatch = {
           type: 'screenplay_apply_coverage',
           coverage,
         };
-        this.collabSession.broadcastPatch(patch);
-        applyScenePatch(this.sceneData, patch);
-        this.cams.setScene(this.sceneData);
-        this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
-        this.contentVersion++;
-        this.persistence.saveNow(this.sceneData);
+        // Coverage cameras go into the scene the studio was opened for; this
+        // used to add them to the live scene whichever scene that was.
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            applyScenePatch(t, patch);
+          },
+          () => {
+            // As applyRemotePatch: a carried camera root sits on the controller
+            // ray, out of reach of the rebuild, so end the carry first.
+            if (this.draggedCamera) this.cancelActiveManipulation();
+            this.cams.setScene(this.sceneData);
+            this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
+            this.contentVersion++;
+          },
+          patch,
+        );
         this.debug.log(`Applied ${coverage.length} AI coverage cameras to scene`);
-        this.markDirty();
       },
       () => {
         this.debug.log('Exported Screenplay Shot List CSV');
@@ -3142,25 +4002,25 @@ class App {
       () => {
         this.debug.log('Exported Director Pitch Deck HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openWebXRProfilerDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('WebXR Profiler');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openWebXRProfilerModal(
       sc,
       (config) => {
-        sc.profiler = config;
-        if (sc.id === this.sceneData.id) {
-          this.profilerRuntime.updateConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'profiler_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.profiler = config;
+          },
+          () => this.profilerRuntime.updateConfig(config),
+          { type: 'profiler_update', config },
+        );
       },
       async (scenarioId) => {
         const report = await this.profilerRuntime.startBenchmark(scenarioId);
@@ -3174,25 +4034,25 @@ class App {
       () => {
         this.debug.log('Exported WebXR standalone performance audit deck HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openVRComfortDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('VR Comfort Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openVRComfortModal(
       sc,
       (config) => {
-        sc.comfort = config;
-        if (sc.id === this.sceneData.id) {
-          this.comfortRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'comfort_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.comfort = config;
+          },
+          () => this.comfortRenderer.setConfig(config),
+          { type: 'comfort_update', config },
+        );
       },
       undefined,
       () => {
@@ -3201,49 +4061,69 @@ class App {
       () => {
         this.debug.log('Exported VR standalone comfort audit deck HTML');
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
   private openSetDressingDialog(sceneToUse?: SceneData): void {
+    const host = this.studioHost('Set Dressing Studio');
+    if (!host) return;
     const sc = sceneToUse ?? this.sceneData;
     openSetDressingStudioModal(
       sc,
       (config) => {
-        sc.setDressing = config;
-        if (sc.id === this.sceneData.id) {
-          this.setDressingRenderer.setConfig(config);
-        }
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'set_dressing_update',
-          config,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            t.setDressing = config;
+          },
+          () => this.setDressingRenderer.setConfig(config),
+          // Normalized copy: the Gemini key is a device setting and must never
+          // travel in a patch, whatever the modal hands over.
+          { type: 'set_dressing_update', config: normalizeSetDressingConfig(config) },
+        );
       },
       (_theme, _density, _enablePhysics) => {
-        if (sc.id === this.sceneData.id && sc.setDressing) {
-          this.setDressingRenderer.setConfig(sc.setDressing);
-        }
-        this.persistence.saveNow(this.sceneData);
-        if (sc.setDressing) {
-          this.collabSession.broadcastPatch({
-            type: 'set_dressing_scatter',
-            theme: sc.setDressing.activeTheme,
-            items: sc.setDressing.settledItems,
-          });
-        }
-        this.markDirty();
+        const scattered = sc.setDressing;
+        if (!scattered) return;
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            // The modal scattered into sc.setDressing already; mirror it when the
+            // live scene is a different object (an undo replaced it meanwhile).
+            if (t === sc) return;
+            if (!t.setDressing) t.setDressing = createSetDressingConfig();
+            t.setDressing.activeTheme = scattered.activeTheme;
+            t.setDressing.settledItems = scattered.settledItems;
+          },
+          () => this.setDressingRenderer.setConfig(this.sceneData.setDressing ?? scattered),
+          { type: 'set_dressing_scatter', theme: scattered.activeTheme, items: scattered.settledItems },
+        );
       },
       (mutations) => {
-        this.persistence.saveNow(this.sceneData);
-        this.collabSession.broadcastPatch({
-          type: 'set_dressing_ai_mutate',
-          mutations,
-        });
-        this.markDirty();
+        this.commitStudioEdit(
+          sc,
+          (t) => {
+            // The modal applied the mutations to sc; repeat them only on a
+            // different live object (see the scatter callback above).
+            if (t !== sc) applyAiMutationsToScene(t, mutations);
+          },
+          () => {
+            // AI edits add and remove props, not just the dressing config: the
+            // same refresh a remote set_dressing_ patch gets, so AI-added props
+            // appear without a reload. A prop still carried (grip held while
+            // clicking Apply in dom-overlay) is put back first, as there, so
+            // its release cannot re-attach a disposed root as a ghost.
+            this.setDressingRenderer.setConfig(this.sceneData.setDressing ?? createSetDressingConfig());
+            if (this.draggedProp) this.cancelActiveManipulation();
+            this.dropPropSelectionForRebuild();
+            this.props.setScene(this.sceneData);
+            this.contentVersion++;
+          },
+          { type: 'set_dressing_ai_mutate', mutations },
+        );
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 
@@ -3434,26 +4314,47 @@ class App {
         this.refreshWristState();
         break;
       }
+      case 'camera_duplicate': {
+        this.duplicateCamera(entityId);
+        break;
+      }
       case 'record_take': {
         void this.toggleRecording();
         break;
       }
       case 'prop_ground_floor': {
-        const prop = this.props.all().find((p) => p.data.id === entityId);
+        const prop = this.props.get(entityId);
         if (prop) {
           prop.data.position.y = 0;
           prop.root.position.y = 0;
+          this.collabSession.broadcastPatch({ type: 'prop_move', propId: entityId, position: prop.data.position });
           this.debug.log(`Grounded prop ${prop.data.name} to floor`);
           this.markDirty();
         }
         break;
       }
+      case 'prop_grid_snap': {
+        const prop = this.props.get(entityId);
+        if (prop) {
+          prop.data.position = snapPropToGrid(prop.data).position;
+          const p = prop.data.position;
+          prop.root.position.set(p.x, p.y, p.z);
+          this.collabSession.broadcastPatch({ type: 'prop_move', propId: entityId, position: p });
+          this.debug.log(`Snapped ${prop.data.name} to the 10 cm grid`);
+          this.markDirty();
+        }
+        break;
+      }
       case 'prop_duplicate': {
-        const prop = this.props.all().find((p) => p.data.id === entityId);
+        const prop = this.props.get(entityId);
         if (prop) {
           void this.props.duplicateProp(prop.data.id).then((spawned) => {
             if (spawned) {
+              // Same commit as the wrist/wheel Dup: hover targets, peers, undo.
+              this.contentVersion++;
               this.selectProp(spawned.data.id);
+              this.collabSession.broadcastPatch({ type: 'prop_add', prop: spawned.data });
+              this.debug.log(`duplicated → ${spawned.data.name}`);
               this.markDirty();
             }
           });
@@ -3461,14 +4362,25 @@ class App {
         break;
       }
       case 'prop_delete': {
-        this.props.removeProp(entityId);
+        // Same commit as the wrist/wheel Delete (deleteTarget): end any carry
+        // first, then hover targets, peers and undo.
+        this.cancelActiveManipulation();
+        if (this.props.removeProp(entityId)) {
+          this.collabSession.broadcastPatch({ type: 'prop_remove', propId: entityId });
+          this.contentVersion++;
+          this.hover = null;
+          this.debug.log('deleted prop');
+          this.markDirty();
+        }
         this.contextualRadial.hide();
-        this.selectedPropId = null;
-        this.markDirty();
+        if (this.selectedPropId === entityId) this.selectedPropId = null;
         break;
       }
       default:
-        this.debug.log(`Quick action executed: ${action.label}`);
+        // Not "executed": nothing ran. The domain tests keep every action the
+        // headset radial can show wired, so this is only reachable from a
+        // stale or foreign action list.
+        this.debug.log(`${action.label}: no handler for "${actionKey}"`);
         break;
     }
   }
@@ -3476,14 +4388,20 @@ class App {
   private updateHover(rc: THREE.Raycaster | null): void {
     let next: Hover = null;
     if (rc && !this.draggedActor && !this.draggedCamera && !this.draggedProp && !this.draggedFurniture && !this.miniGrabbing) {
-      if (this.hoverTargetsVersion !== this.contentVersion) {
+      // Keyed on the mode as well as the content: startAR resets the mode to
+      // Block directly, so a session that ended in Dress would otherwise keep
+      // the Dress list (furniture grabbable, actors and cameras not).
+      if (this.hoverTargetsVersion !== this.contentVersion || this.hoverTargetsMode !== this.interactionMode) {
         // The mode decides what the ray can touch: blocking never hovers the
-        // couch behind an actor; dressing never disturbs the blocking.
+        // couch behind an actor; dressing never disturbs the blocking. Props
+        // are set dressing too, so Dress can grab them; the hits below are
+        // distance-sorted, so the nearer of a prop and a scanned piece wins.
         this.hoverTargets =
           this.interactionMode === 'block'
             ? [...this.actors.raycastTargets(), ...this.cams.raycastTargets(), ...this.props.raycastTargets()]
-            : [...this.location.furnitureTargets()];
+            : [...this.location.furnitureTargets(), ...this.props.raycastTargets()];
         this.hoverTargetsVersion = this.contentVersion;
+        this.hoverTargetsMode = this.interactionMode;
       }
       const hits = rc.intersectObjects(this.hoverTargets, true);
       for (const hit of hits) {
@@ -3522,20 +4440,29 @@ class App {
     const success = applyScenePatch(this.sceneData, patch);
     if (!success) return;
 
+    // A branch below that rebuilds a manager disposes and replaces every object
+    // in it. If the local user is carrying one of those objects, end the carry
+    // first (as loadScene / restoreScene do): a carried camera or prop root sits
+    // under the controller ray, out of reach of the rebuild, and releasing the
+    // stale object afterwards would leave an undeletable ghost in the set.
     if (patch.type.startsWith('actor_')) {
+      if (this.draggedActor) this.cancelActiveManipulation();
       this.actors.setScene(this.sceneData);
       this.keyframes.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('prop_')) {
+      if (this.draggedProp) this.cancelActiveManipulation();
       this.props.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('camera_')) {
+      if (this.draggedCamera) this.cancelActiveManipulation();
       this.cams.setScene(this.sceneData);
       this.keyframes.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('screenplay_')) {
       this.screenplayRenderer.setConfig(this.sceneData.screenplay ?? null);
       if (patch.type === 'screenplay_apply_coverage') {
+        if (this.draggedCamera) this.cancelActiveManipulation();
         this.cams.setScene(this.sceneData);
         this.contentVersion++;
       }
@@ -3553,12 +4480,13 @@ class App {
     } else if (patch.type.startsWith('solar_')) {
       this.solarRenderer.setConfig(this.sceneData.solar || createSolarEnvironmentConfig('golden_hour_sunset'));
     } else if (patch.type.startsWith('icvfx_')) {
-      this.icvfxRenderer.setConfig(this.sceneData.icvfx || createLedVolumeConfig());
+      this.icvfxRenderer.setConfig(this.sceneData.icvfx || createLedVolumeConfig('horseshoe_270', { enabled: false }));
     } else if (patch.type.startsWith('acoustics_')) {
       this.acousticsRenderer.setConfig(this.sceneData.acoustics || createAcousticsConfig());
     } else if (patch.type.startsWith('set_dressing_')) {
       this.setDressingRenderer.setConfig(this.sceneData.setDressing || createSetDressingConfig());
       // Dressing mutates the prop list itself, not just the config.
+      if (this.draggedProp) this.cancelActiveManipulation();
       this.props.setScene(this.sceneData);
       this.contentVersion++;
     } else if (patch.type.startsWith('profiler_')) {
@@ -3575,7 +4503,11 @@ class App {
       // refresh here. Rebuilding everything is heavier than necessary and correct,
       // which is the right way round: a patch that silently fails to reach its
       // renderer leaves the receiving peer looking at stale geometry while their
-      // scene data has already moved on.
+      // scene data has already moved on. The rebuild also re-applies furniture
+      // placements, so a carried scanned piece ends its carry too.
+      if (this.draggedActor || this.draggedCamera || this.draggedProp || this.draggedFurniture) {
+        this.cancelActiveManipulation();
+      }
       this.applySceneToSubsystems(this.sceneData);
     }
 
@@ -3588,24 +4520,32 @@ class App {
   }
 
   private async openPropsLibrary(): Promise<void> {
+    const host = this.studioHost('Prop Library');
+    if (!host) return;
     const customAssets = await globalPropStore.listAssets();
     openPropsLibraryModal(
       async (assetId, customKey) => {
-        const viewerLocal = this.contentRoot.worldToLocal(this.lastViewerPos.clone());
-        const spawnPos = {
-          x: viewerLocal.x,
-          y: 0,
-          z: viewerLocal.z - 1.2,
-        };
+        const spawnPos = this.propSpawnPoint();
+        // An upload is an IndexedDB model: without sourceType 'indexeddb' the
+        // renderer drew it as a placeholder box. Name and file it as the upload.
+        const upload = customKey ? customAssets.find((a) => a.id === customKey) : undefined;
         const obj = await this.props.addProp(assetId, spawnPos, {
           customModelKey: customKey,
+          ...(customKey ? { sourceType: 'indexeddb' as const, category: upload?.category ?? 'custom' } : {}),
+          ...(upload ? { name: upload.name } : {}),
+          rotationY: this.faceViewerYaw(spawnPos),
         });
+        if (!obj) return;
         this.collabSession.broadcastPatch({
           type: 'prop_add',
           prop: obj.data,
         });
         this.markDirty();
         this.contentVersion++;
+        // Keep main's selection in step with the manager's highlight (Delete /
+        // Dup act on it); the radial menu only means something in a session.
+        if (this.session.session) this.selectProp(obj.data.id);
+        else this.selectedPropId = obj.data.id;
         this.debug.log(`placed prop: ${obj.data.name}`);
       },
       customAssets,
@@ -3615,6 +4555,7 @@ class App {
       async (id) => {
         await globalPropStore.deleteAsset(id);
       },
+      host,
     );
   }
 
@@ -3637,6 +4578,8 @@ class App {
   }
 
   private openLiveLinkDialog(): void {
+    const host = this.studioHost('LiveLink');
+    if (!host) return;
     openLiveLinkModal(
       this.liveLinkStreamer,
       this.sceneData,
@@ -3644,7 +4587,7 @@ class App {
         this.sceneData.livelink = cfg;
         this.persistence.saveNow(this.sceneData);
       },
-      document.getElementById('overlay') ?? document.body,
+      host,
     );
   }
 }

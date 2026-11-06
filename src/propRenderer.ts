@@ -10,12 +10,13 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { clone as cloneModel } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import {
   getBuiltinPropDefinition,
+  resolvePropSourceType,
   type PropData,
 } from './props.ts';
-import { globalPropStore } from './propStore.ts';
-import { disposeTree } from './ui.ts';
+import { globalPropStore, type CustomPropAsset } from './propStore.ts';
 
 // Shared reusable materials & geometries to keep WebXR draw calls minimal
 const _matCache = new Map<string, THREE.Material>();
@@ -42,6 +43,159 @@ const FABRIC_MAT = getOrCreateMaterial('#1e293b', 0.9, 0.0);
 const GREEN_CHROMA_MAT = getOrCreateMaterial('#22c55e', 0.9, 0.0);
 const EMISSIVE_WARM_MAT = new THREE.MeshBasicMaterial({ color: 0xffedd5 });
 
+/** Texture slots carried over when an uploaded model's materials become Lambert. */
+type LambertSource = THREE.Material & {
+  color?: THREE.Color;
+  map?: THREE.Texture | null;
+  emissive?: THREE.Color;
+  emissiveMap?: THREE.Texture | null;
+  emissiveIntensity?: number;
+  alphaMap?: THREE.Texture | null;
+  flatShading?: boolean;
+};
+
+/**
+ * Makes an uploaded model obey the render budget (flat Lambert, no lights of
+ * its own). glTF materials parse as MeshStandard/Physical (PBR: costlier, and
+ * metallic parts render black with no environment map) and OBJ as Phong; each
+ * becomes a MeshLambertMaterial with the same colour, base and emissive maps,
+ * vertex colours, transparency and side. Unlit (MeshBasic) materials stay.
+ * KHR_lights_punctual lights would light the whole set and force a shader
+ * recompile, so each is swapped for an empty group that keeps its children.
+ *
+ * Returns how many texture maps the original materials carried, so a caller
+ * can tell when a model that declares textures got none of them.
+ */
+export function flattenModelForBudget(root: THREE.Object3D): number {
+  const lights: THREE.Light[] = [];
+  const meshes: THREE.Mesh[] = [];
+  root.traverse((o) => {
+    if ((o as THREE.Light).isLight) lights.push(o as THREE.Light);
+    else if ((o as THREE.Mesh).isMesh) meshes.push(o as THREE.Mesh);
+  });
+
+  for (const light of lights) {
+    const stand = new THREE.Group();
+    stand.name = light.name;
+    stand.position.copy(light.position);
+    stand.quaternion.copy(light.quaternion);
+    stand.scale.copy(light.scale);
+    const target = (light as THREE.Light & { target?: THREE.Object3D }).target;
+    for (const child of [...light.children]) if (child !== target) stand.add(child);
+    const parent = light.parent;
+    light.removeFromParent();
+    parent?.add(stand);
+    light.dispose();
+  }
+
+  const swapped = new Map<THREE.Material, THREE.Material>();
+  const seenMaps = new Set<THREE.Texture>();
+  const keptMaps = new Set<THREE.Texture>();
+  const swap = (m: THREE.Material): THREE.Material => {
+    const known = swapped.get(m);
+    if (known) return known;
+    for (const v of Object.values(m)) if ((v as THREE.Texture | null)?.isTexture) seenMaps.add(v as THREE.Texture);
+    if ((m as THREE.MeshLambertMaterial).isMeshLambertMaterial || (m as THREE.MeshBasicMaterial).isMeshBasicMaterial) {
+      for (const v of Object.values(m)) if ((v as THREE.Texture | null)?.isTexture) keptMaps.add(v as THREE.Texture);
+      swapped.set(m, m);
+      return m;
+    }
+    const src = m as LambertSource;
+    const lambert = new THREE.MeshLambertMaterial({
+      name: src.name,
+      color: src.color ?? 0xffffff,
+      map: src.map ?? null,
+      emissive: src.emissive ?? 0x000000,
+      emissiveMap: src.emissiveMap ?? null,
+      emissiveIntensity: src.emissiveIntensity ?? 1,
+      alphaMap: src.alphaMap ?? null,
+      vertexColors: src.vertexColors,
+      transparent: src.transparent,
+      opacity: src.opacity,
+      alphaTest: src.alphaTest,
+      side: src.side,
+      depthWrite: src.depthWrite,
+      flatShading: src.flatShading ?? false,
+    });
+    for (const t of [lambert.map, lambert.emissiveMap, lambert.alphaMap]) if (t) keptMaps.add(t);
+    swapped.set(m, lambert);
+    return lambert;
+  };
+  for (const mesh of meshes) {
+    mesh.material = Array.isArray(mesh.material) ? mesh.material.map(swap) : swap(mesh.material);
+  }
+  // Free what the Lambert copies no longer reference (PBR maps, old materials).
+  for (const t of seenMaps) if (!keptMaps.has(t)) t.dispose();
+  for (const [from, to] of swapped) if (from !== to) from.dispose();
+  return seenMaps.size;
+}
+
+/**
+ * Frees a prop subtree: geometry, skeletons, materials and EVERY texture slot
+ * on them. ui.ts disposeTree frees only `map`, which would leak the emissive
+ * and alpha maps flattenModelForBudget keeps. Sprite geometry is three's
+ * shared quad, so a label sprite keeps it (its material and texture go).
+ */
+export function disposeModelTree(root: THREE.Object3D): void {
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (mesh.geometry && !(o as THREE.Sprite).isSprite) mesh.geometry.dispose();
+    if ((o as THREE.SkinnedMesh).isSkinnedMesh) (o as THREE.SkinnedMesh).skeleton.dispose();
+    const mats = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+    for (const m of mats) {
+      for (const v of Object.values(m)) if ((v as THREE.Texture | null)?.isTexture) (v as THREE.Texture).dispose();
+      m.dispose();
+    }
+  });
+}
+
+/** Triangles a ray tests in a model: three's Mesh.raycast has no BVH and walks every one. */
+export function countModelTriangles(root: THREE.Object3D): number {
+  let n = 0;
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const g = mesh.geometry;
+    const verts = g.index ? g.index.count : (g.attributes.position?.count ?? 0);
+    const copies = (o as THREE.InstancedMesh).isInstancedMesh ? (o as THREE.InstancedMesh).count : 1;
+    n += Math.floor(verts / 3) * copies;
+  });
+  return n;
+}
+
+/**
+ * Uploaded models with more triangles than this are picked by an invisible
+ * box over their bounds instead of their triangles. Hover raycasts every
+ * frame, and inside a model's bounds Mesh.raycast tests each triangle: about
+ * 2 ms for 50k triangles on an Apple Silicon Mac, more on Quest 3, against a
+ * 13.9 ms frame at 72 fps.
+ */
+export const EXACT_PICK_MAX_TRIANGLES = 5000;
+
+/** three's Raycaster does not descend into a node whose raycast returns false. */
+function skipSubtreeRaycast(): boolean {
+  return false;
+}
+
+/** Identifies the stored asset a cached model was parsed from. */
+function assetStamp(asset: CustomPropAsset | null): string {
+  return asset ? `${asset.fileType}:${asset.sizeBytes}:${asset.uploadedAt}` : '';
+}
+
+/** One parsed upload, shared by every prop that shows it (see PropRenderer.models). */
+interface CachedModel {
+  key: string;
+  /** assetStamp of the asset it was parsed from. */
+  stamp: string;
+  /** The grounded, flattened model; never in a scene itself. Null when the load failed. */
+  template: Promise<THREE.Group | null>;
+  /** Picked by its box: template children are [model, pick box] (EXACT_PICK_MAX_TRIANGLES). */
+  boxPick: boolean;
+  /** Clones handed out and not yet released. */
+  users: number;
+  freed: boolean;
+}
+
 export interface PropRenderInstance {
   data: PropData;
   root: THREE.Group;
@@ -55,12 +209,40 @@ export class PropRenderer {
   private gltfLoader = new GLTFLoader();
   private objLoader = new OBJLoader();
 
+  /**
+   * Parsed uploads by customModelKey. props.setScene (undo, redo, remote
+   * patches, scene load) disposes and rebuilds every prop; without this each
+   * rebuild re-parsed every upload on the main thread, once per copy, and the
+   * model vanished until the parse finished. Each prop gets a clone sharing
+   * the template's geometry, materials and textures: disposeProp releases it
+   * instead of freeing them, and the template is freed once no prop uses it.
+   * Failed loads are never cached, so a model imported later still loads.
+   */
+  private models = new Map<string, CachedModel>();
+  /** A handed-out clone -> the cached model it shares resources with. */
+  private modelUsers = new WeakMap<THREE.Object3D, CachedModel>();
+
+  /**
+   * Called when an uploaded model cannot be shown and the prop falls back to a
+   * placeholder box (missing from this device's store, unsupported file type,
+   * or a parse error such as a Draco-compressed GLB). main.ts routes it to the
+   * debug log and the wrist status.
+   */
+  onLoadError?: (assetKey: string, err: unknown) => void;
+
+  /**
+   * Called when an uploaded model IS shown but incompletely: today, a model
+   * that declares textures and got none of them (GLTFLoader only logs a
+   * failed texture to the console and carries on untextured).
+   */
+  onLoadWarning?: (assetKey: string, message: string) => void;
+
   /** Builds the Three.js 3D visual object for a given PropData. */
   async createPropMesh(prop: PropData): Promise<THREE.Group> {
     const group = new THREE.Group();
     group.name = `prop_${prop.id}`;
 
-    if (prop.sourceType === 'indexeddb' && prop.customModelKey) {
+    if (prop.customModelKey && resolvePropSourceType(prop.sourceType, prop.customModelKey) === 'indexeddb') {
       const customMesh = await this.loadCustomModel(prop.customModelKey);
       if (customMesh) {
         group.add(customMesh);
@@ -74,27 +256,105 @@ export class PropRenderer {
     return group;
   }
 
-  /** Loads and normalizes a custom 3D model from PropStore. */
-  private async loadCustomModel(customKey: string): Promise<THREE.Group | null> {
+  /**
+   * A prop's own copy of a custom model, from the cache (see models). Null
+   * when it cannot be shown (the caller then shows the placeholder box).
+   */
+  private async loadCustomModel(customKey: string, recheck = true): Promise<THREE.Group | null> {
+    // Acquired before any await: setScene clears every prop and rebuilds them
+    // in the same task, and release() frees a template only a tick later.
+    const entry = this.acquireModel(customKey);
+    const template = await entry.template;
+    if (!template) {
+      this.release(entry);
+      return null;
+    }
+    if (recheck && assetStamp(await globalPropStore.getAsset(customKey)) !== entry.stamp) {
+      // Deleted or replaced in the library since it was parsed: load what is stored now.
+      if (this.models.get(customKey) === entry) this.models.delete(customKey);
+      this.release(entry);
+      return this.loadCustomModel(customKey, false);
+    }
+    const model = cloneModel(template) as THREE.Group;
+    if (entry.boxPick) model.children[0].raycast = skipSubtreeRaycast;
+    this.modelUsers.set(model, entry);
+    return model;
+  }
+
+  private acquireModel(key: string): CachedModel {
+    let entry = this.models.get(key);
+    if (!entry) {
+      const created: CachedModel = { key, stamp: '', template: Promise.resolve(null), boxPick: false, users: 0, freed: false };
+      created.template = this.parseCustomModel(key, created).then((t) => {
+        if (!t && this.models.get(key) === created) this.models.delete(key);
+        return t;
+      });
+      this.models.set(key, created);
+      entry = created;
+    }
+    entry.users++;
+    return entry;
+  }
+
+  /** Drops one clone's hold; an unused template is freed a tick later unless re-acquired. */
+  private release(entry: CachedModel): void {
+    if (--entry.users > 0) return;
+    setTimeout(() => {
+      if (entry.users > 0 || entry.freed) return;
+      entry.freed = true;
+      if (this.models.get(entry.key) === entry) this.models.delete(entry.key);
+      void entry.template.then((t) => {
+        if (t) disposeModelTree(t);
+      });
+    }, 0);
+  }
+
+  /**
+   * Loads and normalizes a custom 3D model from PropStore. Parses the stored
+   * bytes directly (GLTFLoader.parseAsync / OBJLoader.parse) rather than
+   * fetching the model through a blob: URL, which Quest Browser has been
+   * reported to refuse with ERR_ACCESS_DENIED. Images embedded in a GLB still
+   * go through blob: URLs inside GLTFLoader, so textured GLBs on Quest are
+   * unverified on device; if every texture fails the model shows untextured
+   * and onLoadWarning says so. Failures go to onLoadError and return null.
+   */
+  private async parseCustomModel(customKey: string, entry: CachedModel): Promise<THREE.Group | null> {
+    const root = new THREE.Group();
     try {
       const asset = await globalPropStore.getAsset(customKey);
-      if (!asset) return null;
+      if (!asset || !asset.buffer) {
+        throw new Error('model not found in this device\'s prop library (uploaded on another device, or deleted)');
+      }
+      entry.stamp = assetStamp(asset);
 
-      const url = await globalPropStore.getAssetBlobUrl(customKey);
-      if (!url) return null;
+      if (asset.fileType !== 'glb' && asset.fileType !== 'gltf' && asset.fileType !== 'obj') {
+        throw new Error(`unsupported model type "${asset.fileType}" (use GLB, glTF or OBJ)`);
+      }
+      let declaredTextures = 0;
+      try {
+        if (asset.fileType === 'obj') {
+          root.add(this.objLoader.parse(new TextDecoder().decode(asset.buffer)));
+        } else {
+          // Empty base path: a .gltf whose buffers or textures are separate files
+          // cannot resolve them and fails here (reported); embedded data URIs
+          // work. Draco / meshopt / KTX2 compressed files fail too (no decoders).
+          const gltf = await this.gltfLoader.parseAsync(asset.buffer, '');
+          declaredTextures = (gltf.parser.json as { textures?: unknown[] }).textures?.length ?? 0;
+          root.add(gltf.scene);
+        }
+      } catch (parseErr) {
+        const why = parseErr instanceof Error ? parseErr.message : String(parseErr);
+        throw new Error(`could not read ${asset.fileName || asset.fileType.toUpperCase()}: ${why}`);
+      }
 
-      const root = new THREE.Group();
-
-      if (asset.fileType === 'glb' || asset.fileType === 'gltf') {
-        const gltf = await this.gltfLoader.loadAsync(url);
-        root.add(gltf.scene);
-      } else if (asset.fileType === 'obj') {
-        const obj = await this.objLoader.loadAsync(url);
-        root.add(obj);
+      const loadedTextures = flattenModelForBudget(root);
+      if (declaredTextures > 0 && loadedTextures === 0) {
+        this.onLoadWarning?.(customKey, `${asset.fileName || 'model'}: textures did not load, shown untextured`);
       }
 
       // Compute bounding box and normalize center/floor
       const box = new THREE.Box3().setFromObject(root);
+      if (box.isEmpty()) throw new Error('model has no visible geometry');
       const size = new THREE.Vector3();
       box.getSize(size);
       const center = new THREE.Vector3();
@@ -107,8 +367,22 @@ export class PropRenderer {
 
       const wrapper = new THREE.Group();
       wrapper.add(root);
+      if (countModelTriangles(root) > EXACT_PICK_MAX_TRIANGLES) {
+        // Mesh.raycast ignores material.visible, and the renderer skips it.
+        const pick = new THREE.Mesh(
+          new THREE.BoxGeometry(Math.max(size.x, 0.01), Math.max(size.y, 0.01), Math.max(size.z, 0.01)),
+          new THREE.MeshBasicMaterial({ visible: false }),
+        );
+        pick.name = 'prop_pick_box';
+        pick.position.y = size.y / 2;
+        wrapper.add(pick);
+        entry.boxPick = true;
+      }
       return wrapper;
-    } catch {
+    } catch (err) {
+      // Free anything a parse got as far as building before it failed.
+      disposeModelTree(root);
+      this.onLoadError?.(customKey, err);
       return null;
     }
   }
@@ -424,9 +698,26 @@ export class PropRenderer {
     return line;
   }
 
-  /** Disposes a rendered prop hierarchy. */
-  disposeProp(group: THREE.Group): void {
-    disposeTree(group);
+  /**
+   * Disposes a rendered prop hierarchy. An uploaded model in it is a clone
+   * sharing the cached template's geometry, materials and textures, so it is
+   * detached and released instead (only its own skeleton copies are freed).
+   */
+  disposeProp(root: THREE.Object3D): void {
+    const shared: THREE.Object3D[] = [];
+    root.traverse((o) => {
+      if (this.modelUsers.has(o)) shared.push(o);
+    });
+    for (const model of shared) {
+      const entry = this.modelUsers.get(model)!;
+      this.modelUsers.delete(model);
+      model.removeFromParent();
+      model.traverse((o) => {
+        if ((o as THREE.SkinnedMesh).isSkinnedMesh) (o as THREE.SkinnedMesh).skeleton.dispose();
+      });
+      this.release(entry);
+    }
+    if (!shared.includes(root)) disposeModelTree(root);
   }
 }
 

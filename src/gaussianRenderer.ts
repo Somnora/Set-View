@@ -79,6 +79,9 @@ export interface SplatRendererOptions {
   enableDepthSort?: boolean;
 }
 
+/** Scratch for the per-frame sort (update() must not allocate). */
+const _camDir = new THREE.Vector3();
+
 export class GaussianSplatRenderer {
   readonly group = new THREE.Group();
   private cloud: GaussianCloudData | null = null;
@@ -101,6 +104,8 @@ export class GaussianSplatRenderer {
   private depthBuffer: Float32Array = new Float32Array(0);
   private lastSortFrame = 0;
   private sortIntervalFrames = 2; // Throttle sorting for Quest 3 72fps budget
+  /** Back-to-front comparator, created once so the per-frame sort allocates no closure. */
+  private readonly compareDepthDesc = (a: number, b: number): number => this.depthBuffer[b] - this.depthBuffer[a];
 
   // Transform Gizmo & Alignment Visualizers
   private wireframeGroup = new THREE.Group();
@@ -147,10 +152,18 @@ export class GaussianSplatRenderer {
    */
   setSplatBudget(budget: number): void {
     const clamped = Math.max(100, Math.min(500000, Math.floor(budget)));
-    if (this.maxSplatBudget !== clamped) {
-      this.maxSplatBudget = clamped;
-      this.rebuildMesh();
-    }
+    if (this.maxSplatBudget === clamped) return;
+    const before = this.effectiveSplatCount();
+    this.maxSplatBudget = clamped;
+    // Rebuild only when the number of splats drawn actually changes. A budget move
+    // above the cloud's size (the common case: small clouds, budget in the 100k
+    // range) changes nothing on screen and must not reallocate every buffer.
+    if (this.effectiveSplatCount() !== before) this.rebuildMesh();
+  }
+
+  /** Splats actually drawn: the cloud size capped by the budget. */
+  private effectiveSplatCount(): number {
+    return this.cloud ? Math.min(this.cloud.splats.length, this.maxSplatBudget) : 0;
   }
 
   getSplatBudget(): number {
@@ -278,7 +291,20 @@ export class GaussianSplatRenderer {
     if (this.instancedMesh) {
       this.group.remove(this.instancedMesh);
       this.instancedMesh.geometry?.dispose();
+      // Frees the instanceMatrix GPU buffer (64 bytes per splat): three releases it
+      // only on the InstancedMesh 'dispose' event, not with the geometry.
+      this.instancedMesh.dispose();
       this.instancedMesh = null;
+    }
+    // The material was rebuilt (and its GPU program kept alive) on every rebuild
+    // without being disposed; release it along with the geometry.
+    if (this.splatMaterial) {
+      this.splatMaterial.dispose();
+      this.splatMaterial = null;
+    }
+    if (this.splatGeometry) {
+      this.splatGeometry.dispose();
+      this.splatGeometry = null;
     }
 
     if (!this.cloud || this.cloud.splats.length === 0) {
@@ -379,8 +405,7 @@ export class GaussianSplatRenderer {
     }
 
     // Camera view direction
-    const camDir = new THREE.Vector3();
-    camera.getWorldDirection(camDir);
+    const camDir = camera.getWorldDirection(_camDir);
 
     const count = this.rawSplats.length;
     const splats = this.rawSplats;
@@ -401,7 +426,7 @@ export class GaussianSplatRenderer {
     }
 
     // Depth sort indices back-to-front (furthest first for normal alpha blending)
-    indices.sort((a, b) => depths[b] - depths[a]);
+    indices.sort(this.compareDepthDesc);
 
     // Update instanced attributes with sorted order
     if (this.posAttr && this.scaleAttr && this.rotAttr && this.colAttr && this.opAttr) {
@@ -452,6 +477,7 @@ export class GaussianSplatRenderer {
     if (this.instancedMesh) {
       this.group.remove(this.instancedMesh);
       this.instancedMesh.geometry?.dispose();
+      this.instancedMesh.dispose(); // the instanceMatrix GPU buffer
       this.instancedMesh = null;
     }
     if (this.splatMaterial) {

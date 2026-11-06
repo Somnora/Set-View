@@ -1,0 +1,97 @@
+<!doctype html>
+<!-- Scan display mode through the REAL app (P0.7). preview-smoke.html?scan
+     builds its own LocationRenderer; this one boots src/main.ts, so it covers
+     App's own wiring: syncLocation restoring the saved mode on load, the
+     preview Room button going through App.cycleLocationMode, and the
+     debounced save writing the new mode back to the scene.
+
+     Seeds a scene with the synthetic test room's summary and a saved
+     locationMode of 'solid', boots the app with ?preview, then asserts:
+       1. the Room button reads 'Room: Solid' (restored, not the Ghost default)
+       2. one click reads 'Room: Wireframe'
+       3. after the 800 ms autosave, the stored scene has locationMode 'wireframe'
+     No IndexedDB needed: syncLocation sets the mode before the blob loads, and
+     a missing blob leaves it alone. The seeded scene is removed afterwards and
+     the previous current scene restored.
+
+     Headed (vite.http.config.ts): http://localhost:5174/test/location-mode-smoke.html
+     Headless:
+       chrome --headless=new --disable-gpu --enable-unsafe-swiftshader \
+         --window-size=1280,800 --virtual-time-budget=10000 --dump-dom \
+         http://localhost:5174/test/location-mode-smoke.html | grep LOCMODE-SMOKE -->
+<html>
+  <head><meta charset="utf-8" /><title>location mode smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6">running…</pre>
+    <script type="module">
+      import { createScene } from '../src/model.ts';
+      import { summarizeScan } from '../src/scan.ts';
+      import { createSyntheticLocationScan } from '../src/scanExporters.ts';
+
+      const out = document.getElementById('out');
+      const CURRENT_KEY = 'setview.currentScene';
+      const INDEX_KEY = 'setview.sceneIndex';
+      const SCENE_PREFIX = 'setview.scene.';
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const report = (ok, msg) => {
+        out.textContent = `LOCMODE-SMOKE ${ok ? 'PASS' : 'FAIL'} | ${msg}`;
+        out.style.color = ok ? '#9f6' : '#f66';
+      };
+
+      const prevCurrent = localStorage.getItem(CURRENT_KEY);
+      const scene = createScene('location-mode smoke');
+      scene.scan = summarizeScan(createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']));
+      scene.locationMode = 'solid';
+      const cleanup = () => {
+        try {
+          localStorage.removeItem(SCENE_PREFIX + scene.id);
+          const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+          localStorage.setItem(INDEX_KEY, JSON.stringify(index.filter((e) => e.id !== scene.id)));
+          if (prevCurrent) localStorage.setItem(CURRENT_KEY, prevCurrent);
+          else localStorage.removeItem(CURRENT_KEY);
+        } catch {
+          /* storage blocked: nothing was seeded */
+        }
+      };
+      try {
+        localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
+        const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+        index.push({ id: scene.id, name: scene.name, updatedAt: Date.now(), actors: 0, cameras: 0, hasScan: true });
+        localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+        localStorage.setItem(CURRENT_KEY, scene.id);
+        // The app opens the desktop preview on ?preview.
+        if (!new URLSearchParams(location.search).has('preview')) {
+          history.replaceState(null, '', `${location.pathname}?preview`);
+        }
+        await import('../src/main.ts');
+        // Registered after the app's own beforeunload save, so it runs last.
+        addEventListener('beforeunload', cleanup);
+
+        let roomBtn = null;
+        for (let i = 0; i < 40 && !roomBtn; i++) {
+          roomBtn = [...document.querySelectorAll('.preview-bar button')].find((b) =>
+            b.textContent.startsWith('Room:'),
+          );
+          if (!roomBtn) await sleep(100);
+        }
+        if (!roomBtn) {
+          report(false, 'no Room button in the preview toolbar');
+        } else {
+          const restored = roomBtn.textContent;
+          roomBtn.click();
+          const cycled = roomBtn.textContent;
+          await sleep(1200); // markDirty debounce is 800 ms
+          const saved = JSON.parse(localStorage.getItem(SCENE_PREFIX + scene.id) || 'null');
+          const ok = restored === 'Room: Solid' && cycled === 'Room: Wireframe' && saved?.locationMode === 'wireframe';
+          report(ok, `restored=${restored} cycled=${cycled} saved=${saved?.locationMode}`);
+        }
+      } catch (e) {
+        report(false, e.message);
+      } finally {
+        cleanup();
+      }
+    </script>
+  </body>
+</html>

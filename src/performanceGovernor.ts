@@ -660,6 +660,24 @@ export function calculateAdaptiveLODBudget(
   return Math.max(safeMin, Math.min(safeMax, Math.round(scaledBudget)));
 }
 
+/** Granularity of the splat budget the governor hands the splat renderer. */
+export const SPLAT_BUDGET_STEP = 5000;
+
+/**
+ * Turns the continuous adaptive splat budget into one that moves rarely. The raw
+ * budget is a function of the rolling frame-time average, so outside the tolerance
+ * band it changes on nearly every frame, and each change used to rebuild the splat
+ * mesh. The current budget is held until the proposal moves more than one step away,
+ * then it snaps to the nearest multiple of `step`, so jitter around a value or a
+ * step boundary cannot make it flip frame to frame.
+ */
+export function stepSplatBudget(current: number, proposed: number, step: number = SPLAT_BUDGET_STEP): number {
+  const safeStep = Number.isFinite(step) && step >= 1 ? Math.floor(step) : SPLAT_BUDGET_STEP;
+  if (!Number.isFinite(proposed) || proposed <= 0) return current;
+  if (Number.isFinite(current) && Math.abs(proposed - current) <= safeStep) return current;
+  return Math.max(safeStep, Math.round(proposed / safeStep) * safeStep);
+}
+
 /**
  * Estimates Garbage Collection / memory pressure from frame time jitter and latency spikes.
  */

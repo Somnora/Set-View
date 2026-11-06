@@ -1,0 +1,397 @@
+<!doctype html>
+<!-- Desktop smoke for the XR capability probe (test/xr-probe.html, roadmap P0.0).
+     Loads the real probe markup and script against a scripted fake WebXR
+     runtime (and stubbed navigator.storage) and drives it end to end: env
+     checks, persist(), two file reads, Enter AR, per-second sampling (with
+     detected planes undefined and detected meshes throwing for the first
+     2.5 s, which must not stop the polling), the sentinel anchor, Keyboard
+     test, the two-press room capture (with a reset, a visibility flip and a
+     lost anchor), Exit AR and Download JSON. It checks the saved report after
+     each step and prints XR-PROBE-SMOKE PASS or FAIL.
+
+       npx vite --config vite.http.config.ts
+       chrome --headless=new --disable-gpu --enable-unsafe-swiftshader \
+         --window-size=1100,900 --virtual-time-budget=60000 --dump-dom \
+         http://localhost:5174/test/xr-probe-smoke.html
+
+     With --screenshot instead of --dump-dom, the top of the page shows the
+     last frame of the in-AR panel. This proves the probe's own code paths
+     only. It says nothing about any headset: that is what the probe is for.
+     It clears the probe's saved report in this browser profile. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>xr probe smoke</title>
+  </head>
+  <body>
+    <pre id="smoke-out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6;background:#000">running...</pre>
+    <script type="module">
+      const out = document.getElementById('smoke-out');
+      const KEY = 'setview.xrProbe.report.v2';
+      const errors = [];
+      window.addEventListener('error', (e) => errors.push(`error: ${e.message}`));
+      window.addEventListener('unhandledrejection', (e) => errors.push(`rejection: ${e.reason && e.reason.message}`));
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const check = (cond, msg) => {
+        if (!cond) throw new Error(msg);
+      };
+      // Polls instead of fixed sleeps. Every step is paced by timers (fake
+      // frames, 1 Hz ticks, the fake room capture), which run on headless
+      // virtual time; real-time browser work such as storage IPC is stubbed
+      // out below, because virtual time races past it.
+      const until = async (cond, msg, maxMs = 20000) => {
+        for (let waited = 0; waited < maxMs; waited += 50) {
+          try {
+            if (cond()) return;
+          } catch {
+            /* not ready yet */
+          }
+          await wait(50);
+        }
+        throw new Error(`timed out: ${msg}`);
+      };
+      try {
+        localStorage.removeItem(KEY);
+
+        // --- probe markup, without its script ---
+        const html = await (await fetch('./xr-probe.html')).text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        for (const s of doc.querySelectorAll('script')) s.remove();
+        for (const st of doc.head.querySelectorAll('style')) document.head.append(document.importNode(st, true));
+        document.body.prepend(...Array.from(doc.body.childNodes, (n) => document.importNode(n, true)));
+        const $ = (id) => document.getElementById(id);
+
+        // --- fake WebXR runtime ---
+        const ident = () => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+        const translate = (x, y, z) => {
+          const m = ident();
+          m[12] = x;
+          m[13] = y;
+          m[14] = z;
+          return m;
+        };
+        const pose = (m) => ({
+          transform: { position: { x: m[12], y: m[13], z: m[14], w: 1 }, orientation: { x: 0, y: 0, z: 0, w: 1 }, matrix: m },
+        });
+        const f = 1 / Math.tan(Math.PI / 4);
+        const near = 0.01;
+        const far = 100;
+        const proj = new Float32Array([f, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) / (near - far), -1, 0, 0, (2 * far * near) / (near - far), 0]);
+        const HEAD_Y = 1.6;
+        const viewerPose = {
+          ...pose(translate(0, HEAD_Y, 0)),
+          views: [
+            { eye: 'left', projectionMatrix: proj, transform: pose(translate(-0.032, HEAD_Y, 0)).transform },
+            { eye: 'right', projectionMatrix: proj, transform: pose(translate(0.032, HEAD_Y, 0)).transform },
+          ],
+        };
+        class FakeSpace extends EventTarget {}
+        const localFloor = new FakeSpace();
+        const viewerSpace = new FakeSpace();
+        const anchorSpace = new FakeSpace();
+        const targetRaySpace = new FakeSpace();
+        const anchor = { anchorSpace, delete() {} };
+        const tracked = new Set();
+        let aim = translate(0, 0, 0);
+        let anchorPos = translate(0, 0, 0);
+        const plane = (semanticLabel, orientation, n) => ({
+          semanticLabel,
+          orientation,
+          polygon: Array.from({ length: n }, () => ({ x: 0, y: 0, z: 0, w: 1 })),
+          planeSpace: new FakeSpace(),
+          lastChangedTime: 0,
+        });
+        const planes = new Set([plane('floor', 'horizontal', 6), plane('wall', 'vertical', 4), plane(undefined, 'vertical', 4)]);
+        const meshes = new Set([
+          { semanticLabel: 'global mesh', vertices: new Float32Array(3000), indices: new Uint32Array(6000), meshSpace: new FakeSpace(), lastChangedTime: 0 },
+          { semanticLabel: 'table', vertices: new Float32Array(72), indices: new Uint32Array(36), meshSpace: new FakeSpace(), lastChangedTime: 0 },
+        ]);
+        // Detected geometry is not ready until GEOMETRY_READY_MS after requestSession:
+        // planes read as undefined (three.js also reads that attribute every frame,
+        // so it must not throw) and meshes throw. The probe must keep polling.
+        const GEOMETRY_READY_MS = 2500;
+        let geometryReadyAt = Infinity;
+        const geometryReady = () => performance.now() >= geometryReadyAt;
+        const frame = {
+          getViewerPose: () => viewerPose,
+          getPose: (space) => (space === targetRaySpace ? pose(aim) : space === anchorSpace ? pose(anchorPos) : null),
+          getHitTestResults: () => [{ getPose: () => pose(translate(0, 0, -1.5)) }],
+          get detectedPlanes() {
+            return geometryReady() ? planes : undefined;
+          },
+          get detectedMeshes() {
+            if (!geometryReady()) throw new DOMException('meshes not ready', 'InvalidStateError');
+            return meshes;
+          },
+          trackedAnchors: tracked,
+          createAnchor: () => {
+            tracked.add(anchor);
+            return Promise.resolve(anchor);
+          },
+        };
+        const inputSource = {
+          handedness: 'right',
+          targetRayMode: 'tracked-pointer',
+          targetRaySpace,
+          profiles: ['fake-controller'],
+          gamepad: null,
+          hand: null,
+        };
+        let roomCalls = 0;
+        let session = null;
+        class FakeSession extends EventTarget {
+          constructor() {
+            super();
+            this.enabledFeatures = ['hit-test', 'local-floor', 'anchors', 'plane-detection', 'mesh-detection'];
+            this.domOverlayState = null;
+            this.environmentBlendMode = 'alpha-blend';
+            this.interactionMode = 'world-space';
+            this.visibilityState = 'visible';
+            this.inputSources = [];
+            this.renderState = {};
+            this.frameRate = 72;
+            this.supportedFrameRates = new Float32Array([72, 90]);
+            this.persistentAnchors = ['', 'abc'];
+            this.ended = false;
+          }
+          updateRenderState(s) {
+            Object.assign(this.renderState, s);
+          }
+          requestReferenceSpace(type) {
+            return Promise.resolve(type === 'viewer' ? viewerSpace : localFloor);
+          }
+          requestHitTestSource() {
+            return Promise.resolve({ cancel() {} });
+          }
+          // Frames run on timers, not rAF: headless virtual time fast-forwards
+          // timers but paces rAF on its own, which would starve the 1 Hz ticks.
+          requestAnimationFrame(cb) {
+            return setTimeout(() => {
+              if (!this.ended) cb(performance.now(), frame);
+            }, 14);
+          }
+          cancelAnimationFrame(id) {
+            clearTimeout(id);
+          }
+          setVisibility(v) {
+            this.visibilityState = v;
+            this.dispatchEvent(new Event('visibilitychange'));
+          }
+          initiateRoomCapture() {
+            roomCalls++;
+            // Simulated OS flow: hidden, a pose reset, visible again, then the
+            // sentinel anchor is lost and shifted shortly after the call resolves.
+            this.setVisibility('hidden');
+            localFloor.dispatchEvent(new Event('reset'));
+            return new Promise((resolve) =>
+              setTimeout(() => {
+                this.setVisibility('visible');
+                resolve(undefined);
+                setTimeout(() => {
+                  tracked.delete(anchor);
+                  anchorPos = translate(0.05, 0, 0);
+                }, 1000);
+              }, 300),
+            );
+          }
+          end() {
+            if (!this.ended) {
+              this.ended = true;
+              this.dispatchEvent(new Event('end'));
+            }
+            return Promise.resolve();
+          }
+        }
+        let lastInit = null;
+        Object.defineProperty(navigator, 'xr', {
+          configurable: true,
+          value: {
+            isSessionSupported: async (mode) => mode === 'immersive-ar',
+            requestSession: async (_mode, init) => {
+              lastInit = init;
+              geometryReadyAt = performance.now() + GEOMETRY_READY_MS;
+              session = new FakeSession();
+              return session;
+            },
+          },
+        });
+        window.XRWebGLBinding = undefined;
+        window.XRWebGLLayer = class {
+          constructor() {
+            this.framebuffer = null;
+            this.framebufferWidth = 800;
+            this.framebufferHeight = 400;
+            this.ignoreDepthValues = true;
+          }
+          getViewport(view) {
+            return { x: view.eye === 'right' ? 400 : 0, y: 0, width: 400, height: 400 };
+          }
+        };
+        WebGL2RenderingContext.prototype.makeXRCompatible = () => Promise.resolve();
+        WebGLRenderingContext.prototype.makeXRCompatible = () => Promise.resolve();
+        if (typeof window.XRRigidTransform === 'undefined') {
+          window.XRRigidTransform = class {
+            constructor() {
+              this.matrix = ident();
+            }
+          };
+        }
+
+        // Panel geometry mirrors xr-probe.ts (PANEL_M_W 0.96, 1.2 m ahead, 0.15 m below the eyes)
+        // and the PANEL_BUTTONS layout in xr-probe-core.ts.
+        const BUTTONS = { keyboard: [134, 584], room: [386, 584], recenter: [638, 584], exit: [890, 584] };
+        const select = (id) => {
+          const [px, py] = BUTTONS[id];
+          aim = translate((px / 1024 - 0.5) * 0.96, HEAD_Y - 0.15 + (0.5 - py / 640) * 0.6, 0);
+          const ev = new Event('select');
+          Object.defineProperties(ev, { frame: { value: frame }, inputSource: { value: inputSource } });
+          session.dispatchEvent(ev);
+        };
+        const read = () => JSON.parse(localStorage.getItem(KEY));
+        const last = () => read().sessions.at(-1);
+
+        // Keep a handle on the in-AR panel canvas so a --screenshot run can show it.
+        let panelCanvas = null;
+        const realGetContext = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
+          if (type === '2d' && this.width === 1024 && this.height === 640) panelCanvas = this;
+          return realGetContext.call(this, type, ...rest);
+        };
+
+        Object.defineProperty(navigator, 'storage', {
+          configurable: true,
+          value: {
+            estimate: async () => ({ usage: 1234, quota: 5e9 }),
+            persisted: async () => false,
+            persist: async () => true,
+          },
+        });
+
+        await import('./xr-probe.ts');
+        await until(() => read().env.immersiveAR === true && read().env.storage.quota === 5e9, 'env probe');
+        $('persist').click();
+        await until(() => read().env.persistRequest === true, 'persist() result');
+
+        // --- 2D file read ---
+        const files = new DataTransfer();
+        files.items.add(new File([new Uint8Array([0x67, 0x6c, 0x54, 0x46, 2, 0, 0, 0, 9, 9])], 'room.glb'));
+        files.items.add(new File([new Uint8Array([0x4e, 0x47])], 'noext'));
+        $('files').files = files.files;
+        $('files').dispatchEvent(new Event('change'));
+        await until(() => read().files.length === 2, 'file reads');
+        const [glb, noext] = read().files;
+        check(glb.name === 'room.glb' && glb.byteLength === 10 && glb.head === '67 6c 54 46 02 00 00 00' && !glb.error, 'glb read');
+        check(noext.byteLength === 2 && noext.ascii === 'NG', 'extensionless read');
+
+        // --- Enter AR and let it sample ---
+        $('space-setup').value = 'yes';
+        $('enter').click();
+        await until(
+          () =>
+            last().ticks.length >= 3 &&
+            last().anchor.created &&
+            last().detection.planes.setTicks >= 1 &&
+            last().detection.meshes.setTicks >= 1,
+          'AR sampling',
+        );
+        check(lastInit && lastInit.requiredFeatures.join() === 'hit-test', 'hit-test must be the only required feature');
+        for (const feat of ['anchors', 'hand-tracking', 'dom-overlay', 'local-floor', 'mesh-detection', 'plane-detection']) {
+          check(lastInit.optionalFeatures.includes(feat), `optional feature ${feat} not requested`);
+        }
+        check(lastInit.domOverlay && lastInit.domOverlay.root === $('xr-overlay'), 'dom-overlay root is not #xr-overlay');
+        let s = last();
+        check(s.referenceSpace === 'local-floor', `ref space ${s.referenceSpace}`);
+        check(s.domOverlayState === 'null', `domOverlayState ${s.domOverlayState}`);
+        check(s.persistentAnchors && s.persistentAnchors.count === 2 && s.persistentAnchors.blank === 1, 'persistentAnchors not read');
+        check(s.spaceSetup === 'yes', `spaceSetup ${s.spaceSetup}`);
+        check(s.ticks.length >= 2, `only ${s.ticks.length} ticks`);
+        check(s.ticks.at(-1).fps > 0, 'no frames counted');
+        check(s.ticks[0].t >= 1000, `first tick (and first geometry read) at ${s.ticks[0].t} ms, before 1 s`);
+        check(s.ticks.every((tk) => typeof tk.saveMs === 'number'), 'ticks lack saveMs');
+        const dp = s.detection.planes;
+        const dm = s.detection.meshes;
+        check(
+          dp.skipped === null && dp.missingTicks >= 1 && dp.throwTicks === 0 && dp.setTicks >= 1 && dp.firstSetAt >= GEOMETRY_READY_MS - 500,
+          `planes stopped polling after an undefined read: ${JSON.stringify(dp)}`,
+        );
+        check(
+          dm.skipped === null && dm.throwTicks >= 1 && /^InvalidStateError: meshes not ready$/.test(dm.error) && dm.setTicks >= 1,
+          `meshes stopped polling after a throw: ${JSON.stringify(dm)}`,
+        );
+        check(s.ticks[0].planes === null && s.ticks.at(-1).planes === 3, 'per-second plane counts did not recover');
+        check(
+          s.events.filter((e) => e.type === 'meshes' && /threw/.test(e.detail)).length === 1,
+          'a repeated mesh throw must be logged once',
+        );
+        const g = s.geometry.find((x) => x.planes && x.meshes);
+        check(g, 'no geometry sample with planes and meshes');
+        check(g.planes.count === 3 && g.planes.labels.wall === 1 && g.planes.labels['(none)'] === 1, 'plane labels wrong');
+        check(g.meshes.perMesh[0][0] === 'global mesh' && g.meshes.perMesh[0][1] === 1000, 'global mesh size wrong');
+        check(s.anchor.created && s.ticks.at(-1).anchor === 1, 'sentinel anchor not created and tracked');
+        check(s.hitTest.source === 'ok' && s.hitTest.framesWithHit > 0, 'viewer hit-test not sampled');
+
+        // --- Keyboard test ---
+        select('keyboard');
+        check(last().keyboard && last().keyboard.activeIsInput, 'keyboard test did not focus the hidden input');
+        $('kbd').value = 'ok';
+        $('kbd').dispatchEvent(new Event('input'));
+        $('kbd').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+        s = last();
+        check(s.keyboard.typed === 'ok' && s.keyboard.endedBy === 'enter', `keyboard record ${JSON.stringify(s.keyboard)}`);
+
+        // --- Room capture: first press only arms it ---
+        select('room');
+        check(roomCalls === 0 && last().roomCapture === null, 'a single press must not call initiateRoomCapture');
+        select('room');
+        check(roomCalls === 1, 'second press did not call initiateRoomCapture');
+        check(last().roomCapture.outcome === 'pending', 'attempt not saved before the call');
+        await until(() => last().roomCapture.anchorLater !== null, 'room-capture follow-up');
+        s = last();
+        const rc = s.roomCapture;
+        check(rc.outcome === 'resolved', `outcome ${rc.outcome}`);
+        check(rc.anchorBefore.tracked === true, 'anchor before should be tracked');
+        check(rc.anchorAfter && rc.anchorAfter.tracked === true, 'anchor right after should be tracked');
+        check(rc.anchorLater && rc.anchorLater.tracked === false, 'anchor 3 s later should be lost');
+        check(rc.anchorMovedM === 0.05, `anchor moved ${rc.anchorMovedM}`);
+        check(rc.resetsDuring === 1, `resets ${rc.resetsDuring}`);
+        check(rc.visibilityDuring.join() === 'hidden,visible', `visibility ${rc.visibilityDuring}`);
+        check(rc.planesBefore === 3 && rc.planesAfter === 3, 'plane counts around the call');
+        select('room');
+        select('room');
+        check(roomCalls === 1, 'initiateRoomCapture must run at most once per session');
+
+        check(panelCanvas, 'panel canvas was never created');
+        panelCanvas.style.cssText = 'display:block;width:1024px;height:640px;margin:0 0 16px;border:1px solid #888';
+        document.body.prepend(panelCanvas);
+
+        // --- Exit AR ---
+        select('exit');
+        await until(() => typeof last().endedAt === 'string', 'session end');
+        s = last();
+        check(typeof s.endedAt === 'string' && s.endedAt.length > 0, 'session end not recorded');
+        check($('enter').disabled === false, 'Enter AR not re-enabled');
+        const summary = $('summary').textContent;
+        check(summary.includes('resolved') && summary.includes('global mesh x1'), 'summary table missing session answers');
+
+        // --- Download JSON (the click is captured, nothing is written to disk) ---
+        let downloaded = null;
+        const realClick = HTMLAnchorElement.prototype.click;
+        HTMLAnchorElement.prototype.click = function () {
+          downloaded = { name: this.download, href: this.href };
+        };
+        $('download').click();
+        HTMLAnchorElement.prototype.click = realClick;
+        check(downloaded && /^\d{4}-\d{2}-\d{2}-[a-z0-9-]+\.json$/.test(downloaded.name), `download name ${downloaded && downloaded.name}`);
+        check(downloaded.href.startsWith('blob:'), 'download is not a blob URL');
+
+        const bad = read().log.filter(([, m]) => /window error|unhandled rejection|setup failed|frame callback threw/.test(m));
+        check(!errors.length && !bad.length, `errors: ${[...errors, ...bad.map(([, m]) => m)].join(' | ')}`);
+        out.textContent = `XR-PROBE-SMOKE PASS | ${s.ticks.length} ticks, ${s.events.length} events, download ${downloaded.name}`;
+      } catch (e) {
+        out.textContent = `XR-PROBE-SMOKE FAIL ${e && e.message} ${errors.join(' | ')}`;
+      }
+      // A pending timer lets --virtual-time-budget run out and --dump-dom fire after the verdict.
+      setTimeout(() => {}, 60_000);
+    </script>
+  </body>
+</html>
