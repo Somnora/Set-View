@@ -819,6 +819,9 @@ class App {
       if (!this.renderer.xr.isPresenting) this.refreshLanding();
     };
     globalPropStore.onError = (m) => this.reportDataIssue(m);
+    // A store whose storage opened late has saved what it held in memory.
+    this.persistence.onNotice = (m) => this.reportStorageNotice(m);
+    globalPropStore.onNotice = (m) => this.reportStorageNotice(m);
 
     // Fires whichever way a take ends (wrist toggle, camera deleted, session
     // end, MAX_RECORD_S cap, encoder error) — the file is already downloading.
@@ -1051,7 +1054,18 @@ class App {
       if (!scan) {
         this.displayedScanId = null;
         this.location.setScan(null);
-        this.debug.log('⚠ scan geometry missing for this scene (Remove scan on the landing page to clear)');
+        if (this.persistence.scans.storageState === 'open') {
+          this.debug.log('⚠ scan geometry missing for this scene (Remove scan on the landing page to clear)');
+          return;
+        }
+        // Not proof the scan is gone: storage has not opened (slow first load,
+        // or it failed). Load it when storage opens; never advise removing it.
+        this.debug.log('scan geometry not loaded yet: storage is slow to open (the scan loads when it does)');
+        void this.persistence.scans.whenStorageOpens().then((opened) => {
+          if (token !== this.locationSyncToken) return; // superseded
+          if (opened) this.syncLocation();
+          else this.debug.log('⚠ scan geometry not loaded: storage did not open. The scan is not removed; reload to try again');
+        });
         return;
       }
       this.displayedScanId = scan.id;
@@ -1574,6 +1588,13 @@ class App {
    * debug log (console and drift board), the 3D wrist status, and a landing banner
    * on the 2D page. Banners sharing a key replace each other (default: the text).
    */
+  /** Good news after a data warning (storage opened late and saved what it held). */
+  private reportStorageNotice(message: string): void {
+    this.debug.log(message);
+    this.wrist.setStatus(message);
+    this.landing.showBanner(message, 'info');
+  }
+
   private reportDataIssue(message: string, key?: string, action?: { label: string; run: () => void }): void {
     this.debug.log(message);
     this.wrist.setStatus(message);

@@ -178,9 +178,15 @@ export class Persistence {
   private unsaved = new Map<string, SceneData>();
   private persistRequested = false;
   private storageReportCache: { at: number; report: Promise<StorageReport> } | null = null;
+  /** Good news from the stores, e.g. scans held in memory saved after a late open. */
+  onNotice: (msg: string) => void = () => {};
 
   constructor() {
     this.scans.onError = (m) => this.onError(m);
+    this.scans.onNotice = (m) => {
+      this.storageReportCache = null;
+      this.onNotice(m);
+    };
   }
 
   /**

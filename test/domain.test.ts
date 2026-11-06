@@ -227,6 +227,8 @@ import { CameraSystem, type CamObject } from '../src/cameraView.ts';
 import { ViewManager } from '../src/views.ts';
 import { isLocationDisplayMode, LOCATION_DISPLAY_MODES } from '../src/model.ts';
 import { estimateScanSizeBytes, ScanStore } from '../src/scanStore.ts';
+import { IdbConnection } from '../src/idbOpen.ts';
+import { asFactory, FakeIndexedDb } from './fake-indexeddb.ts';
 import {
   calculateMeshAABB,
   calculateMeshNormals,
@@ -7514,6 +7516,186 @@ async function propStoreFallback(): Promise<void> {
   assert.equal(await store.getAsset('asset-custom-1'), null);
 }
 
+// Storage fallback is temporary (review 2026-11-06). Before, one IndexedDB open
+// slower than 4 s made the stores memory-only for the whole session: a late
+// open was ignored, scans saved earlier read as missing (and the app said to
+// Remove them), and new ones were lost on reload. A fake IndexedDB whose open
+// can be held back acts out the slow first load.
+const settleSoon = async (check: () => boolean, ms = 2000): Promise<void> => {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error('timed out waiting for the store');
+    await new Promise((r) => setTimeout(r, 2));
+  }
+};
+
+async function storageLateOpenTest(): Promise<void> {
+  const conn = (idb: FakeIndexedDb | null, extra: { onOpen?: () => void; timeoutMs?: number } = {}) =>
+    new IdbConnection({
+      name: 'late-open-test',
+      version: 1,
+      upgrade: (db) => {
+        if (!db.objectStoreNames.contains('s')) db.createObjectStore('s');
+      },
+      onOpen: extra.onOpen,
+      timeoutMs: extra.timeoutMs ?? 20,
+      factory: idb ? asFactory(idb) : null,
+    });
+
+  // The connection: a slow open falls back for now, keeps running, and is used once it opens.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    let opened = 0;
+    const c = conn(idb, { onOpen: () => opened++ });
+    assert.equal(await c.get(), null, 'past the limit the caller gets null and falls back');
+    assert.equal(c.state, 'waiting');
+    const t0 = Date.now();
+    assert.equal(await c.get(), null);
+    assert.ok(Date.now() - t0 < 15, 'a later call does not wait out the limit again');
+    assert.equal(idb.opens, 1, 'the one open request is kept, not abandoned');
+    const opening = c.whenOpen();
+    idb.release();
+    assert.equal(await opening, true);
+    assert.equal(c.state, 'open');
+    assert.equal(opened, 1, 'onOpen runs for a late open');
+    assert.ok(await c.get(), 'every later call gets the database');
+  }
+  // Blocked by another tab: fall back at once instead of after the limit, adopt the open when it succeeds.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    const c = conn(idb, { timeoutMs: 10_000 });
+    const first = c.get();
+    idb.block();
+    assert.equal(await first, null);
+    assert.equal(c.state, 'waiting');
+    idb.release();
+    assert.equal(await c.whenOpen(), true);
+  }
+  // A failed open is tried again on the next call; so is a connection the browser closed.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    const c = conn(idb, { timeoutMs: 10_000 });
+    const first = c.get();
+    idb.fail();
+    assert.equal(await first, null);
+    assert.equal(c.state, 'closed');
+    const db1 = await c.get();
+    assert.ok(db1, 'the next call opens again');
+    assert.equal(idb.opens, 2);
+    idb.evict();
+    assert.equal(c.state, 'closed', 'onclose (eviction) drops the connection');
+    const db2 = await c.get();
+    assert.ok(db2 && db2 !== db1, 'and the next call reopens');
+  }
+  // No IndexedDB at all.
+  {
+    const c = conn(null);
+    assert.equal(await c.get(), null);
+    assert.equal(c.state, 'unavailable');
+    assert.equal(await c.whenOpen(), false);
+  }
+  passed++;
+  console.log('  ✓ Storage: a slow IndexedDB open falls back for now and is used once it opens (blocked, failed, closed, none)');
+
+  // ScanStore across two sessions, the second with storage slow to open.
+  {
+    const idb = new FakeIndexedDb();
+    const opts = { indexedDB: asFactory(idb), openTimeoutMs: 20 };
+    const earlier = new ScanStore(opts);
+    const saved = { ...makeScan(), id: 'scan-saved' };
+    assert.equal(await earlier.putScan(saved), true, 'session 1: storage is fine');
+
+    idb.hold();
+    const store = new ScanStore(opts);
+    const warnings: string[] = [];
+    const notices: string[] = [];
+    store.onError = (m) => warnings.push(m);
+    store.onNotice = (m) => notices.push(m);
+    assert.equal(await store.getScan('scan-saved'), null, 'not readable before storage opens');
+    assert.equal(store.storageState, 'waiting', 'so the app can tell slow storage from a missing scan');
+    const fresh = { ...makeScan(), id: 'scan-new' };
+    assert.equal(await store.putScan(fresh), false);
+    assert.match(warnings[0] ?? '', /held in memory and saved when it opens/);
+    const dropped = { ...makeScan(), id: 'scan-dropped' };
+    await store.putScan(dropped);
+    await store.deleteScan('scan-dropped');
+    // The launch prune sees only memory while storage is closed, so it cannot
+    // delete a saved scan (scan-saved is referenced by no scene here).
+    assert.equal(await store.pruneOrphans(new Set(['scan-new'])), 0);
+
+    const opening = store.whenStorageOpens();
+    idb.release();
+    assert.equal(await opening, true);
+    assert.equal(store.storageState, 'open');
+    assert.equal((await store.getScan('scan-saved'))?.id, 'scan-saved', 'the scan saved earlier loads once storage opens');
+    await settleSoon(() => notices.length > 0);
+    assert.match(notices[0], /the scan held in memory is now saved/);
+    const rows = idb.rows('setview', 'scans');
+    assert.ok(rows.has('scan-new'), 'the scan held in memory was written to storage');
+    assert.ok(rows.has('scan-saved'), 'the prune that ran while storage was closed deleted nothing');
+    assert.equal(rows.has('scan-dropped'), false, 'a held scan deleted before the open is not written');
+    assert.equal((store as unknown as { memory: Map<string, unknown> }).memory.size, 0, 'and memory is freed');
+
+    const later = new ScanStore(opts);
+    const back = await later.getScan('scan-new');
+    assert.deepEqual(back?.meshes[0].positions, fresh.meshes[0].positions, 'session 3 reads it back');
+    assert.equal(later.storageState, 'open');
+  }
+  // Without IndexedDB nothing changes: memory only, and the state says so.
+  {
+    const store = new ScanStore({ indexedDB: null });
+    let warned = '';
+    store.onError = (m) => (warned = m);
+    assert.equal(await store.putScan(makeScan()), false);
+    assert.match(warned, /storage unavailable/);
+    assert.equal(store.storageState, 'unavailable');
+    assert.equal(await store.whenStorageOpens(), false);
+  }
+  passed++;
+  console.log('  ✓ Storage: ScanStore loads saved scans and saves held ones when storage opens late');
+
+  // PropStore: memory doubles as its cache, so only puts that missed storage are written later.
+  {
+    const idb = new FakeIndexedDb();
+    idb.hold();
+    const props = new PropStore({ indexedDB: asFactory(idb), openTimeoutMs: 20 });
+    const warnings: string[] = [];
+    const notices: string[] = [];
+    props.onError = (m) => warnings.push(m);
+    props.onNotice = (m) => notices.push(m);
+    const asset = (id: string) => ({
+      id,
+      name: 'Console',
+      fileName: 'console.glb',
+      fileType: 'glb' as const,
+      category: 'custom' as const,
+      sizeBytes: 4,
+      uploadedAt: 1,
+      dimensions: { width: 1, height: 1, depth: 1 },
+      buffer: new ArrayBuffer(4),
+    });
+    assert.equal(await props.putAsset(asset('asset-late')), false);
+    assert.match(warnings[0] ?? '', /held in memory and saved when it opens/);
+    await props.putAsset(asset('asset-gone'));
+    await props.deleteAsset('asset-gone');
+    idb.release();
+    assert.equal(await props.whenStorageOpens(), true);
+    await settleSoon(() => notices.length > 0);
+    assert.match(notices[0], /the custom prop held in memory is now saved/);
+    const rows = idb.rows('setview_assets', 'custom_props');
+    assert.ok(rows.has('asset-late'));
+    assert.equal(rows.has('asset-gone'), false);
+    assert.equal((await props.listAssets()).length, 1);
+    const later = new PropStore({ indexedDB: asFactory(idb), openTimeoutMs: 20 });
+    assert.equal((await later.getAsset('asset-late'))?.fileName, 'console.glb', 'a later session reads it back');
+  }
+  passed++;
+  console.log('  ✓ Storage: PropStore saves props held in memory when storage opens late');
+}
+
 // ============================================================================
 // --- Performance Governor & Spatial Interaction Tests -----------------------
 // ============================================================================
@@ -14269,7 +14451,9 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
   if (!hadDocument) delete g.document;
 }
 
-void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
+void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()])
+  .then(() => storageLateOpenTest())
+  .then(
 
   () => {
     passed += 4;

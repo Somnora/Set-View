@@ -128,6 +128,7 @@ src/
   scanner.ts      Reads Scene Mesh off live XRFrame into scene space
   location.ts     Renders scanned room: hidden/ghost/solid + furniture moves
   scanStore.ts    IndexedDB blob store for scan geometry
+  idbOpen.ts      IndexedDB open with a time limit that is not final (late opens are used)
   input.ts        Controllers + hands input routing & edge detection
   actors.ts       Humanoid meshes, scale, floor-locking, stance joints, walk cycle
   lights.ts       In-app VR lighting rig rendering & gizmos
