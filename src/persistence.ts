@@ -414,16 +414,22 @@ export class Persistence {
   }
 
   /** Downloads a scene as .setview.json. Resolves false when there is nothing to export. */
-  async exportScene(id: string, live?: SceneData | null): Promise<boolean> {
+  /** The .setview.json text Export would download (scan geometry embedded), or null. */
+  async sceneFileText(id: string, live?: SceneData | null): Promise<{ name: string; text: string } | null> {
     const scene = this.sceneForExport(id, live);
-    if (!scene) return false;
+    if (!scene) return null;
     const scan = scene.scan ? await this.scans.getScan(scene.scan.id) : null;
-    const file = buildSceneFile(scene, scan);
-    const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
+    return { name: scene.name, text: JSON.stringify(buildSceneFile(scene, scan), null, 2) };
+  }
+
+  async exportScene(id: string, live?: SceneData | null): Promise<boolean> {
+    const file = await this.sceneFileText(id, live);
+    if (!file) return false;
+    const blob = new Blob([file.text], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${scene.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.setview.json`;
+    a.download = `${file.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.setview.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
     return true;

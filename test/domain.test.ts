@@ -611,6 +611,11 @@ import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
 import * as ingest from '../src/sceneImport.ts';
 import { BlobStore } from '../src/blobStore.ts';
 import { importLocationBytes, partsFromObject3D } from '../src/locationImport.ts';
+import * as drop from '../src/dropBox.ts';
+import { dropBox as dropBoxPlugin } from '../vite.plugins.ts';
+import * as nodeHttp from 'node:http';
+import * as nodeOs from 'node:os';
+import * as nodePath from 'node:path';
 import { collectBlobRefs, isScanSourceFile } from '../src/model.ts';
 import { sanitizeMeshBuffers } from '../src/scan.ts';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
@@ -14799,10 +14804,163 @@ async function p1LocationImportTest(): Promise<void> {
   console.log('  ✓ P1.2: attachImportedScan writes the scene it was opened for and resets its display mode');
 }
 
+// --- P1 drop box (P1.5) ---
+{
+  test('P1.5: sanitizeDropName strips paths, hidden-file dots and reserved characters, keeps unicode', () => {
+    assert.equal(drop.sanitizeDropName('room.glb'), 'room.glb');
+    assert.equal(drop.sanitizeDropName('../../etc/passwd'), 'passwd');
+    assert.equal(drop.sanitizeDropName('..\\..\\Windows\\win.ini'), 'win.ini');
+    assert.equal(drop.sanitizeDropName('/abs/path/scan.ply'), 'scan.ply');
+    assert.equal(drop.sanitizeDropName('..'), null);
+    assert.equal(drop.sanitizeDropName('.'), null);
+    assert.equal(drop.sanitizeDropName(''), null);
+    assert.equal(drop.sanitizeDropName('   '), null);
+    assert.equal(drop.sanitizeDropName('folder/'), null);
+    assert.equal(drop.sanitizeDropName('.hidden'), 'hidden');
+    assert.equal(drop.sanitizeDropName('a<b>c:d"e|f?g*h.glb'), 'a_b_c_d_e_f_g_h.glb');
+    assert.equal(drop.sanitizeDropName('tab\there\nnew.obj'), 'tab_here_new.obj', 'control characters become _');
+    assert.equal(drop.sanitizeDropName('trailing dots...'), 'trailing dots');
+    assert.equal(drop.sanitizeDropName('Café Ünïcode 日本.glb'), 'Café Ünïcode 日本.glb');
+    assert.equal(drop.sanitizeDropName('Café.glb'), 'Café.glb', 'NFC normalized');
+    const long = drop.sanitizeDropName(`${'x'.repeat(300)}.glb`)!;
+    assert.equal(long.length, drop.DROP_MAX_NAME);
+    assert.ok(long.endsWith('.glb'));
+    // A sanitized name never escapes the folder.
+    for (const raw of ['../a', 'a/../../b', '..\\..\\c', '\u0000x', 'x/‮.glb']) {
+      const s = drop.sanitizeDropName(raw);
+      assert.ok(s === null || (!s.includes('/') && !s.includes('\\') && !s.startsWith('.')), raw);
+    }
+  });
+
+  test('P1.5: uniqueDropName, sceneDropName and the actions offered per kind', () => {
+    const taken = new Set(['room.glb', 'room (2).glb', 'notes']);
+    assert.equal(drop.uniqueDropName('new.glb', taken), 'new.glb');
+    assert.equal(drop.uniqueDropName('room.glb', taken), 'room (3).glb');
+    assert.equal(drop.uniqueDropName('notes', taken), 'notes (2)');
+    assert.equal(drop.sceneDropName('Act 2: Kitchen'), 'Act 2_ Kitchen.setview.json');
+    assert.equal(drop.sceneDropName('x.setview.json'), 'x.setview.json');
+    assert.deepEqual(drop.dropActionsFor('glb'), ['location', 'prop']);
+    assert.deepEqual(drop.dropActionsFor('obj'), ['location', 'prop']);
+    assert.deepEqual(drop.dropActionsFor('fbx'), ['location']);
+    assert.deepEqual(drop.dropActionsFor('ply-mesh'), ['location']);
+    assert.deepEqual(drop.dropActionsFor('setview-json'), ['scene']);
+    assert.deepEqual(drop.dropActionsFor('spz'), []);
+    assert.match(drop.dropRefusal('spz')!, /splat/i);
+    assert.equal(drop.dropRefusal('glb'), null);
+    assert.equal(drop.propExtensionFor('glb'), '.glb');
+    assert.equal(drop.propExtensionFor('fbx'), null);
+  });
+
+  test('P1.5: parseByteRange and isSameOriginRequest', () => {
+    assert.deepEqual(drop.parseByteRange('bytes=0-99', 1000), { start: 0, end: 99 });
+    assert.deepEqual(drop.parseByteRange('bytes=900-', 1000), { start: 900, end: 999 });
+    assert.deepEqual(drop.parseByteRange('bytes=-100', 1000), { start: 900, end: 999 });
+    assert.deepEqual(drop.parseByteRange('bytes=0-65535', 10), { start: 0, end: 9 }, 'clamped to the file');
+    assert.equal(drop.parseByteRange('bytes=2000-', 1000), null);
+    assert.equal(drop.parseByteRange('bytes=5-1', 1000), null);
+    assert.equal(drop.parseByteRange('items=0-1', 1000), null);
+    assert.equal(drop.parseByteRange(undefined, 1000), null);
+    assert.equal(drop.isSameOriginRequest(undefined, '192.168.1.5:5173'), true, 'no Origin header (curl)');
+    assert.equal(drop.isSameOriginRequest('https://192.168.1.5:5173', '192.168.1.5:5173'), true);
+    assert.equal(drop.isSameOriginRequest('https://evil.example', '192.168.1.5:5173'), false);
+    assert.equal(drop.isSameOriginRequest('null', '192.168.1.5:5173'), false);
+  });
+}
+
+/** Async: the drop box middleware on a real local HTTP server, in a temp folder. */
+async function p1DropBoxServerTest(): Promise<void> {
+  const root = probeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'setview-drop-'));
+  const plugin = dropBoxPlugin() as unknown as {
+    configResolved: (c: { root: string }) => void;
+    configureServer: (s: { config: { base: string }; middlewares: { use: (fn: unknown) => void } }) => void;
+  };
+  plugin.configResolved({ root });
+  let handler: ((req: nodeHttp.IncomingMessage, res: nodeHttp.ServerResponse, next: () => void) => void) | null = null;
+  plugin.configureServer({ config: { base: '/' }, middlewares: { use: (fn) => (handler = fn as typeof handler) } });
+  const server = nodeHttp.createServer((req, res) =>
+    handler!(req, res, () => {
+      res.statusCode = 299; // "fell through to Vite"
+      res.end('fallthrough');
+    }),
+  );
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const port = (server.address() as { port: number }).port;
+  const url = (p: string) => `http://127.0.0.1:${port}${p}`;
+  try {
+    const body = new Uint8Array(1000).map((_, i) => i % 251);
+    const up = await fetch(url('/drop/upload?name=' + encodeURIComponent('../../evil/room.glb')), { method: 'POST', body });
+    assert.equal(up.status, 201);
+    assert.deepEqual(await up.json(), { name: 'room.glb', size: 1000 });
+    assert.ok(probeFs.existsSync(nodePath.join(root, 'drop', 'room.glb')), 'stored inside ./drop under the clean name');
+    const up2 = await fetch(url('/drop/upload?name=room.glb'), { method: 'POST', body: new Uint8Array(3) });
+    assert.equal(((await up2.json()) as { name: string }).name, 'room (2).glb', 'never overwrites');
+    const list = (await (await fetch(url('/drop/list'))).json()) as { name: string; size: number }[];
+    assert.deepEqual(list.map((e) => e.name).sort(), ['room (2).glb', 'room.glb']);
+
+    const whole = await fetch(url('/drop/file/room.glb'));
+    assert.equal(whole.status, 200);
+    assert.equal(whole.headers.get('content-type'), 'application/octet-stream');
+    assert.equal(whole.headers.get('x-content-type-options'), 'nosniff');
+    assert.match(whole.headers.get('content-disposition') ?? '', /^attachment/);
+    assert.match(whole.headers.get('content-security-policy') ?? '', /sandbox/);
+    assert.deepEqual(new Uint8Array(await whole.arrayBuffer()), body);
+    const part = await fetch(url('/drop/file/room.glb'), { headers: { Range: 'bytes=10-19' } });
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get('content-range'), 'bytes 10-19/1000');
+    assert.deepEqual(new Uint8Array(await part.arrayBuffer()), body.slice(10, 20));
+    assert.equal((await fetch(url('/drop/file/room.glb'), { headers: { Range: 'bytes=5000-' } })).status, 416);
+
+    // Nothing outside the folder, and no raw serving of uploads by Vite.
+    probeFs.writeFileSync(nodePath.join(root, 'secret.txt'), 'top secret');
+    assert.equal((await fetch(url('/drop/file/..%2Fsecret.txt'))).status, 404);
+    assert.equal((await fetch(url('/drop/file/%2E%2E%2Fsecret.txt'))).status, 404);
+    assert.equal((await fetch(url('/drop/room.glb'))).status, 404, 'every /drop/ path is answered here');
+    probeFs.writeFileSync(nodePath.join(root, 'drop', 'page.html'), '<script>alert(1)</script>');
+    assert.equal((await fetch(url('/drop/page.html'))).status, 404, 'an uploaded page is never served as a page');
+    assert.equal((await fetch(url('/drop.html'))).status, 299, 'the upload page itself is left to Vite');
+    assert.equal((await fetch(url('/src/main.ts'))).status, 299);
+
+    // State changes from another site are refused; oversize uploads too.
+    const cross = await fetch(url('/drop/upload?name=x.glb'), {
+      method: 'POST',
+      body: new Uint8Array(4),
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(cross.status, 403);
+    const crossDel = await fetch(url('/drop/file/room.glb'), { method: 'DELETE', headers: { Origin: 'https://evil.example' } });
+    assert.equal(crossDel.status, 403);
+    assert.ok(probeFs.existsSync(nodePath.join(root, 'drop', 'room.glb')));
+    const huge = await new Promise<number>((resolve) => {
+      const req = nodeHttp.request(
+        { host: '127.0.0.1', port, path: '/drop/upload?name=huge.glb', method: 'POST', headers: { 'Content-Length': String(drop.DROP_MAX_BYTES + 1) } },
+        (res) => {
+          resolve(res.statusCode ?? 0);
+          res.resume();
+        },
+      );
+      req.on('error', () => resolve(-1));
+      req.end();
+    });
+    assert.equal(huge, 413);
+    assert.equal((await fetch(url('/drop/upload?name=' + encodeURIComponent('..')), { method: 'POST', body: new Uint8Array(1) })).status, 400);
+
+    const del = await fetch(url('/drop/file/' + encodeURIComponent('room (2).glb')), { method: 'DELETE' });
+    assert.equal(del.status, 200);
+    const after = (await (await fetch(url('/drop/list'))).json()) as { name: string }[];
+    assert.deepEqual(after.map((e) => e.name).sort(), ['page.html', 'room.glb'], 'the planted page is listed as a file, never served as a page');
+  } finally {
+    server.close();
+    probeFs.rmSync(root, { recursive: true, force: true });
+  }
+  passed++;
+  console.log('  ✓ P1.5: drop box server: upload, list, ranged inert downloads, no traversal, no raw serving, same-origin writes, size cap');
+}
+
 // Async tests that swap globalThis.localStorage run one after another, never concurrently.
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()])
   .then(() => p1BlobStoreTest())
   .then(() => p1LocationImportTest())
+  .then(() => p1DropBoxServerTest())
   .then(
   () => {
     passed += 4;

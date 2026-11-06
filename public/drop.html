@@ -1,0 +1,166 @@
+<!doctype html>
+<!-- SetView LAN drop box: upload scans and scenes from a phone or laptop to the
+     computer running `npm run dev`. The headset's SetView landing page lists them
+     under "Files on your computer". Served only by the dev server (vite.plugins.ts). -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SetView drop box</title>
+    <style>
+      :root { color-scheme: dark; --bg: #0b0f17; --card: #141a26; --line: #263044; --text: #e2e8f0; --dim: #94a3b8; --accent: #3b82f6; --bad: #f87171; --ok: #4ade80; }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 -apple-system, system-ui, sans-serif; }
+      main { max-width: 640px; margin: 0 auto; padding: 20px 16px 48px; }
+      h1 { font-size: 22px; margin: 4px 0 6px; }
+      p { color: var(--dim); margin: 6px 0 14px; }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 14px 0; }
+      label.pick { display: block; text-align: center; padding: 22px 12px; border: 2px dashed var(--line); border-radius: 10px; cursor: pointer; font-weight: 600; }
+      label.pick:hover, label.pick.over { border-color: var(--accent); }
+      input[type=file] { display: none; }
+      .job { margin-top: 12px; font-size: 14px; }
+      .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+      .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
+      .ok { color: var(--ok); }
+      .bad { color: var(--bad); }
+      ul { list-style: none; padding: 0; margin: 0; }
+      li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+      li:first-child { border-top: 0; }
+      li .meta { color: var(--dim); font-size: 13px; }
+      li .name { word-break: break-all; }
+      button { background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; font: inherit; font-size: 14px; }
+      button:active { background: var(--line); }
+      .hint { font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>SetView drop box</h1>
+      <p>
+        Send a phone scan or a scene to this computer. On the headset, open SetView's
+        landing page and find it under <b>Files on your computer</b>.
+      </p>
+      <div class="card">
+        <label class="pick" id="pick">Choose files to send<input id="file" type="file" multiple /></label>
+        <p class="hint">
+          From a phone: export the scan from the capture app (GLB, OBJ, FBX or a PLY mesh), save it
+          to Files, then choose it here. SetView scenes (.setview.json) work too.
+        </p>
+        <div id="jobs"></div>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <b>On this computer</b><button id="refresh">Refresh</button>
+        </div>
+        <p id="status" class="hint">Loading...</p>
+        <ul id="list"></ul>
+      </div>
+    </main>
+    <script>
+      const base = location.pathname.replace(/drop\.html$/, '');
+      const api = (p) => `${base}drop/${p}`;
+      const fmt = (n) =>
+        n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`;
+      const status = document.getElementById('status');
+      const listEl = document.getElementById('list');
+
+      async function refresh() {
+        try {
+          const r = await fetch(api('list'), { cache: 'no-store' });
+          if (!r.ok) throw new Error(String(r.status));
+          const files = await r.json();
+          listEl.textContent = '';
+          status.textContent = files.length ? '' : 'Nothing here yet.';
+          for (const f of files) {
+            const li = document.createElement('li');
+            const left = document.createElement('div');
+            const name = document.createElement('div');
+            name.className = 'name';
+            name.textContent = f.name;
+            const meta = document.createElement('div');
+            meta.className = 'meta';
+            meta.textContent = `${fmt(f.size)}, ${new Date(f.mtime).toLocaleString()}`;
+            left.append(name, meta);
+            const del = document.createElement('button');
+            del.textContent = 'Delete';
+            del.onclick = async () => {
+              if (!confirm(`Delete "${f.name}" from the computer?`)) return;
+              await fetch(api(`file/${encodeURIComponent(f.name)}`), { method: 'DELETE' });
+              refresh();
+            };
+            li.append(left, del);
+            listEl.appendChild(li);
+          }
+        } catch {
+          status.textContent =
+            'The drop box is not available. It only runs while SetView is started with npm run dev on the computer.';
+          status.className = 'hint bad';
+        }
+      }
+
+      function upload(file) {
+        const job = document.createElement('div');
+        job.className = 'job';
+        const label = document.createElement('div');
+        label.textContent = `${file.name} (${fmt(file.size)})`;
+        const bar = document.createElement('div');
+        bar.className = 'bar';
+        const fill = document.createElement('i');
+        bar.appendChild(fill);
+        job.append(label, bar);
+        document.getElementById('jobs').prepend(job);
+        return new Promise((resolve) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', api(`upload?name=${encodeURIComponent(file.name)}`));
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) fill.style.width = `${Math.round((e.loaded / e.total) * 100)}%`;
+          };
+          xhr.onload = () => {
+            let body = {};
+            try {
+              body = JSON.parse(xhr.responseText);
+            } catch {}
+            if (xhr.status === 201) {
+              fill.style.width = '100%';
+              label.textContent = `Sent: ${body.name}`;
+              label.className = 'ok';
+            } else {
+              label.textContent = `${file.name}: ${body.error || `failed (${xhr.status})`}`;
+              label.className = 'bad';
+            }
+            resolve();
+          };
+          xhr.onerror = () => {
+            label.textContent = `${file.name}: the upload failed (network)`;
+            label.className = 'bad';
+            resolve();
+          };
+          xhr.send(file);
+        });
+      }
+
+      async function sendAll(files) {
+        for (const f of files) await upload(f);
+        refresh();
+      }
+      const input = document.getElementById('file');
+      input.onchange = () => {
+        sendAll([...input.files]);
+        input.value = '';
+      };
+      const pick = document.getElementById('pick');
+      pick.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        pick.classList.add('over');
+      });
+      pick.addEventListener('dragleave', () => pick.classList.remove('over'));
+      pick.addEventListener('drop', (e) => {
+        e.preventDefault();
+        pick.classList.remove('over');
+        sendAll([...e.dataTransfer.files]);
+      });
+      document.getElementById('refresh').onclick = refresh;
+      refresh();
+    </script>
+  </body>
+</html>

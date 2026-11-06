@@ -6,6 +6,8 @@
 import * as THREE from 'three';
 import type { SupportReport } from './session.ts';
 import type { UnitChoice, UpAxisChoice } from './locationImport.ts';
+import { describeSceneFileKind, sniffSceneFile, SNIFF_BYTES, type SceneFileKind } from './sceneImport.ts';
+import { dropActionsFor, dropRefusal, propExtensionFor, type DropEntry } from './dropBox.ts';
 import {
   ASPECT_NAMES,
   MAX_KEYFRAMES,
@@ -785,7 +787,15 @@ export interface LandingCallbacks {
   onExportScanPackage?: (id: string) => void;
   onAddSyntheticScan?: (id: string) => void;
   /** Imports a mesh file (phone scan, GLB, OBJ, FBX, PLY) as the scene's location. */
-  onImportLocation?: (sceneId: string, file: File, opts: { upAxis: UpAxisChoice; unit: UnitChoice }) => void;
+  onImportLocation?: (
+    sceneId: string,
+    file: { name: string; arrayBuffer(): Promise<ArrayBuffer> },
+    opts: { upAxis: UpAxisChoice; unit: UnitChoice },
+  ) => void;
+  /** Adds a model file to the Prop Library (drop box). */
+  onAddPropFile?: (file: File) => Promise<boolean>;
+  /** Posts a scene's .setview.json to the LAN drop box (dev server only). */
+  onSendSceneToComputer?: (sceneId: string) => Promise<boolean>;
   /** One-line storage usage for the Scene & Environment card (may be cached). */
   getStorageSummary?: () => Promise<string>;
   /** Turns a scene's ICVFX LED volume on or off without opening ICVFX Studio. */
@@ -863,11 +873,204 @@ export class Landing {
   private bannerEl!: HTMLElement;
   private listEl!: HTMLElement;
   private lastSelectedSceneId = '';
+  /** "Files on your computer" (LAN drop box); hidden unless the dev server answers. */
+  private dropEl!: HTMLElement;
+  private dropAvailable = false;
+  /** Sniffed kind per drop file, keyed by name, size and mtime. */
+  private dropKinds = new Map<string, SceneFileKind>();
+  private dropRefreshing = false;
+  /** Where a phone should open drop.html (the dev server's LAN URL when this page is on localhost). */
+  private dropPhoneUrl: string | null = null;
+  /** The scene the landing shows as current (target of a drop-box location import). */
+  private currentSceneId: string | null = null;
 
   constructor(root: HTMLElement, cb: LandingCallbacks) {
     this.root = root;
     this.cb = cb;
     this.build();
+    // The drop box list changes when a phone uploads; poll it while the landing is on screen.
+    setInterval(() => {
+      if (document.visibilityState === 'visible' && this.root.offsetParent !== null) void this.refreshDropBox();
+    }, 8000);
+  }
+
+  /** URL of a drop-box API path on the dev server (vite.plugins.ts). */
+  private dropUrl(path: string): string {
+    const env = (import.meta as { env?: { BASE_URL?: string } }).env;
+    const base = env?.BASE_URL ?? '/';
+    return `${base.endsWith('/') ? base : `${base}/`}drop/${path}`;
+  }
+
+  /**
+   * Lists the LAN drop box (roadmap P1.5) and shows each file with what it can
+   * be imported as. Files are identified by their first bytes (a ranged GET),
+   * not by name. The panel stays hidden when the dev server does not answer
+   * (a static build, or another origin).
+   */
+  async refreshDropBox(): Promise<void> {
+    if (this.dropRefreshing) return;
+    this.dropRefreshing = true;
+    try {
+      let files: DropEntry[] | null = null;
+      try {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 2500);
+        const r = await fetch(this.dropUrl('list'), { cache: 'no-store', signal: ctl.signal });
+        clearTimeout(timer);
+        const ct = r.headers.get('content-type') ?? '';
+        if (r.ok && ct.includes('application/json')) {
+          const body = (await r.json()) as unknown;
+          if (Array.isArray(body)) files = body as DropEntry[];
+        }
+      } catch {
+        files = null;
+      }
+      this.dropAvailable = files !== null;
+      this.root.classList.toggle('drop-available', this.dropAvailable);
+      this.dropEl.hidden = !this.dropAvailable;
+      if (!files) return;
+      if (this.dropPhoneUrl === null) this.dropPhoneUrl = await this.resolveDropPhoneUrl();
+      const shown = files.slice(0, 30);
+      for (const f of shown) {
+        const key = `${f.name}|${f.size}|${f.mtime}`;
+        if (this.dropKinds.has(key)) continue;
+        try {
+          const r = await fetch(this.dropUrl(`file/${encodeURIComponent(f.name)}`), {
+            headers: { Range: `bytes=0-${SNIFF_BYTES - 1}` },
+            cache: 'no-store',
+          });
+          const head = new Uint8Array(await r.arrayBuffer());
+          this.dropKinds.set(key, sniffSceneFile(head, f.size));
+        } catch {
+          this.dropKinds.set(key, 'unknown');
+        }
+      }
+      this.renderDropBox(shown, files.length);
+    } finally {
+      this.dropRefreshing = false;
+    }
+  }
+
+  /** drop.html as a phone on the network can reach it, or '' when unknown. */
+  private async resolveDropPhoneUrl(): Promise<string> {
+    const page = this.dropUrl('').replace(/drop\/$/, 'drop.html');
+    const local = /^(localhost|127\.|\[::1\])/.test(location.hostname);
+    if (!local) return `${location.origin}${page}`;
+    try {
+      const r = await fetch(this.dropUrl('info'), { cache: 'no-store' });
+      const info = (await r.json()) as { network?: string[] };
+      const net = info.network?.[0];
+      if (net) return `${net.replace(/\/$/, '')}${page}`;
+    } catch {
+      /* fall through */
+    }
+    return '';
+  }
+
+  private renderDropBox(files: DropEntry[], total: number): void {
+    const panel = this.dropEl;
+    panel.innerHTML = '';
+    const head = document.createElement('div');
+    head.className = 'drop-head';
+    const title = document.createElement('b');
+    title.textContent = 'Files on your computer';
+    const refresh = document.createElement('button');
+    refresh.className = 'small';
+    refresh.textContent = 'Refresh';
+    refresh.onclick = () => void this.refreshDropBox();
+    head.append(title, refresh);
+    panel.appendChild(head);
+    const hint = document.createElement('p');
+    hint.className = 'drop-hint';
+    hint.textContent = this.dropPhoneUrl
+      ? `To send a scan from a phone on this network, open ${this.dropPhoneUrl} and choose the file.`
+      : "To send a scan from a phone on this network, open drop.html at the Network address npm run dev printed, and choose the file.";
+    panel.appendChild(hint);
+    if (!files.length) {
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = 'Nothing here yet.';
+      panel.appendChild(p);
+      return;
+    }
+    const fmt = (n: number) =>
+      n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`;
+    for (const f of files) {
+      const kind = this.dropKinds.get(`${f.name}|${f.size}|${f.mtime}`) ?? 'unknown';
+      const row = document.createElement('div');
+      row.className = 'drop-row';
+      const info = document.createElement('div');
+      info.className = 'drop-info';
+      const name = document.createElement('span');
+      name.className = 'drop-name';
+      name.textContent = f.name;
+      const meta = document.createElement('span');
+      meta.className = 'drop-meta';
+      const refusal = dropRefusal(kind);
+      meta.textContent = `${describeSceneFileKind(kind)}, ${fmt(f.size)}${refusal ? ` (${refusal})` : ''}`;
+      info.append(name, meta);
+      row.appendChild(info);
+      const fetchBytes = async (): Promise<ArrayBuffer> => {
+        const r = await fetch(this.dropUrl(`file/${encodeURIComponent(f.name)}`), { cache: 'no-store' });
+        if (!r.ok) throw new Error(`the computer answered ${r.status}`);
+        return r.arrayBuffer();
+      };
+      const btn = (label: string, run: () => void | Promise<void>) => {
+        const b = document.createElement('button');
+        b.className = 'small';
+        b.textContent = label;
+        b.onclick = () => void run();
+        row.appendChild(b);
+      };
+      for (const action of dropActionsFor(kind)) {
+        if (action === 'location' && this.cb.onImportLocation) {
+          btn('Use as location', () => {
+            const sceneId = this.currentSceneId;
+            if (!sceneId) {
+              this.showBanner('Create or open a scene first, then import the location into it.', 'warn', 'location-import');
+              return;
+            }
+            const scene = this.cb.getScene(sceneId);
+            if (scene?.scan && !confirm(`Replace the location of "${scene.name}" with "${f.name}"?`)) return;
+            this.cb.onImportLocation?.(sceneId, { name: f.name, arrayBuffer: fetchBytes }, {
+              upAxis: this.locationImportUpAxis,
+              unit: this.locationImportUnit,
+            });
+          });
+        } else if (action === 'scene') {
+          btn('Open scene', async () => {
+            try {
+              this.cb.onImport(new File([await fetchBytes()], f.name, { type: 'application/json' }));
+            } catch (e) {
+              this.showBanner(`Could not fetch "${f.name}" from the computer: ${(e as Error).message}`, 'error', 'drop');
+            }
+          });
+        } else if (action === 'prop' && this.cb.onAddPropFile) {
+          btn('Add to props', async () => {
+            try {
+              const ext = propExtensionFor(kind) ?? '';
+              const fileName = ext && !f.name.toLowerCase().endsWith(ext) ? `${f.name}${ext}` : f.name;
+              const ok = await this.cb.onAddPropFile!(new File([await fetchBytes()], fileName));
+              if (ok) this.showBanner(`Added "${f.name}" to the Prop Library.`, 'info', 'drop');
+            } catch (e) {
+              this.showBanner(`Could not fetch "${f.name}" from the computer: ${(e as Error).message}`, 'error', 'drop');
+            }
+          });
+        }
+      }
+      btn('Delete', async () => {
+        if (!confirm(`Delete "${f.name}" from the computer?`)) return;
+        await fetch(this.dropUrl(`file/${encodeURIComponent(f.name)}`), { method: 'DELETE' }).catch(() => null);
+        void this.refreshDropBox();
+      });
+      panel.appendChild(row);
+    }
+    if (total > files.length) {
+      const more = document.createElement('p');
+      more.className = 'empty';
+      more.textContent = `${total - files.length} older files not shown.`;
+      panel.appendChild(more);
+    }
   }
 
   private build(): void {
@@ -946,6 +1149,10 @@ export class Landing {
       splatBtn.style.color = '#d8b4fe';
       splatBtn.onclick = () => this.cb.onGaussianSplatStudio?.(this.lastSelectedSceneId);
     }
+
+    this.dropEl = el('div', 'drop-panel', wrap);
+    this.dropEl.hidden = true;
+    void this.refreshDropBox();
 
     this.listEl = el('div', 'scenes', wrap);
 
@@ -1157,6 +1364,7 @@ export class Landing {
   }
 
   refreshScenes(scenes: SceneSummary[], currentId: string | null): void {
+    this.currentSceneId = currentId;
     // Edits re-render the whole list; keep expanded prep panels expanded so
     // the blocking editor doesn't collapse after every field change.
     const openIds = new Set(
@@ -1205,6 +1413,18 @@ export class Landing {
         b.textContent = label;
         b.onclick = () => fn(s.id);
         head.appendChild(b);
+      }
+      if (this.cb.onSendSceneToComputer) {
+        // Shown only while the LAN drop box answers (CSS: .drop-available).
+        const send = document.createElement('button');
+        send.className = 'small send-to-computer';
+        send.textContent = 'Send to computer';
+        send.title = 'Put this scene in the drop box on the computer running SetView, to open it on another device';
+        send.onclick = () =>
+          void this.cb.onSendSceneToComputer!(s.id).then((ok) => {
+            if (ok) void this.refreshDropBox();
+          });
+        head.appendChild(send);
       }
       row.appendChild(head);
 

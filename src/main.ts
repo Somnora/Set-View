@@ -61,6 +61,7 @@ import {
 import { Persistence } from './persistence.ts';
 import { formatStorageLine } from './persistence.ts';
 import { importLocationBytes, type UnitChoice, type UpAxisChoice } from './locationImport.ts';
+import { sceneDropName } from './dropBox.ts';
 import type { ScanSourceFile } from './model.ts';
 import {
   buildWristPanel,
@@ -707,6 +708,8 @@ class App {
         });
       },
       onImportLocation: (id, file, opts) => void this.importLocationFile(id, file, opts),
+      onAddPropFile: async (file) => !!(await globalPropStore.saveAssetFromFile(file)),
+      onSendSceneToComputer: (id) => this.sendSceneToComputer(id),
       getStorageSummary: () => this.persistence.storageReport().then(formatStorageLine),
       onSetLedVolumeEnabled: (sceneId, enabled) => this.setLedVolumeEnabled(sceneId, enabled),
       onPreview: (id) => this.openPreview(id),
@@ -1641,7 +1644,7 @@ class App {
     this.refreshLanding();
     const s = res.built.stats;
     const lines = [
-      `Imported "${name}" as the location: ${Math.round(s.triangles / 1000)}k triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}.`,
+      `Imported "${name}" as the location: ${s.triangles < 1000 ? s.triangles : `${Math.round(s.triangles / 1000)}k`} triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}.`,
       ...res.notes,
     ];
     if (!attached.scanSaved) lines.push('The geometry could not be saved to storage and is lost on reload.');
@@ -1649,6 +1652,32 @@ class App {
     this.landing.showBanner(lines.join(' '), res.budget.level === 'warn' || !attached.scanSaved ? 'warn' : 'info', key);
     if (bytes.byteLength > 5 * 1024 * 1024) this.requestPersistentStorage();
     return true;
+  }
+
+  /**
+   * Posts a scene's .setview.json (the same file Export downloads, with no API
+   * key inside since P0.15) to the LAN drop box, so another device can open it
+   * from "Files on your computer". Dev server only.
+   */
+  private async sendSceneToComputer(sceneId: string): Promise<boolean> {
+    const live = sceneId === this.sceneData.id ? this.sceneData : null;
+    const file = await this.persistence.sceneFileText(sceneId, live);
+    if (!file) return false;
+    const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+    const name = sceneDropName(file.name);
+    try {
+      const r = await fetch(`${base}drop/upload?name=${encodeURIComponent(name)}`, {
+        method: 'POST',
+        body: new Blob([file.text], { type: 'application/json' }),
+      });
+      const body = (await r.json().catch(() => ({}))) as { name?: string; error?: string };
+      if (r.status !== 201) throw new Error(body.error ?? `the computer answered ${r.status}`);
+      this.landing.showBanner(`Sent "${file.name}" to the computer as ${body.name ?? name}.`, 'info', 'drop');
+      return true;
+    } catch (e) {
+      this.reportDataIssue(`Could not send "${file.name}" to the computer: ${(e as Error).message}`, 'drop');
+      return false;
+    }
   }
 
   /** On the first heavy import, asks once for persistent storage and says what the browser decided. */

@@ -5,5 +5,7 @@ dist/
 CLAUDE.md
 *-this-session-is-being-continued-*.txt
 __pycache__/
+# LAN drop box uploads (npm run dev only)
+drop/
 *.pyc
 
