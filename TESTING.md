@@ -223,3 +223,31 @@ Results (fill in from each committed report; the Summary table on the probe page
 | `typeof requestPersistentHandle` (S11, partial: API presence only) | | |
 
 These answers set the P0.5 room-capture UX, the P0.6 label table, and whether P1.2's file picker or P1.5's drop box is the primary import path. Until a row is filled in from a real report, treat the claim as unverified.
+
+## Bring a location in (roadmap Phase 1, P1.1 to P1.8)
+
+Branch `p1/bring-a-location-in`. Plan and review notes: `docs/roadmap-scan-import-build.md`.
+
+### Verified headset-free
+
+- `npm test`: the `P1.1` to `P1.8` domain tests (file sniffing, conversion, blob store, adapter, drop box rules and its middleware on a real local server, Photo mode, the Align solver and baking, the whole-scene move and its schema coverage, the scan flow, plane collection and triangulation).
+- Headed smokes, served with `npx vite --config vite.http.config.ts` (5174) and opened in a normal desktop Chrome window (headless Chrome never runs the animation loop these pages report from):
+  - `test/location-import-smoke.html`: textured GLB import through the landing card, Photo mode with the texture capped at 2048 px, a Draco GLB through the served decoders, a refused splat. `?preview` stops after the textured import and opens the desktop preview to look at Photo mode.
+  - `test/drop-box-smoke.html`: an extensionless upload listed as glTF, imported as the location, the scene sent to the computer and reopened from it.
+  - `test/align-smoke.html`: an Align apply (scan rebuilt, bounds within 1 mm, the Photo original re-placed without re-parsing, rest pose, undo) and an "Everything" apply that carries an actor.
+  - `test/preview-smoke.html` and `test/location-mode-smoke.html` now also fail when any preview toolbar button is off-screen.
+
+### On a headset
+
+Run the probe first (section above): its answers decide whether the Quest file picker or the drop box is the main import path, and which plane labels Quest and Galaxy XR really send.
+
+- [ ] **Import on the Quest 2D page (P1.2):** Scene card, Import location, pick a Polycam GLB. Note whether the picker offers it and whether it imports (the probe's S4 row predicts this). Then Enter AR: the room is there in Photo mode.
+- [ ] **Drop box (P1.5):** with `npm run dev` on the Mac, open the drop page address shown under "Files on your computer" on a phone, accept the certificate, save a scan to Files and send it. On the Quest landing page it is listed; Use as location. Also send a 100 to 300 MB file and time the import (spike S7).
+- [ ] **Photo mode (P1.4):** frame rate with a real Polycam GLB, 4 actors and Camera View open (spike S8). Camera View shows the textured room. Owner sign-off needed on unlit materials for Photo (review R13).
+- [ ] **Align, Grab & Turn (P1.6):** Dress, Align, Grab & Turn: hold grip and carry the room onto the real one, release, fine-tune with the right stick (turns about you, pushes lift 1 cm), Apply. The room stays put after Exit and after a reload. Hands: does the squeeze carry work?
+- [ ] **Align, two-point (P1.6):** tape two marks 3 to 5 m apart. Two-point: trigger on scan feature A, then the real mark A, then B. The preview fits; Apply. Check against the marks; note the reported fit. B steps back.
+- [ ] **Align refusals:** after a glide or teleport, Align asks for Re-align first; in Mini or Camera view it asks for Full view; while aligning, glide, snap turn and teleport do nothing.
+- [ ] **Return another day (P1.7):** block actors and a camera on tape marks, exit, re-enter from a different spot, Align with Moves: Everything against the same marks. Actors, cameras, props and walls land back on the marks, and anchors hold.
+- [ ] **Guided capture on Quest (P1.8):** Scan Room captures the room mesh plus planes; walls are not drawn twice. On a scene with an imported location, the first Scan Room press asks for a second.
+- [ ] **Guided capture on Galaxy XR (P1.8):** Scan Room, look across the floor, walls and tables: outlines build up and the wheel reads "Finish Scan (N)"; press again to keep it. Unlabeled planes come out as floor, table, ceiling or wall.
+- [ ] **Empty scene:** a brand-new scene opens its AR session in Dress, with the "Scan Room" chip on the left controller.

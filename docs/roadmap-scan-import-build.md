@@ -5,7 +5,8 @@ How SetView gets from today to letting a user scan a location, bring it into a s
 ## Status
 
 - **Phase 0 is implemented** on branch `p0/make-existing-honest` ([PR #1](https://github.com/Somnora/Set-View/pull/1)). 498 unit tests pass, typecheck and build are clean, and nine headless smoke pages pass. Nothing has been checked on a headset yet.
-- **Phases 1 to 4 have not started.** Several Phase 1 items depend on the answers from the probe page (spikes S1 to S7), so running `test/xr-probe.html` on a Quest 3 is the next gate. P1.1 (ingest core) and P1.5 (LAN drop box) do not depend on the probe.
+- **Phase 1 is implemented** on branch `p1/bring-a-location-in`, built on Phase 0. 551 unit tests pass, typecheck and build are clean, and 6 headed and 9 headless smoke pages pass. Nothing has been checked on a headset yet; see the Phase 1 table below and `TESTING.md`. The probe answers (spikes S1 to S7) are still needed to confirm the plane labels and which import path the Quest prefers.
+- **Phases 2 to 4 have not started.**
 - **Before building any Phase 1 to 4 item, read its review notes** in [Review corrections](#review-corrections). An independent review found design problems the item text below does not yet reflect.
 - File and line references are as of commit `cd82a8e`, before Phase 0. Phase 0 moved many of them, so find each site by its content before editing.
 
@@ -89,6 +90,19 @@ Implemented in PR #1. The headset checks are in the PR's test plan and in `test/
 ## Phase 1: Bring a location in
 
 Goal: A user gets a phone mesh scan or an in-headset room capture into a scene and lines it up with the real room on Quest 3 and Android XR, with no cloud backend and no new runtime dependency.
+
+Implemented on branch `p1/bring-a-location-in` (2026-11-06). Where the build differs from the item text below:
+
+| Item | Status |
+| --- | --- |
+| **P1.1** Ingest core | Done (`src/sceneImport.ts`). Budget caps are still the placeholders (warn 300k, refuse 500k triangles) until spike S8. |
+| **P1.2** Import on the 2D page | Done (`src/locationImport.ts`, Scene card). Draco and KTX2 decoders are served by a Vite plugin (`vite.plugins.ts`) instead of copied into `public/`. Geometry imports skip texture decoding. The original is kept only when it is textured. Writes to the scene it was opened for (R4); replacing asks first (R7). |
+| **P1.3** Blob store | Done (`src/blobStore.ts`). `listAssetMeta` reads one record at a time and keeps no bytes; an IndexedDB cursor cannot skip a record's bytes entirely. Originals and scans written this session are never pruned (a launch-prune race found by the import smoke). |
+| **P1.4** Photo mode | Done. Unlit `MeshBasicMaterial` needs owner sign-off (R13). The source transform composes with every Align (R1). |
+| **P1.5** LAN drop box | Done (`public/drop.html`, dev-server plugin). Phones save to Files and upload with the page's picker (no share-sheet target). Uploaded files are served as inert downloads and never as pages on the app's origin. |
+| **P1.6** Align tool | Done: Grab & Turn and two-point on the Dress ring, previewed and baked on Apply. Guards for view, shift and floor (R2). The two real survey points are not stored on the scene: nothing reads them yet. |
+| **P1.7** Re-register everything | Done: "Moves: Everything" with an explicit field schema and a coverage test (R5). Collaborators are not sent the move. |
+| **P1.8** Guided capture | Done. Plane pieces use a `plane:` label prefix instead of a codec bump (R3); re-reads are throttled to 2 Hz (R12). A completely empty scene opens in Dress (stricter than the item text: no actors or cameras either). |
 
 ### P1.1 Pure ingest core: identify by content, convert to LocationScan
 
@@ -466,7 +480,7 @@ Review notes: R11.
 
 ## Review corrections
 
-An independent review of this plan found the problems below. Those that applied to Phase 0 were fixed in PR #1: the auto-realign that cancelled its own scan, wrong-scene saves in every studio, the per-frame splat budget rebuild, the floor re-base during scan capture, the ignored reference-space reset, the wireframe overlay keyed by label, the prop settle point and the stale AI scatter config. The rest are still open:
+An independent review of this plan found the problems below. Those that applied to Phase 0 were fixed in PR #1: the auto-realign that cancelled its own scan, wrong-scene saves in every studio, the per-frame splat budget rebuild, the floor re-base during scan capture, the ignored reference-space reset, the wireframe overlay keyed by label, the prop settle point and the stale AI scatter config. Phase 1 resolved R1, R2, R3, R4, R5, R7 (Scan Room and Replace location both ask first) and R12; R13 awaits the owner's sign-off. Still open for Phase 2 and later: R6, R8, R9, R10 and R11.
 
 - **R1 (P1.4, P1.6): Photo mode drifts after Align.** P1.6 bakes alignment into the LocationScan with applyRigidToScan, but P1.4 draws Photo mode from the original source bytes, which never receive the import recentring, the convention matrix or any Align delta. Store an accumulated sourceTransform on ScanSummary and apply it to the Photo group.
 - **R2 (P1.6, P1.7): Align must respect the view state and the floor estimate.** toggleScan refuses unless the user is in Full view and not shifted; P1.6 and P1.7 need the same guard, or alignment baked while shifted is wrong after Re-align (restoreScene also skips re-anchoring while shifted). floor.ts re-bases contentRoot y, so Align should also wait for the floor estimate to commit, as Scan Room now does.
