@@ -6206,8 +6206,15 @@ test('collab.ts: architecture_update and architecture_patch network sync patches
   assert.equal(res3.granted, true);
 });
 
-test('ArchitectureRenderer: builds 3D meshes with window/door cutouts and interactive door pivots', () => {
+test('ArchitectureRenderer (P2.1): flat Lambert, merged per material, openings and door pivots', () => {
   const renderer = new ArchitectureRenderer();
+  const meshesOf = (root: THREE.Object3D) => {
+    const out: THREE.Mesh[] = [];
+    root.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh) out.push(o as THREE.Mesh);
+    });
+    return out;
+  };
 
   const win = createWindowData({ type: 'casement', offsetAlongWallM: 2.0, widthM: 1.2, heightM: 1.4 });
   const door = createDoorData({ type: 'single_swing', offsetAlongWallM: 4.5, widthM: 0.9, heightM: 2.1, openAngleDeg: 45 });
@@ -6222,42 +6229,79 @@ test('ArchitectureRenderer: builds 3D meshes with window/door cutouts and intera
   });
 
   const wallMesh = renderer.createWallMesh(wall);
-  assert.ok(wallMesh instanceof THREE.Group);
   assert.equal(wallMesh.name, `wall_${wall.id}`);
+  const meshes = meshesOf(wallMesh);
+  // Wall, window frame, door frame and glass merged per material; the door
+  // leaf and its handle stay apart so the leaf can swing.
+  assert.equal(meshes.length, 6, 'wall + window frame + door frame + glass + door leaf + handle');
+  for (const m of meshes) {
+    assert.ok(m.material instanceof THREE.MeshLambertMaterial, `${m.name} is flat Lambert`);
+    assert.equal(m.castShadow, false);
+    assert.equal(m.receiveShadow, false);
+    assert.equal(m.userData.wallId, wall.id, 'tagged for raycasting');
+    assert.equal((m.material as THREE.MeshLambertMaterial).map, null, 'no textures');
+  }
+  const solid = wallMesh.getObjectByName(`wall_solid_${wall.id}`) as THREE.Mesh;
+  assert.ok(solid?.isMesh);
+  // Leading block, window lintel and sill, middle block, door lintel, trailing block: 6 boxes of 24 vertices.
+  assert.equal(solid.geometry.getAttribute('position').count, 6 * 24);
+  const glass = meshes.filter((m) => (m.material as THREE.Material).transparent);
+  assert.equal(glass.length, 1);
+  assert.equal(glass[0].renderOrder, 1);
 
-  // Checks child solid blocks around window and door cutouts
-  const solidGroup = wallMesh.getObjectByName(`wall_solid_${wall.id}`);
-  assert.ok(solidGroup);
-  assert.ok(solidGroup.children.length >= 3); // Leading block, lintel/sill blocks, trailing block
-
-  // Checks window assembly with frame and glass
-  const winGroup = wallMesh.getObjectByName(`window_${win.id}`);
-  assert.ok(winGroup);
-  assert.ok(winGroup.children.length >= 5); // 4 frame sides + glass pane
-
-  // Checks door assembly with hinge pivot
-  const doorGroup = wallMesh.getObjectByName(`door_${door.id}`);
-  assert.ok(doorGroup);
-  const doorHinge = wallMesh.getObjectByName(`door_hinge_${door.id}`);
-  assert.ok(doorHinge);
-
-  // Test interactive door angle update
+  // The door leaf swings on its hinge without a rebuild.
+  const hinge = wallMesh.getObjectByName(`door_hinge_${door.id}`)!;
+  approx(hinge.rotation.y, Math.PI / 4);
   renderer.updateDoorAngle(wall.id, door.id, 90);
-  approx(doorHinge.rotation.y, Math.PI / 2);
+  approx(hinge.rotation.y, Math.PI / 2);
 
-  // Test full set mesh creation
-  const archSet = createArchitecturalSet('Soundstage B', { walls: [wall] });
-  const setRoot = renderer.createArchitecturalSetMesh(archSet);
-  assert.ok(setRoot instanceof THREE.Group);
+  // A plain wall is one draw call, and runs along its baseline in scene space:
+  // start (2, 0.6, 1) to (2, 0.6, 5) is 4 m along +z on a floor raised 0.6 m.
+  const plain = createWallData({ start: { x: 2, y: 0.6, z: 1 }, end: { x: 2, y: 0.6, z: 5 }, heightM: 2.4, thicknessM: 0.1 });
+  const plainRoot = renderer.createWallMesh(plain);
+  assert.equal(meshesOf(plainRoot).length, 1);
+  plainRoot.updateMatrixWorld(true);
+  const bb = new THREE.Box3().setFromObject(plainRoot);
+  approx(bb.min.z, 1, 1e-6);
+  approx(bb.max.z, 5, 1e-6);
+  approx(bb.min.x, 1.95, 1e-6);
+  approx(bb.max.x, 2.05, 1e-6);
+  approx(bb.min.y, 0.6, 1e-6);
+  approx(bb.max.y, 3.0, 1e-6);
+
+  // setArchitecture: shows the set, skips a rebuild when nothing changed,
+  // rebuilds when a wall did, and shares one material per color.
+  const twin = createWallData({ start: { x: 0, y: 0, z: 2 }, end: { x: 3, y: 0, z: 2 }, tintHex: wall.tintHex });
+  const archSet = createArchitecturalSet('Soundstage B', { walls: [wall, twin] });
+  renderer.setArchitecture(archSet);
+  assert.equal(renderer.group.children.length, 2);
+  assert.equal(renderer.wallCount, 2);
+  const firstChild = renderer.group.children[0];
+  renderer.setArchitecture(JSON.parse(JSON.stringify(archSet)));
+  assert.equal(renderer.group.children[0], firstChild, 'same walls (an undo that did not touch them): no rebuild');
+  const wallMats = new Set(
+    renderer.group.children.map((c) => ((c.getObjectByName(`wall_solid_${c.userData.wallId}`) as THREE.Mesh).material as THREE.Material).uuid),
+  );
+  assert.equal(wallMats.size, 1, 'two walls of one color share a material');
+  renderer.setArchitecture({ ...archSet, walls: [{ ...wall, heightM: 3.8 }, twin] });
+  assert.notEqual(renderer.group.children[0], firstChild, 'a changed wall is rebuilt');
+  const tall = new THREE.Box3().setFromObject(renderer.group.children[0]);
+  approx(tall.max.y, 3.8, 1e-6);
+
+  // The older calls still work on the same group.
+  const setRoot = renderer.createArchitecturalSetMesh(createArchitecturalSet('B', { walls: [wall] }));
+  assert.equal(setRoot, renderer.group);
   assert.equal(setRoot.children.length, 1);
-
-  // Test wall update and cleanup
-  const updatedWall = { ...wall, heightM: 3.8 };
-  renderer.updateWall(updatedWall);
+  renderer.updateWall({ ...wall, heightM: 3.5 });
   assert.equal(setRoot.children.length, 1);
-
   renderer.removeWall(wall.id);
   assert.equal(setRoot.children.length, 0);
+  renderer.setArchitecture(null);
+  assert.equal(renderer.wallCount, 0);
+
+  // A degenerate wall draws nothing instead of throwing.
+  const zero = renderer.createWallMesh(createWallData({ start: { x: 1, y: 0, z: 1 }, end: { x: 1, y: 0, z: 1 } }));
+  assert.equal(meshesOf(zero).length, 0);
 
   renderer.dispose();
 });

@@ -1,0 +1,106 @@
+<!doctype html>
+<!-- Built walls through the REAL app (roadmap P2.1).
+       1. seeds a scene whose architecture has three walls (a window in one,
+          a door in another), loads the app, and checks they are on display
+          under contentRoot as flat Lambert meshes tagged with their wall id;
+       2. a collaborator removes a wall (architecture_patch) and then sends the
+          whole set back (architecture_update): the walls follow each time;
+       3. opens the desktop preview from the scene card, so the screenshot
+          shows the room as a crew would see it at a laptop.
+     The scene is removed afterwards.
+     Headed (vite.http.config.ts): http://localhost:5174/test/walls-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>walls smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;left:8px;z-index:99;color:#9f6;max-width:70vw;white-space:pre-wrap">running…</pre>
+    <script type="module">
+      import { createActor, createScene } from '../src/model.ts';
+      import { createArchitecturalSet, createDoorData, createWallData, createWindowData } from '../src/architecture.ts';
+
+      const out = document.getElementById('out');
+      const CURRENT_KEY = 'setview.currentScene';
+      const INDEX_KEY = 'setview.sceneIndex';
+      const SCENE_PREFIX = 'setview.scene.';
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const notes = [];
+      const report = (ok, msg) => {
+        out.textContent = `WALLS-SMOKE ${ok ? 'PASS' : 'FAIL'} | ${msg}`;
+        out.style.color = ok ? '#9f6' : '#f66';
+      };
+      const until = async (fn, ms = 15000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          const v = await fn();
+          if (v) return v;
+          await sleep(100);
+        }
+        return null;
+      };
+
+      const prevCurrent = localStorage.getItem(CURRENT_KEY);
+      const scene = createScene('walls smoke');
+      createActor(scene, { x: 0, y: 0, z: 0 }, 0);
+      createActor(scene, { x: 1.5, y: 0, z: -1 }, -0.6);
+      const walls = [
+        createWallData({ name: 'Back', start: { x: -3.5, y: 0, z: -3 }, end: { x: 4, y: 0, z: -3 }, heightM: 2.7, thicknessM: 0.12,
+          windows: [createWindowData({ type: 'sash', offsetAlongWallM: 4.2, widthM: 1.4, heightM: 1.3 })] }),
+        createWallData({ name: 'Left', start: { x: -3.5, y: 0, z: 3 }, end: { x: -3.5, y: 0, z: -3 }, heightM: 2.7, thicknessM: 0.12,
+          doors: [createDoorData({ type: 'single_swing', offsetAlongWallM: 3.6, widthM: 0.9, heightM: 2.1, openAngleDeg: 30 })] }),
+        createWallData({ name: 'Right', start: { x: 4, y: 0, z: -3 }, end: { x: 4, y: 0, z: 1.5 }, heightM: 2.7, thicknessM: 0.12, tintHex: '#cbd5e1' }),
+      ];
+      scene.architecture = createArchitecturalSet('smoke room', { walls });
+      const cleanup = () => {
+        try {
+          localStorage.removeItem(SCENE_PREFIX + scene.id);
+          const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+          localStorage.setItem(INDEX_KEY, JSON.stringify(index.filter((e) => e.id !== scene.id)));
+          if (prevCurrent) localStorage.setItem(CURRENT_KEY, prevCurrent);
+          else localStorage.removeItem(CURRENT_KEY);
+        } catch {
+          /* storage blocked */
+        }
+      };
+      try {
+        localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
+        const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+        index.push({ id: scene.id, name: scene.name, updatedAt: Date.now(), actors: 2, cameras: 0, hasScan: false });
+        localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+        localStorage.setItem(CURRENT_KEY, scene.id);
+        await import('../src/main.ts');
+        const t = await until(() => window.__setviewTest);
+        if (!t) throw new Error('no __setviewTest hooks (not the dev server?)');
+
+        // 1. On display after load.
+        await until(() => t.wallCount() === 3);
+        const meshes = t.wallMeshes();
+        const lambert = meshes.length > 0 && meshes.every((m) => m.material === 'MeshLambertMaterial');
+        const tagged = meshes.every((m) => walls.some((w) => w.id === m.wallId));
+        const step1 = t.wallCount() === 3 && meshes.length === 8 && lambert && tagged && t.wallsUnderContentRoot();
+        notes.push(`load: walls=${t.wallCount()} meshes=${meshes.length} lambert=${lambert} tagged=${tagged} underContentRoot=${t.wallsUnderContentRoot()}`);
+
+        // 2. Collab: one wall removed, then the whole set sent back.
+        t.applyRemotePatch({ type: 'architecture_patch', wallIdToRemove: walls[2].id });
+        const afterRemove = t.wallCount();
+        t.applyRemotePatch({ type: 'architecture_update', architecture: JSON.parse(JSON.stringify(scene.architecture)) });
+        const afterUpdate = t.wallCount();
+        const step2 = afterRemove === 2 && afterUpdate === 3;
+        notes.push(`collab: remove->${afterRemove} update->${afterUpdate}`);
+
+        // 3. The desktop preview from the scene card.
+        const previewBtn = await until(() => [...document.querySelectorAll('#landing button')].find((b) => (b.textContent ?? '').trim() === 'Preview'));
+        previewBtn?.click();
+        const bar = await until(() => document.querySelector('.preview-bar'));
+        notes.push(`preview=${!!bar}`);
+        await sleep(600);
+
+        report(step1 && step2 && !!bar, notes.join(' | '));
+      } catch (e) {
+        report(false, `${e.message} | ${notes.join(' | ')}`);
+      } finally {
+        cleanup();
+      }
+    </script>
+  </body>
+</html>

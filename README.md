@@ -134,6 +134,7 @@ src/
   session.ts      WebXR session, feature detection, hit-test, anchors, mic grant
   scanner.ts      Reads Scene Mesh off live XRFrame into scene space
   location.ts     Renders scanned room: hidden/ghost/solid + furniture moves
+  architectureRenderer.ts  Built walls, doors and windows (flat Lambert, merged per wall)
   scanStore.ts    IndexedDB blob store for scan geometry
   blobStore.ts    IndexedDB store for imported originals (Photo mode)
   locationImport.ts  Parses imported mesh files with three's loaders

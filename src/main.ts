@@ -33,6 +33,7 @@ import { roomCaptureMessage, scanFloorY, summarizeScan, translateScanY, type Loc
 import { captureScanFromFrame, PlaneCollector } from './scanner.ts';
 import { scanCollected, scanFrame, scanPress, scanSectorLabel, scanStart, type ScanFlowState } from './scanFlow.ts';
 import { LocationRenderer, type LocationMode } from './location.ts';
+import { ArchitectureRenderer } from './architectureRenderer.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
 import { ActorManager, findActorId, type ActorObject } from './actors.ts';
@@ -247,6 +248,8 @@ class App {
   private preview: DesktopPreview;
   private recorder = new MonitorRecorder();
   private location = new LocationRenderer();
+  /** Walls, doors and windows from sceneData.architecture (roadmap P2.1). */
+  private architecture = new ArchitectureRenderer();
   private splatRenderer = new GaussianSplatRenderer();
   private volumetrics: VolumetricManager;
   private gizmo: TransformGizmo;
@@ -499,6 +502,9 @@ class App {
     // Scanned location lives under contentRoot: teleport walkthrough, the
     // miniature diorama, and camera framing all see the room where the actors are.
     this.contentRoot.add(this.location.group);
+    // Built walls: under contentRoot like the scan, so Re-align, the diorama,
+    // Camera View and the desktop preview all see them where the actors are.
+    this.contentRoot.add(this.architecture.group);
     this.contentRoot.add(this.splatRenderer.group);
     this.contentRoot.add(this.collabAvatars.group);
     this.views = new ViewManager(this.contentRoot, this.camera);
@@ -1843,6 +1849,7 @@ class App {
       : null;
     this.splatRenderer.setCloud(activeCloud);
     this.splatRenderer.setFloorplanOverlay(data.architecture ?? null);
+    this.architecture.setArchitecture(data.architecture); // rebuilds only if the walls changed
 
     this.volumetrics.update(
       data.atmosphere ?? createAtmosphereConfig('clear'),
@@ -3546,6 +3553,11 @@ class App {
       box.expandByPoint(new THREE.Vector3(scan.boundsMin.x, scan.boundsMin.y, scan.boundsMin.z));
       box.expandByPoint(new THREE.Vector3(scan.boundsMax.x, scan.boundsMax.y, scan.boundsMax.z));
     }
+    // So do built walls (P2.1): the preview and the miniature frame the whole set.
+    for (const w of this.sceneData.architecture?.walls ?? []) {
+      box.expandByPoint(new THREE.Vector3(w.start.x, w.start.y, w.start.z));
+      box.expandByPoint(new THREE.Vector3(w.end.x, w.end.y + w.heightM, w.end.z));
+    }
     if (box.isEmpty()) return null;
     box.expandByScalar(0.5);
     return box;
@@ -4346,6 +4358,18 @@ class App {
       aligning: () => this.align !== null,
       actorPositions: () => this.sceneData.actors.map((a) => ({ ...a.position, rotationY: a.rotationY })),
       locationPose: () => this.location.poseDelta(),
+      // test/walls-smoke.html: the built walls on display (P2.1).
+      wallCount: () => this.architecture.wallCount,
+      wallMeshes: () => {
+        const out: { wallId: string; material: string }[] = [];
+        this.architecture.group.traverse((o) => {
+          const m = o as THREE.Mesh;
+          if (m.isMesh) out.push({ wallId: m.userData.wallId, material: (m.material as THREE.Material).type });
+        });
+        return out;
+      },
+      wallsUnderContentRoot: () => this.architecture.group.parent === this.contentRoot,
+      applyRemotePatch: (p: CollabScenePatch) => this.applyRemotePatch(p),
     };
   }
 
@@ -4477,6 +4501,7 @@ class App {
     const clouds = data.gaussianClouds ?? [];
     this.splatRenderer.setCloud(clouds.find((c) => c.id === data.activeSplatCloudId) ?? clouds[0] ?? null);
     this.splatRenderer.setFloorplanOverlay(data.architecture ?? null);
+    this.architecture.setArchitecture(data.architecture);
   }
 
   private openSplatStudioDialog(sceneToUse?: SceneData): void {
@@ -4501,6 +4526,10 @@ class App {
             if (updated.architecture !== architectureAtOpen) t.architecture = updated.architecture;
           },
           () => this.applySplatState(this.sceneData),
+          // Extracted walls are scene content peers now see; the clouds stay local as before.
+          updated.architecture !== architectureAtOpen && updated.architecture
+            ? { type: 'architecture_update', architecture: updated.architecture }
+            : undefined,
         );
       },
       host,
@@ -5170,12 +5199,16 @@ class App {
       this.contentVersion++;
     } else if (patch.type.startsWith('profiler_')) {
       this.profilerRuntime.updateConfig(this.sceneData.profiler ?? createVRProfilerConfig());
+    } else if (patch.type.startsWith('architecture_')) {
+      // Walls only: the renderer rebuilds when they changed, and the 3DGS
+      // floorplan overlay follows them.
+      this.architecture.setArchitecture(this.sceneData.architecture);
+      this.splatRenderer.setFloorplanOverlay(this.sceneData.architecture ?? null);
     } else if (
       patch.type.startsWith('light_') ||
       patch.type.startsWith('atmosphere_') ||
       patch.type.startsWith('dmx_') ||
       patch.type.startsWith('splat_cloud_') ||
-      patch.type.startsWith('architecture_') ||
       patch.type.startsWith('audio_cue_')
     ) {
       // Types the union defines and a peer may send, but which have no cheap targeted
