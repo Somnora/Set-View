@@ -4501,7 +4501,7 @@ class App {
   private async openPropsLibrary(): Promise<void> {
     const host = this.studioHost('Prop Library');
     if (!host) return;
-    const customAssets = await globalPropStore.listAssets();
+    const customAssets = await globalPropStore.listAssetMeta();
     openPropsLibraryModal(
       async (assetId, customKey) => {
         const spawnPos = this.propSpawnPoint();

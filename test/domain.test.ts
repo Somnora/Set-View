@@ -609,6 +609,8 @@ import {
 import { SPLAT_BUDGET_STEP, stepSplatBudget } from '../src/performanceGovernor.ts';
 import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
 import * as ingest from '../src/sceneImport.ts';
+import { BlobStore } from '../src/blobStore.ts';
+import { collectBlobRefs, isScanSourceFile } from '../src/model.ts';
 import { sanitizeMeshBuffers } from '../src/scan.ts';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
@@ -14452,8 +14454,137 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
   });
 }
 
-void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()]).then(
+// --- P1 blob store (P1.3) ---
+{
+  const src = (blobId: string) => ({
+    blobId,
+    format: 'glb',
+    fileName: 'room.glb',
+    app: 'polycam',
+    transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0.05, 0, 1],
+    textured: true,
+  });
 
+  test('P1.3: isScanSourceFile and collectBlobRefs', () => {
+    assert.ok(isScanSourceFile(src('blob-a')));
+    assert.equal(isScanSourceFile({ ...src('blob-a'), transform: [1, 2, 3] }), false);
+    assert.equal(isScanSourceFile({ ...src(''), blobId: '' }), false);
+    assert.equal(isScanSourceFile({ ...src('x'), transform: Array(16).fill(NaN) }), false);
+    const a = createScene('a');
+    const b = createScene('b');
+    const c = createScene('c');
+    const scanOf = (id: string) => summarizeScan({ version: 1, id, capturedAt: 1, meshes: [] });
+    a.scan = { ...scanOf('scan-a'), source: src('blob-a') };
+    b.scan = { ...scanOf('scan-b'), source: src('blob-a') }; // a duplicate shares its original
+    c.scan = scanOf('scan-c'); // headset capture: no original
+    assert.deepEqual([...collectBlobRefs([a, b, c, null, undefined])], ['blob-a']);
+  });
+
+  test('P1.3: normalizeScene keeps a valid source and drops a malformed one without losing the scan', () => {
+    const s = createScene('src');
+    s.scan = { ...summarizeScan({ version: 1, id: 'scan-1', capturedAt: 1, meshes: [] }), source: src('blob-1') };
+    assert.ok(isSceneData(s));
+    normalizeScene(s);
+    assert.equal(s.scan?.source?.blobId, 'blob-1');
+    const bad = JSON.parse(JSON.stringify(s)) as SceneData;
+    (bad.scan as { source: unknown }).source = { blobId: 7 };
+    assert.ok(isSceneData(bad), 'a bad source does not fail the import');
+    normalizeScene(bad);
+    assert.equal(bad.scan?.id, 'scan-1');
+    assert.equal(bad.scan?.source, undefined);
+  });
+
+  test('P1.3: the storage line shows original files only when there are some', () => {
+    const MB = 1024 * 1024;
+    const base = { usageBytes: null, quotaBytes: null, persisted: null, sceneBytes: MB, scanBytes: 2 * MB };
+    assert.ok(!formatStorageLine(base).includes('original'));
+    assert.ok(!formatStorageLine({ ...base, blobBytes: 0 }).includes('original'));
+    assert.match(formatStorageLine({ ...base, blobBytes: 150 * MB }), /original files 150\.0 MB/);
+  });
+}
+
+/** Async: BlobStore memory fallback, PropStore metadata listing, launch pruning of originals. */
+async function p1BlobStoreTest(): Promise<void> {
+  const store = new BlobStore();
+  let warned = '';
+  store.onError = (m) => (warned = m);
+  const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+  const put = await store.putBlob({ data: bytes, format: 'glb', name: 'room.glb' });
+  assert.equal(put.saved, false, 'Node has no IndexedDB: memory only');
+  assert.match(warned, /memory/);
+  assert.match(put.id, /^blob-/);
+  const rec = await store.getBlob(put.id);
+  assert.equal(rec?.size, 5);
+  assert.equal(rec?.format, 'glb');
+  assert.deepEqual(new Uint8Array((await store.getBytes(put.id))!), bytes);
+  const meta = await store.listMeta();
+  assert.equal(meta.length, 1);
+  assert.equal('data' in meta[0], false, 'a listing carries no bytes');
+  assert.equal(await store.getTotalBytes(), 5);
+  const kept = await store.putBlob({ id: 'blob-kept', data: new Blob(['abc']), format: 'obj' });
+  assert.equal(kept.id, 'blob-kept');
+  assert.equal(await store.pruneOrphans(new Set(['blob-kept'])), 1);
+  assert.equal(await store.hasBlob(put.id), false);
+  assert.equal(await store.hasBlob('blob-kept'), true);
+  await store.deleteBlob('blob-kept');
+  assert.equal(await store.getBlob('blob-kept'), null);
+  passed++;
+  console.log('  ✓ P1.3: BlobStore memory fallback (put/get/bytes/list/prune/delete + warning)');
+
+  const props = new PropStore();
+  props.onError = () => {};
+  await props.putAsset({
+    id: 'asset-meta-1',
+    name: 'Console',
+    fileName: 'console.glb',
+    fileType: 'glb',
+    category: 'custom',
+    sizeBytes: 2048,
+    uploadedAt: 1,
+    dimensions: { width: 1, height: 1, depth: 1 },
+    buffer: new ArrayBuffer(2048),
+  });
+  const list = await props.listAssetMeta();
+  assert.equal(list.length, 1);
+  assert.equal(list[0].name, 'Console');
+  assert.equal('buffer' in list[0], false, 'metadata listing carries no model bytes');
+  passed++;
+  console.log('  ✓ P1.3: PropStore.listAssetMeta lists uploads without their bytes');
+
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: new P0MemoryStorage(), configurable: true, writable: true });
+  try {
+    const p = new Persistence();
+    p.onError = () => {};
+    const used = await p.blobs.putBlob({ data: new Uint8Array(8), format: 'glb' });
+    const orphan = await p.blobs.putBlob({ data: new Uint8Array(4), format: 'glb' });
+    const scene = createScene('with original');
+    scene.scan = {
+      ...summarizeScan({ version: 1, id: 'scan-x', capturedAt: 1, meshes: [] }),
+      source: {
+        blobId: used.id,
+        format: 'glb',
+        transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+      },
+    };
+    assert.equal(p.saveNow(scene), true);
+    await p.pruneOrphanScans();
+    assert.equal(await p.blobs.hasBlob(used.id), true, 'a referenced original survives');
+    assert.equal(await p.blobs.hasBlob(orphan.id), false, 'an unreferenced original is swept at launch');
+    const report = await p.storageReport(0);
+    assert.equal(report.blobBytes, 8);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+  passed++;
+  console.log('  ✓ P1.3: launch pruning keeps referenced originals and sweeps orphans; storage report counts them');
+}
+
+// Async tests that swap globalThis.localStorage run one after another, never concurrently.
+void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()])
+  .then(() => p1BlobStoreTest())
+  .then(
   () => {
     passed += 4;
     console.log('  ✓ ScanStore: memory fallback contract (put/get/list/prune/delete + warning)');

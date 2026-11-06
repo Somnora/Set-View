@@ -3,7 +3,7 @@
 // No backend — everything stays on the device.
 // ---------------------------------------------------------------------------
 
-import { createScene, isSceneData, normalizeScene, uid, type SceneData } from './model.ts';
+import { collectBlobRefs, createScene, isSceneData, normalizeScene, uid, type SceneData } from './model.ts';
 import {
   createSyntheticLocationScan,
   downloadFloorplan,
@@ -16,6 +16,7 @@ import {
 } from './exporters.ts';
 import { decodeScan, encodeScan, summarizeScan, type LocationScan } from './scan.ts';
 import { ScanStore } from './scanStore.ts';
+import { BlobStore } from './blobStore.ts';
 
 /** Exported scene files optionally embed the scan geometry as base64. */
 export type SceneFile = SceneData & { scanData?: string };
@@ -115,6 +116,8 @@ export interface StorageReport {
   sceneBytes: number;
   /** Approximate stored scan geometry (ScanStore). */
   scanBytes: number;
+  /** Original files of imported locations (BlobStore); omitted or 0 when there are none. */
+  blobBytes?: number;
 }
 
 /** "512 B", "3.4 KB", "12.0 MB", "1.95 GB". */
@@ -129,6 +132,7 @@ export function formatBytes(n: number): string {
 /** One-line storage summary for the landing Scene card. */
 export function formatStorageLine(r: StorageReport): string {
   let line = `Storage: scenes ${formatBytes(r.sceneBytes)}, scans ${formatBytes(r.scanBytes)}`;
+  if (r.blobBytes) line += `, original files ${formatBytes(r.blobBytes)}`;
   if (r.usageBytes !== null && r.quotaBytes !== null && r.quotaBytes > 0) {
     line += `; browser total ${formatBytes(r.usageBytes)} of ${formatBytes(r.quotaBytes)}`;
   }
@@ -165,6 +169,8 @@ function indexEntryFor(scene: SceneData): SceneIndexEntry {
 export class Persistence {
   /** Scan geometry blobs (IndexedDB) — scene JSON carries only the summary. */
   readonly scans = new ScanStore();
+  /** Original files of imported locations (IndexedDB 'setview_blobs'); scenes hold only ids. */
+  readonly blobs = new BlobStore();
 
   private saveTimer: number | null = null;
   /** The scene the pending debounced save is for. A save of another scene writes it
@@ -181,6 +187,7 @@ export class Persistence {
 
   constructor() {
     this.scans.onError = (m) => this.onError(m);
+    this.blobs.onError = (m) => this.onError(m);
   }
 
   /**
@@ -209,11 +216,17 @@ export class Persistence {
    */
   async pruneOrphanScans(): Promise<void> {
     const referenced = new Set<string>();
+    const scenes: SceneData[] = [];
     for (const e of this.listScenes()) {
       const s = this.loadScene(e.id);
-      if (s?.scan) referenced.add(s.scan.id);
+      if (!s) continue;
+      scenes.push(s);
+      if (s.scan) referenced.add(s.scan.id);
     }
     await this.scans.pruneOrphans(referenced);
+    // Original files of imported locations: same rule, swept only at launch.
+    // Never deleted with a scene, because a duplicate shares its original.
+    await this.blobs.pruneOrphans(collectBlobRefs(scenes));
   }
 
   listScenes(): SceneIndexEntry[] {
@@ -585,6 +598,7 @@ export class Persistence {
     const report = (async (): Promise<StorageReport> => {
       const sceneBytes = this.localSceneBytes();
       const scanBytes = await this.scans.getTotalStorageBytes().catch(() => 0);
+      const blobBytes = await this.blobs.getTotalBytes().catch(() => 0);
       let usageBytes: number | null = null;
       let quotaBytes: number | null = null;
       let persisted: boolean | null = null;
@@ -599,7 +613,7 @@ export class Persistence {
       } catch {
         // Estimates are informational; missing ones are simply not shown.
       }
-      return { usageBytes, quotaBytes, persisted, sceneBytes, scanBytes };
+      return { usageBytes, quotaBytes, persisted, sceneBytes, scanBytes, blobBytes };
     })();
     this.storageReportCache = { at: now, report };
     return report;

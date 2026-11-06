@@ -61,7 +61,7 @@ import {
   type PropCategory,
   type PropDefinition,
 } from './props.ts';
-import { globalPropStore, type CustomPropAsset } from './propStore.ts';
+import { globalPropStore, type CustomPropAssetMeta } from './propStore.ts';
 import {
   type LiveLinkConfig,
   type LiveLinkConnectionState,
@@ -2937,7 +2937,7 @@ export function openCollabModal(
 /** Opens the 3D Set & Prop Asset Library browser and uploader modal. */
 export function openPropsLibraryModal(
   onPlaceProp: (assetId: string, customKey?: string) => void,
-  customAssets: CustomPropAsset[] = [],
+  customAssets: CustomPropAssetMeta[] = [],
   onUploadCustomAsset?: (file: File) => Promise<void>,
   onDeleteCustomAsset?: (id: string) => Promise<void>,
   // document.body on the 2D page; the dom-overlay root (#overlay) in AR, since
@@ -3149,7 +3149,7 @@ export function openPropsLibraryModal(
       if (onUploadCustomAsset) {
         await onUploadCustomAsset(file);
         // Refresh custom assets list from store
-        const updated = await globalPropStore.listAssets();
+        const updated = await globalPropStore.listAssetMeta();
         customAssets.length = 0;
         customAssets.push(...updated);
         renderCards();
