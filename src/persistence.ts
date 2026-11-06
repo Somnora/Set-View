@@ -3,7 +3,16 @@
 // No backend — everything stays on the device.
 // ---------------------------------------------------------------------------
 
-import { collectBlobRefs, createScene, isSceneData, normalizeScene, uid, type SceneData, type ScanSourceFile } from './model.ts';
+import {
+  collectBlobRefs,
+  createScene,
+  isSceneData,
+  normalizeScene,
+  uid,
+  type LocationDisplayMode,
+  type SceneData,
+  type ScanSourceFile,
+} from './model.ts';
 import {
   createSyntheticLocationScan,
   downloadFloorplan,
@@ -527,6 +536,7 @@ export class Persistence {
     scan: LocationScan,
     source: ScanSourceFile | null,
     getLive?: () => SceneData | null,
+    mode?: LocationDisplayMode,
   ): Promise<{ scene: SceneData; scanSaved: boolean } | null> {
     const scanSaved = await this.scans.putScan(scan);
     const live = getLive?.() ?? null;
@@ -534,9 +544,13 @@ export class Persistence {
     if (!scene) return null;
     scene.scan = summarizeScan(scan);
     if (source) scene.scan.source = source;
-    // A new location starts in its default mode, not the old scan's Hidden.
+    // A new location starts in its default mode (or the one asked for), not the old scan's Hidden.
     delete scene.locationMode;
     normalizeScene(scene);
+    if (mode) {
+      scene.locationMode = mode;
+      normalizeScene(scene); // Photo without a textured source falls back to Solid
+    }
     this.saveNow(scene);
     this.storageReportCache = null;
     return { scene, scanSaved };

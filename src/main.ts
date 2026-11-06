@@ -60,7 +60,8 @@ import {
 } from './floor.ts';
 import { Persistence } from './persistence.ts';
 import { formatStorageLine } from './persistence.ts';
-import { importLocationBytes, type UnitChoice, type UpAxisChoice } from './locationImport.ts';
+import { disposeModel, importLocationBytes, parseModelBytes, type UnitChoice, type UpAxisChoice } from './locationImport.ts';
+import type { SceneFileKind } from './sceneImport.ts';
 import { sceneDropName } from './dropBox.ts';
 import type { ScanSourceFile } from './model.ts';
 import {
@@ -1041,6 +1042,8 @@ class App {
       // Same geometry, possibly different furniture placements (undo/redo,
       // scene restore) — re-apply without reloading the blob.
       this.location.applyPlacements(summary.furniture);
+      // An Align (or its undo) moves the textured original with the scan.
+      this.location.setPhotoTransform(summary.source?.transform);
       // The display mode is a view preference, not an undoable edit: keep what
       // is on screen, and write it back so a snapshot taken before the last
       // mode change doesn't revert it on the next save.
@@ -1065,7 +1068,43 @@ class App {
       this.location.applyPlacements(this.sceneData.scan?.furniture);
       this.contentVersion++; // furniture raycast targets changed
       this.refreshWristState();
+      this.loadLocationPhoto(token);
     });
+  }
+
+  /**
+   * Loads the textured original of an imported location for Photo mode (P1.4):
+   * the bytes from the blob store, parsed with their textures. Photo draws the
+   * scan as Solid until this finishes, and keeps doing so if it fails (the
+   * original is not on this device, e.g. after a scene export and import).
+   */
+  private loadLocationPhoto(token: number): void {
+    const source = this.sceneData.scan?.source;
+    if (!source?.textured) return;
+    this.location.markPhotoLoading();
+    void (async () => {
+      const bytes = await this.persistence.blobs.getBytes(source.blobId);
+      if (token !== this.locationSyncToken) return;
+      if (!bytes) {
+        this.location.markPhotoFailed();
+        this.debug.log('Photo mode unavailable: the original file is not on this device (scene exports do not carry it)');
+        return;
+      }
+      try {
+        const model = await parseModelBytes(bytes, source.format as SceneFileKind, { textures: true, renderer: this.renderer });
+        if (token !== this.locationSyncToken) {
+          disposeModel(model.root);
+          return;
+        }
+        this.location.setPhoto(model.root, this.sceneData.scan?.source?.transform ?? source.transform);
+        this.debug.log(`Photo mode ready (${this.location.photoPartCount} part${this.location.photoPartCount === 1 ? '' : 's'})`);
+        this.refreshWristState();
+      } catch (e) {
+        if (token !== this.locationSyncToken) return;
+        this.location.markPhotoFailed();
+        this.debug.log(`Photo mode unavailable: ${(e as Error)?.message ?? e}`);
+      }
+    })();
   }
 
   /** Drops a scene's scan summary (landing page). The geometry blob is kept
@@ -1571,7 +1610,18 @@ class App {
    *  what is in memory, not an older localStorage copy (or nothing) after a failed save. */
   private exportSceneFile(id: string): void {
     void this.persistence.exportScene(id, this.sceneData).then((ok) => {
-      if (!ok) this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
+      if (!ok) {
+        this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
+        return;
+      }
+      const scene = id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id);
+      if (scene?.scan?.source) {
+        this.landing.showBanner(
+          'The exported scene carries the location geometry but not its photo textures: the original file stays on this device, so Photo mode is unavailable where the export is opened.',
+          'info',
+          'export-photo',
+        );
+      }
     });
   }
 
@@ -1631,7 +1681,14 @@ class App {
         textured: true,
       };
     }
-    const attached = await this.persistence.attachImportedScan(sceneId, res.built.scan, source, () => this.sceneData);
+    // A textured import opens in Photo; a plain mesh in Ghost (the default).
+    const attached = await this.persistence.attachImportedScan(
+      sceneId,
+      res.built.scan,
+      source,
+      () => this.sceneData,
+      source ? 'photo' : undefined,
+    );
     if (!attached) {
       this.reportDataIssue(`"${name}" was read, but its scene no longer exists.`, key);
       return false;
@@ -3750,14 +3807,19 @@ class App {
       currentSceneId: () => this.sceneData.id,
       currentScan: () => this.sceneData.scan ?? null,
       displayedScanId: () => this.displayedScanId,
+      // Geometry-scan meshes only (Photo parts are counted by photoParts).
       locationMeshCount: () => {
         let n = 0;
         this.location.group.traverse((o) => {
-          if ((o as THREE.Mesh).isMesh) n++;
+          if ((o as THREE.Mesh).isMesh && o.name.startsWith('scan:')) n++;
         });
         return n;
       },
       blobBytes: async (id: string) => (await this.persistence.blobs.getBytes(id))?.byteLength ?? null,
+      locationMode: () => this.location.mode,
+      photoState: () => this.location.photoState,
+      photoParts: () => this.location.photoPartCount,
+      photoTextureSizes: () => this.location.photoTextureSizes(),
     };
   }
 

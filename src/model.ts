@@ -1124,9 +1124,9 @@ export interface SceneData {
 }
 
 /** Location scan display modes (rendered by location.ts). */
-export type LocationDisplayMode = 'hidden' | 'ghost' | 'solid' | 'wireframe';
+export type LocationDisplayMode = 'hidden' | 'ghost' | 'solid' | 'wireframe' | 'photo';
 
-export const LOCATION_DISPLAY_MODES: readonly LocationDisplayMode[] = ['hidden', 'ghost', 'solid', 'wireframe'];
+export const LOCATION_DISPLAY_MODES: readonly LocationDisplayMode[] = ['hidden', 'ghost', 'solid', 'wireframe', 'photo'];
 
 export function isLocationDisplayMode(v: unknown): v is LocationDisplayMode {
   return typeof v === 'string' && (LOCATION_DISPLAY_MODES as readonly string[]).includes(v);
@@ -1883,6 +1883,8 @@ export function normalizeScene(s: SceneData): SceneData {
   // one's Hidden and seem to do nothing.
   if (!s.scan) delete s.locationMode;
   if (s.scan && s.locationMode === undefined) s.locationMode = 'ghost';
+  // Photo needs a textured original; without one it would only ever draw Solid.
+  if (s.locationMode === 'photo' && !s.scan?.source?.textured) s.locationMode = 'solid';
   if (!Array.isArray(s.lights)) {
     s.lights = [];
   } else {

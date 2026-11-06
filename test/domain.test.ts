@@ -612,6 +612,7 @@ import * as ingest from '../src/sceneImport.ts';
 import { BlobStore } from '../src/blobStore.ts';
 import { importLocationBytes, partsFromObject3D } from '../src/locationImport.ts';
 import * as drop from '../src/dropBox.ts';
+import { fitTextureSize, LocationRenderer as P1LocationRenderer } from '../src/location.ts';
 import { dropBox as dropBoxPlugin } from '../vite.plugins.ts';
 import * as nodeHttp from 'node:http';
 import * as nodeOs from 'node:os';
@@ -14980,6 +14981,99 @@ async function p1DropBoxServerTest(): Promise<void> {
   }
   passed++;
   console.log('  ✓ P1.5: drop box server: upload, list, ranged inert downloads, no traversal, no raw serving, same-origin writes, size cap');
+}
+
+// --- P1 photo mode (P1.4) ---
+{
+  test('P1.4: fitTextureSize caps the longest edge at 2048 and keeps the aspect ratio', () => {
+    assert.deepEqual(fitTextureSize(4096, 2048), { width: 2048, height: 1024 });
+    assert.deepEqual(fitTextureSize(1000, 500), { width: 1000, height: 500 });
+    assert.deepEqual(fitTextureSize(2048, 2048), { width: 2048, height: 2048 });
+    assert.deepEqual(fitTextureSize(8192, 100), { width: 2048, height: 25 });
+  });
+
+  const photoRoot = () => {
+    const root = new THREE.Group();
+    const tex = new THREE.DataTexture(new Uint8Array(4 * 4 * 4), 4, 4);
+    const normal = new THREE.DataTexture(new Uint8Array(4 * 4 * 4), 4, 4);
+    let normalDisposed = false;
+    normal.addEventListener('dispose', () => (normalDisposed = true));
+    const textured = new THREE.MeshStandardMaterial({ map: tex, normalMap: normal });
+    const quad = () => {
+      const g = new THREE.PlaneGeometry(1, 1);
+      return g;
+    };
+    const a = new THREE.Mesh(quad(), textured);
+    const b = new THREE.Mesh(quad(), textured);
+    b.position.set(2, 0, 0);
+    const plain = new THREE.Mesh(quad(), new THREE.MeshStandardMaterial({ color: 0x336699 }));
+    root.add(a, b, plain);
+    return { root, tex, wasNormalDisposed: () => normalDisposed };
+  };
+
+  test('P1.4: setPhoto merges per material, draws unlit, frees unused textures and takes over from the scan', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    loc.setMode('photo');
+    const photoGroup = loc.group.getObjectByName('location-photo')!;
+    assert.equal(photoGroup.visible, false, 'nothing to show before the original loads');
+    assert.ok(loc.group.children.some((c) => (c as THREE.Mesh).isMesh && c.visible), 'Photo draws the scan (Solid) meanwhile');
+    loc.markPhotoLoading();
+    assert.equal(loc.photoState, 'loading');
+    const { root, tex, wasNormalDisposed } = photoRoot();
+    const transform = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0.25, 0, 1];
+    loc.setPhoto(root, transform);
+    assert.equal(loc.photoState, 'ready');
+    assert.equal(loc.photoPartCount, 2, 'two meshes sharing a textured material merge; the plain one stays separate');
+    const parts = photoGroup.children as THREE.Mesh[];
+    for (const p of parts) assert.ok((p.material as THREE.Material).type === 'MeshBasicMaterial', 'unlit');
+    const texturedPart = parts.find((p) => (p.material as THREE.MeshBasicMaterial).map)!;
+    assert.equal((texturedPart.material as THREE.MeshBasicMaterial).map, tex, 'small textures are kept as-is');
+    assert.ok(!texturedPart.geometry.getAttribute('normal'), 'normals are not kept for an unlit draw');
+    assert.equal(wasNormalDisposed(), true, 'a texture Photo never draws is freed');
+    approx(photoGroup.matrix.elements[13], 0.25, 1e-9);
+    assert.equal(photoGroup.visible, true);
+    const scanMeshes = loc.group.children.filter((c) => (c as THREE.Mesh).isMesh && c.name.startsWith('scan:'));
+    assert.ok(scanMeshes.length > 0 && scanMeshes.every((m) => !m.visible), 'the geometry scan is hidden under Photo');
+    loc.setPhotoTransform([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 3, 0, 0, 1]);
+    approx(photoGroup.matrix.elements[12], 3, 1e-9);
+  });
+
+  test('P1.4: the mode cycle offers Photo only when loaded, and the camera pass prefers it', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    loc.setMode('wireframe');
+    assert.equal(loc.cycleMode(), 'hidden', 'no Photo without an original');
+    loc.setPhoto(photoRoot().root, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    loc.setMode('wireframe');
+    assert.equal(loc.cycleMode(), 'photo');
+    assert.equal(loc.cycleMode(), 'hidden');
+    loc.setMode('hidden');
+    loc.beginCameraPass();
+    assert.equal(loc.mode, 'photo', 'Camera View shows the textured location');
+    loc.endCameraPass();
+    assert.equal(loc.mode, 'hidden');
+    loc.markPhotoFailed();
+    loc.beginCameraPass();
+    assert.equal(loc.mode, 'solid', 'without the original the camera pass is Solid');
+    loc.endCameraPass();
+    loc.setMode('photo');
+    loc.setScan(null);
+    assert.equal(loc.photoState, 'none', 'removing the scan drops its photo');
+    assert.equal(loc.photoPartCount, 0);
+  });
+
+  test('P1.4: normalizeScene keeps Photo only with a textured original', () => {
+    const s = createScene('photo');
+    s.scan = summarizeScan(createSyntheticLocationScan());
+    s.locationMode = 'photo';
+    normalizeScene(s);
+    assert.equal(s.locationMode, 'solid');
+    s.scan.source = { blobId: 'b', format: 'glb', transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], textured: true };
+    s.locationMode = 'photo';
+    normalizeScene(s);
+    assert.equal(s.locationMode, 'photo');
+  });
 }
 
 // Async tests that swap globalThis.localStorage run one after another, never concurrently.

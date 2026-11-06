@@ -54,7 +54,7 @@ export interface WheelContext {
   recording: boolean;
   /** A location scan exists in the scene (enables Room cycling). */
   hasScan: boolean;
-  locationMode: 'hidden' | 'ghost' | 'solid' | 'wireframe';
+  locationMode: 'hidden' | 'ghost' | 'solid' | 'wireframe' | 'photo';
   /** Active-camera lens state, for value labels in the Lens sub-wheel. */
   lensFocal: number;
   tStop: number;

@@ -2,16 +2,19 @@
 <!-- Location import through the REAL app (roadmap P1.2). Boots src/main.ts on the
      landing page, then drives the Scene & Environment card's "Import location"
      file input the way a user's picker would:
-       1. a textured GLB of the synthetic test room (built here with GLTFExporter):
-          the live scene gets the scan, the location renders one mesh per part,
-          and the textured original is kept in the blob store byte for byte;
+       1. a textured GLB of the synthetic test room (built here with GLTFExporter,
+          with a 3000 px texture): the live scene gets the scan, the location
+          renders one mesh per part, the textured original is kept in the blob
+          store byte for byte, and the scene opens in Photo mode (P1.4) with the
+          texture downscaled to at most 2048 px;
        2. a Draco-compressed GLB (built here with DRACOExporter) replacing it:
           proves the decoders are served (vite.plugins.ts) and decode;
        3. a Gaussian splat PLY header: refused with a banner, scene unchanged.
      Needs the dev server (the test hooks are DEV-only) and a headed browser
      (IndexedDB hangs headless on macOS; the stores then fall back to memory).
 
-     Headed (vite.http.config.ts): http://localhost:5174/test/location-import-smoke.html -->
+     Headed (vite.http.config.ts): http://localhost:5174/test/location-import-smoke.html
+     ?preview stops after step 1 and opens the desktop preview, to look at Photo mode. -->
 <html>
   <head><meta charset="utf-8" /><title>location import smoke</title></head>
   <body>
@@ -51,12 +54,17 @@
       // A room the importer must reproduce: one textured mesh per scan mesh.
       const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
       const roomTris = room.meshes.reduce((n, m) => n + m.indices.length / 3, 0);
+      // Larger than Photo mode's 2048 px cap, so the downscale path runs.
       const tex = (() => {
         const c = document.createElement('canvas');
-        c.width = c.height = 16;
+        c.width = 3000;
+        c.height = 1500;
         const g = c.getContext('2d');
-        g.fillStyle = '#c84';
-        g.fillRect(0, 0, 16, 16);
+        for (let y = 0; y < 15; y++)
+          for (let x = 0; x < 30; x++) {
+            g.fillStyle = (x + y) % 2 ? '#c84' : '#3a6ea5';
+            g.fillRect(x * 100, y * 100, 100, 100);
+          }
         return new THREE.CanvasTexture(c);
       })();
       const toThree = (withUv) => {
@@ -65,7 +73,15 @@
           const geom = new THREE.BufferGeometry();
           geom.setAttribute('position', new THREE.BufferAttribute(m.positions.slice(), 3));
           geom.setIndex(new THREE.BufferAttribute(m.indices.slice(), 1));
-          if (withUv) geom.setAttribute('uv', new THREE.BufferAttribute(new Float32Array((m.positions.length / 3) * 2), 2));
+          if (withUv) {
+            // Planar UVs over the floor plan, so Photo shows the checker.
+            const uv = new Float32Array((m.positions.length / 3) * 2);
+            for (let i = 0, j = 0; i < m.positions.length; i += 3, j += 2) {
+              uv[j] = m.positions[i] / 7 + 0.5 + m.positions[i + 1] / 14;
+              uv[j + 1] = m.positions[i + 2] / 6 + 0.5;
+            }
+            geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+          }
           group.add(new THREE.Mesh(geom, new THREE.MeshStandardMaterial(withUv ? { map: tex } : {})));
         }
         return group;
@@ -150,6 +166,7 @@
         input.dispatchEvent(new Event('change'));
       }
 
+      const STOP = Symbol('stop'); // ?preview ends the run early (module scripts cannot return)
       const prevCurrent = localStorage.getItem(CURRENT_KEY);
       const scene = createScene('location import smoke');
       const cleanup = () => {
@@ -191,8 +208,23 @@
           s1.source?.app === 'polycam' &&
           kept === glb.byteLength &&
           /Imported "Polycam room\.glb"/.test(bannerText());
+        // Photo mode: a textured import opens in Photo once the original loads.
+        const photo = await until(() => t.photoState() === 'ready');
+        const sizes = t.photoTextureSizes();
+        if (new URLSearchParams(location.search).has('preview')) {
+          [...document.querySelectorAll('.scene.current button')].find((b) => b.textContent === 'Preview')?.click();
+          report(ok1, `stopped for a look at Photo mode | photo=${t.photoState()} mode=${t.locationMode()}`);
+          throw STOP;
+        }
+        const ok1p =
+          !!photo &&
+          t.locationMode() === 'photo' &&
+          t.photoParts() > 0 &&
+          sizes.length > 0 &&
+          sizes.every((s) => Math.max(s.width, s.height) <= 2048 && s.width > 0);
         notes.push(
           `glb tris=${s1.triangles}/${roomTris} meshes=${t.locationMeshCount()}/${room.meshes.length} source=${s1.source?.format}:${s1.source?.app} kept=${kept}/${glb.byteLength}`,
+          `photo=${t.photoState()} mode=${t.locationMode()} parts=${t.photoParts()} tex=${sizes.map((s) => `${s.width}x${s.height}`).join(',')}`,
         );
 
         // 2. Draco GLB replaces it.
@@ -216,9 +248,12 @@
         const ok3 = !!refused && t.currentScan()?.id === s2.id;
         notes.push(`splat refused=${!!refused}`);
 
-        report(ok1 && ok2 && ok3, `${ok1 ? 'glb ok' : 'GLB FAIL'} ${ok2 ? 'draco ok' : 'DRACO FAIL'} ${ok3 ? 'splat ok' : 'SPLAT FAIL'} | ${notes.join(' | ')}`);
+        report(
+          ok1 && ok1p && ok2 && ok3,
+          `${ok1 ? 'glb ok' : 'GLB FAIL'} ${ok1p ? 'photo ok' : 'PHOTO FAIL'} ${ok2 ? 'draco ok' : 'DRACO FAIL'} ${ok3 ? 'splat ok' : 'SPLAT FAIL'} | ${notes.join(' | ')}`,
+        );
       } catch (e) {
-        report(false, `${e.message} | ${notes.join(' | ')}`);
+        if (e !== STOP) report(false, `${e.message} | ${notes.join(' | ')}`);
       } finally {
         cleanup();
       }
