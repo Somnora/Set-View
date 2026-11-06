@@ -38,6 +38,7 @@ interface HandState {
   axes: { x: number; y: number };
   /** Edge-latch for thumbstick-as-stepper (focal length etc.). */
   stickLatchedX: number;
+  stickLatchedY: number;
   connected: boolean;
   isHand: boolean;
 }
@@ -49,6 +50,7 @@ function freshHandState(): HandState {
     buttons: {},
     axes: { x: 0, y: 0 },
     stickLatchedX: 0,
+    stickLatchedY: 0,
     connected: false,
     isHand: false,
   };
@@ -198,6 +200,21 @@ export class InputManager {
     if (Math.abs(x) > 0.7 && st.stickLatchedX === 0) {
       st.stickLatchedX = Math.sign(x);
       return x > 0 ? 1 : -1;
+    }
+    return 0;
+  }
+
+  /** stickStepX for the Y axis (-1 = pushed forward/up, +1 = pulled back), with its own latch. */
+  stickStepY(hand: Hand): -1 | 0 | 1 {
+    const st = this.state[hand];
+    const y = st.axes.y;
+    if (Math.abs(y) < 0.35) {
+      st.stickLatchedY = 0;
+      return 0;
+    }
+    if (Math.abs(y) > 0.7 && st.stickLatchedY === 0) {
+      st.stickLatchedY = Math.sign(y);
+      return y > 0 ? 1 : -1;
     }
     return 0;
   }

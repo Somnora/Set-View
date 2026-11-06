@@ -61,9 +61,18 @@ import {
 import { Persistence } from './persistence.ts';
 import { formatStorageLine } from './persistence.ts';
 import { disposeModel, importLocationBytes, parseModelBytes, type UnitChoice, type UpAxisChoice } from './locationImport.ts';
-import type { SceneFileKind } from './sceneImport.ts';
+import { multiplyMat4, type SceneFileKind } from './sceneImport.ts';
+import {
+  rigidDeltaMatrix,
+  twoPointAddPoint,
+  twoPointBack,
+  twoPointInitial,
+  twoPointPrompt,
+  type RigidDelta,
+  type TwoPointState,
+} from './registration.ts';
 import { sceneDropName } from './dropBox.ts';
-import type { ScanSourceFile } from './model.ts';
+import type { ScanSourceFile, ScanSummary } from './model.ts';
 import {
   buildWristPanel,
   DebugLog,
@@ -146,7 +155,7 @@ import { PropsManager, type PropObject } from './propsManager.ts';
 import { globalPropRenderer } from './propRenderer.ts';
 import { getBuiltinPropDefinition, propSpawnHitUsable, settlePropY, snapPropToGrid } from './props.ts';
 import { locomotionSuppressed, type LocomotionState } from './locomotion.ts';
-import { quatYaw } from './scan.ts';
+import { applyRigidToScan, quatYaw } from './scan.ts';
 import { submenuForSector, wheelPropPreset, wheelSectorRoute } from './wheel.ts';
 import { globalPropStore } from './propStore.ts';
 import { LiveLinkStreamer } from './liveLinkStreamer.ts';
@@ -301,6 +310,24 @@ class App {
   private draggedMonitor = false;
   /** Scanned furniture mesh being grip-carried (Stage 1 movable furniture). */
   private draggedFurniture: THREE.Object3D | null = null;
+  /**
+   * Align tool (P1.6): lines the scan or imported location up with the real
+   * room. A pending move lives on location.group as a preview (Ghost forced)
+   * and is baked into the scan data only on Apply, as one undo step.
+   */
+  private align: {
+    tool: 'none' | 'nudge' | 'two-point';
+    /** Display mode to return to on exit (Ghost is forced while aligning). */
+    restoreMode: LocationMode;
+    twoPoint: TwoPointState;
+    /** The location is on the controller ray (Grab & Turn). */
+    grabbing: boolean;
+  } | null = null;
+  private alignApplying = false;
+  /** Photo originals parsed so far (the align smoke checks an Apply does not re-parse one). */
+  private photoLoadCount = 0;
+  /** Picked-point markers: scan A, scan B (on the scan), real A, real B (in the room). */
+  private alignMarkers: THREE.Mesh[] = [];
   /** Per-session floor-height sanity check (see floor.ts). */
   private floorEst = newFloorEstimate();
 
@@ -1064,11 +1091,16 @@ class App {
         return;
       }
       this.displayedScanId = scan.id;
-      this.location.setScan(scan);
+      // An Align rebuilds the scan under a new id but keeps its original: the
+      // loaded photo stays and is only re-placed, instead of being parsed again.
+      const src = this.sceneData.scan?.source;
+      const keepPhoto = !!src && this.location.hasPhoto && this.location.photoSourceId === src.blobId;
+      this.location.setScan(scan, { keepPhoto });
       this.location.applyPlacements(this.sceneData.scan?.furniture);
       this.contentVersion++; // furniture raycast targets changed
       this.refreshWristState();
-      this.loadLocationPhoto(token);
+      if (keepPhoto) this.location.setPhotoTransform(src!.transform);
+      else this.loadLocationPhoto(token);
     });
   }
 
@@ -1091,12 +1123,13 @@ class App {
         return;
       }
       try {
+        this.photoLoadCount++;
         const model = await parseModelBytes(bytes, source.format as SceneFileKind, { textures: true, renderer: this.renderer });
         if (token !== this.locationSyncToken) {
           disposeModel(model.root);
           return;
         }
-        this.location.setPhoto(model.root, this.sceneData.scan?.source?.transform ?? source.transform);
+        this.location.setPhoto(model.root, this.sceneData.scan?.source?.transform ?? source.transform, source.blobId);
         this.debug.log(`Photo mode ready (${this.location.photoPartCount} part${this.location.photoPartCount === 1 ? '' : 's'})`);
         this.refreshWristState();
       } catch (e) {
@@ -1148,6 +1181,238 @@ class App {
     const next = this.location.cycleMode();
     this.setLocationMode(next); // remember it on the scene
     return next;
+  }
+
+  // --- Align (P1.6) ---------------------------------------------------------
+
+  /** Wrist status, debug log and the wheel hub hint, so an Align step is never silent. */
+  private alignSay(msg: string): void {
+    this.debug.log(msg);
+    this.wrist.setStatus(msg);
+    this.refreshWristState();
+  }
+
+  /** Short next-step hint for the Align sub-wheel hub. */
+  private alignHint(): string | undefined {
+    const a = this.align;
+    if (!a) return undefined;
+    if (a.tool === 'nudge') return a.grabbing ? 'release grip' : 'grip: move';
+    if (a.tool === 'two-point') {
+      return { scanA: 'scan point A', realA: 'room point A', scanB: 'scan point B', realB: 'room point B', preview: 'Apply?' }[
+        a.twoPoint.phase
+      ];
+    }
+    return 'pick a tool';
+  }
+
+  /**
+   * Starts Align if it can run. It needs a location, Full view, a set that has
+   * not been glided, teleported or snap-turned (the alignment is baked in scene
+   * space), and a committed floor estimate, since a later floor re-base would
+   * move what was just aligned (review R2).
+   */
+  private ensureAlign(): boolean {
+    if (this.align) return true;
+    if (!this.location.hasScan) {
+      this.alignSay('Align needs a location: Scan Room, or import one on the 2D page.');
+      return false;
+    }
+    if (this.views.mode !== 'full') {
+      this.alignSay('Align works in Full view. Switch View to Full first.');
+      return false;
+    }
+    if (this.views.isShifted) {
+      this.alignSay('The set has been moved (glide, teleport or turn). Use Re-align first, then Align.');
+      return false;
+    }
+    if (this.session.session && !this.floorEst.committed) {
+      this.alignSay('Look at the floor for a moment so SetView can settle its height, then Align.');
+      return false;
+    }
+    this.cancelActiveManipulation();
+    this.align = { tool: 'none', restoreMode: this.location.mode, twoPoint: twoPointInitial(), grabbing: false };
+    this.location.setMode('ghost'); // a view of the fit, not a saved preference
+    this.location.resetPose();
+    this.contentVersion++;
+    return true;
+  }
+
+  private alignStartNudge(): void {
+    if (!this.ensureAlign()) return;
+    this.align!.tool = 'nudge';
+    this.align!.twoPoint = twoPointInitial();
+    this.hideAlignMarkers();
+    this.alignSay('Grab & Turn: hold grip to carry the location, release, then fine-tune with the right stick. Apply to keep it.');
+  }
+
+  private alignStartTwoPoint(): void {
+    if (!this.ensureAlign()) return;
+    this.align!.tool = 'two-point';
+    this.align!.twoPoint = twoPointInitial();
+    this.location.resetPose(); // picks are made on the scan at rest
+    this.hideAlignMarkers();
+    this.alignSay(twoPointPrompt(this.align!.twoPoint));
+  }
+
+  /** B / Undo step: one point back (two-point), or drop the pending move (Grab & Turn). */
+  private alignBack(): void {
+    const a = this.align;
+    if (!a) return;
+    if (a.tool === 'two-point') {
+      a.twoPoint = twoPointBack(a.twoPoint);
+      this.location.resetPose();
+      this.syncAlignMarkers();
+      this.alignSay(twoPointPrompt(a.twoPoint));
+    } else if (a.tool === 'nudge' && !a.grabbing) {
+      this.location.resetPose();
+      this.alignSay('Move discarded. Hold grip to carry the location.');
+    }
+  }
+
+  /** Trigger while aligning: pick the next two-point point, or apply a previewed fit. */
+  private alignTrigger(rc: THREE.Raycaster | null): void {
+    const a = this.align!;
+    if (a.tool === 'nudge') {
+      this.alignApply();
+      return;
+    }
+    if (a.tool !== 'two-point') {
+      this.alignSay('Pick Grab & Turn or Two-point on the Align wheel.');
+      return;
+    }
+    const phase = a.twoPoint.phase;
+    if (phase === 'preview') {
+      this.alignApply();
+      return;
+    }
+    let world: THREE.Vector3 | null = null;
+    if (phase === 'scanA' || phase === 'scanB') {
+      const hit = rc ? rc.intersectObjects(this.location.pickTargets(), false)[0] : undefined;
+      if (!hit) {
+        this.alignSay('Point the ray at the scan itself, then trigger.');
+        return;
+      }
+      world = hit.point;
+    } else {
+      if (!this.session.lastHit) {
+        this.alignSay('Point at the real spot until the ring shows on it, then trigger.');
+        return;
+      }
+      world = _pt.copy(this.session.lastHit.point);
+    }
+    // Both kinds of point in the scan's own frame (the group is at rest while picking).
+    const local = this.location.group.worldToLocal(world.clone());
+    a.twoPoint = twoPointAddPoint(a.twoPoint, { x: local.x, y: local.y, z: local.z });
+    globalSpatialFeedback.triggerHaptic('both', 'grab');
+    if (a.twoPoint.phase === 'preview' && a.twoPoint.solution?.ok) this.location.previewDelta(a.twoPoint.solution.delta);
+    this.syncAlignMarkers();
+    this.alignSay(twoPointPrompt(a.twoPoint));
+  }
+
+  /** Bakes the pending move into the scan (one undo step) and leaves Align. */
+  private alignApply(): void {
+    const a = this.align;
+    if (!a || this.alignApplying) return;
+    let delta: RigidDelta | null = null;
+    if (a.tool === 'two-point') {
+      const sol = a.twoPoint.solution;
+      if (a.twoPoint.phase !== 'preview' || !sol?.ok) {
+        this.alignSay(twoPointPrompt(a.twoPoint));
+        return;
+      }
+      delta = sol.delta;
+    } else if (a.tool === 'nudge' && !a.grabbing) {
+      delta = this.location.poseDelta();
+    }
+    if (!delta || (Math.hypot(delta.dx, delta.dy, delta.dz) < 0.001 && Math.abs(delta.rotY) < 0.0005)) {
+      this.alignSay('Nothing to apply yet.');
+      return;
+    }
+    void this.alignCommit(delta);
+  }
+
+  private async alignCommit(delta: RigidDelta): Promise<void> {
+    const summary = this.sceneData.scan;
+    if (!summary) return;
+    this.alignApplying = true;
+    const sceneId = this.sceneData.id;
+    try {
+      const scan = await this.persistence.scans.getScan(summary.id);
+      if (!scan) {
+        this.exitAlign('Align failed: the scan geometry is missing on this device.');
+        return;
+      }
+      const out = applyRigidToScan(scan, summary.furniture, delta);
+      await this.persistence.scans.putScan(out.scan);
+      // Applied to the scene that is live now, and only if it still shows this scan.
+      if (this.sceneData.id !== sceneId || this.sceneData.scan?.id !== summary.id) {
+        this.exitAlign('Align not applied: the scene changed meanwhile.');
+        return;
+      }
+      const next: ScanSummary = summarizeScan(out.scan);
+      if (out.furniture) next.furniture = out.furniture;
+      // The textured original moves with its scan (review R1).
+      if (summary.source) {
+        next.source = { ...summary.source, transform: multiplyMat4(rigidDeltaMatrix(delta), summary.source.transform) };
+      }
+      const moved = Math.hypot(delta.dx, delta.dz);
+      this.exitAlign(); // restores the display mode and the rest pose
+      this.sceneData.scan = next;
+      this.syncLocation();
+      this.history.record(this.sceneData);
+      this.markDirty();
+      this.contentVersion++;
+      this.alignSay(
+        `Aligned: moved ${moved.toFixed(2)} m, turned ${Math.round((delta.rotY * 180) / Math.PI)} degrees. Undo reverts it.`,
+      );
+    } finally {
+      this.alignApplying = false;
+    }
+  }
+
+  /** Leaves Align: the pending move is dropped and the display mode restored. */
+  private exitAlign(msg?: string): void {
+    const a = this.align;
+    if (!a) return;
+    if (a.grabbing) this.contentRoot.attach(this.location.group);
+    this.align = null;
+    this.location.resetPose();
+    this.location.setMode(a.restoreMode);
+    this.hideAlignMarkers();
+    this.contentVersion++;
+    if (msg) this.alignSay(msg);
+    else this.refreshWristState();
+  }
+
+  /** Small markers on the picked points, created once and reused. */
+  private syncAlignMarkers(): void {
+    if (!this.alignMarkers.length) {
+      const geo = new THREE.SphereGeometry(0.03, 12, 8);
+      const scanMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, depthTest: false });
+      const realMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b, depthTest: false });
+      for (let i = 0; i < 4; i++) {
+        const m = new THREE.Mesh(geo, i < 2 ? scanMat : realMat);
+        m.renderOrder = 10;
+        m.visible = false;
+        m.raycast = () => {};
+        this.alignMarkers.push(m);
+      }
+    }
+    const tp = this.align?.twoPoint;
+    const pts = [tp?.srcA, tp?.srcB, tp?.dstA, tp?.dstB];
+    for (let i = 0; i < 4; i++) {
+      const m = this.alignMarkers[i];
+      const p = pts[i];
+      // Scan points ride the scan (they move with the preview); real ones stay in the room.
+      const parent = i < 2 ? this.location.group : this.contentRoot;
+      if (m.parent !== parent) parent.add(m);
+      m.visible = !!p;
+      if (p) m.position.set(p.x, i < 2 ? p.y : p.y + this.location.floorOffset, p.z);
+    }
+  }
+
+  private hideAlignMarkers(): void {
+    for (const m of this.alignMarkers) m.visible = false;
   }
 
   /** Wrist "Scan Room": starts (or cancels) waiting for the platform's room data. */
@@ -1514,6 +1779,8 @@ class App {
    * ray; the miniature grab is released.
    */
   private cancelActiveManipulation(): void {
+    // A scene load, undo or restore mid-Align discards the pending move.
+    if (this.align) this.exitAlign();
     if (this.draggedCamera) this.cams.gizmoGroup.attach(this.draggedCamera.root);
     if (this.draggedProp) {
       // Back into the props group (removeProp / setScene only detach from
@@ -1772,6 +2039,7 @@ class App {
     this.keyframes.onChange = () => this.markDirty();
     this.cams.onChange = () => this.markDirty();
     this.views.onModeChange = (mode) => {
+      if (this.align && mode !== 'full') this.exitAlign('Align ended: it works in Full view only.');
       this.cams.monitor.visible = mode === 'camera';
       // (0,0,0) is the "park me where the user looks" sentinel (cams.update).
       if (mode === 'camera') this.cams.monitor.position.set(0, 0, 0);
@@ -1791,6 +2059,7 @@ class App {
         // raise your hand. The wheel ALSO always rides the left hand (below).
         if (button === 'y') this.toggleMenuInFront();
         else if (button === 'x') this.setPlaceMode(nextPlaceMode(this.placeMode));
+        else if (button === 'b' && this.align) this.alignBack();
         else if (button === 'b' && this.interactionMode === 'block') this.captureKeyframe();
         else if (button === 'a') this.onButtonA();
         else if (button === 'thumbclick' && hand === this.input.pointerHand()) this.tryTeleport();
@@ -1840,6 +2109,22 @@ class App {
         case 'mark':
           // The B button is unreachable on hand tracking — this is its home.
           if (this.interactionMode === 'block') this.captureKeyframe();
+          break;
+        // Align sub-wheel (P1.6).
+        case 'align-nudge':
+          this.alignStartNudge();
+          break;
+        case 'align-2pt':
+          this.alignStartTwoPoint();
+          break;
+        case 'align-apply':
+          this.alignApply();
+          break;
+        case 'align-back':
+          this.alignBack();
+          break;
+        case 'align-exit':
+          this.exitAlign('Align closed; nothing changed.');
           break;
       }
     } else {
@@ -2268,6 +2553,12 @@ class App {
     const rc = this.input.raycaster(hand, this.raycaster);
     if (rc && this.contextualRadial.handlePointer(rc, true)) return;
 
+    // While aligning, the trigger picks Align points (or applies), never content.
+    if (this.align) {
+      this.alignTrigger(rc);
+      return;
+    }
+
     if (this.hover?.kind === 'actor') {
       this.selectActor(this.hover.id);
       return;
@@ -2360,6 +2651,15 @@ class App {
 
   private onSqueezeDown(hand: Hand): void {
     if (this.noteEditor.isOpen || hand !== this.input.pointerHand()) return;
+    if (this.align) {
+      // Grab & Turn: the whole location rides the ray until release.
+      const ray = this.input.raySpace(hand);
+      if (this.align.tool === 'nudge' && ray && !this.align.grabbing && !this.alignApplying) {
+        this.align.grabbing = true;
+        ray.attach(this.location.group);
+      }
+      return;
+    }
     if (this.views.mode === 'mini') {
       const grip = this.input.gripSpace(hand);
       if (grip) {
@@ -2416,6 +2716,14 @@ class App {
 
   private onSqueezeUp(hand: Hand): void {
     if (hand !== this.input.pointerHand()) return;
+    if (this.align?.grabbing) {
+      this.align.grabbing = false;
+      this.contentRoot.attach(this.location.group); // world pose kept
+      // Pure yaw: drop the pitch and roll of the hand-held carry.
+      this.location.previewDelta(this.location.poseDelta());
+      this.alignSay('Moved. Right stick turns it, push it up or down to lift 1 cm. Apply to keep it.');
+      return;
+    }
     if (this.miniGrabbing) {
       this.views.miniGrabEnd();
       this.miniGrabbing = false;
@@ -2537,6 +2845,11 @@ class App {
   }
 
   private tryTeleport(): void {
+    // Teleporting shifts the set, which Align must not be done under (review R2).
+    if (this.align) {
+      this.alignSay('Teleport is off while aligning. Exit Align first.');
+      return;
+    }
     if (this.views.mode !== 'full' || !this.session.lastHit) return;
     this.views.teleportTo(this.session.lastHit.point, this.lastViewerPos);
     this.debug.log('teleported (Re-align on wrist menu restores registration)');
@@ -3073,6 +3386,8 @@ class App {
           recording: this.recorder.recording,
           hasScan: this.location.hasScan,
           locationMode: this.location.mode,
+          alignTool: this.align?.tool ?? 'none',
+          alignHint: this.alignHint(),
           lensFocal: activeCam?.data.lensFocalLength ?? 35,
           tStop: activeCam?.data.tStop ?? this.cams.currentTStop,
           formatShort: sensorFormat(activeCam?.data.formatId ?? this.cams.currentFormat).short,
@@ -3503,6 +3818,24 @@ class App {
           held.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
         }
       }
+    } else if (this.align?.tool === 'nudge' && !this.align.grabbing) {
+      // Grab & Turn fine-tuning: stick X turns the location slowly about the
+      // viewer (not the far-away scene origin), stick Y lifts it 1 cm a step.
+      if (Math.abs(axes.x) > 0.15) {
+        this.contentRoot.worldToLocal(_pt.copy(this.lastViewerPos));
+        const g = this.location.group;
+        const a = -axes.x * dt * 0.5;
+        g.position.x -= _pt.x;
+        g.position.z -= _pt.z;
+        g.position.applyAxisAngle(_up, a);
+        g.position.x += _pt.x;
+        g.position.z += _pt.z;
+        g.rotateOnWorldAxis(_up, a);
+      }
+      const lift = this.input.stickStepY(pointer);
+      if (lift !== 0) this.location.group.position.y -= lift * 0.01;
+    } else if (this.align) {
+      // Two-point (or no tool): the stick neither turns nor glides the set.
     } else if (this.miniGrabbing) {
       const grip = this.input.gripSpace(pointer);
       if (grip)
@@ -3540,6 +3873,7 @@ class App {
     loco.draggingProp = this.draggedProp !== null;
     loco.draggingFurniture = this.draggedFurniture !== null;
     loco.miniGrabbing = this.miniGrabbing;
+    loco.aligning = this.align !== null;
     if (!locomotionSuppressed(loco)) {
       const ls = this.input.axes('left');
       if (ls.x * ls.x + ls.y * ls.y > LOCOMOTION_DEADZONE * LOCOMOTION_DEADZONE) {
@@ -3820,6 +4154,17 @@ class App {
       photoState: () => this.location.photoState,
       photoParts: () => this.location.photoPartCount,
       photoTextureSizes: () => this.location.photoTextureSizes(),
+      photoLoads: () => this.photoLoadCount,
+      // test/align-smoke.html: the Grab & Turn path with a scripted move (no XR input on a desktop).
+      alignNudge: (d: RigidDelta) => {
+        this.alignStartNudge();
+        if (!this.align) return false;
+        this.location.previewDelta(d);
+        this.alignApply();
+        return true;
+      },
+      aligning: () => this.align !== null,
+      locationPose: () => this.location.poseDelta(),
     };
   }
 

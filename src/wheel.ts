@@ -30,7 +30,7 @@ export function nextPlaceMode(mode: PlaceArm): PlaceArm {
 }
 
 /** Menu levels: the root ring, or one of the sub-wheels. */
-export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit' | 'stance' | 'light' | 'props';
+export type WheelPath = 'root' | 'lens' | 'marks' | 'capture' | 'edit' | 'stance' | 'light' | 'props' | 'align';
 
 export interface WheelSector {
   id: string;
@@ -64,6 +64,9 @@ export interface WheelContext {
   dofOn: boolean;
   /** Playback pace (m/s) for the Marks sub-wheel readout. */
   pace: number;
+  /** Align tool in use (P1.6), and a short hint for the next step (hub sub-label). */
+  alignTool?: 'none' | 'nudge' | 'two-point';
+  alignHint?: string;
   /** Active selected light parameters for light sub-wheel readout. */
   activeLightKelvin?: number;
   activeLightIntensity?: number;
@@ -75,7 +78,8 @@ export const MAX_SECTORS = 8;
 /** The wheel for a given state + menu level. Sector 0 sits at 12 o'clock. */
 export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
   if (path !== 'root') {
-    return { hub: { id: 'wheel-back', label: '◂ Back', sub: 'to tools' }, sectors: SUBMENUS[path](ctx) };
+    const sub = path === 'align' && ctx.alignHint ? ctx.alignHint : 'to tools';
+    return { hub: { id: 'wheel-back', label: '◂ Back', sub }, sectors: SUBMENUS[path](ctx) };
   }
   const viewLabel = { full: 'Full', mini: 'Mini', camera: 'Cam' }[ctx.viewMode];
   const hub = {
@@ -120,7 +124,9 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
           ? `Room:\n${ctx.locationMode[0].toUpperCase()}${ctx.locationMode.slice(1)}`
           : 'Room:\n(scan first)',
       },
-      { id: 'splat-studio', label: '3DGS\nStudio ✨' },
+      // Line the scan or imported location up with the real room (P1.6). Replaces
+      // 3DGS Studio here: its DOM dialog cannot show in AR (it lives on the 2D page).
+      { id: 'sub-align', label: ctx.hasScan ? 'Align ▸' : 'Align ▸\n(scan first)', submenu: 'align' },
       { id: 'sub-props', label: 'Props ▸', submenu: 'props' },
       { id: 'wheel-view', label: `View:\n${viewLabel}` },
       { id: 'sub-capture', label: 'Camera ▸', submenu: 'capture' },
@@ -131,6 +137,13 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
 }
 
 const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelSector[]> = {
+  align: (ctx) => [
+    { id: 'align-nudge', label: ctx.alignTool === 'nudge' ? 'Grab &\nTurn ●' : 'Grab &\nTurn' },
+    { id: 'align-2pt', label: ctx.alignTool === 'two-point' ? 'Two-\npoint ●' : 'Two-\npoint' },
+    { id: 'align-apply', label: 'Apply' },
+    { id: 'align-back', label: 'Undo\nstep' },
+    { id: 'align-exit', label: 'Exit\nAlign' },
+  ],
   lens: (ctx) => [
     { id: 'focal-down', label: 'Focal −' },
     { id: 'focal-up', label: 'Focal +' },
@@ -202,6 +215,7 @@ export const SUBMENU_IDS: Readonly<Record<string, Exclude<WheelPath, 'root'>>> =
   'sub-edit': 'edit',
   'sub-stance': 'stance',
   'sub-props': 'props',
+  'sub-align': 'align',
 };
 
 /** Props sub-wheel presets: sector id to BUILTIN_PROPS id (props.ts). */
@@ -237,6 +251,7 @@ export const WHEEL_SECTOR_HANDLERS: Readonly<Record<string, WheelSectorRoute>> =
   'sub-edit': 'nav',
   'sub-stance': 'nav',
   'sub-props': 'nav',
+  'sub-align': 'nav',
   // Root rings
   'wheel-place': 'wheel',
   'wheel-view': 'wheel',
@@ -244,7 +259,12 @@ export const WHEEL_SECTOR_HANDLERS: Readonly<Record<string, WheelSectorRoute>> =
   help: 'wrist',
   scan: 'wrist',
   location: 'wrist',
-  'splat-studio': 'wrist',
+  // Align (P1.6)
+  'align-nudge': 'wheel',
+  'align-2pt': 'wheel',
+  'align-apply': 'wheel',
+  'align-back': 'wheel',
+  'align-exit': 'wheel',
   // Lens
   'focal-down': 'wheel',
   'focal-up': 'wheel',

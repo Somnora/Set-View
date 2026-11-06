@@ -64,6 +64,8 @@ export interface LocomotionState {
   draggingProp: boolean;
   draggingFurniture: boolean;
   miniGrabbing: boolean;
+  /** The Align tool owns the sticks (turning and lifting the location). */
+  aligning?: boolean;
 }
 
 /**
@@ -79,7 +81,8 @@ export function locomotionSuppressed(s: LocomotionState): boolean {
     s.draggingCamera ||
     s.draggingProp ||
     s.draggingFurniture ||
-    s.miniGrabbing
+    s.miniGrabbing ||
+    !!s.aligning
   );
 }
 

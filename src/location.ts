@@ -28,6 +28,7 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { FurniturePlacement, LocationDisplayMode } from './model.ts';
+import type { RigidDelta } from './registration.ts';
 import {
   isMovableScanMesh,
   meshFootprintCenter,
@@ -158,6 +159,8 @@ export class LocationRenderer {
   private photoTextures: THREE.Texture[] = [];
   /** Whether the current scan has a photo original, and how loading it went. */
   photoState: PhotoState = 'none';
+  /** Blob id of the photo original on show, so a re-aligned scan can keep it. */
+  photoSourceId: string | null = null;
 
   constructor() {
     this.group.name = 'location-scan';
@@ -200,7 +203,7 @@ export class LocationRenderer {
    * material; textures over PHOTO_MAX_TEXTURE are downscaled. Takes ownership
    * of root's geometries and textures (disposed here or on clear).
    */
-  setPhoto(root: THREE.Object3D, transform: ArrayLike<number>): void {
+  setPhoto(root: THREE.Object3D, transform: ArrayLike<number>, sourceId: string | null = null): void {
     this.disposePhoto();
     root.updateMatrixWorld(true);
     const buckets = new Map<string, { material: THREE.MeshBasicMaterial; geoms: THREE.BufferGeometry[] }>();
@@ -274,7 +277,39 @@ export class LocationRenderer {
     for (const tex of kept) this.photoTextures.push(tex);
     this.setPhotoTransform(transform);
     this.photoState = 'ready';
+    this.photoSourceId = sourceId;
     this.applyMode();
+  }
+
+  // --- Align (P1.6): a pending move previewed on the group, baked on Apply ---
+
+  /** Scan meshes a picking ray can hit (Align's scan points), while shown. */
+  pickTargets(): THREE.Object3D[] {
+    return this.mode === 'hidden' ? [] : this.meshes;
+  }
+
+  /** Back to the rest pose: scan coordinates are scene coordinates (plus the floor offset). */
+  resetPose(): void {
+    this.group.position.set(0, this.floorOffset, 0);
+    this.group.quaternion.identity();
+    this.group.scale.set(1, 1, 1);
+  }
+
+  /** Shows the scan moved by d (a preview; the data is unchanged until Apply bakes it). */
+  previewDelta(d: RigidDelta): void {
+    this.group.position.set(d.dx, this.floorOffset + d.dy, d.dz);
+    this.group.rotation.set(0, d.rotY, 0);
+  }
+
+  /**
+   * The move the group's current pose represents relative to rest, pure yaw
+   * (pitch and roll from a hand-held carry are dropped). Assumes the group's
+   * parent is contentRoot at its rest pose, which Align requires.
+   */
+  poseDelta(): RigidDelta {
+    const q = this.group.quaternion;
+    const p = this.group.position;
+    return { dx: p.x, dy: p.y - this.floorOffset, dz: p.z, rotY: quatYaw(q.x, q.y, q.z, q.w) };
   }
 
   /** Re-places the photo original (after an Align moved the scan). */
@@ -298,6 +333,7 @@ export class LocationRenderer {
   }
 
   private disposePhoto(): void {
+    this.photoSourceId = null;
     for (const child of [...this.photoGroup.children]) {
       this.photoGroup.remove(child);
       (child as THREE.Mesh).geometry?.dispose();
@@ -316,9 +352,14 @@ export class LocationRenderer {
     return this.activeDimensions;
   }
 
-  /** Replaces the displayed scan (null clears). Disposes prior geometry. */
-  setScan(scan: LocationScan | null): void {
-    this.clear();
+  /**
+   * Replaces the displayed scan (null clears). Disposes prior geometry, and the
+   * photo original unless keepPhoto (the same original, e.g. after an Align
+   * rebuilt the scan under a new id). Resets any Align preview pose.
+   */
+  setScan(scan: LocationScan | null, opts: { keepPhoto?: boolean } = {}): void {
+    this.clear(!!opts.keepPhoto && !!scan);
+    this.resetPose();
     if (!scan) {
       this.applyMode(); // nothing left to show
       return;
@@ -641,7 +682,7 @@ export class LocationRenderer {
     }
   }
 
-  private clear(): void {
+  private clear(keepPhoto = false): void {
     // Meshes may sit outside this.group (a grip carry re-parents one to the
     // controller ray), so detach through the mesh list rather than children.
     for (const mesh of this.meshes) {
@@ -655,7 +696,9 @@ export class LocationRenderer {
     this.staticPivots.clear();
     this.wireframeLines = [];
     this.activeDimensions = null;
-    this.disposePhoto(); // the photo original belongs to the scan it was imported with
+    // The photo original belongs to the scan it was imported with, unless the
+    // caller is swapping in a re-aligned copy of the same scan.
+    if (!keepPhoto) this.disposePhoto();
     while (this.boundsGroup.children.length > 0) {
       const b = this.boundsGroup.children[0];
       this.boundsGroup.remove(b);

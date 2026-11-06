@@ -14160,7 +14160,7 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
     before(
       mainMethodBody(src, 'syncLocation'),
       'if (this.draggedFurniture) this.cancelActiveManipulation();',
-      'this.location.setScan(scan);',
+      'this.location.setScan(scan, { keepPhoto });',
       'a late scan load ends a furniture carry before setScan',
     );
     // A disowned piece is never re-attached.
@@ -15194,6 +15194,81 @@ async function p1DropBoxServerTest(): Promise<void> {
     assert.equal(applyRigidToScan(scan, undefined, reg.IDENTITY_DELTA).furniture, undefined);
     const bounds = summarizeScan(applyRigidToScan(scan, undefined, { dx: 10, dy: 0, dz: 0, rotY: 0 }).scan);
     approx(bounds.boundsMin.x, summarizeScan(scan).boundsMin.x + 10, 1e-4);
+  });
+}
+
+// --- P1 align runtime pieces (P1.6) ---
+{
+  test('P1.6: LocationRenderer previews a delta, reads it back as pure yaw, and returns to rest', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    loc.setMode('ghost');
+    const d = { dx: 1.2, dy: 0.05, dz: -0.4, rotY: 0.7 };
+    loc.previewDelta(d);
+    const back = loc.poseDelta();
+    approx(back.dx, d.dx, 1e-9);
+    approx(back.dy, d.dy, 1e-9);
+    approx(back.dz, d.dz, 1e-9);
+    approx(back.rotY, d.rotY, 1e-9);
+    // A hand-held carry adds pitch and roll; poseDelta keeps only the yaw.
+    loc.group.rotation.set(0.2, 0.7, -0.1, 'YXZ');
+    approx(loc.poseDelta().rotY, 0.7, 1e-6);
+    loc.resetPose();
+    const rest = loc.poseDelta();
+    assert.deepEqual([rest.dx, rest.dy, rest.dz], [0, 0, 0]);
+    approx(rest.rotY, 0, 1e-12);
+    assert.ok(loc.pickTargets().length > 0);
+    loc.setMode('hidden');
+    assert.equal(loc.pickTargets().length, 0, 'nothing to pick on a hidden scan');
+    // A new scan resets any preview pose.
+    loc.previewDelta(d);
+    loc.setScan(createSyntheticLocationScan());
+    assert.equal(loc.group.position.x, 0);
+  });
+
+  test('P1.6: setScan keeps the photo original only when asked (an Align rebuild of the same scan)', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshStandardMaterial()));
+    loc.setPhoto(root, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], 'blob-1');
+    assert.equal(loc.photoSourceId, 'blob-1');
+    loc.setScan(createSyntheticLocationScan(), { keepPhoto: true });
+    assert.equal(loc.hasPhoto, true);
+    assert.equal(loc.photoSourceId, 'blob-1');
+    assert.equal(loc.photoPartCount, 1);
+    loc.setScan(createSyntheticLocationScan());
+    assert.equal(loc.hasPhoto, false, 'a different scan drops the photo');
+    assert.equal(loc.photoSourceId, null);
+  });
+
+  test('P1.6: the Dress ring opens Align (not the in-AR 3DGS dialog); the Align ring routes and hints', () => {
+    const dress = wheelMenu({ ...WHEEL_BASE, mode: 'dress', hasScan: true }, 'root');
+    assert.ok(dress.sectors.some((s) => s.id === 'sub-align' && s.submenu === 'align'));
+    assert.ok(!dress.sectors.some((s) => s.id === 'splat-studio'), '3DGS Studio lives on the 2D page');
+    assert.equal(wheelSectorRoute('splat-studio'), null);
+    const align = wheelMenu({ ...WHEEL_BASE, mode: 'dress', alignTool: 'two-point', alignHint: 'scan point A' }, 'align');
+    assert.deepEqual(
+      align.sectors.map((s) => s.id),
+      ['align-nudge', 'align-2pt', 'align-apply', 'align-back', 'align-exit'],
+    );
+    assert.equal(align.hub.sub, 'scan point A');
+    assert.ok(align.sectors.find((s) => s.id === 'align-2pt')!.label.includes('●'), 'the tool in use is marked');
+    for (const s of align.sectors) assert.equal(wheelSectorRoute(s.id), 'wheel');
+    assert.equal(wheelMenu({ ...WHEEL_BASE, mode: 'dress' }, 'align').hub.sub, 'to tools');
+  });
+
+  test('P1.6: aligning suppresses the stick glide', () => {
+    const base = {
+      viewMode: 'full' as const,
+      draggingActor: false,
+      draggingCamera: false,
+      draggingProp: false,
+      draggingFurniture: false,
+      miniGrabbing: false,
+    };
+    assert.equal(locomotionSuppressed(base), false);
+    assert.equal(locomotionSuppressed({ ...base, aligning: true }), true);
   });
 }
 
