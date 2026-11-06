@@ -9,8 +9,12 @@
 // listing does not pull hundreds of megabytes into memory.
 //
 // Degrades like ScanStore: with IndexedDB unavailable or hung, an in-memory
-// Map keeps the current session working and onError tells the user.
+// Map keeps the current session working and onError tells the user. When
+// IndexedDB is only slow to open, what was held in memory is written to it
+// once it opens (idbOpen.ts).
 // ---------------------------------------------------------------------------
+
+import { IdbConnection, type IdbState, type StoreOptions } from './idbOpen.ts';
 
 const DB_NAME = 'setview_blobs';
 const DB_VERSION = 1;
@@ -57,9 +61,11 @@ const metaOf = (r: BlobRecord): BlobMeta => ({
 export class BlobStore {
   /** Notified on storage failures so the UI can warn (headsets have no console). */
   onError: (msg: string) => void = () => {};
+  /** Notified when originals held in memory reach storage after a late open. */
+  onNotice: (msg: string) => void = () => {};
 
-  private dbPromise: Promise<IDBDatabase | null> | null = null;
-  /** Fallback when IndexedDB is unavailable (session lifetime only). */
+  /** Fallback when IndexedDB is unavailable or not open yet. Everything in it is
+   *  written to IndexedDB when the database opens, then dropped from here. */
   private memory = new Map<string, BlobRecord>();
   /**
    * Ids written by this page. The launch prune never deletes them: it decides
@@ -69,37 +75,57 @@ export class BlobStore {
    */
   private writtenThisSession = new Set<string>();
 
-  private open(): Promise<IDBDatabase | null> {
-    if (this.dbPromise) return this.dbPromise;
-    this.dbPromise = new Promise((resolve) => {
-      if (typeof indexedDB === 'undefined') {
-        resolve(null);
-        return;
-      }
-      try {
-        // Watchdog: some environments never fire any event on the open request.
-        const watchdog = setTimeout(() => resolve(null), 4000);
-        const done = (db: IDBDatabase | null) => {
-          clearTimeout(watchdog);
-          resolve(db);
-        };
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = () => {
-          if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE, { keyPath: 'id' });
-        };
-        req.onsuccess = () => {
-          req.result.onclose = () => {
-            this.dbPromise = null;
-          };
-          done(req.result);
-        };
-        req.onerror = () => done(null);
-        req.onblocked = () => done(null);
-      } catch {
-        resolve(null);
-      }
+  private readonly conn: IdbConnection;
+
+  constructor(opts: StoreOptions = {}) {
+    this.conn = new IdbConnection({
+      name: DB_NAME,
+      version: DB_VERSION,
+      upgrade: (db) => {
+        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
+      },
+      onOpen: (db) => this.saveHeld(db),
+      timeoutMs: opts.openTimeoutMs,
+      factory: opts.indexedDB,
     });
-    return this.dbPromise;
+  }
+
+  private open(): Promise<IDBDatabase | null> {
+    return this.conn.get();
+  }
+
+  /** 'open' when originals can be read; see ScanStore.storageState. */
+  get storageState(): IdbState {
+    return this.conn.state;
+  }
+
+  whenStorageOpens(): Promise<boolean> {
+    return this.conn.whenOpen();
+  }
+
+  /** Writes the originals held in memory once the database opens (late or reopened). */
+  private saveHeld(db: IDBDatabase): void {
+    const held = [...this.memory.values()];
+    if (held.length === 0) return;
+    let reported = false; // a failed request fires both onerror and onabort
+    const failed = () => {
+      if (reported) return;
+      reported = true;
+      this.onError('storage opened, but saving the original files held in memory failed (storage full?); they are lost on reload');
+    };
+    try {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      for (const rec of held) store.put(rec);
+      tx.oncomplete = () => {
+        for (const rec of held) if (this.memory.get(rec.id) === rec) this.memory.delete(rec.id);
+        const n = held.length;
+        this.onNotice(`storage opened: ${n === 1 ? 'the original file' : `${n} original files`} held in memory ${n === 1 ? 'is' : 'are'} now saved on this device`);
+      };
+      tx.onerror = tx.onabort = failed;
+    } catch {
+      failed();
+    }
   }
 
   /**
@@ -126,7 +152,11 @@ export class BlobStore {
     const db = await this.open();
     if (!db) {
       this.memory.set(rec.id, rec);
-      this.onError('original file kept in memory only (storage unavailable); it is lost on reload');
+      this.onError(
+        this.conn.state === 'waiting'
+          ? 'storage is slow to open: the original file is held in memory and saved when it opens'
+          : 'original file kept in memory only (storage unavailable); it is lost on reload',
+      );
       return { id: rec.id, saved: false };
     }
     return new Promise((resolve) => {

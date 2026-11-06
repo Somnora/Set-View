@@ -857,6 +857,9 @@ class App {
       if (!this.renderer.xr.isPresenting) this.refreshLanding();
     };
     globalPropStore.onError = (m) => this.reportDataIssue(m);
+    // A store whose storage opened late has saved what it held in memory.
+    this.persistence.onNotice = (m) => this.reportStorageNotice(m);
+    globalPropStore.onNotice = (m) => this.reportStorageNotice(m);
 
     // Fires whichever way a take ends (wrist toggle, camera deleted, session
     // end, MAX_RECORD_S cap, encoder error) — the file is already downloading.
@@ -1091,7 +1094,18 @@ class App {
       if (!scan) {
         this.displayedScanId = null;
         this.location.setScan(null);
-        this.debug.log('⚠ scan geometry missing for this scene (Remove scan on the landing page to clear)');
+        if (this.persistence.scans.storageState === 'open') {
+          this.debug.log('⚠ scan geometry missing for this scene (Remove scan on the landing page to clear)');
+          return;
+        }
+        // Not proof the scan is gone: storage has not opened (slow first load,
+        // or it failed). Load it when storage opens; never advise removing it.
+        this.debug.log('scan geometry not loaded yet: storage is slow to open (the scan loads when it does)');
+        void this.persistence.scans.whenStorageOpens().then((opened) => {
+          if (token !== this.locationSyncToken) return; // superseded
+          if (opened) this.syncLocation();
+          else this.debug.log('⚠ scan geometry not loaded: storage did not open. The scan is not removed; reload to try again');
+        });
         return;
       }
       this.displayedScanId = scan.id;
@@ -1121,6 +1135,20 @@ class App {
     void (async () => {
       const bytes = await this.persistence.blobs.getBytes(source.blobId);
       if (token !== this.locationSyncToken) return;
+      if (!bytes && this.persistence.blobs.storageState !== 'open') {
+        // Not proof the original is gone: storage has not opened. Photo keeps
+        // drawing Solid and loads once it does.
+        this.debug.log('Photo mode waiting: storage is slow to open');
+        const opened = await this.persistence.blobs.whenStorageOpens();
+        if (token !== this.locationSyncToken) return;
+        if (opened) {
+          this.loadLocationPhoto(token);
+        } else {
+          this.location.markPhotoFailed();
+          this.debug.log('Photo mode unavailable: storage did not open (reload to try again)');
+        }
+        return;
+      }
       if (!bytes) {
         this.location.markPhotoFailed();
         this.debug.log('Photo mode unavailable: the original file is not on this device (scene exports do not carry it)');
@@ -1345,7 +1373,11 @@ class App {
     try {
       const scan = await this.persistence.scans.getScan(summary.id);
       if (!scan) {
-        this.exitAlign('Align failed: the scan geometry is missing on this device.');
+        this.exitAlign(
+          this.persistence.scans.storageState === 'open'
+            ? 'Align failed: the scan geometry is missing on this device.'
+            : 'Align failed: storage has not opened yet. Try again in a moment.',
+        );
         return;
       }
       const out = applyRigidToScan(scan, summary.furniture, delta);
@@ -2003,6 +2035,13 @@ class App {
    * debug log (console and drift board), the 3D wrist status, and a landing banner
    * on the 2D page. Banners sharing a key replace each other (default: the text).
    */
+  /** Good news after a data warning (storage opened late and saved what it held). */
+  private reportStorageNotice(message: string): void {
+    this.debug.log(message);
+    this.wrist.setStatus(message);
+    this.landing.showBanner(message, 'info');
+  }
+
   private reportDataIssue(message: string, key?: string, action?: { label: string; run: () => void }): void {
     this.debug.log(message);
     this.wrist.setStatus(message);
@@ -2079,7 +2118,13 @@ class App {
       `Imported "${name}" as the location: ${s.triangles < 1000 ? s.triangles : `${Math.round(s.triangles / 1000)}k`} triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}${size}.`,
       ...res.notes,
     ];
-    if (!attached.scanSaved) lines.push('The geometry could not be saved to storage and is lost on reload.');
+    if (!attached.scanSaved) {
+      lines.push(
+        this.persistence.scans.storageState === 'waiting'
+          ? 'Storage is slow to open: the geometry is held in memory and saved when it opens.'
+          : 'The geometry could not be saved to storage and is lost on reload.',
+      );
+    }
     this.debug.log(lines.join(' '));
     this.landing.showBanner(lines.join(' '), res.budget.level === 'warn' || !attached.scanSaved ? 'warn' : 'info', key);
     if (bytes.byteLength > 5 * 1024 * 1024) this.requestPersistentStorage();
