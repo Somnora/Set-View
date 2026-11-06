@@ -8,22 +8,32 @@
 //   ghost     - translucent overlay for checking scan/world alignment.
 //   solid     - gray-box set for walking the location anywhere (VR walkthrough).
 //   wireframe - semantic wireframe overlay for scouting spatial layout.
+//   photo     - the textured original of an imported phone scan (P1.4), unlit,
+//               offered only once that original has loaded.
 //
-// Whatever the mode, the virtual camera pass temporarily forces solid so the
-// monitor and photo captures frame shots inside the scanned set.
+// Whatever the mode, the virtual camera pass temporarily forces photo (when
+// loaded) or solid, so the monitor and captures frame shots inside the set.
 //
 // Each display mode draws with its own fixed-flag materials (see
 // MaterialVariant) and a mode switch swaps them, because three bakes the
 // translucency of the first compile into the shader program.
 //
-// Perf: flat Lambert per the app-wide budget (no shadows, no textures - the
-// platform never exposes camera imagery, so scans are untextured by design).
+// Perf: flat Lambert per the app-wide budget (no shadows). Headset captures are
+// untextured by design (the platform never exposes camera imagery). Photo mode
+// is the one exception: MeshBasicMaterial, because phone-scan textures already
+// contain their lighting, with meshes merged per material and textures capped
+// at PHOTO_MAX_TEXTURE px.
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { FurniturePlacement, LocationDisplayMode } from './model.ts';
+import type { RigidDelta } from './registration.ts';
 import {
+  baseScanLabel,
+  GLOBAL_MESH_LABEL,
   isMovableScanMesh,
+  isPlaneLabel,
   meshFootprintCenter,
   normalizeSemanticLabel,
   quatYaw,
@@ -43,6 +53,19 @@ export type LocationMode = LocationDisplayMode;
  * material assignment per mesh and no shader-program churn.
  */
 type MaterialVariant = 'solid' | 'ghost' | 'wireframe';
+
+/** Longest texture edge Photo mode keeps (px); larger photo textures are downscaled once at load. */
+export const PHOTO_MAX_TEXTURE = 2048;
+
+/** Size a texture is drawn at under PHOTO_MAX_TEXTURE, keeping its aspect ratio. */
+export function fitTextureSize(width: number, height: number, max = PHOTO_MAX_TEXTURE): { width: number; height: number } {
+  const longest = Math.max(width, height);
+  if (!(longest > max)) return { width, height };
+  const k = max / longest;
+  return { width: Math.max(1, Math.round(width * k)), height: Math.max(1, Math.round(height * k)) };
+}
+
+export type PhotoState = 'none' | 'loading' | 'ready' | 'failed';
 
 const GHOST_OPACITY = 0.35;
 const WIREFRAME_OPACITY = 0.85;
@@ -113,6 +136,11 @@ export class LocationRenderer {
   private meshes: THREE.Mesh[] = [];
   /** Tint of meshes[i]. */
   private meshColors: number[] = [];
+  /**
+   * meshes[i] is a plane piece drawn by the room mesh already (Quest captures
+   * both). Kept in the scan for wall conversion, never drawn or picked.
+   */
+  private meshHidden: boolean[] = [];
   /** Bounded furniture meshes, movable in Stage 1. */
   private furniture: FurnitureEntry[] = [];
   /** Footprint center of a static mesh with a saved placement, by mesh index
@@ -129,6 +157,18 @@ export class LocationRenderer {
    * a grip carry and commitFurniture move it with the mesh. Empty until then.
    */
   private wireframeLines: THREE.LineSegments[] = [];
+  /**
+   * Photo mode: the textured original of an imported location, placed by its
+   * source-to-scene transform (ScanSourceFile.transform). A child of group,
+   * so floor leveling and the view transforms apply to it as to the scan.
+   */
+  private readonly photoGroup = new THREE.Group();
+  private photoMaterials: THREE.MeshBasicMaterial[] = [];
+  private photoTextures: THREE.Texture[] = [];
+  /** Whether the current scan has a photo original, and how loading it went. */
+  photoState: PhotoState = 'none';
+  /** Blob id of the photo original on show, so a re-aligned scan can keep it. */
+  photoSourceId: string | null = null;
 
   constructor() {
     this.group.name = 'location-scan';
@@ -136,19 +176,198 @@ export class LocationRenderer {
     this.boundsGroup.name = 'location-scan-bounds';
     this.boundsGroup.visible = false;
     this.group.add(this.boundsGroup);
+    this.photoGroup.name = 'location-photo';
+    this.photoGroup.matrixAutoUpdate = false;
+    this.photoGroup.visible = false;
+    this.group.add(this.photoGroup);
   }
 
   get hasScan(): boolean {
     return this.meshes.length > 0;
   }
 
+  /** The textured original is loaded and Photo mode can show it. */
+  get hasPhoto(): boolean {
+    return this.photoState === 'ready';
+  }
+
+  /** The scan has a textured original that is being loaded (Photo shows Solid until then). */
+  markPhotoLoading(): void {
+    this.disposePhoto();
+    this.photoState = 'loading';
+    this.applyMode();
+  }
+
+  /** The original could not be loaded (missing on this device, unreadable, out of memory). */
+  markPhotoFailed(): void {
+    this.disposePhoto();
+    this.photoState = 'failed';
+    this.applyMode();
+  }
+
+  /**
+   * Shows `root` (a parsed original with its textures) as Photo mode: every
+   * mesh is baked into the root's space, re-materialled unlit, and merged per
+   * material; textures over PHOTO_MAX_TEXTURE are downscaled. Takes ownership
+   * of root's geometries and textures (disposed here or on clear).
+   */
+  setPhoto(root: THREE.Object3D, transform: ArrayLike<number>, sourceId: string | null = null): void {
+    this.disposePhoto();
+    root.updateMatrixWorld(true);
+    const buckets = new Map<string, { material: THREE.MeshBasicMaterial; geoms: THREE.BufferGeometry[] }>();
+    const textureFor = new Map<THREE.Texture, THREE.Texture>();
+    const used: THREE.Mesh[] = [];
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.geometry?.getAttribute('position')) return;
+      used.push(mesh);
+      const src = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as THREE.MeshStandardMaterial | undefined;
+      const srcMap = src?.map ?? null;
+      const g = mesh.geometry;
+      const hasUv = !!srcMap && !!g.getAttribute('uv');
+      const hasColor = !!g.getAttribute('color');
+      let map: THREE.Texture | null = null;
+      if (hasUv && srcMap) {
+        map = textureFor.get(srcMap) ?? downscaleTexture(srcMap);
+        textureFor.set(srcMap, map);
+      }
+      const color = map || hasColor ? 0xffffff : (src?.color?.getHex() ?? DEFAULT_COLOR);
+      const key = `${map ? map.uuid : 'nomap'}|${hasColor ? 'vc' : 'novc'}|${color}|${src?.side ?? THREE.FrontSide}`;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = {
+          material: new THREE.MeshBasicMaterial({ map, vertexColors: hasColor, color, side: src?.side ?? THREE.FrontSide }),
+          geoms: [],
+        };
+        buckets.set(key, bucket);
+      }
+      // Only what an unlit draw needs, so parts merge and normals are not kept.
+      const baked = new THREE.BufferGeometry();
+      baked.setAttribute('position', g.getAttribute('position').clone());
+      if (map) baked.setAttribute('uv', g.getAttribute('uv').clone());
+      if (hasColor) baked.setAttribute('color', g.getAttribute('color').clone());
+      if (g.index) baked.setIndex(g.index.clone());
+      baked.applyMatrix4(mesh.matrixWorld);
+      bucket.geoms.push(baked);
+    });
+    for (const { material, geoms } of buckets.values()) {
+      this.photoMaterials.push(material);
+      const indexed = geoms.every((x) => x.index);
+      const merged = geoms.length > 1 && (indexed || geoms.every((x) => !x.index)) ? mergeGeometries(geoms, false) : null;
+      const parts = merged ? [merged] : geoms;
+      if (merged) for (const x of geoms) x.dispose();
+      for (const part of parts) {
+        const m = new THREE.Mesh(part, material);
+        m.name = 'location-photo-part';
+        m.raycast = noRaycast; // grabs and hover use the geometry scan
+        this.photoGroup.add(m);
+      }
+    }
+    // The parsed original is no longer needed: its geometry was copied, a
+    // texture that was downscaled is replaced by its copy, and textures Photo
+    // mode never draws (normal, roughness, ...) are freed with their images.
+    const kept = new Set(textureFor.values());
+    const unused = new Set<THREE.Texture>();
+    for (const mesh of used) {
+      mesh.geometry.dispose();
+      for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+        if (!m) continue;
+        for (const v of Object.values(m)) {
+          if ((v as THREE.Texture)?.isTexture && !kept.has(v as THREE.Texture)) unused.add(v as THREE.Texture);
+        }
+        m.dispose();
+      }
+    }
+    for (const tex of unused) {
+      disposeTextureImage(tex);
+      tex.dispose();
+    }
+    for (const tex of kept) this.photoTextures.push(tex);
+    this.setPhotoTransform(transform);
+    this.photoState = 'ready';
+    this.photoSourceId = sourceId;
+    this.applyMode();
+  }
+
+  // --- Align (P1.6): a pending move previewed on the group, baked on Apply ---
+
+  /** Scan meshes a picking ray can hit (Align's scan points), while shown. */
+  pickTargets(): THREE.Object3D[] {
+    return this.mode === 'hidden' ? [] : this.meshes.filter((_, i) => !this.meshHidden[i]);
+  }
+
+  /** Back to the rest pose: scan coordinates are scene coordinates (plus the floor offset). */
+  resetPose(): void {
+    this.group.position.set(0, this.floorOffset, 0);
+    this.group.quaternion.identity();
+    this.group.scale.set(1, 1, 1);
+  }
+
+  /** Shows the scan moved by d (a preview; the data is unchanged until Apply bakes it). */
+  previewDelta(d: RigidDelta): void {
+    this.group.position.set(d.dx, this.floorOffset + d.dy, d.dz);
+    this.group.rotation.set(0, d.rotY, 0);
+  }
+
+  /**
+   * The move the group's current pose represents relative to rest, pure yaw
+   * (pitch and roll from a hand-held carry are dropped). Assumes the group's
+   * parent is contentRoot at its rest pose, which Align requires.
+   */
+  poseDelta(): RigidDelta {
+    const q = this.group.quaternion;
+    const p = this.group.position;
+    return { dx: p.x, dy: p.y - this.floorOffset, dz: p.z, rotY: quatYaw(q.x, q.y, q.z, q.w) };
+  }
+
+  /** Re-places the photo original (after an Align moved the scan). */
+  setPhotoTransform(transform: ArrayLike<number> | null | undefined): void {
+    if (!transform || transform.length !== 16) return;
+    this.photoGroup.matrix.fromArray(transform as number[]);
+    this.photoGroup.matrixWorldNeedsUpdate = true;
+  }
+
+  /** Parts drawn in Photo mode (for tests and the headed smoke). */
+  get photoPartCount(): number {
+    return this.photoGroup.children.length;
+  }
+
+  /** Pixel sizes of the textures Photo mode keeps (for the headed smoke). */
+  photoTextureSizes(): { width: number; height: number }[] {
+    return this.photoTextures.map((t) => {
+      const img = t.image as { width?: number; height?: number } | null;
+      return { width: img?.width ?? 0, height: img?.height ?? 0 };
+    });
+  }
+
+  private disposePhoto(): void {
+    this.photoSourceId = null;
+    for (const child of [...this.photoGroup.children]) {
+      this.photoGroup.remove(child);
+      (child as THREE.Mesh).geometry?.dispose();
+    }
+    for (const m of this.photoMaterials) m.dispose();
+    for (const tex of this.photoTextures) {
+      disposeTextureImage(tex);
+      tex.dispose();
+    }
+    this.photoMaterials = [];
+    this.photoTextures = [];
+    this.photoState = 'none';
+  }
+
   get dimensions(): RoomDimensions | null {
     return this.activeDimensions;
   }
 
-  /** Replaces the displayed scan (null clears). Disposes prior geometry. */
-  setScan(scan: LocationScan | null): void {
-    this.clear();
+  /**
+   * Replaces the displayed scan (null clears). Disposes prior geometry, and the
+   * photo original unless keepPhoto (the same original, e.g. after an Align
+   * rebuilt the scan under a new id). Resets any Align preview pose.
+   */
+  setScan(scan: LocationScan | null, opts: { keepPhoto?: boolean } = {}): void {
+    this.clear(!!opts.keepPhoto && !!scan);
+    this.resetPose();
     if (!scan) {
       this.applyMode(); // nothing left to show
       return;
@@ -160,6 +379,8 @@ export class LocationRenderer {
     let maxX = -Infinity;
     let maxY = -Infinity;
     let maxZ = -Infinity;
+    // A room mesh draws walls and floor already; plane pieces would double them.
+    const hasRoomMesh = scan.meshes.some((m) => normalizeSemanticLabel(m.label) === GLOBAL_MESH_LABEL);
 
     scan.meshes.forEach((m, meshIndex) => {
       const geo = new THREE.BufferGeometry();
@@ -206,6 +427,7 @@ export class LocationRenderer {
       }
       this.meshes.push(mesh);
       this.meshColors.push(color);
+      this.meshHidden.push(hasRoomMesh && isPlaneLabel(m.label));
       this.group.add(mesh);
       // Wireframe overlay edges are built on first use (ensureWireframes).
     });
@@ -376,20 +598,25 @@ export class LocationRenderer {
   }
 
   cycleMode(): LocationMode {
-    const order: LocationMode[] = ['hidden', 'ghost', 'solid', 'wireframe'];
-    this.setMode(order[(order.indexOf(this.mode) + 1) % order.length]);
+    // Photo joins the cycle only once the textured original has loaded.
+    const order: LocationMode[] = this.hasPhoto
+      ? ['hidden', 'ghost', 'solid', 'wireframe', 'photo']
+      : ['hidden', 'ghost', 'solid', 'wireframe'];
+    const at = order.indexOf(this.mode);
+    this.setMode(order[(at < 0 ? 0 : at + 1) % order.length]);
     return this.mode;
   }
 
   /**
-   * Forces the scan visible + solid for the virtual camera's render pass, so
-   * the monitor/captures show shots composed inside the scanned set even when
-   * the wearer has it hidden. Call endCameraPass in a finally.
+   * Forces the scan visible for the virtual camera's render pass (the textured
+   * original when it is loaded, otherwise solid), so the monitor/captures show
+   * shots composed inside the set even when the wearer has it hidden. Call
+   * endCameraPass in a finally.
    */
   beginCameraPass(): void {
     if (this.cameraPassRestore !== null || !this.hasScan) return;
     this.cameraPassRestore = this.mode;
-    this.mode = 'solid';
+    this.mode = this.hasPhoto ? 'photo' : 'solid';
     this.applyMode();
   }
 
@@ -428,9 +655,14 @@ export class LocationRenderer {
     this.group.visible = this.mode !== 'hidden' && this.hasScan;
     this.boundsGroup.visible = this.showBounds && this.mode !== 'hidden' && this.hasScan;
 
+    // Photo shows the textured original instead of the scan meshes; until it
+    // has loaded (or when it failed), Photo draws the scan as Solid.
+    const photo = this.mode === 'photo' && this.hasPhoto;
+    this.photoGroup.visible = photo;
     const variant = variantFor(this.mode);
     for (let i = 0; i < this.meshes.length; i++) {
       this.meshes[i].material = this.material(variant, this.meshColors[i]);
+      this.meshes[i].visible = !photo && !this.meshHidden[i];
     }
     this.applyWireVisibility();
   }
@@ -461,7 +693,7 @@ export class LocationRenderer {
     }
   }
 
-  private clear(): void {
+  private clear(keepPhoto = false): void {
     // Meshes may sit outside this.group (a grip carry re-parents one to the
     // controller ray), so detach through the mesh list rather than children.
     for (const mesh of this.meshes) {
@@ -471,10 +703,14 @@ export class LocationRenderer {
     for (const wire of this.wireframeLines) wire.geometry.dispose();
     this.meshes = [];
     this.meshColors = [];
+    this.meshHidden = [];
     this.furniture = [];
     this.staticPivots.clear();
     this.wireframeLines = [];
     this.activeDimensions = null;
+    // The photo original belongs to the scan it was imported with, unless the
+    // caller is swapping in a re-aligned copy of the same scan.
+    if (!keepPhoto) this.disposePhoto();
     while (this.boundsGroup.children.length > 0) {
       const b = this.boundsGroup.children[0];
       this.boundsGroup.remove(b);
@@ -483,13 +719,48 @@ export class LocationRenderer {
   }
 }
 
+/** Frees the pixel data behind a texture (ImageBitmap) when the browser allows it. */
+function disposeTextureImage(tex: THREE.Texture): void {
+  const img = tex.image as { close?: () => void } | null;
+  if (img && typeof img.close === 'function') img.close();
+}
+
+/**
+ * The texture itself when it fits PHOTO_MAX_TEXTURE (or cannot be redrawn,
+ * e.g. GPU-compressed KTX2), otherwise a downscaled canvas copy with the same
+ * sampling settings. Runs once per texture at load, never per frame.
+ */
+function downscaleTexture(tex: THREE.Texture): THREE.Texture {
+  const img = tex.image as (CanvasImageSource & { width: number; height: number }) | null;
+  if (!img || (tex as THREE.CompressedTexture).isCompressedTexture || typeof document === 'undefined') return tex;
+  const size = fitTextureSize(img.width, img.height);
+  if (size.width === img.width && size.height === img.height) return tex;
+  const canvas = document.createElement('canvas');
+  canvas.width = size.width;
+  canvas.height = size.height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return tex;
+  ctx.drawImage(img, 0, 0, size.width, size.height);
+  const copy = new THREE.CanvasTexture(canvas);
+  copy.colorSpace = tex.colorSpace;
+  copy.flipY = tex.flipY;
+  copy.wrapS = tex.wrapS;
+  copy.wrapT = tex.wrapT;
+  copy.channel = tex.channel;
+  copy.offset.copy(tex.offset);
+  copy.repeat.copy(tex.repeat);
+  copy.rotation = tex.rotation;
+  copy.center.copy(tex.center);
+  return copy;
+}
+
 function variantFor(mode: LocationMode): MaterialVariant {
   // Hidden draws nothing; it keeps the solid set so the camera pass, which
-  // forces solid, finds the meshes already on it.
+  // forces solid, finds the meshes already on it. Photo falls back to solid.
   return mode === 'ghost' ? 'ghost' : mode === 'wireframe' ? 'wireframe' : 'solid';
 }
 
 function labelColor(label: string): number {
   // Normalized so scans stored before label normalization still tint right.
-  return LABEL_COLORS[normalizeSemanticLabel(label)] ?? DEFAULT_COLOR;
+  return LABEL_COLORS[baseScanLabel(normalizeSemanticLabel(label))] ?? DEFAULT_COLOR;
 }

@@ -25,7 +25,7 @@ What SetView is today and where it's headed. Dated so it stays honest.
 
 ## Scan, import and build (planned 2026-11-05)
 
-The detailed plan for scanning locations, importing them and building sets from scratch in the headset is in [docs/roadmap-scan-import-build.md](docs/roadmap-scan-import-build.md). Phase 0 (make the existing scan, import and build paths work or fail clearly) is implemented in PR #1 and waiting for a headset check. Phases 1 to 4 have not started. GLB location import is item P1.2 there, and Gaussian splat locations are P3.2, which waits on an owner decision and a Quest spike.
+The detailed plan for scanning locations, importing them and building sets from scratch in the headset is in [docs/roadmap-scan-import-build.md](docs/roadmap-scan-import-build.md). Phase 0 (make the existing scan, import and build paths work or fail clearly) is implemented in PR #1 and waiting for a headset check. Phase 1 (bring a location in: file import including GLB, a LAN drop box, Photo mode, Align, guided capture) is implemented on branch `p1/bring-a-location-in`, also waiting for a headset check. Phases 2 to 4 have not started. Gaussian splat locations are P3.2, which waits on an owner decision and a Quest spike.
 
 ## Near term (headset-free-buildable)
 - **Multi-camera live monitoring (video village)** — simultaneous grid view of multiple active camera feeds on a virtual desk split board.

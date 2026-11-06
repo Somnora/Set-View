@@ -1,15 +1,15 @@
 <!doctype html>
 <!-- The storage fallback is temporary, in a real browser's IndexedDB.
-     ScanStore and PropStore run against Chrome's own IndexedDB through a thin
+     ScanStore, PropStore and BlobStore run against Chrome's own IndexedDB through a thin
      wrapper that sends them to throwaway databases at version 2. This page first
      opens those databases at version 1 and keeps the connections, so the stores'
      opens are blocked (another tab holding an older version is a real cause of
      a late open). Then:
-       1. while blocked, a scan and a prop are put: both report not saved and
-          say they are held in memory until storage opens;
+       1. while blocked, a scan, a prop and an imported original are put: each
+          reports not saved and says it is held in memory until storage opens;
        2. the page closes its old connections: the opens finish late, the stores
           adopt them, write what they held and send a notice;
-       3. fresh stores (a later session) read both back from IndexedDB.
+       3. fresh stores (a later session) read all three back from IndexedDB.
      The throwaway databases are deleted afterwards. The app's own data is not touched.
      Headed (vite.http.config.ts): http://localhost:5174/test/storage-late-open-smoke.html -->
 <html>
@@ -19,6 +19,7 @@
     <script type="module">
       import { ScanStore } from '../src/scanStore.ts';
       import { PropStore } from '../src/propStore.ts';
+      import { BlobStore } from '../src/blobStore.ts';
 
       const out = document.getElementById('out');
       const report = (ok, msg) => {
@@ -70,51 +71,60 @@
       try {
         await dropDb('setview');
         await dropDb('setview_assets');
+        await dropDb('setview_blobs');
         // Old-version connections that ignore versionchange: the stores' opens are blocked.
-        held = [await openV1('setview'), await openV1('setview_assets')];
+        held = [await openV1('setview'), await openV1('setview_assets'), await openV1('setview_blobs')];
 
         const opts = { indexedDB: wrapper, openTimeoutMs: 1500 };
         const scans = new ScanStore(opts);
         const props = new PropStore(opts);
+        const blobs = new BlobStore(opts);
         const warnings = [];
         const notices = [];
-        scans.onError = props.onError = (m) => warnings.push(m);
-        scans.onNotice = props.onNotice = (m) => notices.push(m);
+        scans.onError = props.onError = blobs.onError = (m) => warnings.push(m);
+        scans.onNotice = props.onNotice = blobs.onNotice = (m) => notices.push(m);
 
         // 1. Blocked.
         const t0 = performance.now();
         const scanSaved = await scans.putScan(scan);
         const blockedMs = Math.round(performance.now() - t0);
         const propSaved = await props.putAsset(asset);
+        const blob = await blobs.putBlob({ id: 'late-open-blob', data: new Uint8Array([5, 6, 7]), format: 'glb', name: 'room.glb' });
         const step1 =
           scanSaved === false &&
           propSaved === false &&
+          blob.saved === false &&
           scans.storageState === 'waiting' &&
           props.storageState === 'waiting' &&
-          warnings.length === 2 &&
+          blobs.storageState === 'waiting' &&
+          warnings.length === 3 &&
           warnings.every((w) => /held in memory and saved when it opens/.test(w));
-        notes.push(`blocked: saved=${scanSaved}/${propSaved} state=${scans.storageState}/${props.storageState} fellBackIn=${blockedMs}ms warnings=${warnings.length}`);
+        notes.push(`blocked: saved=${scanSaved}/${propSaved}/${blob.saved} state=${scans.storageState}/${props.storageState}/${blobs.storageState} fellBackIn=${blockedMs}ms warnings=${warnings.length}`);
 
         // 2. Let go: the opens finish late and the stores write what they held.
         for (const db of held) db.close();
         held = [];
-        const opened = await Promise.all([scans.whenStorageOpens(), props.whenStorageOpens()]);
-        const gotNotices = await until(() => notices.length >= 2);
+        const opened = await Promise.all([scans.whenStorageOpens(), props.whenStorageOpens(), blobs.whenStorageOpens()]);
+        const gotNotices = await until(() => notices.length >= 3);
         const step2 = opened.every(Boolean) && !!gotNotices && scans.storageState === 'open';
         notes.push(`late open: opened=${opened} notices=${JSON.stringify(notices)}`);
 
         // 3. A later session reads both back from IndexedDB.
         const scans2 = new ScanStore(opts);
         const props2 = new PropStore(opts);
+        const blobs2 = new BlobStore(opts);
         const back = await scans2.getScan(scan.id);
         const backAsset = await props2.getAsset(asset.id);
+        const backBytes = await blobs2.getBytes('late-open-blob');
         const step3 =
           !!back &&
           back.meshes[0].positions instanceof Float32Array &&
           back.meshes[0].positions[3] === 1 &&
           !!backAsset &&
-          new Uint8Array(backAsset.buffer)[3] === 4;
-        notes.push(`later session: scan=${!!back} prop=${!!backAsset}`);
+          new Uint8Array(backAsset.buffer)[3] === 4 &&
+          !!backBytes &&
+          new Uint8Array(backBytes)[2] === 7;
+        notes.push(`later session: scan=${!!back} prop=${!!backAsset} original=${!!backBytes}`);
 
         report(step1 && step2 && step3, notes.join(' | '));
       } catch (e) {
@@ -123,6 +133,7 @@
         for (const db of held) db.close();
         await dropDb('setview');
         await dropDb('setview_assets');
+        await dropDb('setview_blobs');
       }
     </script>
   </body>

@@ -19,6 +19,12 @@ export interface GuideContext {
   eyesMode: boolean;
   /** Block = plan the shot; dress = adjust the physical space. */
   interaction: 'block' | 'dress';
+  /** The scene has a location (scan or import). Absent = not shown. */
+  hasScan?: boolean;
+  /** A Scan Room in progress: reading room data, or collecting planes (P1.8). */
+  scanning?: 'none' | 'waiting' | 'collecting';
+  /** The Align tool in use (P1.6). */
+  aligning?: 'none' | 'nudge' | 'two-point';
 }
 
 export interface GuideItem {
@@ -70,8 +76,29 @@ export function guideItems(ctx: GuideContext): GuideItem[] {
     items.push({ hand: 'left', anchor: 'stick', label: 'Glide through the set' });
   }
 
-  // Right controller.
+  // Scan and Align guidance (Dress, Full view), on the free left X slot.
   if (ctx.mode === 'full' && ctx.interaction === 'dress') {
+    const scanLabel =
+      ctx.scanning === 'collecting'
+        ? 'Look around the room; Scan Room again to finish'
+        : ctx.scanning === 'waiting'
+          ? 'Scanning: reading the room'
+          : ctx.hasScan === false
+            ? 'Wheel: Scan Room to capture this room'
+            : null;
+    if (scanLabel) items.push({ hand: 'left', anchor: 'lower', label: scanLabel });
+  }
+
+  // Right controller.
+  if (ctx.mode === 'full' && ctx.aligning && ctx.aligning !== 'none') {
+    items.push(
+      ctx.aligning === 'nudge'
+        ? { hand: 'right', anchor: 'grip', label: 'Hold: carry the room into place' }
+        : { hand: 'right', anchor: 'trigger', label: 'Pick the scan point, then the real one' },
+    );
+    items.push({ hand: 'right', anchor: 'upper', label: 'B: back one step' });
+    if (ctx.aligning === 'nudge') items.push({ hand: 'right', anchor: 'stick', label: 'Turn the room; push to lift' });
+  } else if (ctx.mode === 'full' && ctx.interaction === 'dress') {
     items.push({ hand: 'right', anchor: 'grip', label: 'Hold: grab furniture to move it' });
     items.push({ hand: 'right', anchor: 'stick', label: 'Snap turn (or spin held furniture)' });
     items.push({ hand: 'right', anchor: 'stick-click', label: 'Click: teleport to the ring' });

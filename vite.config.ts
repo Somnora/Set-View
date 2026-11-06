@@ -1,12 +1,13 @@
 import { defineConfig } from 'vite';
 import basicSsl from '@vitejs/plugin-basic-ssl';
+import { dropBox, threeDecoders } from './vite.plugins.ts';
 
 // basicSsl() generates a self-signed cert and switches the dev server to
 // HTTPS automatically. host: true exposes the server on the LAN so the
 // headset can reach it. WebXR requires a secure context (localhost is
 // exempt, but the headset is not localhost).
 export default defineConfig({
-  plugins: [basicSsl()],
+  plugins: [basicSsl(), threeDecoders(), dropBox()],
   server: {
     host: true,
     port: 5173,

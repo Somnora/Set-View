@@ -3,7 +3,16 @@
 // No backend — everything stays on the device.
 // ---------------------------------------------------------------------------
 
-import { createScene, isSceneData, normalizeScene, uid, type SceneData } from './model.ts';
+import {
+  collectBlobRefs,
+  createScene,
+  isSceneData,
+  normalizeScene,
+  uid,
+  type LocationDisplayMode,
+  type SceneData,
+  type ScanSourceFile,
+} from './model.ts';
 import {
   createSyntheticLocationScan,
   downloadFloorplan,
@@ -16,6 +25,7 @@ import {
 } from './exporters.ts';
 import { decodeScan, encodeScan, summarizeScan, type LocationScan } from './scan.ts';
 import { ScanStore } from './scanStore.ts';
+import { BlobStore } from './blobStore.ts';
 
 /** Exported scene files optionally embed the scan geometry as base64. */
 export type SceneFile = SceneData & { scanData?: string };
@@ -115,6 +125,8 @@ export interface StorageReport {
   sceneBytes: number;
   /** Approximate stored scan geometry (ScanStore). */
   scanBytes: number;
+  /** Original files of imported locations (BlobStore); omitted or 0 when there are none. */
+  blobBytes?: number;
 }
 
 /** "512 B", "3.4 KB", "12.0 MB", "1.95 GB". */
@@ -129,6 +141,7 @@ export function formatBytes(n: number): string {
 /** One-line storage summary for the landing Scene card. */
 export function formatStorageLine(r: StorageReport): string {
   let line = `Storage: scenes ${formatBytes(r.sceneBytes)}, scans ${formatBytes(r.scanBytes)}`;
+  if (r.blobBytes) line += `, original files ${formatBytes(r.blobBytes)}`;
   if (r.usageBytes !== null && r.quotaBytes !== null && r.quotaBytes > 0) {
     line += `; browser total ${formatBytes(r.usageBytes)} of ${formatBytes(r.quotaBytes)}`;
   }
@@ -165,6 +178,8 @@ function indexEntryFor(scene: SceneData): SceneIndexEntry {
 export class Persistence {
   /** Scan geometry blobs (IndexedDB) — scene JSON carries only the summary. */
   readonly scans = new ScanStore();
+  /** Original files of imported locations (IndexedDB 'setview_blobs'); scenes hold only ids. */
+  readonly blobs = new BlobStore();
 
   private saveTimer: number | null = null;
   /** The scene the pending debounced save is for. A save of another scene writes it
@@ -183,7 +198,8 @@ export class Persistence {
 
   constructor() {
     this.scans.onError = (m) => this.onError(m);
-    this.scans.onNotice = (m) => {
+    this.blobs.onError = (m) => this.onError(m);
+    this.scans.onNotice = this.blobs.onNotice = (m) => {
       this.storageReportCache = null;
       this.onNotice(m);
     };
@@ -215,11 +231,17 @@ export class Persistence {
    */
   async pruneOrphanScans(): Promise<void> {
     const referenced = new Set<string>();
+    const scenes: SceneData[] = [];
     for (const e of this.listScenes()) {
       const s = this.loadScene(e.id);
-      if (s?.scan) referenced.add(s.scan.id);
+      if (!s) continue;
+      scenes.push(s);
+      if (s.scan) referenced.add(s.scan.id);
     }
     await this.scans.pruneOrphans(referenced);
+    // Original files of imported locations: same rule, swept only at launch.
+    // Never deleted with a scene, because a duplicate shares its original.
+    await this.blobs.pruneOrphans(collectBlobRefs(scenes));
   }
 
   listScenes(): SceneIndexEntry[] {
@@ -407,16 +429,22 @@ export class Persistence {
   }
 
   /** Downloads a scene as .setview.json. Resolves false when there is nothing to export. */
-  async exportScene(id: string, live?: SceneData | null): Promise<boolean> {
+  /** The .setview.json text Export would download (scan geometry embedded), or null. */
+  async sceneFileText(id: string, live?: SceneData | null): Promise<{ name: string; text: string } | null> {
     const scene = this.sceneForExport(id, live);
-    if (!scene) return false;
+    if (!scene) return null;
     const scan = scene.scan ? await this.scans.getScan(scene.scan.id) : null;
-    const file = buildSceneFile(scene, scan);
-    const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
+    return { name: scene.name, text: JSON.stringify(buildSceneFile(scene, scan), null, 2) };
+  }
+
+  async exportScene(id: string, live?: SceneData | null): Promise<boolean> {
+    const file = await this.sceneFileText(id, live);
+    if (!file) return false;
+    const blob = new Blob([file.text], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${scene.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.setview.json`;
+    a.download = `${file.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.setview.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
     return true;
@@ -500,6 +528,39 @@ export class Persistence {
     this.saveNow(scene);
     this.storageReportCache = null;
     return { scan, scene };
+  }
+
+  /**
+   * Attaches an imported location to a scene: stores the geometry, then looks the
+   * scene up (the live object when it is the current scene, as attachSyntheticScan
+   * does, so an undo or restore during the write is neither overwritten nor
+   * missed), replaces its scan and saves. The previous scan blob is kept until the
+   * next launch so undo can bring it back. Resolves null when the scene is gone.
+   */
+  async attachImportedScan(
+    id: string,
+    scan: LocationScan,
+    source: ScanSourceFile | null,
+    getLive?: () => SceneData | null,
+    mode?: LocationDisplayMode,
+  ): Promise<{ scene: SceneData; scanSaved: boolean } | null> {
+    const scanSaved = await this.scans.putScan(scan);
+    const live = getLive?.() ?? null;
+    const scene = live && live.id === id ? live : this.loadScene(id);
+    if (!scene) return null;
+    scene.scan = summarizeScan(scan);
+    scene.scan.imported = true;
+    if (source) scene.scan.source = source;
+    // A new location starts in its default mode (or the one asked for), not the old scan's Hidden.
+    delete scene.locationMode;
+    normalizeScene(scene);
+    if (mode) {
+      scene.locationMode = mode;
+      normalizeScene(scene); // Photo without a textured source falls back to Solid
+    }
+    this.saveNow(scene);
+    this.storageReportCache = null;
+    return { scene, scanSaved };
   }
 
   /**
@@ -591,6 +652,7 @@ export class Persistence {
     const report = (async (): Promise<StorageReport> => {
       const sceneBytes = this.localSceneBytes();
       const scanBytes = await this.scans.getTotalStorageBytes().catch(() => 0);
+      const blobBytes = await this.blobs.getTotalBytes().catch(() => 0);
       let usageBytes: number | null = null;
       let quotaBytes: number | null = null;
       let persisted: boolean | null = null;
@@ -605,7 +667,7 @@ export class Persistence {
       } catch {
         // Estimates are informational; missing ones are simply not shown.
       }
-      return { usageBytes, quotaBytes, persisted, sceneBytes, scanBytes };
+      return { usageBytes, quotaBytes, persisted, sceneBytes, scanBytes, blobBytes };
     })();
     this.storageReportCache = { at: now, report };
     return report;

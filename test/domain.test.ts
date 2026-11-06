@@ -611,6 +611,32 @@ import {
 } from '../src/gaussianSplat.ts';
 import { SPLAT_BUDGET_STEP, stepSplatBudget } from '../src/performanceGovernor.ts';
 import { GaussianSplatRenderer } from '../src/gaussianRenderer.ts';
+import * as ingest from '../src/sceneImport.ts';
+import { BlobStore } from '../src/blobStore.ts';
+import { importLocationBytes, partsFromObject3D } from '../src/locationImport.ts';
+import * as drop from '../src/dropBox.ts';
+import { fitTextureSize, LocationRenderer as P1LocationRenderer } from '../src/location.ts';
+import * as reg from '../src/registration.ts';
+import * as flow from '../src/scanFlow.ts';
+import { baseScanLabel, classifyPlane, isPlaneLabel, planeLabel, triangulatePolygon } from '../src/scan.ts';
+import { captureScanFromFrame as p1Capture, PlaneCollector } from '../src/scanner.ts';
+import { createAudioCue as p1CreateAudioCue } from '../src/audioCues.ts';
+import { createAcousticsConfig as p1Acoustics, createBoomMicEntity as p1Boom, createLavalierMicEntity as p1Lav } from '../src/acousticsEngine.ts';
+import { createSetDressingConfig as p1Dressing } from '../src/setDressingEngine.ts';
+import { createGaussianSplatCloud as p1Cloud } from '../src/gaussianSplat.ts';
+import { createArchitecturalSet as p1Arch, createWallData as p1Wall } from '../src/architecture.ts';
+import { createGripRigConfig as p1Grip } from '../src/cameraGrip.ts';
+import { createLedVolumeConfig as p1Led } from '../src/icvfxEngine.ts';
+import { calculateSolarVector as p1Sun, createSolarEnvironmentConfig as p1Solar } from '../src/solarEngine.ts';
+import { applyRigidToScan, meshFootprintCenter as p1FootprintCenter } from '../src/scan.ts';
+import { dropBox as dropBoxPlugin } from '../vite.plugins.ts';
+import * as nodeHttp from 'node:http';
+import * as nodeOs from 'node:os';
+import * as nodePath from 'node:path';
+import { collectBlobRefs, isScanSourceFile } from '../src/model.ts';
+import { sanitizeMeshBuffers } from '../src/scan.ts';
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
 
 
 let passed = 0;
@@ -7477,13 +7503,18 @@ async function scanStoreFallback(): Promise<void> {
   assert.equal(await store.getScan('scan-1'), scan);
   assert.deepEqual(await store.listScanIds(), ['scan-1']);
 
-  // Prune keeps referenced ids, removes orphans.
+  // Prune keeps referenced ids, removes orphans left by an earlier session, and
+  // never removes a scan written in this one (the launch prune can still be
+  // running when a scan is captured or imported).
   const other = { ...makeScan(), id: 'scan-2' };
-  await store.putScan(other);
+  (store as unknown as { memory: Map<string, LocationScan> }).memory.set('scan-2', other); // as if from an earlier session
+  const fresh = { ...makeScan(), id: 'scan-3' };
+  await store.putScan(fresh);
   const removed = await store.pruneOrphans(new Set(['scan-1']));
   assert.equal(removed, 1);
   assert.equal(await store.getScan('scan-2'), null);
   assert.equal((await store.getScan('scan-1'))?.id, 'scan-1');
+  assert.equal((await store.getScan('scan-3'))?.id, 'scan-3', 'written this session: never pruned');
 
   await store.deleteScan('scan-1');
   assert.equal(await store.getScan('scan-1'), null);
@@ -14376,7 +14407,7 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
       'coverage cameras end a camera carry before cams.setScene',
     );
     before(
-      mainMethodBody(src, 'updatePendingScan'),
+      mainMethodBody(src, 'commitCapturedScan'),
       'if (this.draggedFurniture) this.cancelActiveManipulation();',
       'this.location.setScan(scan);',
       'a scan capture ends a furniture carry before setScan',
@@ -14384,7 +14415,7 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
     before(
       mainMethodBody(src, 'syncLocation'),
       'if (this.draggedFurniture) this.cancelActiveManipulation();',
-      'this.location.setScan(scan);',
+      'this.location.setScan(scan, { keepPhoto });',
       'a late scan load ends a furniture carry before setScan',
     );
     // A disowned piece is never re-attached.
@@ -14451,10 +14482,1475 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
   if (!hadDocument) delete g.document;
 }
 
+// --- P1 ingest (P1.1) ---
+{
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const bytes = (...b: number[]) => new Uint8Array(b);
+
+  test('P1.1: sniffSceneFile identifies formats by magic bytes, not names', () => {
+    assert.equal(ingest.sniffSceneFile(enc('glTF\x02\x00\x00\x00')), 'glb');
+    assert.equal(ingest.sniffSceneFile(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0)), 'png');
+    assert.equal(ingest.sniffSceneFile(bytes(0xff, 0xd8, 0xff, 0xe0)), 'jpeg');
+    assert.equal(ingest.sniffSceneFile(bytes(0x50, 0x4b, 0x03, 0x04, 0)), 'zip');
+    assert.equal(ingest.sniffSceneFile(enc('Kaydara FBX Binary  \x00\x1a\x00')), 'fbx');
+    assert.equal(ingest.sniffSceneFile(enc('; FBX 7.4.0 project file\n')), 'fbx');
+    assert.equal(ingest.sniffSceneFile(enc('NGSP\x02\x00\x00\x00')), 'spz');
+    assert.equal(ingest.sniffSceneFile(bytes(0x1f, 0x8b, 0x08, 0)), 'spz');
+    assert.equal(ingest.sniffSceneFile(new Uint8Array(0)), 'unknown');
+    assert.equal(ingest.sniffSceneFile(enc('hello, this is just a note\n')), 'unknown');
+  });
+
+  test('P1.1: sniffSceneFile tells PLY meshes, points and Gaussian splats apart', () => {
+    const mesh = 'ply\nformat binary_little_endian 1.0\nelement vertex 8\nproperty float x\nproperty float y\nproperty float z\nelement face 12\nproperty list uchar uint vertex_indices\nend_header\n';
+    const points = 'ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n';
+    const gs =
+      'ply\r\nformat binary_little_endian 1.0\r\nelement vertex 100\r\nproperty float x\r\nproperty float y\r\nproperty float z\r\n' +
+      'property float f_dc_0\r\nproperty float opacity\r\nproperty float scale_0\r\nproperty float rot_0\r\nend_header\r\n';
+    const compressed = 'ply\nformat binary_little_endian 1.0\nelement chunk 4\nproperty float min_x\nelement vertex 1024\nproperty uint packed_position\nend_header\n';
+    assert.equal(ingest.sniffSceneFile(enc(mesh)), 'ply-mesh');
+    assert.equal(ingest.sniffSceneFile(enc(points)), 'ply-points');
+    assert.equal(ingest.sniffSceneFile(enc(gs)), 'ply-3dgs');
+    assert.equal(ingest.sniffSceneFile(enc(compressed)), 'ply-3dgs-compressed');
+    const h = ingest.parsePlyHeader(enc(mesh))!;
+    assert.equal(h.format, 'binary_little_endian');
+    assert.deepEqual(h.elements.map((e) => [e.name, e.count]), [['vertex', 8], ['face', 12]]);
+    assert.equal(h.headerBytes, mesh.length);
+    assert.equal(ingest.parsePlyHeader(enc('plyx')), null);
+  });
+
+  test('P1.1: sniffSceneFile reads JSON kinds, OBJ text and headerless .splat', () => {
+    const sample = new Uint8Array(probeFs.readFileSync(new URL('./sample_scene.setview.json', import.meta.url)));
+    assert.equal(ingest.sniffSceneFile(sample.subarray(0, ingest.SNIFF_BYTES), sample.length), 'setview-json');
+    assert.equal(ingest.sniffSceneFile(enc('{"asset":{"version":"2.0"},"meshes":[]}')), 'gltf-json');
+    assert.equal(ingest.sniffSceneFile(enc('{"hello":1}')), 'unknown');
+    assert.equal(ingest.sniffSceneFile(enc('# Polycam\nmtllib a.mtl\no room\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n')), 'obj');
+    // Two plausible 32-byte splat records.
+    const splat = new Uint8Array(64);
+    const dv = new DataView(splat.buffer);
+    for (let r = 0; r < 2; r++) {
+      dv.setFloat32(r * 32, 1.5, true);
+      dv.setFloat32(r * 32 + 4, 0.2, true);
+      dv.setFloat32(r * 32 + 8, -3, true);
+      for (let i = 0; i < 3; i++) dv.setFloat32(r * 32 + 12 + i * 4, 0.01, true);
+      splat[r * 32 + 24] = 200;
+    }
+    assert.equal(ingest.sniffSceneFile(splat, 64), 'splat');
+    assert.equal(ingest.sniffSceneFile(splat, 65), 'unknown', 'not a multiple of 32 bytes');
+    // Random-looking binary that fails the splat plausibility check.
+    const junk = new Uint8Array(64).fill(0xff);
+    assert.equal(ingest.sniffSceneFile(junk, 64), 'unknown');
+  });
+
+  test('P1.1: locationImportRefusal accepts meshes and explains everything else', () => {
+    for (const k of ['glb', 'obj', 'fbx', 'ply-mesh'] as const) assert.equal(ingest.locationImportRefusal(k), null);
+    for (const k of ['ply-3dgs', 'ply-3dgs-compressed', 'spz', 'splat'] as const) {
+      assert.match(ingest.locationImportRefusal(k)!, /splat/i);
+    }
+    assert.match(ingest.locationImportRefusal('setview-json')!, /Import Scene/);
+    assert.match(ingest.locationImportRefusal('ply-points')!, /no faces/);
+    assert.match(ingest.locationImportRefusal('unknown')!, /not recognised/);
+    assert.ok(ingest.describeSceneFileKind('glb').includes('.glb'));
+  });
+
+  const apply = (m: ArrayLike<number>, x: number, y: number, z: number) => [
+    m[0] * x + m[4] * y + m[8] * z + m[12],
+    m[1] * x + m[5] * y + m[9] * z + m[13],
+    m[2] * x + m[6] * y + m[10] * z + m[14],
+  ];
+
+  test('P1.1: conventionMatrix maps RDF and Z-up sources into y-up as proper rotations', () => {
+    assert.deepEqual(apply(ingest.conventionMatrix('RUB'), 1, 2, 3), [1, 2, 3]);
+    assert.deepEqual(apply(ingest.conventionMatrix('RDF'), 1, 2, 3), [1, -2, -3]);
+    const z = ingest.conventionMatrix('ZUP');
+    assert.deepEqual(apply(z, 0, 0, 1), [0, 1, 0], 'Z-up up is y-up up');
+    assert.deepEqual(apply(z, 0, 1, 0), [0, 0, -1], 'Z-up forward is -Z forward');
+    for (const c of ['RUB', 'RDF', 'ZUP'] as const) {
+      const m = ingest.conventionMatrix(c);
+      const det =
+        m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2]) + m[8] * (m[1] * m[6] - m[5] * m[2]);
+      approx(det, 1, 1e-12);
+    }
+    const t = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 5, 6, 7, 1];
+    assert.deepEqual(apply(ingest.multiplyMat4(t, ingest.conventionMatrix('RDF')), 1, 1, 1), [6, 5, 6]);
+  });
+
+  test('P1.1: buildLocationScanFromParts bakes matrices, recentres to the floor and reports the transform', () => {
+    const tri = new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const moved = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 2, -4, 1];
+    const r = ingest.buildLocationScanFromParts(
+      [
+        { positions: tri, indices: new Uint32Array([0, 1, 2]) },
+        { positions: tri, indices: new Uint16Array([0, 2, 1]), matrix: moved },
+      ],
+      { id: 'imp-1', capturedAt: 5 },
+    );
+    assert.ok(r.scan && !r.error);
+    assert.equal(r.scan!.id, 'imp-1');
+    assert.equal(r.scan!.meshes.length, 2);
+    assert.equal(r.stats.triangles, 2);
+    assert.deepEqual(r.scan!.meshes[1].indices, new Uint32Array([0, 2, 1]));
+    assert.equal(tri[0], 0, 'input positions are not mutated');
+    const sum = summarizeScan(r.scan!);
+    approx(sum.boundsMin.y, 0, 1e-6);
+    approx(sum.boundsMin.x + sum.boundsMax.x, 0, 1e-6);
+    approx(sum.boundsMin.z + sum.boundsMax.z, 0, 1e-6);
+    // The reported transform takes source-root points to where the scan put them.
+    const p = r.scan!.meshes[1].positions;
+    const q = apply(r.sourceTransform, 10 + 1, 2, -4);
+    approx(p[3], q[0], 1e-5);
+    approx(p[4], q[1], 1e-5);
+    approx(p[5], q[2], 1e-5);
+    assert.deepEqual([r.sourceBoundsMin.x, r.sourceBoundsMax.x], [0, 11]);
+    for (const m of r.scan!.meshes) {
+      assert.equal(m.label, ingest.IMPORTED_MESH_LABEL);
+      assert.equal(isMovableScanMesh(m.label), false, 'imported geometry is static');
+    }
+  });
+
+  test('P1.1: buildLocationScanFromParts handles non-indexed parts, units, axes and keepCoordinates', () => {
+    // A non-indexed quad (two triangles) in centimetres, Z-up.
+    const soup = new Float32Array([0, 0, 100, 200, 0, 100, 0, 300, 100, 200, 0, 100, 200, 300, 100, 0, 300, 100]);
+    const r = ingest.buildLocationScanFromParts([{ positions: soup, indices: null }], {
+      unitScale: ingest.UNIT_SCALE.cm,
+      convention: 'ZUP',
+      keepCoordinates: true,
+    });
+    assert.equal(r.stats.triangles, 2);
+    assert.deepEqual(Array.from(r.scan!.meshes[0].indices), [0, 1, 2, 3, 4, 5]);
+    const p = r.scan!.meshes[0].positions;
+    // Z-up (0, 300 cm forward, 100 cm up) -> y-up (0, 1 m up, -3 m forward).
+    approx(p[6], 0, 1e-6);
+    approx(p[7], 1, 1e-6);
+    approx(p[8], -3, 1e-6);
+  });
+
+  test('P1.1: buildLocationScanFromParts drops bad parts with a warning and refuses empty or oversized input', () => {
+    const good = { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]), indices: new Uint32Array([0, 1, 2]) };
+    const nan = { positions: new Float32Array([0, 0, 0, NaN, 0, 0, 0, 0, 1]), indices: new Uint32Array([0, 1, 2]) };
+    const degenerate = { positions: good.positions, indices: new Uint32Array([0, 0, 1]) };
+    const r = ingest.buildLocationScanFromParts([good, nan, degenerate]);
+    assert.equal(r.scan!.meshes.length, 1);
+    assert.equal(r.stats.droppedParts, 2);
+    assert.match(r.warnings[0], /2 parts/);
+    const none = ingest.buildLocationScanFromParts([nan]);
+    assert.equal(none.scan, null);
+    assert.match(none.error!, /no usable triangles/);
+    const many = ingest.buildLocationScanFromParts(Array.from({ length: 1025 }, () => good));
+    assert.equal(many.scan, null);
+    assert.match(many.error!, /1024 separate meshes/);
+  });
+
+  test('P1.1: sanitizeMeshBuffers keeps valid buffers as-is and filters bad triangles without a number array', () => {
+    const pos = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0]);
+    const ok = new Uint32Array([0, 1, 2, 1, 3, 2]);
+    assert.equal(sanitizeMeshBuffers(pos, ok)!.indices, ok, 'nothing dropped: same array back');
+    const mixed = new Uint32Array([0, 1, 2, 0, 0, 1, 1, 9, 2, 1, 3, 2]);
+    assert.deepEqual(Array.from(sanitizeMeshBuffers(pos, mixed)!.indices), [0, 1, 2, 1, 3, 2]);
+    assert.equal(sanitizeMeshBuffers(pos, new Uint32Array([0, 0, 0])), null);
+    assert.equal(sanitizeMeshBuffers(new Float32Array([0, 0, 0, 1, 0, 0]), ok), null, 'fewer than 3 vertices');
+    assert.equal(sanitizeMeshBuffers(new Float32Array([0, 0, 0, 1, 0, Infinity, 0, 1, 0]), new Uint32Array([0, 1, 2])), null);
+  });
+
+  test('P1.1: guessUnitScale and checkImportBudget', () => {
+    const z = { x: 0, y: 0, z: 0 };
+    assert.equal(ingest.guessUnitScale(z, { x: 6, y: 3, z: 5 }).unit, 'm');
+    assert.equal(ingest.guessUnitScale(z, { x: 600, y: 280, z: 500 }).unit, 'cm');
+    assert.equal(ingest.guessUnitScale(z, { x: 6000, y: 2800, z: 5000 }).unit, 'mm');
+    assert.equal(ingest.guessUnitScale(z, { x: 6000, y: 2800, z: 5000 }).scale, 0.001);
+    assert.equal(ingest.checkImportBudget({ triangles: 120_000, vertices: 60_000, meshes: 1 }).level, 'ok');
+    assert.equal(ingest.checkImportBudget({ triangles: 400_000, vertices: 200_000, meshes: 1 }).level, 'warn');
+    const big = ingest.checkImportBudget({ triangles: 900_000, vertices: 450_000, meshes: 1 });
+    assert.equal(big.level, 'reject');
+    assert.match(big.reason, /900k triangles/);
+  });
+
+  test('P1.1: detectCaptureApp and the license reminder', () => {
+    assert.equal(ingest.detectCaptureApp('Polycam glTF exporter', null), 'polycam');
+    assert.equal(ingest.detectCaptureApp(null, 'Scaniverse 2026-11-01.glb'), 'scaniverse');
+    assert.equal(ingest.detectCaptureApp('Khronos glTF Blender I/O', 'room.glb'), 'unknown');
+    assert.match(ingest.captureLicenseNote('scaniverse')!, /no commercial rights/);
+    assert.equal(ingest.captureLicenseNote('unknown'), null);
+  });
+
+  // Round trip: SetView's own scan exports, parsed by three's loaders, rebuilt by the ingest core.
+  const partsFromThree = (root: THREE.Object3D): ingest.ImportMeshPart[] => {
+    root.updateMatrixWorld(true);
+    const parts: ingest.ImportMeshPart[] = [];
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const g = mesh.geometry as THREE.BufferGeometry;
+      const pos = g.getAttribute('position');
+      parts.push({
+        positions: new Float32Array(pos.array as ArrayLike<number>),
+        indices: g.index ? new Uint32Array(g.index.array as ArrayLike<number>) : null,
+        matrix: mesh.matrixWorld.elements,
+      });
+    });
+    return parts;
+  };
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+  const roomSum = summarizeScan(room);
+  const extent = (s: { boundsMin: { x: number; y: number; z: number }; boundsMax: { x: number; y: number; z: number } }) => [
+    s.boundsMax.x - s.boundsMin.x,
+    s.boundsMax.y - s.boundsMin.y,
+    s.boundsMax.z - s.boundsMin.z,
+  ];
+
+  test('P1.1: OBJ round trip (exportScanAsObj -> OBJLoader.parse -> buildLocationScanFromParts)', () => {
+    const { obj } = exportScanAsObj(room);
+    assert.equal(ingest.sniffSceneFile(enc(obj)), 'obj');
+    const r = ingest.buildLocationScanFromParts(partsFromThree(new OBJLoader().parse(obj)));
+    assert.ok(r.scan);
+    assert.equal(r.stats.triangles, roomSum.triangles);
+    const a = extent(summarizeScan(r.scan!));
+    const b = extent(roomSum);
+    for (let i = 0; i < 3; i++) approx(a[i], b[i], 1e-3);
+    approx(summarizeScan(r.scan!).boundsMin.y, 0, 1e-6);
+  });
+
+  test('P1.1: binary PLY round trip (exportScanAsPly -> PLYLoader.parse -> buildLocationScanFromParts)', () => {
+    const ply = exportScanAsPly(room, true) as Uint8Array;
+    assert.equal(ingest.sniffSceneFile(ply.subarray(0, ingest.SNIFF_BYTES), ply.length), 'ply-mesh');
+    const buf = ply.buffer.slice(ply.byteOffset, ply.byteOffset + ply.byteLength) as ArrayBuffer;
+    const geom = new PLYLoader().parse(buf);
+    const r = ingest.buildLocationScanFromParts(partsFromThree(new THREE.Mesh(geom)));
+    assert.ok(r.scan);
+    assert.equal(r.stats.triangles, roomSum.triangles);
+    const a = extent(summarizeScan(r.scan!));
+    const b = extent(roomSum);
+    for (let i = 0; i < 3; i++) approx(a[i], b[i], 1e-3);
+  });
+}
+
+// --- P1 blob store (P1.3) ---
+{
+  const src = (blobId: string) => ({
+    blobId,
+    format: 'glb',
+    fileName: 'room.glb',
+    app: 'polycam',
+    transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0.05, 0, 1],
+    textured: true,
+  });
+
+  test('P1.3: isScanSourceFile and collectBlobRefs', () => {
+    assert.ok(isScanSourceFile(src('blob-a')));
+    assert.equal(isScanSourceFile({ ...src('blob-a'), transform: [1, 2, 3] }), false);
+    assert.equal(isScanSourceFile({ ...src(''), blobId: '' }), false);
+    assert.equal(isScanSourceFile({ ...src('x'), transform: Array(16).fill(NaN) }), false);
+    const a = createScene('a');
+    const b = createScene('b');
+    const c = createScene('c');
+    const scanOf = (id: string) => summarizeScan({ version: 1, id, capturedAt: 1, meshes: [] });
+    a.scan = { ...scanOf('scan-a'), source: src('blob-a') };
+    b.scan = { ...scanOf('scan-b'), source: src('blob-a') }; // a duplicate shares its original
+    c.scan = scanOf('scan-c'); // headset capture: no original
+    assert.deepEqual([...collectBlobRefs([a, b, c, null, undefined])], ['blob-a']);
+  });
+
+  test('P1.3: normalizeScene keeps a valid source and drops a malformed one without losing the scan', () => {
+    const s = createScene('src');
+    s.scan = { ...summarizeScan({ version: 1, id: 'scan-1', capturedAt: 1, meshes: [] }), source: src('blob-1') };
+    assert.ok(isSceneData(s));
+    normalizeScene(s);
+    assert.equal(s.scan?.source?.blobId, 'blob-1');
+    const bad = JSON.parse(JSON.stringify(s)) as SceneData;
+    (bad.scan as { source: unknown }).source = { blobId: 7 };
+    assert.ok(isSceneData(bad), 'a bad source does not fail the import');
+    normalizeScene(bad);
+    assert.equal(bad.scan?.id, 'scan-1');
+    assert.equal(bad.scan?.source, undefined);
+  });
+
+  test('P1.3: the storage line shows original files only when there are some', () => {
+    const MB = 1024 * 1024;
+    const base = { usageBytes: null, quotaBytes: null, persisted: null, sceneBytes: MB, scanBytes: 2 * MB };
+    assert.ok(!formatStorageLine(base).includes('original'));
+    assert.ok(!formatStorageLine({ ...base, blobBytes: 0 }).includes('original'));
+    assert.match(formatStorageLine({ ...base, blobBytes: 150 * MB }), /original files 150\.0 MB/);
+  });
+}
+
+/** Async: BlobStore memory fallback, PropStore metadata listing, launch pruning of originals. */
+async function p1BlobStoreTest(): Promise<void> {
+  const store = new BlobStore();
+  let warned = '';
+  store.onError = (m) => (warned = m);
+  const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+  const put = await store.putBlob({ data: bytes, format: 'glb', name: 'room.glb' });
+  assert.equal(put.saved, false, 'Node has no IndexedDB: memory only');
+  assert.match(warned, /memory/);
+  assert.match(put.id, /^blob-/);
+  const rec = await store.getBlob(put.id);
+  assert.equal(rec?.size, 5);
+  assert.equal(rec?.format, 'glb');
+  assert.deepEqual(new Uint8Array((await store.getBytes(put.id))!), bytes);
+  const meta = await store.listMeta();
+  assert.equal(meta.length, 1);
+  assert.equal('data' in meta[0], false, 'a listing carries no bytes');
+  assert.equal(await store.getTotalBytes(), 5);
+  const kept = await store.putBlob({ id: 'blob-kept', data: new Blob(['abc']), format: 'obj' });
+  assert.equal(kept.id, 'blob-kept');
+  // An original left by an earlier session and referenced by no scene.
+  (store as unknown as { memory: Map<string, unknown> }).memory.set('blob-old', {
+    id: 'blob-old',
+    data: new Blob(['old']),
+    format: 'glb',
+    name: '',
+    size: 3,
+    createdAt: 0,
+  });
+  assert.equal(await store.pruneOrphans(new Set(['blob-kept'])), 1, 'only the earlier-session orphan goes');
+  assert.equal(await store.hasBlob('blob-old'), false);
+  assert.equal(await store.hasBlob(put.id), true, 'written this session: never pruned, referenced or not');
+  assert.equal(await store.hasBlob('blob-kept'), true);
+  await store.deleteBlob('blob-kept');
+  assert.equal(await store.getBlob('blob-kept'), null);
+  passed++;
+  console.log('  ✓ P1.3: BlobStore memory fallback (put/get/bytes/list/prune/delete + warning)');
+
+  const props = new PropStore();
+  props.onError = () => {};
+  await props.putAsset({
+    id: 'asset-meta-1',
+    name: 'Console',
+    fileName: 'console.glb',
+    fileType: 'glb',
+    category: 'custom',
+    sizeBytes: 2048,
+    uploadedAt: 1,
+    dimensions: { width: 1, height: 1, depth: 1 },
+    buffer: new ArrayBuffer(2048),
+  });
+  const list = await props.listAssetMeta();
+  assert.equal(list.length, 1);
+  assert.equal(list[0].name, 'Console');
+  assert.equal('buffer' in list[0], false, 'metadata listing carries no model bytes');
+  passed++;
+  console.log('  ✓ P1.3: PropStore.listAssetMeta lists uploads without their bytes');
+
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: new P0MemoryStorage(), configurable: true, writable: true });
+  try {
+    const p = new Persistence();
+    p.onError = () => {};
+    const used = await p.blobs.putBlob({ data: new Uint8Array(8), format: 'glb' });
+    const orphan = { id: 'blob-orphan' }; // left by an earlier session
+    (p.blobs as unknown as { memory: Map<string, unknown> }).memory.set(orphan.id, {
+      id: orphan.id,
+      data: new Blob([new Uint8Array(4)]),
+      format: 'glb',
+      name: '',
+      size: 4,
+      createdAt: 0,
+    });
+    // Imported while the launch prune runs: not yet referenced by any saved scene.
+    const inFlight = await p.blobs.putBlob({ data: new Uint8Array(2), format: 'glb' });
+    const scene = createScene('with original');
+    scene.scan = {
+      ...summarizeScan({ version: 1, id: 'scan-x', capturedAt: 1, meshes: [] }),
+      source: {
+        blobId: used.id,
+        format: 'glb',
+        transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+      },
+    };
+    assert.equal(p.saveNow(scene), true);
+    await p.pruneOrphanScans();
+    assert.equal(await p.blobs.hasBlob(used.id), true, 'a referenced original survives');
+    assert.equal(await p.blobs.hasBlob(orphan.id), false, 'an unreferenced original is swept at launch');
+    assert.equal(await p.blobs.hasBlob(inFlight.id), true, 'one written while the prune ran survives');
+    const report = await p.storageReport(0);
+    assert.equal(report.blobBytes, 10);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+  passed++;
+  console.log('  ✓ P1.3: launch pruning keeps referenced originals and sweeps orphans; storage report counts them');
+}
+
+// --- P1 location import (P1.2) ---
+/** Builds a minimal one-triangle GLB by hand (Node has no FileReader for GLTFExporter). */
+function p1MakeGlb(opts: { generator?: string; textured?: boolean; translation?: [number, number, number] } = {}): ArrayBuffer {
+  const pos = new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const idx = new Uint16Array([0, 1, 2]);
+  const bin = new Uint8Array(52);
+  bin.set(new Uint8Array(pos.buffer), 0);
+  bin.set(new Uint8Array(idx.buffer), 36);
+  bin.set([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4], 44); // a "PNG" that must never be decoded
+  const json: Record<string, unknown> = {
+    asset: { version: '2.0', ...(opts.generator ? { generator: opts.generator } : {}) },
+    scene: 0,
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0, ...(opts.translation ? { translation: opts.translation } : {}) }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, indices: 1, ...(opts.textured ? { material: 0 } : {}) }] }],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, 0], max: [1, 0, 1] },
+      { bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' },
+    ],
+    bufferViews: [
+      { buffer: 0, byteOffset: 0, byteLength: 36 },
+      { buffer: 0, byteOffset: 36, byteLength: 6 },
+      { buffer: 0, byteOffset: 44, byteLength: 8 },
+    ],
+    buffers: [{ byteLength: bin.length }],
+  };
+  if (opts.textured) {
+    json.materials = [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }];
+    json.textures = [{ source: 0 }];
+    json.images = [{ bufferView: 2, mimeType: 'image/png' }];
+  }
+  let jsonText = JSON.stringify(json);
+  while (jsonText.length % 4) jsonText += ' ';
+  const jsonBytes = new TextEncoder().encode(jsonText);
+  const total = 12 + 8 + jsonBytes.length + 8 + bin.length;
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  out.set([0x67, 0x6c, 0x54, 0x46], 0);
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, total, true);
+  dv.setUint32(12, jsonBytes.length, true);
+  dv.setUint32(16, 0x4e4f534a, true);
+  out.set(jsonBytes, 20);
+  const binAt = 20 + jsonBytes.length;
+  dv.setUint32(binAt, bin.length, true);
+  dv.setUint32(binAt + 4, 0x004e4942, true);
+  out.set(bin, binAt + 8);
+  return out.buffer;
+}
+
+{
+  test('P1.2: partsFromObject3D flattens nested and instanced meshes with world matrices and skips points', () => {
+    const tri = () => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]), 3));
+      return g;
+    };
+    const root = new THREE.Group();
+    const parent = new THREE.Group();
+    parent.position.set(5, 0, 0);
+    const child = new THREE.Mesh(tri());
+    child.position.set(0, 1, 0);
+    parent.add(child);
+    root.add(parent);
+    const inst = new THREE.InstancedMesh(tri(), undefined, 2);
+    inst.setMatrixAt(0, new THREE.Matrix4().makeTranslation(0, 0, 0));
+    inst.setMatrixAt(1, new THREE.Matrix4().makeTranslation(0, 0, 9));
+    root.add(inst);
+    root.add(new THREE.Points(tri()));
+    const parts = partsFromObject3D(root);
+    assert.equal(parts.length, 3, 'one nested mesh plus two instances; points skipped');
+    const at = (i: number) => [parts[i].matrix![12], parts[i].matrix![13], parts[i].matrix![14]];
+    assert.deepEqual(at(0), [5, 1, 0]);
+    assert.deepEqual(at(1), [0, 0, 0]);
+    assert.deepEqual(at(2), [0, 0, 9]);
+    assert.equal(parts[0].indices, null, 'non-indexed geometry stays null for the core to index');
+  });
+
+  test('P1.2: partsFromObject3D dequantizes normalized and interleaved positions', () => {
+    const plain = new THREE.BufferGeometry();
+    plain.setAttribute('position', new THREE.BufferAttribute(new Int16Array([0, 0, 0, 32767, 0, 0, 0, 0, 32767]), 3, true));
+    const ib = new THREE.InterleavedBuffer(new Int16Array([0, 0, 0, 0, 32767, 0, 0, 0, 0, 0, 32767, 0]), 4);
+    const inter = new THREE.BufferGeometry();
+    inter.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 3, 0, true));
+    inter.setIndex([0, 1, 2]);
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(plain), new THREE.Mesh(inter));
+    const parts = partsFromObject3D(root);
+    assert.equal(parts.length, 2);
+    for (const p of parts) assert.ok(p.positions instanceof Float32Array && p.positions.length === 9);
+    approx(parts[0].positions[3], 1, 1e-4);
+    approx(parts[0].positions[8], 1, 1e-4);
+    approx(parts[1].positions[3], 1, 1e-4);
+    approx(parts[1].positions[8], 1, 1e-4);
+    assert.deepEqual(Array.from(parts[1].indices!), [0, 1, 2]);
+  });
+}
+
+/** Async: imported originals held in memory while storage was slow reach it when it opens. */
+async function p1BlobLateOpenTest(): Promise<void> {
+  const idb = new FakeIndexedDb();
+  const opts = { indexedDB: asFactory(idb), openTimeoutMs: 20 };
+  const earlier = new BlobStore(opts);
+  const first = await earlier.putBlob({ id: 'blob-saved', data: new Uint8Array([9, 8, 7]), format: 'glb', name: 'a.glb' });
+  assert.equal(first.saved, true, 'session 1: storage is fine');
+
+  idb.hold();
+  const store = new BlobStore(opts);
+  const warnings: string[] = [];
+  const notices: string[] = [];
+  store.onError = (m) => warnings.push(m);
+  store.onNotice = (m) => notices.push(m);
+  assert.equal(await store.getBytes('blob-saved'), null, 'not readable before storage opens');
+  assert.equal(store.storageState, 'waiting');
+  const put = await store.putBlob({ data: new Uint8Array([1, 2, 3, 4]), format: 'glb', name: 'room.glb' });
+  assert.equal(put.saved, false);
+  assert.match(warnings[0] ?? '', /held in memory and saved when it opens/);
+  assert.equal(await store.pruneOrphans(new Set()), 0, 'the launch prune cannot see, so cannot delete, the saved original');
+
+  idb.release();
+  assert.equal(await store.whenStorageOpens(), true);
+  assert.deepEqual(new Uint8Array((await store.getBytes('blob-saved'))!), new Uint8Array([9, 8, 7]), 'the earlier original loads');
+  await settleSoon(() => notices.length > 0);
+  assert.match(notices[0], /the original file held in memory is now saved/);
+  const rows = idb.rows('setview_blobs', 'blobs');
+  assert.ok(rows.has(put.id) && rows.has('blob-saved'));
+  const later = new BlobStore(opts);
+  assert.deepEqual(new Uint8Array((await later.getBytes(put.id))!), new Uint8Array([1, 2, 3, 4]), 'a later session reads it back');
+  passed++;
+  console.log('  ✓ Storage: BlobStore loads saved originals and saves held ones when storage opens late');
+}
+
+/** Async: the adapter end to end on OBJ, PLY and GLB bytes, and attaching an import to a scene. */
+async function p1LocationImportTest(): Promise<void> {
+  const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+  const roomSum = summarizeScan(room);
+  const enc = (s: string) => new TextEncoder().encode(s).buffer as ArrayBuffer;
+
+  const obj = await importLocationBytes(enc(exportScanAsObj(room).obj), { fileName: 'room.obj' });
+  assert.ok(obj.ok);
+  if (obj.ok) {
+    assert.equal(obj.kind, 'obj');
+    assert.equal(obj.built.stats.triangles, roomSum.triangles);
+    assert.equal(obj.unit, 'm');
+    assert.equal(obj.textured, false);
+    assert.equal(obj.budget.level, 'ok');
+  }
+  // The same room in centimetres: the unit is guessed and said.
+  const big = createSyntheticLocationScan(6, 5, 2.8, ['couch']);
+  for (const m of big.meshes) for (let i = 0; i < m.positions.length; i++) m.positions[i] *= 100;
+  const cm = await importLocationBytes(enc(exportScanAsObj(big).obj), { fileName: 'room-cm.obj' });
+  assert.ok(cm.ok && cm.unit === 'cm');
+  if (cm.ok) {
+    const s = summarizeScan(cm.built.scan);
+    const ref = summarizeScan(createSyntheticLocationScan(6, 5, 2.8, ['couch']));
+    approx(s.boundsMax.x - s.boundsMin.x, ref.boundsMax.x - ref.boundsMin.x, 1e-3);
+    assert.ok(cm.notes.some((n) => /centimetres/.test(n)));
+  }
+  const forced = await importLocationBytes(enc(exportScanAsObj(big).obj), { unit: 'm' });
+  assert.ok(forced.ok && forced.unit === 'm', 'an explicit unit is not second-guessed');
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes reads OBJ and guesses centimetres unless told the unit');
+
+  const ply = exportScanAsPly(room, true) as Uint8Array;
+  const plyRes = await importLocationBytes(ply.buffer.slice(ply.byteOffset, ply.byteOffset + ply.byteLength) as ArrayBuffer);
+  assert.ok(plyRes.ok);
+  if (plyRes.ok) {
+    assert.equal(plyRes.kind, 'ply-mesh');
+    assert.equal(plyRes.built.stats.triangles, roomSum.triangles);
+    assert.equal(plyRes.textured, true, 'vertex colours count as worth drawing in Photo mode');
+  }
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes reads a binary PLY mesh with vertex colours');
+
+  const glb = await importLocationBytes(p1MakeGlb({ generator: 'Polycam glTF Exporter', textured: true, translation: [10, 3, 0] }), {
+    fileName: 'scan.glb',
+  });
+  assert.ok(glb.ok, glb.ok ? '' : glb.message);
+  if (glb.ok) {
+    assert.equal(glb.kind, 'glb');
+    assert.equal(glb.app, 'polycam');
+    assert.equal(glb.textured, true);
+    assert.equal(glb.built.stats.triangles, 1);
+    assert.ok(glb.notes.some((n) => /Polycam plan/.test(n)), 'license reminder');
+    const s = summarizeScan(glb.built.scan);
+    approx(s.boundsMin.y, 0, 1e-6);
+    // The source transform takes the file's root to scene space. The node sits at
+    // x 10..11, y 3, z 0..1, so recentring moves the root by (-10.5, -3, -0.5).
+    const m = glb.built.sourceTransform;
+    approx(m[12], -10.5, 1e-6);
+    approx(m[13], -3, 1e-6);
+    approx(m[14], -0.5, 1e-6);
+  }
+  const zup = await importLocationBytes(p1MakeGlb(), { upAxis: 'ZUP' });
+  assert.ok(zup.ok);
+  if (zup.ok) {
+    const s = summarizeScan(zup.built.scan);
+    approx(s.boundsMax.y - s.boundsMin.y, 1, 1e-6);
+  }
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes reads a GLB without decoding its textures, detects Polycam, applies Z-up');
+
+  const splat = new Uint8Array(new TextEncoder().encode('ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n'));
+  const refused = await importLocationBytes(splat.buffer as ArrayBuffer);
+  assert.ok(!refused.ok && /splat/i.test(refused.message));
+  const sceneFile = probeFs.readFileSync(new URL('./sample_scene.setview.json', import.meta.url));
+  const scene = await importLocationBytes(
+    sceneFile.buffer.slice(sceneFile.byteOffset, sceneFile.byteOffset + sceneFile.byteLength) as ArrayBuffer,
+  );
+  assert.ok(!scene.ok && /Import Scene/.test(scene.message));
+  const junk = await importLocationBytes(enc('not a mesh at all'));
+  assert.ok(!junk.ok && /not recognised/.test(junk.message));
+  passed++;
+  console.log('  ✓ P1.2: importLocationBytes refuses splats, scenes and unknown files with a reason');
+
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { value: new P0MemoryStorage(), configurable: true, writable: true });
+  try {
+    const p = new Persistence();
+    p.onError = () => {};
+    const other = createScene('other scene');
+    other.locationMode = 'hidden';
+    other.scan = summarizeScan(createSyntheticLocationScan());
+    assert.equal(p.saveNow(other), true);
+    const live = createScene('live scene');
+    assert.equal(p.saveNow(live), true);
+    const source = { blobId: 'blob-src', format: 'glb', transform: glb.ok ? glb.built.sourceTransform : [], textured: true };
+    // Opened for a scene that is not the live one (review R4): that scene is written.
+    const r1 = await p.attachImportedScan(other.id, obj.ok ? obj.built.scan : room, source, () => live);
+    assert.ok(r1);
+    assert.notEqual(r1!.scene, live);
+    const saved = p.loadScene(other.id)!;
+    assert.equal(saved.scan?.source?.blobId, 'blob-src');
+    assert.equal(saved.scan?.triangles, roomSum.triangles);
+    assert.equal(saved.locationMode, 'ghost', 'a new location starts in Ghost, not the old Hidden');
+    assert.equal(live.scan, null, 'the live scene is untouched');
+    // For the live scene, the live object itself is updated.
+    const r2 = await p.attachImportedScan(live.id, room, null, () => live);
+    assert.equal(r2!.scene, live);
+    const liveScan = (s: SceneData) => s.scan;
+    assert.ok(liveScan(live), 'the live object got the scan');
+    assert.equal(liveScan(live)?.source, undefined, 'an untextured import keeps no original');
+    assert.equal(await p.attachImportedScan('missing-scene', room, null, () => live), null);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+  passed++;
+  console.log('  ✓ P1.2: attachImportedScan writes the scene it was opened for and resets its display mode');
+}
+
+// --- P1 drop box (P1.5) ---
+{
+  test('P1.5: sanitizeDropName strips paths, hidden-file dots and reserved characters, keeps unicode', () => {
+    assert.equal(drop.sanitizeDropName('room.glb'), 'room.glb');
+    assert.equal(drop.sanitizeDropName('../../etc/passwd'), 'passwd');
+    assert.equal(drop.sanitizeDropName('..\\..\\Windows\\win.ini'), 'win.ini');
+    assert.equal(drop.sanitizeDropName('/abs/path/scan.ply'), 'scan.ply');
+    assert.equal(drop.sanitizeDropName('..'), null);
+    assert.equal(drop.sanitizeDropName('.'), null);
+    assert.equal(drop.sanitizeDropName(''), null);
+    assert.equal(drop.sanitizeDropName('   '), null);
+    assert.equal(drop.sanitizeDropName('folder/'), null);
+    assert.equal(drop.sanitizeDropName('.hidden'), 'hidden');
+    assert.equal(drop.sanitizeDropName('a<b>c:d"e|f?g*h.glb'), 'a_b_c_d_e_f_g_h.glb');
+    assert.equal(drop.sanitizeDropName('tab\there\nnew.obj'), 'tab_here_new.obj', 'control characters become _');
+    assert.equal(drop.sanitizeDropName('trailing dots...'), 'trailing dots');
+    assert.equal(drop.sanitizeDropName('Café Ünïcode 日本.glb'), 'Café Ünïcode 日本.glb');
+    assert.equal(drop.sanitizeDropName('Café.glb'), 'Café.glb', 'NFC normalized');
+    const long = drop.sanitizeDropName(`${'x'.repeat(300)}.glb`)!;
+    assert.equal(long.length, drop.DROP_MAX_NAME);
+    assert.ok(long.endsWith('.glb'));
+    // A sanitized name never escapes the folder.
+    for (const raw of ['../a', 'a/../../b', '..\\..\\c', '\u0000x', 'x/‮.glb']) {
+      const s = drop.sanitizeDropName(raw);
+      assert.ok(s === null || (!s.includes('/') && !s.includes('\\') && !s.startsWith('.')), raw);
+    }
+  });
+
+  test('P1.5: uniqueDropName, sceneDropName and the actions offered per kind', () => {
+    const taken = new Set(['room.glb', 'room (2).glb', 'notes']);
+    assert.equal(drop.uniqueDropName('new.glb', taken), 'new.glb');
+    assert.equal(drop.uniqueDropName('room.glb', taken), 'room (3).glb');
+    assert.equal(drop.uniqueDropName('notes', taken), 'notes (2)');
+    assert.equal(drop.sceneDropName('Act 2: Kitchen'), 'Act 2_ Kitchen.setview.json');
+    assert.equal(drop.sceneDropName('x.setview.json'), 'x.setview.json');
+    assert.deepEqual(drop.dropActionsFor('glb'), ['location', 'prop']);
+    assert.deepEqual(drop.dropActionsFor('obj'), ['location', 'prop']);
+    assert.deepEqual(drop.dropActionsFor('fbx'), ['location']);
+    assert.deepEqual(drop.dropActionsFor('ply-mesh'), ['location']);
+    assert.deepEqual(drop.dropActionsFor('setview-json'), ['scene']);
+    assert.deepEqual(drop.dropActionsFor('spz'), []);
+    assert.match(drop.dropRefusal('spz')!, /splat/i);
+    assert.equal(drop.dropRefusal('glb'), null);
+    assert.equal(drop.propExtensionFor('glb'), '.glb');
+    assert.equal(drop.propExtensionFor('fbx'), null);
+  });
+
+  test('P1.5: parseByteRange and isSameOriginRequest', () => {
+    assert.deepEqual(drop.parseByteRange('bytes=0-99', 1000), { start: 0, end: 99 });
+    assert.deepEqual(drop.parseByteRange('bytes=900-', 1000), { start: 900, end: 999 });
+    assert.deepEqual(drop.parseByteRange('bytes=-100', 1000), { start: 900, end: 999 });
+    assert.deepEqual(drop.parseByteRange('bytes=0-65535', 10), { start: 0, end: 9 }, 'clamped to the file');
+    assert.equal(drop.parseByteRange('bytes=2000-', 1000), null);
+    assert.equal(drop.parseByteRange('bytes=5-1', 1000), null);
+    assert.equal(drop.parseByteRange('items=0-1', 1000), null);
+    assert.equal(drop.parseByteRange(undefined, 1000), null);
+    assert.equal(drop.isSameOriginRequest(undefined, '192.168.1.5:5173'), true, 'no Origin header (curl)');
+    assert.equal(drop.isSameOriginRequest('https://192.168.1.5:5173', '192.168.1.5:5173'), true);
+    assert.equal(drop.isSameOriginRequest('https://evil.example', '192.168.1.5:5173'), false);
+    assert.equal(drop.isSameOriginRequest('null', '192.168.1.5:5173'), false);
+  });
+}
+
+/** Async: the drop box middleware on a real local HTTP server, in a temp folder. */
+async function p1DropBoxServerTest(): Promise<void> {
+  const root = probeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'setview-drop-'));
+  const plugin = dropBoxPlugin() as unknown as {
+    configResolved: (c: { root: string }) => void;
+    configureServer: (s: { config: { base: string }; middlewares: { use: (fn: unknown) => void } }) => void;
+  };
+  plugin.configResolved({ root });
+  let handler: ((req: nodeHttp.IncomingMessage, res: nodeHttp.ServerResponse, next: () => void) => void) | null = null;
+  plugin.configureServer({ config: { base: '/' }, middlewares: { use: (fn) => (handler = fn as typeof handler) } });
+  const server = nodeHttp.createServer((req, res) =>
+    handler!(req, res, () => {
+      res.statusCode = 299; // "fell through to Vite"
+      res.end('fallthrough');
+    }),
+  );
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const port = (server.address() as { port: number }).port;
+  const url = (p: string) => `http://127.0.0.1:${port}${p}`;
+  try {
+    const body = new Uint8Array(1000).map((_, i) => i % 251);
+    const up = await fetch(url('/drop/upload?name=' + encodeURIComponent('../../evil/room.glb')), { method: 'POST', body });
+    assert.equal(up.status, 201);
+    assert.deepEqual(await up.json(), { name: 'room.glb', size: 1000 });
+    assert.ok(probeFs.existsSync(nodePath.join(root, 'drop', 'room.glb')), 'stored inside ./drop under the clean name');
+    const up2 = await fetch(url('/drop/upload?name=room.glb'), { method: 'POST', body: new Uint8Array(3) });
+    assert.equal(((await up2.json()) as { name: string }).name, 'room (2).glb', 'never overwrites');
+    const list = (await (await fetch(url('/drop/list'))).json()) as { name: string; size: number }[];
+    assert.deepEqual(list.map((e) => e.name).sort(), ['room (2).glb', 'room.glb']);
+
+    const whole = await fetch(url('/drop/file/room.glb'));
+    assert.equal(whole.status, 200);
+    assert.equal(whole.headers.get('content-type'), 'application/octet-stream');
+    assert.equal(whole.headers.get('x-content-type-options'), 'nosniff');
+    assert.match(whole.headers.get('content-disposition') ?? '', /^attachment/);
+    assert.match(whole.headers.get('content-security-policy') ?? '', /sandbox/);
+    assert.deepEqual(new Uint8Array(await whole.arrayBuffer()), body);
+    const part = await fetch(url('/drop/file/room.glb'), { headers: { Range: 'bytes=10-19' } });
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get('content-range'), 'bytes 10-19/1000');
+    assert.deepEqual(new Uint8Array(await part.arrayBuffer()), body.slice(10, 20));
+    assert.equal((await fetch(url('/drop/file/room.glb'), { headers: { Range: 'bytes=5000-' } })).status, 416);
+
+    // Nothing outside the folder, and no raw serving of uploads by Vite.
+    probeFs.writeFileSync(nodePath.join(root, 'secret.txt'), 'top secret');
+    assert.equal((await fetch(url('/drop/file/..%2Fsecret.txt'))).status, 404);
+    assert.equal((await fetch(url('/drop/file/%2E%2E%2Fsecret.txt'))).status, 404);
+    assert.equal((await fetch(url('/drop/room.glb'))).status, 404, 'every /drop/ path is answered here');
+    probeFs.writeFileSync(nodePath.join(root, 'drop', 'page.html'), '<script>alert(1)</script>');
+    assert.equal((await fetch(url('/drop/page.html'))).status, 404, 'an uploaded page is never served as a page');
+    assert.equal((await fetch(url('/drop.html'))).status, 299, 'the upload page itself is left to Vite');
+    assert.equal((await fetch(url('/src/main.ts'))).status, 299);
+
+    // State changes from another site are refused; oversize uploads too.
+    const cross = await fetch(url('/drop/upload?name=x.glb'), {
+      method: 'POST',
+      body: new Uint8Array(4),
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(cross.status, 403);
+    const crossDel = await fetch(url('/drop/file/room.glb'), { method: 'DELETE', headers: { Origin: 'https://evil.example' } });
+    assert.equal(crossDel.status, 403);
+    assert.ok(probeFs.existsSync(nodePath.join(root, 'drop', 'room.glb')));
+    const huge = await new Promise<number>((resolve) => {
+      const req = nodeHttp.request(
+        { host: '127.0.0.1', port, path: '/drop/upload?name=huge.glb', method: 'POST', headers: { 'Content-Length': String(drop.DROP_MAX_BYTES + 1) } },
+        (res) => {
+          resolve(res.statusCode ?? 0);
+          res.resume();
+        },
+      );
+      req.on('error', () => resolve(-1));
+      req.end();
+    });
+    assert.equal(huge, 413);
+    assert.equal((await fetch(url('/drop/upload?name=' + encodeURIComponent('..')), { method: 'POST', body: new Uint8Array(1) })).status, 400);
+
+    const del = await fetch(url('/drop/file/' + encodeURIComponent('room (2).glb')), { method: 'DELETE' });
+    assert.equal(del.status, 200);
+    const after = (await (await fetch(url('/drop/list'))).json()) as { name: string }[];
+    assert.deepEqual(after.map((e) => e.name).sort(), ['page.html', 'room.glb'], 'the planted page is listed as a file, never served as a page');
+  } finally {
+    server.close();
+    probeFs.rmSync(root, { recursive: true, force: true });
+  }
+  passed++;
+  console.log('  ✓ P1.5: drop box server: upload, list, ranged inert downloads, no traversal, no raw serving, same-origin writes, size cap');
+}
+
+// --- P1 photo mode (P1.4) ---
+{
+  test('P1.4: fitTextureSize caps the longest edge at 2048 and keeps the aspect ratio', () => {
+    assert.deepEqual(fitTextureSize(4096, 2048), { width: 2048, height: 1024 });
+    assert.deepEqual(fitTextureSize(1000, 500), { width: 1000, height: 500 });
+    assert.deepEqual(fitTextureSize(2048, 2048), { width: 2048, height: 2048 });
+    assert.deepEqual(fitTextureSize(8192, 100), { width: 2048, height: 25 });
+  });
+
+  const photoRoot = () => {
+    const root = new THREE.Group();
+    const tex = new THREE.DataTexture(new Uint8Array(4 * 4 * 4), 4, 4);
+    const normal = new THREE.DataTexture(new Uint8Array(4 * 4 * 4), 4, 4);
+    let normalDisposed = false;
+    normal.addEventListener('dispose', () => (normalDisposed = true));
+    const textured = new THREE.MeshStandardMaterial({ map: tex, normalMap: normal });
+    const quad = () => {
+      const g = new THREE.PlaneGeometry(1, 1);
+      return g;
+    };
+    const a = new THREE.Mesh(quad(), textured);
+    const b = new THREE.Mesh(quad(), textured);
+    b.position.set(2, 0, 0);
+    const plain = new THREE.Mesh(quad(), new THREE.MeshStandardMaterial({ color: 0x336699 }));
+    root.add(a, b, plain);
+    return { root, tex, wasNormalDisposed: () => normalDisposed };
+  };
+
+  test('P1.4: setPhoto merges per material, draws unlit, frees unused textures and takes over from the scan', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    loc.setMode('photo');
+    const photoGroup = loc.group.getObjectByName('location-photo')!;
+    assert.equal(photoGroup.visible, false, 'nothing to show before the original loads');
+    assert.ok(loc.group.children.some((c) => (c as THREE.Mesh).isMesh && c.visible), 'Photo draws the scan (Solid) meanwhile');
+    loc.markPhotoLoading();
+    assert.equal(loc.photoState, 'loading');
+    const { root, tex, wasNormalDisposed } = photoRoot();
+    const transform = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0.25, 0, 1];
+    loc.setPhoto(root, transform);
+    assert.equal(loc.photoState, 'ready');
+    assert.equal(loc.photoPartCount, 2, 'two meshes sharing a textured material merge; the plain one stays separate');
+    const parts = photoGroup.children as THREE.Mesh[];
+    for (const p of parts) assert.ok((p.material as THREE.Material).type === 'MeshBasicMaterial', 'unlit');
+    const texturedPart = parts.find((p) => (p.material as THREE.MeshBasicMaterial).map)!;
+    assert.equal((texturedPart.material as THREE.MeshBasicMaterial).map, tex, 'small textures are kept as-is');
+    assert.ok(!texturedPart.geometry.getAttribute('normal'), 'normals are not kept for an unlit draw');
+    assert.equal(wasNormalDisposed(), true, 'a texture Photo never draws is freed');
+    approx(photoGroup.matrix.elements[13], 0.25, 1e-9);
+    assert.equal(photoGroup.visible, true);
+    const scanMeshes = loc.group.children.filter((c) => (c as THREE.Mesh).isMesh && c.name.startsWith('scan:'));
+    assert.ok(scanMeshes.length > 0 && scanMeshes.every((m) => !m.visible), 'the geometry scan is hidden under Photo');
+    loc.setPhotoTransform([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 3, 0, 0, 1]);
+    approx(photoGroup.matrix.elements[12], 3, 1e-9);
+  });
+
+  test('P1.4: the mode cycle offers Photo only when loaded, and the camera pass prefers it', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    loc.setMode('wireframe');
+    assert.equal(loc.cycleMode(), 'hidden', 'no Photo without an original');
+    loc.setPhoto(photoRoot().root, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    loc.setMode('wireframe');
+    assert.equal(loc.cycleMode(), 'photo');
+    assert.equal(loc.cycleMode(), 'hidden');
+    loc.setMode('hidden');
+    loc.beginCameraPass();
+    assert.equal(loc.mode, 'photo', 'Camera View shows the textured location');
+    loc.endCameraPass();
+    assert.equal(loc.mode, 'hidden');
+    loc.markPhotoFailed();
+    loc.beginCameraPass();
+    assert.equal(loc.mode, 'solid', 'without the original the camera pass is Solid');
+    loc.endCameraPass();
+    loc.setMode('photo');
+    loc.setScan(null);
+    assert.equal(loc.photoState, 'none', 'removing the scan drops its photo');
+    assert.equal(loc.photoPartCount, 0);
+  });
+
+  test('P1.4: normalizeScene keeps Photo only with a textured original', () => {
+    const s = createScene('photo');
+    s.scan = summarizeScan(createSyntheticLocationScan());
+    s.locationMode = 'photo';
+    normalizeScene(s);
+    assert.equal(s.locationMode, 'solid');
+    s.scan.source = { blobId: 'b', format: 'glb', transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], textured: true };
+    s.locationMode = 'photo';
+    normalizeScene(s);
+    assert.equal(s.locationMode, 'photo');
+  });
+}
+
+// --- P1 align (P1.6) ---
+{
+  const v = (x: number, y: number, z: number) => ({ x, y, z });
+  const near = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }, eps = 1e-6) => {
+    approx(a.x, b.x, eps);
+    approx(a.y, b.y, eps);
+    approx(a.z, b.z, eps);
+  };
+
+  test('P1.6: rigid deltas follow the three.js rotation.y convention and compose and invert', () => {
+    const q = reg.applyRigidToPoint({ dx: 0, dy: 0, dz: 0, rotY: Math.PI / 2 }, v(0, 0, 1));
+    near(q, v(1, 0, 0)); // Ry(90deg) takes +Z to +X, as THREE.Object3D.rotation.y does
+    const m = new THREE.Matrix4().fromArray(reg.rigidDeltaMatrix({ dx: 1, dy: 2, dz: 3, rotY: 0.7 }));
+    const viaThree = new THREE.Vector3(0.3, 0.5, -1.2).applyMatrix4(m);
+    near(reg.applyRigidToPoint({ dx: 1, dy: 2, dz: 3, rotY: 0.7 }, v(0.3, 0.5, -1.2)), viaThree);
+    const a = { dx: 1, dy: 0.1, dz: -2, rotY: 0.4 };
+    const b = { dx: -0.5, dy: 0, dz: 3, rotY: -1.1 };
+    const p = v(2, 1, 5);
+    near(reg.applyRigidToPoint(reg.composeRigid(a, b), p), reg.applyRigidToPoint(b, reg.applyRigidToPoint(a, p)));
+    near(reg.applyRigidToPoint(reg.invertRigid(a), reg.applyRigidToPoint(a, p)), p);
+    approx(reg.wrapAngle(3 * Math.PI), Math.PI, 1e-12);
+    approx(reg.wrapAngle(-Math.PI), Math.PI, 1e-12);
+  });
+
+  test('P1.6: solveTwoPoint recovers a known move within 1 mm and 0.1 degree, and flags bad input', () => {
+    const truth = { dx: 3.2, dy: -0.04, dz: -1.7, rotY: reg.wrapAngle(2.3) };
+    const srcA = v(-2, 0, 1);
+    const srcB = v(4, 0.02, -3);
+    const sol = reg.solveTwoPoint(srcA, srcB, reg.applyRigidToPoint(truth, srcA), reg.applyRigidToPoint(truth, srcB));
+    assert.ok(sol.ok);
+    if (sol.ok) {
+      approx(sol.delta.dx, truth.dx, 1e-3);
+      approx(sol.delta.dz, truth.dz, 1e-3);
+      approx(sol.delta.dy, truth.dy, 1e-3);
+      approx(sol.delta.rotY, truth.rotY, (0.1 * Math.PI) / 180);
+      assert.ok(sol.residual < 1e-6 && !sol.warn);
+    }
+    // 2 cm of hit-test noise at 7 m: still within a degree, and no warning.
+    const noisy = reg.solveTwoPoint(srcA, srcB, reg.applyRigidToPoint(truth, srcA), {
+      ...reg.applyRigidToPoint(truth, srcB),
+      x: reg.applyRigidToPoint(truth, srcB).x + 0.02,
+    });
+    assert.ok(noisy.ok && Math.abs(noisy.delta.rotY - truth.rotY) < (1 * Math.PI) / 180 && !noisy.warn);
+    // Spans that disagree by 40 cm (wrong points, or the wrong units): flagged.
+    const off = reg.solveTwoPoint(v(0, 0, 0), v(4, 0, 0), v(0, 0, 0), v(4.4, 0, 0));
+    assert.ok(off.ok && off.warn);
+    const close = reg.solveTwoPoint(v(0, 0, 0), v(0.3, 0, 0), v(0, 0, 0), v(0.3, 0, 0));
+    assert.ok(!close.ok && /at least 0.5 m/.test(close.reason));
+    assert.ok(!reg.solveTwoPoint(v(NaN, 0, 0), v(1, 0, 0), v(0, 0, 0), v(1, 0, 0)).ok);
+  });
+
+  test('P1.6: the two-point flow steps scan, real, scan, real, preview; refuses close points; steps back', () => {
+    let s = reg.twoPointInitial();
+    assert.match(reg.twoPointPrompt(s), /scan \(point A\)/);
+    s = reg.twoPointAddPoint(s, v(0, 0, 0));
+    assert.equal(s.phase, 'realA');
+    s = reg.twoPointAddPoint(s, v(1, 0, 1));
+    s = reg.twoPointAddPoint(s, v(0.2, 0, 0));
+    s = reg.twoPointAddPoint(s, v(1.2, 0, 1));
+    assert.equal(s.phase, 'scanB', 'too close: back to the second scan point');
+    assert.match(reg.twoPointPrompt(s), /at least 0.5 m/);
+    s = reg.twoPointAddPoint(s, v(4, 0, 0));
+    s = reg.twoPointAddPoint(s, v(5, 0, 1));
+    assert.equal(s.phase, 'preview');
+    assert.ok(s.solution?.ok);
+    assert.match(reg.twoPointPrompt(s), /Fit within 0 cm/);
+    assert.equal(reg.twoPointAddPoint(s, v(9, 9, 9)), s, 'a trigger in preview adds nothing');
+    s = reg.twoPointBack(s);
+    assert.equal(s.phase, 'realB');
+    assert.equal(s.solution, null);
+    for (const ph of ['scanB', 'realA', 'scanA', 'scanA'] as const) {
+      s = reg.twoPointBack(s);
+      assert.equal(s.phase, ph);
+    }
+  });
+
+  // World position of a scan vertex as LocationRenderer.applyPlacements draws it.
+  const drawn = (scan: LocationScan, placements: { meshIndex: number; dx: number; dz: number; rotY: number }[] | undefined, mi: number, vi: number) => {
+    const pos = scan.meshes[mi].positions;
+    const g = { x: pos[vi * 3], y: pos[vi * 3 + 1], z: pos[vi * 3 + 2] };
+    const pl = placements?.find((p) => p.meshIndex === mi);
+    if (!pl) return g;
+    const c = p1FootprintCenter(pos);
+    const r = reg.rotateXZ(pl.rotY, g.x - c.x, g.z - c.z);
+    return { x: c.x + pl.dx + r.x, y: g.y, z: c.z + pl.dz + r.z };
+  };
+
+  test('P1.6: applyRigidToScan moves every vertex, keeps moved furniture exactly where the move takes it', () => {
+    const scan = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+    const couch = scan.meshes.findIndex((m) => m.label === 'couch');
+    const wall = scan.meshes.findIndex((m) => m.label === 'walls');
+    const placements = [
+      { meshIndex: couch, dx: 0.8, dz: -0.4, rotY: 0.6 },
+      { meshIndex: wall, dx: 0.1, dz: 0, rotY: 0.2 }, // legacy placement on a static piece
+    ];
+    for (const delta of [
+      { dx: 0, dy: 0, dz: 0, rotY: 0 },
+      { dx: 0, dy: 0, dz: 0, rotY: Math.PI / 2 },
+      { dx: 1.5, dy: 0.03, dz: -2, rotY: 0 },
+      { dx: -0.7, dy: 0, dz: 2.2, rotY: 0.65 }, // a non-right angle: footprint centres do not turn with the mesh
+    ]) {
+      const out = applyRigidToScan(scan, placements, delta);
+      assert.notEqual(out.scan.id, scan.id, 'a new blob id, so undo can return to the old one');
+      assert.equal(out.scan.meshes.length, scan.meshes.length);
+      for (const mi of [couch, wall, 0]) {
+        const n = scan.meshes[mi].positions.length / 3;
+        for (const vi of [0, Math.floor(n / 2), n - 1]) {
+          near(drawn(out.scan, out.furniture, mi, vi), reg.applyRigidToPoint(delta, drawn(scan, placements, mi, vi)), 1e-4);
+        }
+      }
+      assert.equal(out.scan.meshes[0].indices, scan.meshes[0].indices, 'topology is shared, not copied');
+    }
+    assert.equal(scan.meshes[0].positions[0], createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']).meshes[0].positions[0], 'input untouched');
+    assert.equal(applyRigidToScan(scan, undefined, reg.IDENTITY_DELTA).furniture, undefined);
+    const bounds = summarizeScan(applyRigidToScan(scan, undefined, { dx: 10, dy: 0, dz: 0, rotY: 0 }).scan);
+    approx(bounds.boundsMin.x, summarizeScan(scan).boundsMin.x + 10, 1e-4);
+  });
+}
+
+// --- P1 align runtime pieces (P1.6) ---
+{
+  test('P1.6: LocationRenderer previews a delta, reads it back as pure yaw, and returns to rest', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    loc.setMode('ghost');
+    const d = { dx: 1.2, dy: 0.05, dz: -0.4, rotY: 0.7 };
+    loc.previewDelta(d);
+    const back = loc.poseDelta();
+    approx(back.dx, d.dx, 1e-9);
+    approx(back.dy, d.dy, 1e-9);
+    approx(back.dz, d.dz, 1e-9);
+    approx(back.rotY, d.rotY, 1e-9);
+    // A hand-held carry adds pitch and roll; poseDelta keeps only the yaw.
+    loc.group.rotation.set(0.2, 0.7, -0.1, 'YXZ');
+    approx(loc.poseDelta().rotY, 0.7, 1e-6);
+    loc.resetPose();
+    const rest = loc.poseDelta();
+    assert.deepEqual([rest.dx, rest.dy, rest.dz], [0, 0, 0]);
+    approx(rest.rotY, 0, 1e-12);
+    assert.ok(loc.pickTargets().length > 0);
+    loc.setMode('hidden');
+    assert.equal(loc.pickTargets().length, 0, 'nothing to pick on a hidden scan');
+    // A new scan resets any preview pose.
+    loc.previewDelta(d);
+    loc.setScan(createSyntheticLocationScan());
+    assert.equal(loc.group.position.x, 0);
+  });
+
+  test('P1.6: setScan keeps the photo original only when asked (an Align rebuild of the same scan)', () => {
+    const loc = new P1LocationRenderer();
+    loc.setScan(createSyntheticLocationScan());
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshStandardMaterial()));
+    loc.setPhoto(root, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], 'blob-1');
+    assert.equal(loc.photoSourceId, 'blob-1');
+    loc.setScan(createSyntheticLocationScan(), { keepPhoto: true });
+    assert.equal(loc.hasPhoto, true);
+    assert.equal(loc.photoSourceId, 'blob-1');
+    assert.equal(loc.photoPartCount, 1);
+    loc.setScan(createSyntheticLocationScan());
+    assert.equal(loc.hasPhoto, false, 'a different scan drops the photo');
+    assert.equal(loc.photoSourceId, null);
+  });
+
+  test('P1.6: the Dress ring opens Align (not the in-AR 3DGS dialog); the Align ring routes and hints', () => {
+    const dress = wheelMenu({ ...WHEEL_BASE, mode: 'dress', hasScan: true }, 'root');
+    assert.ok(dress.sectors.some((s) => s.id === 'sub-align' && s.submenu === 'align'));
+    assert.ok(!dress.sectors.some((s) => s.id === 'splat-studio'), '3DGS Studio lives on the 2D page');
+    assert.equal(wheelSectorRoute('splat-studio'), null);
+    const align = wheelMenu({ ...WHEEL_BASE, mode: 'dress', alignTool: 'two-point', alignHint: 'scan point A' }, 'align');
+    assert.deepEqual(
+      align.sectors.map((s) => s.id),
+      ['align-nudge', 'align-2pt', 'align-apply', 'align-back', 'align-scope', 'align-exit'],
+    );
+    assert.equal(align.hub.sub, 'scan point A');
+    assert.ok(align.sectors.find((s) => s.id === 'align-2pt')!.label.includes('●'), 'the tool in use is marked');
+    for (const s of align.sectors) assert.equal(wheelSectorRoute(s.id), 'wheel');
+    assert.equal(wheelMenu({ ...WHEEL_BASE, mode: 'dress' }, 'align').hub.sub, 'to tools');
+  });
+
+  test('P1.6: aligning suppresses the stick glide', () => {
+    const base = {
+      viewMode: 'full' as const,
+      draggingActor: false,
+      draggingCamera: false,
+      draggingProp: false,
+      draggingFurniture: false,
+      miniGrabbing: false,
+    };
+    assert.equal(locomotionSuppressed(base), false);
+    assert.equal(locomotionSuppressed({ ...base, aligning: true }), true);
+  });
+}
+
+// --- P1 re-register everything (P1.7) ---
+/** A scene with every kind of spatial data the app stores, for the rigid-move tests. */
+function p1PopulatedScene(): SceneData {
+  const s = createScene('populated');
+  const a = createActor(s, { x: 1, y: 0, z: -2 }, 0.3);
+  addKeyframe(a, { x: 2, y: 0, z: -3 }, 0.8);
+  a.ikTargets = { leftHand: { x: 1.2, y: 1.1, z: -2 }, rightHand: { x: 0.8, y: 1.1, z: -2 }, leftFoot: { x: 1.1, y: 0, z: -2 }, rightFoot: { x: 0.9, y: 0, z: -2 } };
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.2, 0.9, 0.05, 'YXZ'));
+  const cam = createCameraSetup(s, { x: -1, y: 1.6, z: 3 }, { x: q.x, y: q.y, z: q.z, w: q.w }, 35, '2.39:1');
+  addCameraKeyframe(cam, { x: -2, y: 1.6, z: 3.5 }, { x: q.x, y: q.y, z: q.z, w: q.w });
+  cam.gripRig = p1Grip('dolly_curved_track', { trackPoints: [{ x: -2, y: 0, z: 3 }, { x: 2, y: 0, z: 3 }], turretBasePos: { x: 0, y: 0, z: 3 } });
+  createLight(s, [3, 2.5, 1], 1.2, -0.4);
+  s.props = [createPropData('apple_box_full', 'box', { x: 0.5, y: 0, z: 1.5 }, { rotationY: 0.4 })];
+  s.audioCues = [p1CreateAudioCue({ name: 'door', position: { x: 4, y: 1, z: -1 } } as Parameters<typeof p1CreateAudioCue>[0])];
+  s.architecture = p1Arch();
+  s.architecture.walls = [p1Wall({ x: -3, y: 0, z: -4 }, { x: 3, y: 0, z: -4 })];
+  const cloud = p1Cloud('scout', [
+    { position: { x: 0, y: 1, z: 0 }, scale: { x: 0.1, y: 0.1, z: 0.1 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, color: { r: 1, g: 1, b: 1 }, opacity: 1 },
+  ]);
+  cloud.transform.position = { x: 0.5, y: 0, z: -0.5 };
+  s.gaussianClouds = [cloud];
+  s.icvfx = p1Led('horseshoe_270');
+  s.acoustics = p1Acoustics('dialogue_soundstage');
+  s.acoustics.boomMics = [p1Boom({ position: { x: 1, y: 2.2, z: 0 } })];
+  s.acoustics.lavalierMics = [p1Lav({ actorId: a.id })];
+  s.solar = p1Solar();
+  s.solar.northHeadingDeg = 30;
+  s.setDressing = p1Dressing({
+    regions: [{ id: 'r', name: 'floor', type: 'floor', bounds: { min: { x: -2, y: 0, z: -1 }, max: { x: 2, y: 0.1, z: 1 } } }],
+    settledItems: [
+      {
+        id: 'i',
+        templateName: 't',
+        propType: 'crate',
+        name: 'crate',
+        position: { x: 1, y: 0.3, z: 1 },
+        rotation: { x: 0.2, y: 0.5, z: -0.1 },
+        scale: { x: 1, y: 1, z: 1 },
+        color: '#888',
+        isSettled: true,
+        stackLevel: 0,
+        surfaceY: 0,
+        weightKg: 5,
+      },
+    ],
+  });
+  return s;
+}
+
+/** Every spatial-looking field of a scene, as schema paths ('a[].b'). */
+function p1SpatialPaths(scene: unknown): Map<string, 'vec' | 'quat' | 'triple' | 'heading'> {
+  const out = new Map<string, 'vec' | 'quat' | 'triple' | 'heading'>();
+  const num = (v: unknown) => typeof v === 'number';
+  const walk = (node: unknown, path: string, key: string) => {
+    if (Array.isArray(node)) {
+      if (node.length === 3 && node.every(num) && key === 'position') out.set(path, 'triple');
+      else for (const el of node) walk(el, `${path}[]`, key);
+      return;
+    }
+    if (!node || typeof node !== 'object') {
+      if (num(node) && (key === 'rotationY' || key === 'northHeadingDeg')) out.set(path, 'heading');
+      return;
+    }
+    const o = node as Record<string, unknown>;
+    if (num(o.x) && num(o.y) && num(o.z)) {
+      out.set(path, num(o.w) ? 'quat' : 'vec');
+      return;
+    }
+    for (const [k, v] of Object.entries(o)) {
+      if (!path && k === 'scan') continue; // replaced by the caller (applyRigidToScan)
+      walk(v, path ? `${path}.${k}` : k, k);
+    }
+  };
+  walk(scene, '', '');
+  return out;
+}
+
+{
+  const v = (x: number, y: number, z: number) => ({ x, y, z });
+  const d: reg.RigidDelta = { dx: 1.4, dy: 0.02, dz: -0.6, rotY: 0.65 };
+
+  test('P1.7: yawQuat and yawEulerXYZ match three.js for tilted orientations', () => {
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.3, -0.7, 0.2));
+    const want = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), d.rotY).multiply(q);
+    const got = reg.yawQuat({ x: q.x, y: q.y, z: q.z, w: q.w }, d.rotY);
+    approx(Math.abs(got.x * want.x + got.y * want.y + got.z * want.z + got.w * want.w), 1, 1e-9);
+    const e = reg.yawEulerXYZ(v(0.3, -0.7, 0.2), d.rotY);
+    const viaEuler = new THREE.Quaternion().setFromEuler(new THREE.Euler(e.x, e.y, e.z));
+    approx(Math.abs(viaEuler.dot(want)), 1, 1e-9);
+    assert.deepEqual(reg.yawEulerXYZ(v(0, 1, 0), 0.5), v(0, 1.5, 0), 'untilted: just adds to y');
+  });
+
+  test('P1.7: transformSceneRigid moves every scheduled field exactly, keeps local ones, and keeps North true', () => {
+    const before = p1PopulatedScene();
+    const after = reg.transformSceneRigid(JSON.parse(JSON.stringify(before)) as SceneData, d);
+    const mv = (p: { x: number; y: number; z: number }) => reg.applyRigidToPoint(d, p);
+    const near = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => {
+      approx(a.x, b.x, 1e-9);
+      approx(a.y, b.y, 1e-9);
+      approx(a.z, b.z, 1e-9);
+    };
+    near(after.actors[0].position, mv(before.actors[0].position));
+    near(after.actors[0].keyframes[0].position, mv(before.actors[0].keyframes[0].position));
+    near(after.actors[0].ikTargets!.leftFoot!, mv(before.actors[0].ikTargets!.leftFoot!));
+    approx(after.actors[0].rotationY, reg.wrapAngle(before.actors[0].rotationY + d.rotY), 1e-12);
+    near(after.cameras[0].position, mv(before.cameras[0].position));
+    near(after.cameras[0].gripRig!.trackPoints![1], mv(before.cameras[0].gripRig!.trackPoints![1]));
+    near(after.cameras[0].gripRig!.turretBasePos!, mv(before.cameras[0].gripRig!.turretBasePos!));
+    const camFwd = (r: { x: number; y: number; z: number; w: number }) =>
+      new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(r.x, r.y, r.z, r.w));
+    const f0 = camFwd(before.cameras[0].rotation);
+    const f1 = camFwd(after.cameras[0].rotation);
+    near(f1, reg.applyRigidToPoint({ ...d, dx: 0, dy: 0, dz: 0 }, f0)); // the camera looks the same way relative to the set
+    const lp = after.lights[0].position;
+    near({ x: lp[0], y: lp[1], z: lp[2] }, mv({ x: before.lights[0].position[0], y: before.lights[0].position[1], z: before.lights[0].position[2] }));
+    approx(after.lights[0].rotationX, before.lights[0].rotationX, 1e-12);
+    near(after.props![0].position, mv(before.props![0].position));
+    near(after.audioCues![0].position!, mv(before.audioCues![0].position!));
+    near(after.architecture!.walls[0].end, mv(before.architecture!.walls[0].end));
+    near(after.gaussianClouds![0].transform.position, mv(before.gaussianClouds![0].transform.position));
+    near(after.gaussianClouds![0].splats[0].position, before.gaussianClouds![0].splats[0].position); // cloud-local
+    near(after.icvfx!.walls[0].center, mv(before.icvfx!.walls[0].center));
+    near(after.acoustics!.boomMics[0].pole.targetPoint, mv(before.acoustics!.boomMics[0].pole.targetPoint));
+    near(after.acoustics!.lavalierMics[0].chestOffset, before.acoustics!.lavalierMics[0].chestOffset); // actor-relative
+    const item0 = before.setDressing!.settledItems[0];
+    const item1 = after.setDressing!.settledItems[0];
+    near(item1.position, mv(item0.position));
+    approx(item1.surfaceY, item0.surfaceY + d.dy, 1e-12);
+    const qi0 = new THREE.Quaternion().setFromEuler(new THREE.Euler(item0.rotation.x, item0.rotation.y, item0.rotation.z));
+    const qi1 = new THREE.Quaternion().setFromEuler(new THREE.Euler(item1.rotation.x, item1.rotation.y, item1.rotation.z));
+    approx(Math.abs(qi1.dot(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), d.rotY).multiply(qi0))), 1, 1e-9);
+    const b = after.setDressing!.regions[0].bounds;
+    for (const x of [-2, 2]) for (const z of [-1, 1]) {
+      const p = mv(v(x, 0, z));
+      assert.ok(p.x >= b.min.x - 1e-9 && p.x <= b.max.x + 1e-9 && p.z >= b.min.z - 1e-9 && p.z <= b.max.z + 1e-9, 'moved box corners stay inside');
+    }
+    // The sun keeps lighting the set from the same real-world side.
+    const sun0 = p1Sun(120, 35, before.solar!.northHeadingDeg);
+    const sun1 = p1Sun(120, 35, after.solar!.northHeadingDeg);
+    const turned = reg.applyRigidToPoint({ ...d, dx: 0, dy: 0, dz: 0 }, sun0);
+    approx(sun1.x, turned.x, 1e-4);
+    approx(sun1.z, turned.z, 1e-4);
+    assert.ok(after.solar!.northHeadingDeg >= 0 && after.solar!.northHeadingDeg < 360);
+    assert.equal(after.scan, before.scan, 'the scan is left to the caller');
+  });
+
+  test('P1.7: every spatial field a scene stores is classified by RIGID_SCENE_SCHEMA (review R5)', () => {
+    const S = reg.RIGID_SCENE_SCHEMA;
+    const known = new Set<string>([
+      ...S.positions,
+      ...S.headings,
+      ...S.orientations,
+      ...S.eulers,
+      ...S.heights,
+      ...S.north,
+      ...S.local,
+      ...S.boxes.flatMap((p) => [`${p}.min`, `${p}.max`]),
+    ]);
+    const found = p1SpatialPaths(p1PopulatedScene());
+    const unknown = [...found.keys()].filter((p) => !known.has(p));
+    assert.deepEqual(unknown, [], `spatial fields with no rigid-move rule: ${unknown.join(', ')}`);
+    // And the fixture exercises every rule that moves something (no typo'd paths).
+    const moved = [...S.positions, ...S.headings, ...S.orientations, ...S.eulers, ...S.north].filter((p) => !found.has(p));
+    assert.deepEqual(moved, [], `schema paths the populated scene does not contain: ${moved.join(', ')}`);
+  });
+}
+
+// --- P1 guided capture (P1.8) ---
+{
+  test('P1.8: guide chips point at Scan Room, explain a scan in progress, and coach Align', () => {
+    const base = { mode: 'full' as const, placeMode: 'none' as const, eyesMode: false, interaction: 'dress' as const };
+    const lower = (ctx: Parameters<typeof guideItems>[0]) => guideItems(ctx).find((i) => i.hand === 'left' && i.anchor === 'lower')?.label;
+    assert.match(lower({ ...base, hasScan: false })!, /Scan Room/);
+    assert.equal(lower({ ...base, hasScan: true }), undefined);
+    assert.equal(lower(base), undefined, 'contexts without the field are unchanged');
+    assert.match(lower({ ...base, hasScan: false, scanning: 'collecting' })!, /again to finish/);
+    assert.match(lower({ ...base, scanning: 'waiting' })!, /reading the room/);
+    const nudge = guideItems({ ...base, aligning: 'nudge' });
+    assert.ok(nudge.some((i) => i.anchor === 'grip' && /carry the room/.test(i.label)));
+    assert.ok(nudge.some((i) => i.anchor === 'upper' && /back one step/.test(i.label)));
+    const two = guideItems({ ...base, aligning: 'two-point' });
+    assert.ok(two.some((i) => i.anchor === 'trigger' && /scan point/.test(i.label)));
+    assert.ok(!two.some((i) => /teleport/.test(i.label)), 'no teleport hint while aligning');
+  });
+
+  test('P1.8: plane pieces are marked, normalized, static, and count as floor evidence', () => {
+    assert.equal(normalizeSemanticLabel('PLANE:Door Frame'), 'plane:door');
+    assert.equal(planeLabel('Wall_Face'), 'plane:wall');
+    assert.ok(isPlaneLabel('plane:table'));
+    assert.equal(baseScanLabel('plane:table'), 'table');
+    assert.equal(isMovableScanMesh('table'), true);
+    assert.equal(isMovableScanMesh('plane:table'), false, 'a plane outline is never grabbable');
+    const floorPlane = { label: 'plane:floor', positions: new Float32Array([0, 0.02, 0, 1, 0.02, 0, 0, 0.02, 1]), indices: new Uint32Array([0, 1, 2]) };
+    approx(scanFloorY({ version: 1, id: 'x', capturedAt: 0, meshes: [floorPlane] })!, 0.02, 1e-6);
+  });
+
+  test('P1.8: unlabeled planes are classified by normal and height', () => {
+    assert.equal(classifyPlane(0.05, 1.2), 'wall');
+    assert.equal(classifyPlane(1, 0.02), 'floor');
+    assert.equal(classifyPlane(-1, 0.75), 'table');
+    assert.equal(classifyPlane(1, 2.6), 'ceiling');
+  });
+
+  const triArea = (xz: number[], ix: Uint32Array) => {
+    let a = 0;
+    for (let k = 0; k < ix.length; k += 3) {
+      const [i, j, m] = [ix[k], ix[k + 1], ix[k + 2]];
+      a += Math.abs((xz[j * 2] - xz[i * 2]) * (xz[m * 2 + 1] - xz[i * 2 + 1]) - (xz[j * 2 + 1] - xz[i * 2 + 1]) * (xz[m * 2] - xz[i * 2])) / 2;
+    }
+    return a;
+  };
+  const facesUp = (xz: number[], ix: Uint32Array) => {
+    for (let k = 0; k < ix.length; k += 3) {
+      const a = new THREE.Vector3(xz[ix[k] * 2], 0, xz[ix[k] * 2 + 1]);
+      const b = new THREE.Vector3(xz[ix[k + 1] * 2], 0, xz[ix[k + 1] * 2 + 1]);
+      const c = new THREE.Vector3(xz[ix[k + 2] * 2], 0, xz[ix[k + 2] * 2 + 1]);
+      if (new THREE.Vector3().subVectors(b, a).cross(new THREE.Vector3().subVectors(c, a)).y <= 0) return false;
+    }
+    return true;
+  };
+
+  test('P1.8: ear clipping triangulates concave plane outlines, either winding, facing the plane normal', () => {
+    const square = [0, 0, 2, 0, 2, 2, 0, 2];
+    const sq = triangulatePolygon(square);
+    assert.equal(sq.length, 6);
+    approx(triArea(square, sq), 4, 1e-9);
+    assert.ok(facesUp(square, sq));
+    // An L-shaped floor (area 3): a fan from vertex 0 would cover the notch.
+    const ell = [0, 0, 2, 0, 2, 1, 1, 1, 1, 2, 0, 2];
+    const l = triangulatePolygon(ell);
+    assert.equal(l.length, 12);
+    approx(triArea(ell, l), 3, 1e-9);
+    assert.ok(facesUp(ell, l));
+    for (let k = 0; k < l.length; k += 3) {
+      const cx = (ell[l[k] * 2] + ell[l[k + 1] * 2] + ell[l[k + 2] * 2]) / 3;
+      const cz = (ell[l[k] * 2 + 1] + ell[l[k + 1] * 2 + 1] + ell[l[k + 2] * 2 + 1]) / 3;
+      assert.ok(!(cx > 1 && cz > 1), 'no triangle inside the notch');
+    }
+    const cw = [0, 2, 1, 2, 1, 1, 2, 1, 2, 0, 0, 0]; // the same L, clockwise
+    const lc = triangulatePolygon(cw);
+    approx(triArea(cw, lc), 3, 1e-9);
+    assert.ok(facesUp(cw, lc));
+    assert.equal(triangulatePolygon([0, 0, 1, 1]).length, 0);
+    assert.doesNotThrow(() => triangulatePolygon([0, 0, 1, 0, 2, 0, 3, 0]), 'collinear outline');
+  });
+
+  const frameIn = (over: Partial<flow.ScanFrameInput> = {}): flow.ScanFrameInput => ({
+    now: 0,
+    fading: false,
+    viewFull: true,
+    shifted: false,
+    visible: true,
+    floorSettled: true,
+    hasData: false,
+    ...over,
+  });
+
+  test('P1.8: the scan flow snapshots meshes, waits for realign and floor, hints, times out, cancels', () => {
+    let s = flow.scanStart(['meshes', 'planes'], true);
+    assert.equal(s.phase, 'realign');
+    assert.equal(s.collect, false, 'meshes available: snapshot, not collect');
+    let r = flow.scanFrame(s, frameIn({ fading: true }));
+    assert.equal(r.action.kind, 'wait');
+    r = flow.scanFrame(r.state, frameIn({ now: 100, floorSettled: false }));
+    assert.equal(r.state.phase, 'waiting');
+    assert.equal(r.action.kind, 'floor-hint');
+    r = flow.scanFrame(r.state, frameIn({ now: 200, floorSettled: false }));
+    assert.equal(r.action.kind, 'wait', 'the floor hint is said once');
+    r = flow.scanFrame(r.state, frameIn({ now: 300, hasData: true }));
+    assert.equal(r.action.kind, 'capture');
+    s = r.state;
+    r = flow.scanFrame(s, frameIn({ now: 100 + flow.SCAN_HINT_AFTER_MS + 1 }));
+    assert.equal(r.action.kind, 'hint');
+    r = flow.scanFrame(r.state, frameIn({ now: 100 + flow.SCAN_TIMEOUT_MS + 1 }));
+    assert.equal(r.action.kind, 'timeout');
+    assert.equal(flow.scanFrame(s, frameIn({ shifted: true })).action.kind, 'cancel');
+    assert.equal(flow.scanFrame(s, frameIn({ viewFull: false })).action.kind, 'cancel');
+    // System UI over the session holds the clock: no timeout during Space Setup.
+    let h = flow.scanStart(['meshes'], false);
+    h = flow.scanFrame(h, frameIn({ now: 0 })).state;
+    h = flow.scanFrame(h, frameIn({ now: 60_000, visible: false })).state;
+    assert.equal(flow.scanFrame(h, frameIn({ now: 61_000 })).action.kind, 'wait');
+    assert.equal(flow.scanPress(null), 'start');
+    assert.equal(flow.scanPress(s), 'cancel');
+    assert.equal(flow.scanSectorLabel(null), 'Scan\nRoom');
+  });
+
+  test('P1.8: planes-only scans collect at most twice a second and finish on the next press', () => {
+    let s = flow.scanStart(['planes'], false);
+    assert.equal(s.phase, 'collecting');
+    let r = flow.scanFrame(s, frameIn({ now: 1000, hasData: true }));
+    assert.equal(r.action.kind, 'collect');
+    s = flow.scanCollected(r.state, 0);
+    assert.equal(flow.scanPress(s), 'cancel', 'nothing collected yet: the press cancels');
+    r = flow.scanFrame(s, frameIn({ now: 1000 + flow.SCAN_COLLECT_INTERVAL_MS - 1, hasData: true }));
+    assert.equal(r.action.kind, 'wait', 'not every frame (review R12)');
+    r = flow.scanFrame(r.state, frameIn({ now: 1000 + flow.SCAN_COLLECT_INTERVAL_MS, hasData: true }));
+    assert.equal(r.action.kind, 'collect');
+    s = flow.scanCollected(r.state, 7);
+    assert.equal(flow.scanPress(s), 'finish');
+    assert.equal(flow.scanSectorLabel(s), 'Finish\nScan (7)');
+    // With planes found it never times out: the user finishes it.
+    let late = flow.scanFrame({ ...s, lastCollectAt: 1e9 }, frameIn({ now: 1000 + flow.SCAN_TIMEOUT_MS * 3 }));
+    assert.notEqual(late.action.kind, 'timeout');
+    late = flow.scanFrame({ ...flow.scanStart(['planes'], false), startedAt: 0, lastCollectAt: 1e12, hinted: true }, frameIn({ now: flow.SCAN_TIMEOUT_MS + 1 }));
+    assert.equal(late.action.kind, 'timeout', 'no planes at all: times out');
+  });
+
+  // A minimal XRFrame / XRPlane stand-in: identity poses in scene space.
+  const identityPose = { transform: { matrix: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) } };
+  const plane = (label: string | undefined, poly: [number, number][], changed: number, y = 0) => ({
+    planeSpace: { y } as unknown as XRSpace,
+    polygon: poly.map(([x, z]) => ({ x, y: 0, z })),
+    semanticLabel: label,
+    lastChangedTime: changed,
+  });
+  const fakeFrame = (planes: ReturnType<typeof plane>[], meshes: unknown[] = []) => {
+    let poses = 0;
+    const frame = {
+      detectedPlanes: new Set(planes),
+      detectedMeshes: new Set(meshes),
+      getPose: (space: { y?: number }) => {
+        poses++;
+        const m = identityPose.transform.matrix.slice();
+        m[13] = space.y ?? 0;
+        return { transform: { matrix: m } };
+      },
+    } as unknown as XRFrame;
+    return { frame, poseCalls: () => poses };
+  };
+
+  test('P1.8: PlaneCollector re-triangulates only changed planes, labels them, and writes outlines into a fixed buffer', () => {
+    const floor = plane(undefined, [[0, 0], [3, 0], [3, 3], [0, 3]], 1);
+    const table = plane(undefined, [[0, 0], [1, 0], [1, 1], [0, 1]], 1, 0.75);
+    const door = plane('door frame', [[0, 0], [1, 0], [1, 2], [0, 2]], 1);
+    const col = new PlaneCollector();
+    const ref = {} as XRReferenceSpace;
+    const ws = new THREE.Matrix4();
+    const f1 = fakeFrame([floor, table, door]);
+    assert.equal(col.refresh(f1.frame, ref, ws), 3);
+    assert.equal(f1.poseCalls(), 3);
+    const f2 = fakeFrame([floor, table, door]);
+    col.refresh(f2.frame, ref, ws);
+    assert.equal(f2.poseCalls(), 0, 'unchanged planes are not re-triangulated');
+    floor.lastChangedTime = 2;
+    const f3 = fakeFrame([floor, table, door]);
+    col.refresh(f3.frame, ref, ws);
+    assert.equal(f3.poseCalls(), 1, 'only the changed plane');
+    const scan = col.toScan()!;
+    assert.deepEqual(scan.meshes.map((m) => m.label).sort(), ['plane:door', 'plane:floor', 'plane:table']);
+    const buf = new Float32Array(1000);
+    assert.equal(col.writeOutlines(buf), 3 * 4 * 2, 'two endpoints per outline edge');
+    assert.equal(col.writeOutlines(new Float32Array(12)), 4, 'stops when the buffer is full');
+    col.clear();
+    assert.equal(col.toScan(), null);
+  });
+
+  test('P1.8: captureScanFromFrame keeps planes alongside meshes; the renderer hides them under a room mesh', () => {
+    const mesh = {
+      meshSpace: {},
+      vertices: new Float32Array([0, 0, 0, 4, 0, 0, 0, 0, 4, 4, 2.5, 0]),
+      indices: new Uint32Array([0, 1, 2, 1, 3, 2]),
+      semanticLabel: undefined,
+    };
+    const wall = plane('wall', [[0, 0], [4, 0], [4, 2.5], [0, 2.5]], 1);
+    const { frame } = fakeFrame([wall], [mesh]);
+    const scan = p1Capture(frame, {} as XRReferenceSpace, new THREE.Matrix4())!;
+    assert.deepEqual(scan.meshes.map((m) => m.label), ['global mesh', 'plane:wall']);
+    const loc = new P1LocationRenderer();
+    loc.setScan(scan);
+    loc.setMode('solid');
+    const drawn = loc.group.children.filter((c) => (c as THREE.Mesh).isMesh && c.name.startsWith('scan:'));
+    assert.equal(drawn.length, 2, 'both kept (mesh indices stay stable)');
+    assert.deepEqual(drawn.map((m) => m.visible), [true, false], 'the wall plane is not drawn twice');
+    assert.equal(loc.pickTargets().length, 1);
+    // Planes only (Android XR): the plane pieces are the room and are drawn.
+    loc.setScan({ ...scan, meshes: scan.meshes.slice(1) });
+    assert.equal(loc.pickTargets().length, 1);
+    assert.ok(loc.group.children.some((c) => c.name === 'scan:plane:wall' && c.visible));
+  });
+}
+
+// Async tests that swap globalThis.localStorage run one after another, never concurrently.
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()])
   .then(() => storageLateOpenTest())
+  .then(() => p1BlobStoreTest())
+  .then(() => p1BlobLateOpenTest())
+  .then(() => p1LocationImportTest())
+  .then(() => p1DropBoxServerTest())
   .then(
-
   () => {
     passed += 4;
     console.log('  ✓ ScanStore: memory fallback contract (put/get/list/prune/delete + warning)');

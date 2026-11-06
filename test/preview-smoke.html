@@ -138,10 +138,19 @@
             roomBtn?.click(); // Hidden
             roomBtn?.click(); // back to Ghost for the screenshot
           }
+          // Every toolbar button must be inside the window (the bar used to run off both edges).
+          const offscreen = [...document.querySelectorAll('.preview-bar button')]
+            .filter((b) => {
+              const r = b.getBoundingClientRect();
+              return r.left < 0 || r.right > innerWidth || r.top < 0 || r.bottom > innerHeight;
+            })
+            .map((b) => b.textContent.trim());
+          if (offscreen.length) scanNote += ` offscreen=[${offscreen.join(', ')}]`;
           const ok =
             err === 0 &&
             preview.active &&
             document.querySelector('.preview-bar') !== null &&
+            offscreen.length === 0 &&
             scanOk &&
             (params.has('gallery') || keyframes.duration > 0); // gallery has no moves
           out.textContent = ok

@@ -23,6 +23,22 @@ export interface CustomPropAsset {
   buffer: ArrayBuffer;
 }
 
+/** An asset without its model bytes, for listings. */
+export type CustomPropAssetMeta = Omit<CustomPropAsset, 'buffer'>;
+
+export function assetMeta(a: CustomPropAsset): CustomPropAssetMeta {
+  return {
+    id: a.id,
+    name: a.name,
+    fileName: a.fileName,
+    fileType: a.fileType,
+    category: a.category,
+    dimensions: a.dimensions,
+    sizeBytes: a.sizeBytes,
+    uploadedAt: a.uploadedAt,
+  };
+}
+
 const DB_NAME = 'setview_assets';
 const DB_VERSION = 1;
 const STORE_NAME = 'custom_props';
@@ -187,6 +203,37 @@ export class PropStore {
         req.onerror = () => resolve(Array.from(this.memory.values()));
       } catch {
         resolve(Array.from(this.memory.values()));
+      }
+    });
+  }
+
+  /**
+   * Metadata of every custom asset, without keeping any model bytes. Walks a
+   * cursor, so each record is read and dropped in turn: peak memory is one
+   * asset, not all of them, and nothing is added to the session cache (unlike
+   * listAssets, whose getAll holds every upload at once).
+   */
+  async listAssetMeta(): Promise<CustomPropAssetMeta[]> {
+    const out = new Map<string, CustomPropAssetMeta>();
+    for (const a of this.memory.values()) out.set(a.id, assetMeta(a));
+    const db = await this.open();
+    if (!db) return [...out.values()];
+    return new Promise((resolve) => {
+      try {
+        const req = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).openCursor();
+        req.onsuccess = () => {
+          const cur = req.result;
+          if (!cur) {
+            resolve([...out.values()]);
+            return;
+          }
+          const a = cur.value as CustomPropAsset;
+          if (a && typeof a.id === 'string') out.set(a.id, assetMeta(a));
+          cur.continue();
+        };
+        req.onerror = () => resolve([...out.values()]);
+      } catch {
+        resolve([...out.values()]);
       }
     });
   }

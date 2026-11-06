@@ -981,6 +981,62 @@ export interface ScanSummary {
   boundsMax: Vec3;
   /** Moved furniture (labeled scan meshes). Absent = everything as captured. */
   furniture?: FurniturePlacement[];
+  /** The original file an imported location came from. Absent for headset captures. */
+  source?: ScanSourceFile;
+  /** Imported from a file (not captured in the headset): Scan Room asks before replacing it. */
+  imported?: boolean;
+}
+
+/**
+ * Reference to the original file of an imported location. The bytes live in
+ * the blob store (blobStore.ts, keyed by blobId); scene JSON, undo and collab
+ * carry only this. Photo mode draws the textured original through `transform`.
+ */
+export interface ScanSourceFile {
+  blobId: string;
+  /** Detected file kind (sceneImport.ts SceneFileKind), e.g. 'glb'. */
+  format: string;
+  fileName?: string;
+  /** Recognised capture app ('polycam', 'scaniverse', ...), if any. */
+  app?: string;
+  /**
+   * Column-major 4x4 from the source file's root to scene space: the import
+   * conversion, then every Align applied since, so the textured original
+   * stays registered with the geometry scan.
+   */
+  transform: number[];
+  /** The original carries textures worth drawing in Photo mode. */
+  textured?: boolean;
+}
+
+export function isScanSourceFile(v: unknown): v is ScanSourceFile {
+  const s = v as ScanSourceFile;
+  return (
+    !!s &&
+    typeof s === 'object' &&
+    typeof s.blobId === 'string' &&
+    s.blobId.length > 0 &&
+    typeof s.format === 'string' &&
+    Array.isArray(s.transform) &&
+    s.transform.length === 16 &&
+    s.transform.every(isFiniteNum) &&
+    (s.fileName === undefined || typeof s.fileName === 'string') &&
+    (s.app === undefined || typeof s.app === 'string') &&
+    (s.textured === undefined || typeof s.textured === 'boolean')
+  );
+}
+
+/**
+ * Every blob-store id the given scenes reference. Used to prune orphaned
+ * originals at launch (never mid-session, so undo can still restore them).
+ */
+export function collectBlobRefs(scenes: Iterable<SceneData | null | undefined>): Set<string> {
+  const refs = new Set<string>();
+  for (const s of scenes) {
+    const id = s?.scan?.source?.blobId;
+    if (id) refs.add(id);
+  }
+  return refs;
 }
 
 export type LightType = 'spot' | 'point' | 'area';
@@ -1070,9 +1126,9 @@ export interface SceneData {
 }
 
 /** Location scan display modes (rendered by location.ts). */
-export type LocationDisplayMode = 'hidden' | 'ghost' | 'solid' | 'wireframe';
+export type LocationDisplayMode = 'hidden' | 'ghost' | 'solid' | 'wireframe' | 'photo';
 
-export const LOCATION_DISPLAY_MODES: readonly LocationDisplayMode[] = ['hidden', 'ghost', 'solid', 'wireframe'];
+export const LOCATION_DISPLAY_MODES: readonly LocationDisplayMode[] = ['hidden', 'ghost', 'solid', 'wireframe', 'photo'];
 
 export function isLocationDisplayMode(v: unknown): v is LocationDisplayMode {
   return typeof v === 'string' && (LOCATION_DISPLAY_MODES as readonly string[]).includes(v);
@@ -1820,6 +1876,9 @@ export function normalizeScene(s: SceneData): SceneData {
     s.scan.furniture = s.scan.furniture.filter(isFurniturePlacement);
     if (s.scan.furniture.length === 0) delete s.scan.furniture;
   }
+  // A malformed original-file reference only costs Photo mode; drop it, keep the scan.
+  if (s.scan && s.scan.source !== undefined && !isScanSourceFile(s.scan.source)) delete s.scan.source;
+  if (s.scan && s.scan.imported !== undefined && typeof s.scan.imported !== 'boolean') delete s.scan.imported;
   // A bad value is dropped rather than failing the import (it is only a view
   // preference); a scene with a scan shows it as Ghost unless told otherwise.
   if (s.locationMode !== undefined && !isLocationDisplayMode(s.locationMode)) delete s.locationMode;
@@ -1827,6 +1886,8 @@ export function normalizeScene(s: SceneData): SceneData {
   // one's Hidden and seem to do nothing.
   if (!s.scan) delete s.locationMode;
   if (s.scan && s.locationMode === undefined) s.locationMode = 'ghost';
+  // Photo needs a textured original; without one it would only ever draw Solid.
+  if (s.locationMode === 'photo' && !s.scan?.source?.textured) s.locationMode = 'solid';
   if (!Array.isArray(s.lights)) {
     s.lights = [];
   } else {

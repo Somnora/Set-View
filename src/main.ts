@@ -29,8 +29,9 @@ import { classifyCameraMove } from './timeline.ts';
 import { History } from './history.ts';
 import { cycleStance, isStanceId, poseFor, type StanceId } from './pose.ts';
 import { locomotionAmount, snapTurnAngle } from './locomotion.ts';
-import { roomCaptureMessage, scanFloorY, summarizeScan, translateScanY, type ScanSource } from './scan.ts';
-import { captureScanFromFrame } from './scanner.ts';
+import { roomCaptureMessage, scanFloorY, summarizeScan, translateScanY, type LocationScan } from './scan.ts';
+import { captureScanFromFrame, PlaneCollector } from './scanner.ts';
+import { scanCollected, scanFrame, scanPress, scanSectorLabel, scanStart, type ScanFlowState } from './scanFlow.ts';
 import { LocationRenderer, type LocationMode } from './location.ts';
 import { checkSupport, SessionManager } from './session.ts';
 import { InputManager, type Hand } from './input.ts';
@@ -60,6 +61,20 @@ import {
 } from './floor.ts';
 import { Persistence } from './persistence.ts';
 import { formatStorageLine } from './persistence.ts';
+import { disposeModel, importLocationBytes, parseModelBytes, type UnitChoice, type UpAxisChoice } from './locationImport.ts';
+import { multiplyMat4, type SceneFileKind } from './sceneImport.ts';
+import {
+  rigidDeltaMatrix,
+  transformSceneRigid,
+  twoPointAddPoint,
+  twoPointBack,
+  twoPointInitial,
+  twoPointPrompt,
+  type RigidDelta,
+  type TwoPointState,
+} from './registration.ts';
+import { sceneDropName } from './dropBox.ts';
+import type { ScanSourceFile, ScanSummary } from './model.ts';
 import {
   buildWristPanel,
   DebugLog,
@@ -142,7 +157,7 @@ import { PropsManager, type PropObject } from './propsManager.ts';
 import { globalPropRenderer } from './propRenderer.ts';
 import { getBuiltinPropDefinition, propSpawnHitUsable, settlePropY, snapPropToGrid } from './props.ts';
 import { locomotionSuppressed, type LocomotionState } from './locomotion.ts';
-import { quatYaw } from './scan.ts';
+import { applyRigidToScan, quatYaw } from './scan.ts';
 import { submenuForSector, wheelPropPreset, wheelSectorRoute } from './wheel.ts';
 import { globalPropStore } from './propStore.ts';
 import { LiveLinkStreamer } from './liveLinkStreamer.ts';
@@ -199,14 +214,10 @@ const LOCOMOTION_DEADZONE = 0.15;
 /** Snap-turn increment (radians) per thumbstick push. */
 const SNAP_TURN_RAD = Math.PI / 6; // 30°
 
-/** Give the platform this long to surface tracked meshes before giving up. */
-const SCAN_TIMEOUT_MS = 30_000;
-/** If nothing is tracked after this long, say what to do about it (once). */
-const SCAN_HINT_AFTER_MS = 5_000;
+/** Most plane-outline segments the planes-only scan preview draws. */
+const SCAN_PREVIEW_MAX_SEGMENTS = 8192;
 /** Run Space Setup needs a second press within this window (anchor warning). */
 const SPACE_SETUP_CONFIRM_MS = 5_000;
-/** Longest a scan waits for the floor estimate to settle before capturing anyway. */
-const SCAN_FLOOR_WAIT_MS = 5_000;
 /** After a tracking reset or Space Setup, anchors get this long to report before re-anchoring. */
 const ANCHOR_RECHECK_GRACE_MS = 1_000;
 
@@ -297,6 +308,30 @@ class App {
   private draggedMonitor = false;
   /** Scanned furniture mesh being grip-carried (Stage 1 movable furniture). */
   private draggedFurniture: THREE.Object3D | null = null;
+  /**
+   * Align tool (P1.6): lines the scan or imported location up with the real
+   * room. A pending move lives on location.group as a preview (Ghost forced)
+   * and is baked into the scan data only on Apply, as one undo step.
+   */
+  private align: {
+    tool: 'none' | 'nudge' | 'two-point';
+    /** Display mode to return to on exit (Ghost is forced while aligning). */
+    restoreMode: LocationMode;
+    twoPoint: TwoPointState;
+    /** The location is on the controller ray (Grab & Turn). */
+    grabbing: boolean;
+  } | null = null;
+  private alignApplying = false;
+  /**
+   * What Align moves (P1.7): the location only (lining a scan up the first
+   * time), or everything in the scene with it (returning to the same room on
+   * another day). Kept between uses of Align.
+   */
+  private alignScope: 'room' | 'everything' = 'room';
+  /** Photo originals parsed so far (the align smoke checks an Apply does not re-parse one). */
+  private photoLoadCount = 0;
+  /** Picked-point markers: scan A, scan B (on the scan), real A, real B (in the room). */
+  private alignMarkers: THREE.Mesh[] = [];
   /** Per-session floor-height sanity check (see floor.ts). */
   private floorEst = newFloorEstimate();
 
@@ -312,15 +347,14 @@ class App {
   private pendingReanchorActors: ActorObject[] = [];
   private pendingReanchorCams: CamObject[] = [];
   /** Non-null while waiting for the platform's room data to capture. */
-  private pendingScan: {
-    /** Clock start (loop time), or -1 to (re)start it on the next frame. */
-    startedAt: number;
-    /** Scan Room re-aligned first; capture waits until that fade has applied. */
-    awaitingRealign: boolean;
-    sources: ScanSource[];
-    floorHinted: boolean;
-    hinted: boolean;
-  } | null = null;
+  /** A pending Scan Room (scanFlow.ts reducer state), or null. */
+  private pendingScan: ScanFlowState | null = null;
+  /** Planes collected by a planes-only scan (Android XR). */
+  private planeCollector = new PlaneCollector();
+  /** Outline preview of the collected planes, created on first use. */
+  private scanPreview: THREE.LineSegments | null = null;
+  /** First Scan Room press over an imported location arms it; a second before this time replaces it. */
+  private scanReplaceArmedUntil = 0;
   /** First 'Run Space Setup' press arms it; a second press before this time runs it. */
   private spaceSetupConfirmUntil = 0;
   /** Session whose Space Setup request is still in flight (OS flow open). */
@@ -704,6 +738,9 @@ class App {
           this.refreshLanding();
         });
       },
+      onImportLocation: (id, file, opts) => void this.importLocationFile(id, file, opts),
+      onAddPropFile: async (file) => !!(await globalPropStore.saveAssetFromFile(file)),
+      onSendSceneToComputer: (id) => this.sendSceneToComputer(id),
       getStorageSummary: () => this.persistence.storageReport().then(formatStorageLine),
       onSetLedVolumeEnabled: (sceneId, enabled) => this.setLedVolumeEnabled(sceneId, enabled),
       onPreview: (id) => this.openPreview(id),
@@ -1038,6 +1075,8 @@ class App {
       // Same geometry, possibly different furniture placements (undo/redo,
       // scene restore) — re-apply without reloading the blob.
       this.location.applyPlacements(summary.furniture);
+      // An Align (or its undo) moves the textured original with the scan.
+      this.location.setPhotoTransform(summary.source?.transform);
       // The display mode is a view preference, not an undoable edit: keep what
       // is on screen, and write it back so a snapshot taken before the last
       // mode change doesn't revert it on the next save.
@@ -1069,11 +1108,67 @@ class App {
         return;
       }
       this.displayedScanId = scan.id;
-      this.location.setScan(scan);
+      // An Align rebuilds the scan under a new id but keeps its original: the
+      // loaded photo stays and is only re-placed, instead of being parsed again.
+      const src = this.sceneData.scan?.source;
+      const keepPhoto = !!src && this.location.hasPhoto && this.location.photoSourceId === src.blobId;
+      this.location.setScan(scan, { keepPhoto });
       this.location.applyPlacements(this.sceneData.scan?.furniture);
       this.contentVersion++; // furniture raycast targets changed
       this.refreshWristState();
+      if (keepPhoto) this.location.setPhotoTransform(src!.transform);
+      else this.loadLocationPhoto(token);
     });
+  }
+
+  /**
+   * Loads the textured original of an imported location for Photo mode (P1.4):
+   * the bytes from the blob store, parsed with their textures. Photo draws the
+   * scan as Solid until this finishes, and keeps doing so if it fails (the
+   * original is not on this device, e.g. after a scene export and import).
+   */
+  private loadLocationPhoto(token: number): void {
+    const source = this.sceneData.scan?.source;
+    if (!source?.textured) return;
+    this.location.markPhotoLoading();
+    void (async () => {
+      const bytes = await this.persistence.blobs.getBytes(source.blobId);
+      if (token !== this.locationSyncToken) return;
+      if (!bytes && this.persistence.blobs.storageState !== 'open') {
+        // Not proof the original is gone: storage has not opened. Photo keeps
+        // drawing Solid and loads once it does.
+        this.debug.log('Photo mode waiting: storage is slow to open');
+        const opened = await this.persistence.blobs.whenStorageOpens();
+        if (token !== this.locationSyncToken) return;
+        if (opened) {
+          this.loadLocationPhoto(token);
+        } else {
+          this.location.markPhotoFailed();
+          this.debug.log('Photo mode unavailable: storage did not open (reload to try again)');
+        }
+        return;
+      }
+      if (!bytes) {
+        this.location.markPhotoFailed();
+        this.debug.log('Photo mode unavailable: the original file is not on this device (scene exports do not carry it)');
+        return;
+      }
+      try {
+        this.photoLoadCount++;
+        const model = await parseModelBytes(bytes, source.format as SceneFileKind, { textures: true, renderer: this.renderer });
+        if (token !== this.locationSyncToken) {
+          disposeModel(model.root);
+          return;
+        }
+        this.location.setPhoto(model.root, this.sceneData.scan?.source?.transform ?? source.transform, source.blobId);
+        this.debug.log(`Photo mode ready (${this.location.photoPartCount} part${this.location.photoPartCount === 1 ? '' : 's'})`);
+        this.refreshWristState();
+      } catch (e) {
+        if (token !== this.locationSyncToken) return;
+        this.location.markPhotoFailed();
+        this.debug.log(`Photo mode unavailable: ${(e as Error)?.message ?? e}`);
+      }
+    })();
   }
 
   /** Drops a scene's scan summary (landing page). The geometry blob is kept
@@ -1119,10 +1214,272 @@ class App {
     return next;
   }
 
-  /** Wrist "Scan Room": starts (or cancels) waiting for the platform's room data. */
+  // --- Align (P1.6) ---------------------------------------------------------
+
+  /** Wrist status, debug log and the wheel hub hint, so an Align step is never silent. */
+  private alignSay(msg: string): void {
+    this.debug.log(msg);
+    this.wrist.setStatus(msg);
+    this.refreshWristState();
+  }
+
+  /** Short next-step hint for the Align sub-wheel hub. */
+  private alignHint(): string | undefined {
+    const a = this.align;
+    if (!a) return undefined;
+    if (a.tool === 'nudge') return a.grabbing ? 'release grip' : 'grip: move';
+    if (a.tool === 'two-point') {
+      return { scanA: 'scan point A', realA: 'room point A', scanB: 'scan point B', realB: 'room point B', preview: 'Apply?' }[
+        a.twoPoint.phase
+      ];
+    }
+    return 'pick a tool';
+  }
+
+  /**
+   * Starts Align if it can run. It needs a location, Full view, a set that has
+   * not been glided, teleported or snap-turned (the alignment is baked in scene
+   * space), and a committed floor estimate, since a later floor re-base would
+   * move what was just aligned (review R2).
+   */
+  private ensureAlign(): boolean {
+    if (this.align) return true;
+    if (!this.location.hasScan) {
+      this.alignSay('Align needs a location: Scan Room, or import one on the 2D page.');
+      return false;
+    }
+    if (this.views.mode !== 'full') {
+      this.alignSay('Align works in Full view. Switch View to Full first.');
+      return false;
+    }
+    if (this.views.isShifted) {
+      this.alignSay('The set has been moved (glide, teleport or turn). Use Re-align first, then Align.');
+      return false;
+    }
+    if (this.session.session && !this.floorEst.committed) {
+      this.alignSay('Look at the floor for a moment so SetView can settle its height, then Align.');
+      return false;
+    }
+    this.cancelActiveManipulation();
+    this.align = { tool: 'none', restoreMode: this.location.mode, twoPoint: twoPointInitial(), grabbing: false };
+    this.location.setMode('ghost'); // a view of the fit, not a saved preference
+    this.location.resetPose();
+    this.contentVersion++;
+    return true;
+  }
+
+  private alignStartNudge(): void {
+    if (!this.ensureAlign()) return;
+    this.align!.tool = 'nudge';
+    this.refreshGuide();
+    this.align!.twoPoint = twoPointInitial();
+    this.hideAlignMarkers();
+    this.alignSay('Grab & Turn: hold grip to carry the location, release, then fine-tune with the right stick. Apply to keep it.');
+  }
+
+  private alignStartTwoPoint(): void {
+    if (!this.ensureAlign()) return;
+    this.align!.tool = 'two-point';
+    this.refreshGuide();
+    this.align!.twoPoint = twoPointInitial();
+    this.location.resetPose(); // picks are made on the scan at rest
+    this.hideAlignMarkers();
+    this.alignSay(twoPointPrompt(this.align!.twoPoint));
+  }
+
+  /** B / Undo step: one point back (two-point), or drop the pending move (Grab & Turn). */
+  private alignBack(): void {
+    const a = this.align;
+    if (!a) return;
+    if (a.tool === 'two-point') {
+      a.twoPoint = twoPointBack(a.twoPoint);
+      this.location.resetPose();
+      this.syncAlignMarkers();
+      this.alignSay(twoPointPrompt(a.twoPoint));
+    } else if (a.tool === 'nudge' && !a.grabbing) {
+      this.location.resetPose();
+      this.alignSay('Move discarded. Hold grip to carry the location.');
+    }
+  }
+
+  /** Trigger while aligning: pick the next two-point point, or apply a previewed fit. */
+  private alignTrigger(rc: THREE.Raycaster | null): void {
+    const a = this.align!;
+    if (a.tool === 'nudge') {
+      this.alignApply();
+      return;
+    }
+    if (a.tool !== 'two-point') {
+      this.alignSay('Pick Grab & Turn or Two-point on the Align wheel.');
+      return;
+    }
+    const phase = a.twoPoint.phase;
+    if (phase === 'preview') {
+      this.alignApply();
+      return;
+    }
+    let world: THREE.Vector3 | null = null;
+    if (phase === 'scanA' || phase === 'scanB') {
+      const hit = rc ? rc.intersectObjects(this.location.pickTargets(), false)[0] : undefined;
+      if (!hit) {
+        this.alignSay('Point the ray at the scan itself, then trigger.');
+        return;
+      }
+      world = hit.point;
+    } else {
+      if (!this.session.lastHit) {
+        this.alignSay('Point at the real spot until the ring shows on it, then trigger.');
+        return;
+      }
+      world = _pt.copy(this.session.lastHit.point);
+    }
+    // Both kinds of point in the scan's own frame (the group is at rest while picking).
+    const local = this.location.group.worldToLocal(world.clone());
+    a.twoPoint = twoPointAddPoint(a.twoPoint, { x: local.x, y: local.y, z: local.z });
+    globalSpatialFeedback.triggerHaptic('both', 'grab');
+    if (a.twoPoint.phase === 'preview' && a.twoPoint.solution?.ok) this.location.previewDelta(a.twoPoint.solution.delta);
+    this.syncAlignMarkers();
+    this.alignSay(twoPointPrompt(a.twoPoint));
+  }
+
+  /** Bakes the pending move into the scan (one undo step) and leaves Align. */
+  private alignApply(): void {
+    const a = this.align;
+    if (!a || this.alignApplying) return;
+    let delta: RigidDelta | null = null;
+    if (a.tool === 'two-point') {
+      const sol = a.twoPoint.solution;
+      if (a.twoPoint.phase !== 'preview' || !sol?.ok) {
+        this.alignSay(twoPointPrompt(a.twoPoint));
+        return;
+      }
+      delta = sol.delta;
+    } else if (a.tool === 'nudge' && !a.grabbing) {
+      delta = this.location.poseDelta();
+    }
+    if (!delta || (Math.hypot(delta.dx, delta.dy, delta.dz) < 0.001 && Math.abs(delta.rotY) < 0.0005)) {
+      this.alignSay('Nothing to apply yet.');
+      return;
+    }
+    void this.alignCommit(delta);
+  }
+
+  private async alignCommit(delta: RigidDelta): Promise<void> {
+    const summary = this.sceneData.scan;
+    if (!summary) return;
+    this.alignApplying = true;
+    const sceneId = this.sceneData.id;
+    try {
+      const scan = await this.persistence.scans.getScan(summary.id);
+      if (!scan) {
+        this.exitAlign(
+          this.persistence.scans.storageState === 'open'
+            ? 'Align failed: the scan geometry is missing on this device.'
+            : 'Align failed: storage has not opened yet. Try again in a moment.',
+        );
+        return;
+      }
+      const out = applyRigidToScan(scan, summary.furniture, delta);
+      await this.persistence.scans.putScan(out.scan);
+      // Applied to the scene that is live now, and only if it still shows this scan.
+      if (this.sceneData.id !== sceneId || this.sceneData.scan?.id !== summary.id) {
+        this.exitAlign('Align not applied: the scene changed meanwhile.');
+        return;
+      }
+      const next: ScanSummary = summarizeScan(out.scan);
+      if (out.furniture) next.furniture = out.furniture;
+      if (summary.imported) next.imported = true;
+      // The textured original moves with its scan (review R1).
+      if (summary.source) {
+        next.source = { ...summary.source, transform: multiplyMat4(rigidDeltaMatrix(delta), summary.source.transform) };
+      }
+      const moved = Math.hypot(delta.dx, delta.dz);
+      const everything = this.alignScope === 'everything';
+      this.exitAlign(); // restores the display mode and the rest pose
+      this.sceneData.scan = next;
+      if (everything) {
+        // The whole set rides the same move (P1.7): every world position,
+        // heading and orientation the scene stores (RIGID_SCENE_SCHEMA). The
+        // restore path reloads every subsystem from the data and re-queues
+        // every actor and camera anchor at its new place.
+        transformSceneRigid(this.sceneData, delta);
+        this.restoreScene(this.sceneData);
+      } else {
+        this.syncLocation();
+      }
+      this.history.record(this.sceneData);
+      this.markDirty();
+      this.contentVersion++;
+      this.alignSay(
+        `Aligned ${everything ? 'everything' : 'the location'}: moved ${moved.toFixed(2)} m, turned ${Math.round((delta.rotY * 180) / Math.PI)} degrees. Undo reverts it.`,
+      );
+    } finally {
+      this.alignApplying = false;
+    }
+  }
+
+  /** Leaves Align: the pending move is dropped and the display mode restored. */
+  private exitAlign(msg?: string): void {
+    const a = this.align;
+    if (!a) return;
+    if (a.grabbing) this.contentRoot.attach(this.location.group);
+    this.align = null;
+    this.location.resetPose();
+    this.location.setMode(a.restoreMode);
+    this.hideAlignMarkers();
+    this.refreshGuide();
+    this.contentVersion++;
+    if (msg) this.alignSay(msg);
+    else this.refreshWristState();
+  }
+
+  /** Small markers on the picked points, created once and reused. */
+  private syncAlignMarkers(): void {
+    if (!this.alignMarkers.length) {
+      const geo = new THREE.SphereGeometry(0.03, 12, 8);
+      const scanMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, depthTest: false });
+      const realMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b, depthTest: false });
+      for (let i = 0; i < 4; i++) {
+        const m = new THREE.Mesh(geo, i < 2 ? scanMat : realMat);
+        m.renderOrder = 10;
+        m.visible = false;
+        m.raycast = () => {};
+        this.alignMarkers.push(m);
+      }
+    }
+    const tp = this.align?.twoPoint;
+    const pts = [tp?.srcA, tp?.srcB, tp?.dstA, tp?.dstB];
+    for (let i = 0; i < 4; i++) {
+      const m = this.alignMarkers[i];
+      const p = pts[i];
+      // Scan points ride the scan (they move with the preview); real ones stay in the room.
+      const parent = i < 2 ? this.location.group : this.contentRoot;
+      if (m.parent !== parent) parent.add(m);
+      m.visible = !!p;
+      if (p) m.position.set(p.x, i < 2 ? p.y : p.y + this.location.floorOffset, p.z);
+    }
+  }
+
+  private hideAlignMarkers(): void {
+    for (const m of this.alignMarkers) m.visible = false;
+  }
+
+  /**
+   * Wrist / wheel "Scan Room". Starts reading the platform's room data; while a
+   * scan is pending it cancels, except on planes-only devices (Android XR),
+   * where planes build up as you look around and a second press finishes the
+   * scan with what was collected (P1.8).
+   */
   private toggleScan(): void {
-    if (this.pendingScan) {
-      this.pendingScan = null;
+    const press = scanPress(this.pendingScan);
+    if (press === 'finish') {
+      const scan = this.planeCollector.toScan();
+      this.endPendingScan();
+      if (scan) this.commitCapturedScan(scan);
+      return;
+    }
+    if (press === 'cancel') {
+      this.endPendingScan();
       this.debug.log('scan cancelled');
       this.refreshWristState();
       return;
@@ -1139,6 +1496,18 @@ class App {
       this.debug.log('scan needs Full view: switch to Full first');
       return;
     }
+    // A scene holds one location: replacing an imported one takes a second
+    // press, since there is no dialog in AR (review R7). Undo brings it back.
+    const imported = !!this.sceneData.scan && (this.sceneData.scan.imported || !!this.sceneData.scan.source);
+    const now = performance.now();
+    if (imported && now > this.scanReplaceArmedUntil) {
+      this.scanReplaceArmedUntil = now + SPACE_SETUP_CONFIRM_MS;
+      const msg = 'This scene has an imported location. Press Scan Room again within 5 s to replace it (Undo brings it back).';
+      this.debug.log(msg);
+      this.wrist.setStatus(msg);
+      return;
+    }
+    this.scanReplaceArmedUntil = 0;
     // Capture bakes the content transform into the geometry, so it must run at
     // true registration. Re-align here instead of refusing. realign() applies
     // behind a fade, so isShifted stays true for about half the fade; the scan
@@ -1146,119 +1515,177 @@ class App {
     // teleport still inside its fade (not applied yet) is replaced the same way.
     const awaitingRealign = this.views.isShifted || this.views.fading;
     if (awaitingRealign) this.views.realign();
-    this.pendingScan = {
-      startedAt: -1,
-      awaitingRealign,
-      sources: cap.sources,
-      floorHinted: false,
-      hinted: false,
-    };
-    this.debug.log(awaitingRealign ? 'scan: re-aligning first…' : `scanning: reading ${cap.sources.join(' + ')}…`);
+    this.pendingScan = scanStart(cap.sources, awaitingRealign);
+    this.planeCollector.clear();
+    this.refreshGuide();
+    this.debug.log(
+      awaitingRealign
+        ? 'scan: re-aligning first…'
+        : this.pendingScan.collect
+          ? 'scanning: look across the floor, walls and tables, then press Scan Room again to finish'
+          : `scanning: reading ${cap.sources.join(' + ')}…`,
+    );
     this.refreshWristState();
   }
 
-  /** Per-frame while a scan is pending: snapshot the room data when tracked. */
+  /** Clears a pending scan and its plane preview. */
+  private endPendingScan(): void {
+    this.pendingScan = null;
+    this.planeCollector.clear();
+    if (this.scanPreview) this.scanPreview.visible = false;
+    this.refreshGuide();
+  }
+
+  /** Per-frame while a scan is pending: the scanFlow reducer decides, this acts. */
   private updatePendingScan(frame: XRFrame, time: number): void {
     const pending = this.pendingScan;
     if (!pending) return;
-    if (pending.awaitingRealign) {
-      if (this.views.fading) return; // realign queued behind the fade, not applied yet
-      pending.awaitingRealign = false;
-      pending.startedAt = -1;
-    }
-    // Teleporting or leaving Full view mid-scan would bake that transform into
-    // the captured geometry: cancel instead of misregistering the room.
-    if (this.views.mode !== 'full' || this.views.isShifted) {
-      this.pendingScan = null;
-      this.debug.log('scan cancelled: view moved (Re-align, then rescan)');
-      this.refreshWristState();
-      return;
-    }
-    // The timeout clock (re)starts on the first frame after the press, a
-    // realign, or a return to 'visible', and is held while system UI covers
-    // the session (no timing out mid Space Setup).
     const visibility = this.session.session?.visibilityState;
-    if (pending.startedAt < 0 || (visibility !== undefined && visibility !== 'visible')) pending.startedAt = time;
-    const waited = time - pending.startedAt;
-    // Capture in a scene space the floor re-base (floor.ts) is about to move
-    // would leave the scan at the wrong height, so give the estimate its
-    // settle window first. Capped: without hit-test results it never settles.
-    if (!floorSettled(this.floorEst, this.lastViewerPos.y, time) && waited < SCAN_FLOOR_WAIT_MS) {
-      if (!pending.floorHinted) {
-        pending.floorHinted = true;
+    const meshesNow = (frame.detectedMeshes?.size ?? 0) > 0;
+    const planesNow = ((frame as unknown as { detectedPlanes?: Set<unknown> }).detectedPlanes?.size ?? 0) > 0;
+    const { state, action } = scanFrame(pending, {
+      now: time,
+      fading: this.views.fading,
+      viewFull: this.views.mode === 'full',
+      // Teleporting or leaving Full view mid-scan would bake that transform
+      // into the captured geometry: cancel instead of misregistering the room.
+      shifted: this.views.isShifted,
+      visible: visibility === undefined || visibility === 'visible',
+      // Capture in a scene space the floor re-base (floor.ts) is about to move
+      // would leave the scan at the wrong height, so give the estimate its
+      // settle window first (capped: without hit-test results it never settles).
+      floorSettled: floorSettled(this.floorEst, this.lastViewerPos.y, time),
+      hasData: meshesNow || planesNow,
+    });
+    this.pendingScan = state;
+    switch (action.kind) {
+      case 'wait':
+        return;
+      case 'cancel':
+        this.endPendingScan();
+        this.debug.log(action.reason);
+        this.refreshWristState();
+        return;
+      case 'floor-hint':
         this.debug.log('scan: settling floor height, look at the floor');
+        return;
+      case 'capture': {
+        const refSpace = this.renderer.xr.getReferenceSpace();
+        if (!refSpace) return;
+        _worldToScene.copy(this.contentRoot.matrixWorld).invert();
+        const scan = captureScanFromFrame(frame, refSpace, _worldToScene);
+        if (!scan) return;
+        this.endPendingScan();
+        this.commitCapturedScan(scan);
+        return;
       }
-      return;
-    }
-    const refSpace = this.renderer.xr.getReferenceSpace();
-    if (!refSpace) return;
-    this.contentRoot.updateMatrixWorld();
-    _worldToScene.copy(this.contentRoot.matrixWorld).invert();
-    const scan = captureScanFromFrame(frame, refSpace, _worldToScene);
-    if (scan) {
-      this.pendingScan = null;
-      // The scan's labelled floor is direct evidence of the real floor. If the
-      // floor origin is too high and hits have not re-based yet (they only
-      // found a desk, or too few landed), re-base now and lift the scan by the
-      // same amount, so the room and the blocking land on the real floor
-      // together. Uncommitted means the floor offset is still 0, so scene y is
-      // reference-space y here.
-      const floorFix = floorCorrectionFromScan(this.floorEst, scanFloorY(scan), this.lastViewerPos.y);
-      if (floorFix !== null) {
-        translateScanY(scan, -floorFix);
-        this.views.setFloorOffset(floorFix);
-        this.debug.log(`⚠ floor origin was ${(-floorFix).toFixed(2)} m too high: re-based to the scanned floor`);
+      case 'collect': {
+        const refSpace = this.renderer.xr.getReferenceSpace();
+        if (!refSpace) return;
+        _worldToScene.copy(this.contentRoot.matrixWorld).invert();
+        const before = state.planes;
+        const count = this.planeCollector.refresh(frame, refSpace, _worldToScene);
+        this.pendingScan = scanCollected(state, count);
+        this.updateScanPreview();
+        if (count !== before) {
+          if (before === 0) this.debug.log('scan: planes found; keep looking around, press Scan Room again to finish');
+          this.refreshWristState();
+        }
+        return;
       }
-      // Then freeze the estimate for the rest of the session: a later re-base
-      // would shift contentRoot under geometry captured in this scene space.
-      this.floorEst.committed = true;
-      const summary = summarizeScan(scan);
-      void this.persistence.scans.putScan(scan); // fire-and-forget; onError warns
-      this.sceneData.scan = summary; // old blob (if any) stays until next-launch prune
-      this.displayedScanId = scan.id;
-      this.locationSyncToken++; // kill any in-flight stale load
-      // The capture can land seconds after the press (realign fade, floor
-      // settle) while a piece of the old room is in hand: end that carry
-      // before setScan disposes the mesh under it.
-      if (this.draggedFurniture) this.cancelActiveManipulation();
-      this.location.setScan(scan);
-      this.setLocationMode('ghost'); // show alignment over passthrough for confirmation
-      this.contentVersion++; // fresh furniture raycast targets
-      this.markDirty();
-      // Not rebuilt in AR: the landing is hidden (its storage line would read
-      // the just-captured scan back to size it); session end re-lists it.
-      if (!this.inXRSession()) this.refreshLanding();
-      this.refreshWristState();
-      this.debug.log(
-        `✓ scanned ${scan.meshes.length} mesh${scan.meshes.length === 1 ? '' : 'es'} · ` +
-          `${(summary.triangles / 1000).toFixed(1)}k tris · ` +
-          `${(summary.boundsMax.x - summary.boundsMin.x).toFixed(1)}×${(summary.boundsMax.z - summary.boundsMin.z).toFixed(1)} m`,
-      );
-      return;
+      case 'hint': {
+        // No automatic initiateRoomCapture here: it works once per session, needs
+        // plane-detection, can wipe anchors and is a stub in Chrome. Space Setup
+        // is the explicit wrist action (runSpaceSetup) instead.
+        const meshes = state.sources.includes('meshes');
+        this.debug.log(
+          !meshes
+            ? 'no planes yet: look around at floor, walls and tables'
+            : this.session.roomCaptureRefusal() === null
+              ? 'no room data yet: Space Setup done? (wrist: Space Setup)'
+              : 'no room data yet: run Space Setup in Quest Settings',
+        );
+        return;
+      }
+      case 'timeout': {
+        const meshes = state.sources.includes('meshes');
+        this.endPendingScan();
+        this.debug.log(
+          meshes
+            ? 'scan timed out: run Space Setup in Quest Settings, then Scan Room again'
+            : 'scan timed out: no planes found, look around the room and rescan',
+        );
+        this.refreshWristState();
+        return;
+      }
     }
-    // No automatic initiateRoomCapture here: it works once per session, needs
-    // plane-detection, can wipe anchors and is a stub in Chrome. Space Setup
-    // is the explicit wrist action (runSpaceSetup) instead.
-    const meshes = pending.sources.includes('meshes');
-    if (!pending.hinted && waited > SCAN_HINT_AFTER_MS) {
-      pending.hinted = true;
-      this.debug.log(
-        !meshes
-          ? 'no planes yet: look around at floor, walls and tables'
-          : this.session.roomCaptureRefusal() === null
-            ? 'no room data yet: Space Setup done? (wrist: Space Setup)'
-            : 'no room data yet: run Space Setup in Quest Settings',
-      );
+  }
+
+  /**
+   * Live outline of the planes collected so far (planes-only scans): one
+   * LineSegments with a preallocated buffer, rewritten only when the
+   * collector refreshes (at most twice a second), never per frame.
+   */
+  private updateScanPreview(): void {
+    if (!this.scanPreview) {
+      const buf = new Float32Array(SCAN_PREVIEW_MAX_SEGMENTS * 6);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(buf, 3).setUsage(THREE.DynamicDrawUsage));
+      geo.setDrawRange(0, 0);
+      const line = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.9 }));
+      line.frustumCulled = false;
+      line.raycast = () => {};
+      line.name = 'scan-preview';
+      this.contentRoot.add(line);
+      this.scanPreview = line;
     }
-    if (waited > SCAN_TIMEOUT_MS) {
-      this.pendingScan = null;
-      this.debug.log(
-        meshes
-          ? 'scan timed out: run Space Setup in Quest Settings, then Scan Room again'
-          : 'scan timed out: no planes found, look around the room and rescan',
-      );
-      this.refreshWristState();
+    const attr = this.scanPreview.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const n = this.planeCollector.writeOutlines(attr.array as Float32Array);
+    this.scanPreview.geometry.setDrawRange(0, n);
+    attr.needsUpdate = true;
+    this.scanPreview.visible = n > 0;
+  }
+
+  /** Stores a captured scan as the scene's location and shows it. */
+  private commitCapturedScan(scan: LocationScan): void {
+    // The scan's labelled floor is direct evidence of the real floor. If the
+    // floor origin is too high and hits have not re-based yet (they only
+    // found a desk, or too few landed), re-base now and lift the scan by the
+    // same amount, so the room and the blocking land on the real floor
+    // together. Uncommitted means the floor offset is still 0, so scene y is
+    // reference-space y here.
+    const floorFix = floorCorrectionFromScan(this.floorEst, scanFloorY(scan), this.lastViewerPos.y);
+    if (floorFix !== null) {
+      translateScanY(scan, -floorFix);
+      this.views.setFloorOffset(floorFix);
+      this.debug.log(`⚠ floor origin was ${(-floorFix).toFixed(2)} m too high: re-based to the scanned floor`);
     }
+    // Then freeze the estimate for the rest of the session: a later re-base
+    // would shift contentRoot under geometry captured in this scene space.
+    this.floorEst.committed = true;
+    const summary = summarizeScan(scan);
+    void this.persistence.scans.putScan(scan); // fire-and-forget; onError warns
+    this.sceneData.scan = summary; // old blob (if any) stays until next-launch prune
+    this.displayedScanId = scan.id;
+    this.locationSyncToken++; // kill any in-flight stale load
+    // The capture can land seconds after the press (realign fade, floor
+    // settle) while a piece of the old room is in hand: end that carry
+    // before setScan disposes the mesh under it.
+    if (this.draggedFurniture) this.cancelActiveManipulation();
+    this.location.setScan(scan);
+    this.setLocationMode('ghost'); // show alignment over passthrough for confirmation
+    this.contentVersion++; // fresh furniture raycast targets
+    this.markDirty();
+    // Not rebuilt in AR: the landing is hidden (its storage line would read
+    // the just-captured scan back to size it); session end re-lists it.
+    if (!this.inXRSession()) this.refreshLanding();
+    this.refreshWristState();
+    this.refreshGuide(); // the "Scan Room" chip gives way now that there is a location
+    this.debug.log(
+      `✓ scanned ${scan.meshes.length} mesh${scan.meshes.length === 1 ? '' : 'es'} · ` +
+        `${(summary.triangles / 1000).toFixed(1)}k tris · ` +
+        `${(summary.boundsMax.x - summary.boundsMin.x).toFixed(1)}×${(summary.boundsMax.z - summary.boundsMin.z).toFixed(1)} m`,
+    );
   }
 
   /**
@@ -1483,6 +1910,8 @@ class App {
    * ray; the miniature grab is released.
    */
   private cancelActiveManipulation(): void {
+    // A scene load, undo or restore mid-Align discards the pending move.
+    if (this.align) this.exitAlign();
     if (this.draggedCamera) this.cams.gizmoGroup.attach(this.draggedCamera.root);
     if (this.draggedProp) {
       // Back into the props group (removeProp / setScene only detach from
@@ -1579,7 +2008,18 @@ class App {
    *  what is in memory, not an older localStorage copy (or nothing) after a failed save. */
   private exportSceneFile(id: string): void {
     void this.persistence.exportScene(id, this.sceneData).then((ok) => {
-      if (!ok) this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
+      if (!ok) {
+        this.reportDataIssue('export failed: this scene is no longer in storage', 'export');
+        return;
+      }
+      const scene = id === this.sceneData.id ? this.sceneData : this.persistence.loadScene(id);
+      if (scene?.scan?.source) {
+        this.landing.showBanner(
+          'The exported scene carries the location geometry but not its photo textures: the original file stays on this device, so Photo mode is unavailable where the export is opened.',
+          'info',
+          'export-photo',
+        );
+      }
     });
   }
 
@@ -1599,6 +2039,113 @@ class App {
     this.debug.log(message);
     this.wrist.setStatus(message);
     this.landing.showBanner(message, 'error', key, action);
+  }
+
+  /**
+   * Imports a phone scan or any mesh file as a scene's location (roadmap P1.2).
+   * Runs on the 2D page. The file is identified by its bytes, converted to a
+   * LocationScan (geometry), and attached to the scene it was opened for, which
+   * need not be the current one (review R4). A textured original is kept in
+   * the blob store for Photo mode. Results and refusals show as banners.
+   */
+  private async importLocationFile(
+    sceneId: string,
+    file: { name: string; arrayBuffer(): Promise<ArrayBuffer> },
+    opts: { upAxis?: UpAxisChoice; unit?: UnitChoice } = {},
+  ): Promise<boolean> {
+    const key = 'location-import';
+    const name = file.name || 'file';
+    let bytes: ArrayBuffer | null = null;
+    try {
+      bytes = await file.arrayBuffer();
+    } catch (e) {
+      console.warn('[setview] location read failed', e);
+    }
+    if (!bytes || bytes.byteLength === 0) {
+      this.reportDataIssue(
+        `Could not read "${name}": the browser returned no data (it blocked the read, or the file is empty).`,
+        key,
+      );
+      return false;
+    }
+    this.landing.showBanner(`Importing "${name}" as the location...`, 'info', key);
+    const res = await importLocationBytes(bytes, { fileName: name, upAxis: opts.upAxis, unit: opts.unit, renderer: this.renderer });
+    if (!res.ok) {
+      this.reportDataIssue(`"${name}" was not imported. ${res.message}`, key);
+      return false;
+    }
+    let source: ScanSourceFile | null = null;
+    if (res.textured) {
+      const blob = await this.persistence.blobs.putBlob({ data: bytes, format: res.kind, name });
+      source = {
+        blobId: blob.id,
+        format: res.kind,
+        fileName: name,
+        ...(res.app !== 'unknown' ? { app: res.app } : {}),
+        transform: res.built.sourceTransform,
+        textured: true,
+      };
+    }
+    // A textured import opens in Photo; a plain mesh in Ghost (the default).
+    const attached = await this.persistence.attachImportedScan(
+      sceneId,
+      res.built.scan,
+      source,
+      () => this.sceneData,
+      source ? 'photo' : undefined,
+    );
+    if (!attached) {
+      this.reportDataIssue(`"${name}" was read, but its scene no longer exists.`, key);
+      return false;
+    }
+    if (attached.scene === this.sceneData) {
+      this.syncLocation();
+      this.history.record(this.sceneData);
+      this.contentVersion++;
+    }
+    this.refreshLanding();
+    const s = res.built.stats;
+    const lines = [
+      `Imported "${name}" as the location: ${s.triangles < 1000 ? s.triangles : `${Math.round(s.triangles / 1000)}k`} triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}.`,
+      ...res.notes,
+    ];
+    if (!attached.scanSaved) {
+      lines.push(
+        this.persistence.scans.storageState === 'waiting'
+          ? 'Storage is slow to open: the geometry is held in memory and saved when it opens.'
+          : 'The geometry could not be saved to storage and is lost on reload.',
+      );
+    }
+    this.debug.log(lines.join(' '));
+    this.landing.showBanner(lines.join(' '), res.budget.level === 'warn' || !attached.scanSaved ? 'warn' : 'info', key);
+    if (bytes.byteLength > 5 * 1024 * 1024) this.requestPersistentStorage();
+    return true;
+  }
+
+  /**
+   * Posts a scene's .setview.json (the same file Export downloads, with no API
+   * key inside since P0.15) to the LAN drop box, so another device can open it
+   * from "Files on your computer". Dev server only.
+   */
+  private async sendSceneToComputer(sceneId: string): Promise<boolean> {
+    const live = sceneId === this.sceneData.id ? this.sceneData : null;
+    const file = await this.persistence.sceneFileText(sceneId, live);
+    if (!file) return false;
+    const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+    const name = sceneDropName(file.name);
+    try {
+      const r = await fetch(`${base}drop/upload?name=${encodeURIComponent(name)}`, {
+        method: 'POST',
+        body: new Blob([file.text], { type: 'application/json' }),
+      });
+      const body = (await r.json().catch(() => ({}))) as { name?: string; error?: string };
+      if (r.status !== 201) throw new Error(body.error ?? `the computer answered ${r.status}`);
+      this.landing.showBanner(`Sent "${file.name}" to the computer as ${body.name ?? name}.`, 'info', 'drop');
+      return true;
+    } catch (e) {
+      this.reportDataIssue(`Could not send "${file.name}" to the computer: ${(e as Error).message}`, 'drop');
+      return false;
+    }
   }
 
   /** On the first heavy import, asks once for persistent storage and says what the browser decided. */
@@ -1636,6 +2183,7 @@ class App {
     this.keyframes.onChange = () => this.markDirty();
     this.cams.onChange = () => this.markDirty();
     this.views.onModeChange = (mode) => {
+      if (this.align && mode !== 'full') this.exitAlign('Align ended: it works in Full view only.');
       this.cams.monitor.visible = mode === 'camera';
       // (0,0,0) is the "park me where the user looks" sentinel (cams.update).
       if (mode === 'camera') this.cams.monitor.position.set(0, 0, 0);
@@ -1655,6 +2203,7 @@ class App {
         // raise your hand. The wheel ALSO always rides the left hand (below).
         if (button === 'y') this.toggleMenuInFront();
         else if (button === 'x') this.setPlaceMode(nextPlaceMode(this.placeMode));
+        else if (button === 'b' && this.align) this.alignBack();
         else if (button === 'b' && this.interactionMode === 'block') this.captureKeyframe();
         else if (button === 'a') this.onButtonA();
         else if (button === 'thumbclick' && hand === this.input.pointerHand()) this.tryTeleport();
@@ -1704,6 +2253,30 @@ class App {
         case 'mark':
           // The B button is unreachable on hand tracking — this is its home.
           if (this.interactionMode === 'block') this.captureKeyframe();
+          break;
+        // Align sub-wheel (P1.6).
+        case 'align-nudge':
+          this.alignStartNudge();
+          break;
+        case 'align-2pt':
+          this.alignStartTwoPoint();
+          break;
+        case 'align-apply':
+          this.alignApply();
+          break;
+        case 'align-back':
+          this.alignBack();
+          break;
+        case 'align-scope':
+          this.alignScope = this.alignScope === 'room' ? 'everything' : 'room';
+          this.alignSay(
+            this.alignScope === 'everything'
+              ? 'Apply will move everything: the location, actors, cameras, props, lights, walls and marks together.'
+              : 'Apply will move the location only.',
+          );
+          break;
+        case 'align-exit':
+          this.exitAlign('Align closed; nothing changed.');
           break;
       }
     } else {
@@ -2061,8 +2634,16 @@ class App {
       }
       this.anchorRecheck = null; // everything is re-anchored above
       this.lastTime = 0;
-      // Every session opens planning the shot; Dress is an explicit switch.
-      this.interactionMode = 'block';
+      // Sessions open planning the shot, except on a completely empty scene,
+      // where the first job is the space: open in Dress, next to Scan Room (P1.8).
+      const d = this.sceneData;
+      const empty =
+        !d.scan &&
+        !d.architecture?.walls?.length &&
+        !d.props?.length &&
+        d.actors.length === 0 &&
+        d.cameras.length === 0;
+      this.interactionMode = empty ? 'dress' : 'block';
       this.wheelInFront = false; // wheel starts on the hand, Y parks it in front
       this.placeMode = 'none'; // placing is armed per use, never carried over
       // Fresh reference space, fresh floor evidence.
@@ -2131,6 +2712,12 @@ class App {
 
     const rc = this.input.raycaster(hand, this.raycaster);
     if (rc && this.contextualRadial.handlePointer(rc, true)) return;
+
+    // While aligning, the trigger picks Align points (or applies), never content.
+    if (this.align) {
+      this.alignTrigger(rc);
+      return;
+    }
 
     if (this.hover?.kind === 'actor') {
       this.selectActor(this.hover.id);
@@ -2224,6 +2811,15 @@ class App {
 
   private onSqueezeDown(hand: Hand): void {
     if (this.noteEditor.isOpen || hand !== this.input.pointerHand()) return;
+    if (this.align) {
+      // Grab & Turn: the whole location rides the ray until release.
+      const ray = this.input.raySpace(hand);
+      if (this.align.tool === 'nudge' && ray && !this.align.grabbing && !this.alignApplying) {
+        this.align.grabbing = true;
+        ray.attach(this.location.group);
+      }
+      return;
+    }
     if (this.views.mode === 'mini') {
       const grip = this.input.gripSpace(hand);
       if (grip) {
@@ -2280,6 +2876,14 @@ class App {
 
   private onSqueezeUp(hand: Hand): void {
     if (hand !== this.input.pointerHand()) return;
+    if (this.align?.grabbing) {
+      this.align.grabbing = false;
+      this.contentRoot.attach(this.location.group); // world pose kept
+      // Pure yaw: drop the pitch and roll of the hand-held carry.
+      this.location.previewDelta(this.location.poseDelta());
+      this.alignSay('Moved. Right stick turns it, push it up or down to lift 1 cm. Apply to keep it.');
+      return;
+    }
     if (this.miniGrabbing) {
       this.views.miniGrabEnd();
       this.miniGrabbing = false;
@@ -2401,6 +3005,11 @@ class App {
   }
 
   private tryTeleport(): void {
+    // Teleporting shifts the set, which Align must not be done under (review R2).
+    if (this.align) {
+      this.alignSay('Teleport is off while aligning. Exit Align first.');
+      return;
+    }
     if (this.views.mode !== 'full' || !this.session.lastHit) return;
     this.views.teleportTo(this.session.lastHit.point, this.lastViewerPos);
     this.debug.log('teleported (Re-align on wrist menu restores registration)');
@@ -2902,7 +3511,15 @@ class App {
       placeMode: this.placeMode,
       eyesMode: this.cams.eyesMode,
       interaction: this.interactionMode,
+      hasScan: !!this.sceneData.scan,
+      scanning: !this.pendingScan ? 'none' : this.pendingScan.collect ? 'collecting' : 'waiting',
+      aligning: this.align?.tool ?? 'none',
     };
+  }
+
+  /** Re-renders the controller chips after a scan or Align state change. */
+  private refreshGuide(): void {
+    this.guide.refresh(this.guideCtx());
   }
 
   private sceneBounds(): THREE.Box3 | null {
@@ -2937,6 +3554,10 @@ class App {
           recording: this.recorder.recording,
           hasScan: this.location.hasScan,
           locationMode: this.location.mode,
+          alignTool: this.align?.tool ?? 'none',
+          alignHint: this.alignHint(),
+          alignScope: this.alignScope,
+          scanLabel: scanSectorLabel(this.pendingScan),
           lensFocal: activeCam?.data.lensFocalLength ?? 35,
           tStop: activeCam?.data.tStop ?? this.cams.currentTStop,
           formatShort: sensorFormat(activeCam?.data.formatId ?? this.cams.currentFormat).short,
@@ -3367,6 +3988,24 @@ class App {
           held.rotateOnWorldAxis(_up, -axes.x * dt * 3.0);
         }
       }
+    } else if (this.align?.tool === 'nudge' && !this.align.grabbing) {
+      // Grab & Turn fine-tuning: stick X turns the location slowly about the
+      // viewer (not the far-away scene origin), stick Y lifts it 1 cm a step.
+      if (Math.abs(axes.x) > 0.15) {
+        this.contentRoot.worldToLocal(_pt.copy(this.lastViewerPos));
+        const g = this.location.group;
+        const a = -axes.x * dt * 0.5;
+        g.position.x -= _pt.x;
+        g.position.z -= _pt.z;
+        g.position.applyAxisAngle(_up, a);
+        g.position.x += _pt.x;
+        g.position.z += _pt.z;
+        g.rotateOnWorldAxis(_up, a);
+      }
+      const lift = this.input.stickStepY(pointer);
+      if (lift !== 0) this.location.group.position.y -= lift * 0.01;
+    } else if (this.align) {
+      // Two-point (or no tool): the stick neither turns nor glides the set.
     } else if (this.miniGrabbing) {
       const grip = this.input.gripSpace(pointer);
       if (grip)
@@ -3404,6 +4043,7 @@ class App {
     loco.draggingProp = this.draggedProp !== null;
     loco.draggingFurniture = this.draggedFurniture !== null;
     loco.miniGrabbing = this.miniGrabbing;
+    loco.aligning = this.align !== null;
     if (!locomotionSuppressed(loco)) {
       const ls = this.input.axes('left');
       if (ls.x * ls.x + ls.y * ls.y > LOCOMOTION_DEADZONE * LOCOMOTION_DEADZONE) {
@@ -3667,6 +4307,36 @@ class App {
       splatCloudId: () => splat.cloud?.id ?? null,
       liveDmxEnabled: () => this.dmxStreamer.getConfig().enabled,
       sentPatches: () => sent.slice(),
+      // test/location-import-smoke.html: what the live scene shows after an import.
+      currentSceneId: () => this.sceneData.id,
+      currentScan: () => this.sceneData.scan ?? null,
+      displayedScanId: () => this.displayedScanId,
+      // Geometry-scan meshes only (Photo parts are counted by photoParts).
+      locationMeshCount: () => {
+        let n = 0;
+        this.location.group.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh && o.name.startsWith('scan:')) n++;
+        });
+        return n;
+      },
+      blobBytes: async (id: string) => (await this.persistence.blobs.getBytes(id))?.byteLength ?? null,
+      locationMode: () => this.location.mode,
+      photoState: () => this.location.photoState,
+      photoParts: () => this.location.photoPartCount,
+      photoTextureSizes: () => this.location.photoTextureSizes(),
+      photoLoads: () => this.photoLoadCount,
+      // test/align-smoke.html: the Grab & Turn path with a scripted move (no XR input on a desktop).
+      alignNudge: (d: RigidDelta, scope: 'room' | 'everything' = 'room') => {
+        this.alignScope = scope;
+        this.alignStartNudge();
+        if (!this.align) return false;
+        this.location.previewDelta(d);
+        this.alignApply();
+        return true;
+      },
+      aligning: () => this.align !== null,
+      actorPositions: () => this.sceneData.actors.map((a) => ({ ...a.position, rotationY: a.rotationY })),
+      locationPose: () => this.location.poseDelta(),
     };
   }
 
@@ -4522,7 +5192,7 @@ class App {
   private async openPropsLibrary(): Promise<void> {
     const host = this.studioHost('Prop Library');
     if (!host) return;
-    const customAssets = await globalPropStore.listAssets();
+    const customAssets = await globalPropStore.listAssetMeta();
     openPropsLibraryModal(
       async (assetId, customKey) => {
         const spawnPos = this.propSpawnPoint();

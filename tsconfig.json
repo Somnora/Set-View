@@ -16,5 +16,5 @@
     "allowImportingTsExtensions": true,
     "isolatedModules": true
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "vite.plugins.ts"]
 }

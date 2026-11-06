@@ -84,7 +84,9 @@ WebXR requires a **secure context** — that's why the dev server is HTTPS. `loc
 
 **The tool wheel (your menu for everything):** a ring of tools that **always rides your left hand** — raise your hand and it's right there, drop your hand and it falls out of frame. **Controllers also have a hard menu button: press Y (left) to pop the wheel head-locked in front of your face** (press Y again to tuck it away). **To operate it: point your right hand/controller at a sector and pull the trigger (or pinch)**.
 
-Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit, Stance, Props) and the hub becomes **◂ Back**. The wheel switches between **Block** (plan the shot) and **Dress** (scan the room, move scanned furniture and props). Lights from an imported scene render and export; placing and tuning lights in AR is not wired yet (roadmap P4.5).
+Sectors marked **▸** open a sub-wheel in place (Lens, Marks, Camera, Edit, Stance, Props, Align) and the hub becomes **◂ Back**. The wheel switches between **Block** (plan the shot) and **Dress** (scan the room, line a location up with the real room, move scanned furniture and props). Lights from an imported scene render and export; placing and tuning lights in AR is not wired yet (roadmap P4.5).
+
+**Bringing a location in:** import a phone scan (Polycam or Scaniverse GLB, FBX or PLY mesh, or any OBJ) from the Scene card on the landing page, or send it from a phone to the computer running `npm run dev` through its drop page and pick it from **Files on your computer** on the headset. Textured scans show in **Room: Photo**. In AR, **Dress > Align ▸** lines the location up with the real room (Grab & Turn, or two matching points), and **Moves: Everything** brings a whole blocked set back into line on a later day. Details and headset checks: `TESTING.md` and `docs/roadmap-scan-import-build.md`.
 
 ### Quick Control Matrix
 
@@ -120,6 +122,10 @@ src/
   pose.ts         Actor stance/pose joint targets (16 rich poses) — PURE
   locomotion.ts   Thumbstick glide + snap-turn math — PURE
   scan.ts         Location-scan data + binary/base64 codec + transforms — PURE
+  sceneImport.ts  Scan file sniffing (by content) and conversion to a location (PURE)
+  registration.ts Align: rigid moves, two-point solve, whole-scene move (PURE)
+  scanFlow.ts     Scan Room state machine (PURE)
+  dropBox.ts      LAN drop box rules (names, ranges, origin) (PURE)
   recording.ts    Video-take policy + audio track mix math — PURE
   analysis.ts     AI Shot Analysis Assistant prompt payload & parser — PURE
   dof.ts          Depth-of-field shader pass for camera monitor
@@ -128,6 +134,8 @@ src/
   scanner.ts      Reads Scene Mesh off live XRFrame into scene space
   location.ts     Renders scanned room: hidden/ghost/solid + furniture moves
   scanStore.ts    IndexedDB blob store for scan geometry
+  blobStore.ts    IndexedDB store for imported originals (Photo mode)
+  locationImport.ts  Parses imported mesh files with three's loaders
   idbOpen.ts      IndexedDB open with a time limit that is not final (late opens are used)
   input.ts        Controllers + hands input routing & edge detection
   actors.ts       Humanoid meshes, scale, floor-locking, stance joints, walk cycle

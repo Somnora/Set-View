@@ -1,0 +1,142 @@
+<!doctype html>
+<!-- LAN drop box through the REAL app (roadmap P1.5). Needs the dev server
+     (the drop box API and the test hooks exist only there) and a headed browser.
+       1. uploads a GLB of the synthetic test room the way public/drop.html does;
+       2. boots src/main.ts: "Files on your computer" lists it as a glTF binary,
+          and "Use as location" attaches it to the current scene;
+       3. "Send to computer" posts the scene's .setview.json to the drop box, and
+          "Open scene" on that file opens it as a new "(imported)" scene;
+       4. public/drop.html lists both files.
+     Everything it uploads or creates is deleted afterwards.
+
+     Headed (vite.http.config.ts): http://localhost:5174/test/drop-box-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>drop box smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6;max-width:60vw;white-space:pre-wrap">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+      import { createScene } from '../src/model.ts';
+      import { createSyntheticLocationScan } from '../src/scanExporters.ts';
+
+      const out = document.getElementById('out');
+      const CURRENT_KEY = 'setview.currentScene';
+      const INDEX_KEY = 'setview.sceneIndex';
+      const SCENE_PREFIX = 'setview.scene.';
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const notes = [];
+      const uploaded = [];
+      const report = (ok, msg) => {
+        out.textContent = `DROPBOX-SMOKE ${ok ? 'PASS' : 'FAIL'} | ${msg}`;
+        out.style.color = ok ? '#9f6' : '#f66';
+      };
+      const until = async (fn, ms = 15000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          const v = await fn();
+          if (v) return v;
+          await sleep(100);
+        }
+        return null;
+      };
+      const dropRow = (name) =>
+        [...document.querySelectorAll('.drop-panel .drop-row')].find((r) => r.querySelector('.drop-name')?.textContent === name);
+      const clickIn = (root, label) => {
+        const b = [...root.querySelectorAll('button')].find((x) => x.textContent === label);
+        if (!b) throw new Error(`no "${label}" button`);
+        b.click();
+      };
+
+      const room = createSyntheticLocationScan(6, 5, 2.8, ['couch']);
+      const roomTris = room.meshes.reduce((n, m) => n + m.indices.length / 3, 0);
+      const group = new THREE.Group();
+      for (const m of room.meshes) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(m.positions.slice(), 3));
+        g.setIndex(new THREE.BufferAttribute(m.indices.slice(), 1));
+        group.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial()));
+      }
+
+      const prevCurrent = localStorage.getItem(CURRENT_KEY);
+      const scene = createScene(`drop smoke ${Date.now()}`);
+      const createdScenes = new Set([scene.id]);
+      const cleanup = async () => {
+        for (const n of uploaded) await fetch(`/drop/file/${encodeURIComponent(n)}`, { method: 'DELETE' }).catch(() => {});
+        try {
+          for (const id of createdScenes) localStorage.removeItem(SCENE_PREFIX + id);
+          const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+          localStorage.setItem(INDEX_KEY, JSON.stringify(index.filter((e) => !createdScenes.has(e.id))));
+          if (prevCurrent) localStorage.setItem(CURRENT_KEY, prevCurrent);
+          else localStorage.removeItem(CURRENT_KEY);
+        } catch {
+          /* storage blocked */
+        }
+      };
+      try {
+        // 1. Upload as the phone page does (raw body, name in the query).
+        const glb = await new GLTFExporter().parseAsync(group, { binary: true });
+        const glbName = `drop-smoke-${Date.now()}`; // no extension: identified by content
+        const up = await fetch(`/drop/upload?name=${encodeURIComponent(glbName)}`, { method: 'POST', body: glb });
+        const upBody = await up.json();
+        if (up.status !== 201) throw new Error(`upload answered ${up.status}: ${upBody.error}`);
+        uploaded.push(upBody.name);
+
+        // 2. Boot the app on a seeded scene.
+        localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
+        const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+        index.push({ id: scene.id, name: scene.name, updatedAt: Date.now(), actors: 0, cameras: 0, hasScan: false });
+        localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+        localStorage.setItem(CURRENT_KEY, scene.id);
+        await import('../src/main.ts');
+        const t = await until(() => window.__setviewTest);
+        if (!t) throw new Error('no __setviewTest hooks (not the dev server?)');
+        const row = await until(() => dropRow(upBody.name));
+        if (!row) throw new Error('the upload is not listed under Files on your computer');
+        const meta = row.querySelector('.drop-meta').textContent;
+        const panelVisible = !document.querySelector('.drop-panel').hidden;
+        clickIn(row, 'Use as location');
+        const scan = await until(() => t.currentScan());
+        const shown = await until(() => scan && t.displayedScanId() === scan.id);
+        const ok1 = panelVisible && /glTF binary/.test(meta) && scan?.triangles === roomTris && !!shown;
+        notes.push(`listed=${!!row} kind="${meta}" tris=${scan?.triangles}/${roomTris}`);
+
+        // 3. Send the scene to the computer, then open it from there.
+        const sendBtn = [...document.querySelectorAll('.scene.current .send-to-computer')][0];
+        const sendVisible = !!sendBtn && getComputedStyle(sendBtn).display !== 'none';
+        sendBtn?.click();
+        const sentName = await until(async () => {
+          const list = await (await fetch('/drop/list')).json();
+          return list.find((e) => e.name.startsWith(scene.name) && e.name.endsWith('.setview.json'))?.name;
+        });
+        if (sentName) uploaded.push(sentName);
+        const before = new Set(JSON.parse(localStorage.getItem(INDEX_KEY) || '[]').map((e) => e.id));
+        document.querySelector('.drop-panel button')?.click(); // Refresh
+        const sentRow = await until(() => sentName && dropRow(sentName));
+        if (sentRow) clickIn(sentRow, 'Open scene');
+        const opened = await until(() => {
+          const now = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+          return now.find((e) => !before.has(e.id) && e.name === `${scene.name} (imported)`);
+        });
+        if (opened) createdScenes.add(opened.id);
+        const openedScene = opened ? JSON.parse(localStorage.getItem(SCENE_PREFIX + opened.id) || 'null') : null;
+        const ok2 = sendVisible && !!sentName && !!opened && openedScene?.scan?.triangles === roomTris;
+        notes.push(`send=${sendVisible} sent=${sentName ?? 'none'} opened=${opened?.name ?? 'none'} openedTris=${openedScene?.scan?.triangles}`);
+
+        // 4. The phone page lists both files.
+        const page = await (await fetch('/drop.html')).text();
+        const list = await (await fetch('/drop/list')).json();
+        const ok3 = /SetView drop box/.test(page) && uploaded.every((n) => list.some((e) => e.name === n));
+        notes.push(`drop.html=${/SetView drop box/.test(page)} listed=${uploaded.length}`);
+
+        report(ok1 && ok2 && ok3, `${ok1 ? 'import ok' : 'IMPORT FAIL'} ${ok2 ? 'send ok' : 'SEND FAIL'} ${ok3 ? 'page ok' : 'PAGE FAIL'} | ${notes.join(' | ')}`);
+      } catch (e) {
+        report(false, `${e.message} | ${notes.join(' | ')}`);
+      } finally {
+        await cleanup();
+      }
+    </script>
+  </body>
+</html>

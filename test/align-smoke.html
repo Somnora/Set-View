@@ -1,0 +1,171 @@
+<!doctype html>
+<!-- Align apply path through the REAL app (roadmap P1.6). XR input cannot be
+     driven on a desktop, so the Grab & Turn path is entered through a dev hook
+     with a scripted move; everything after (bake into the scan, the photo
+     original's transform, the rest pose, undo) is the app's own code.
+       1. imports a textured GLB of the test room (as location-import-smoke does)
+          and waits for Photo mode;
+       2. applies a move (0.65 rad turn, 1.2 m, 0.5 m): the scan is rebuilt under a
+          new id with its bounds moved, the original's transform is composed
+          with the move, the photo is re-placed (not parsed again), and the
+          location is back at its rest pose with Align closed;
+       3. Undo returns the previous scan id and transform.
+       4. With Moves: Everything (P1.7), the same kind of move also carries an
+          actor: its position and heading follow the move exactly; Undo restores.
+     Headed (vite.http.config.ts): http://localhost:5174/test/align-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>align smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6;max-width:60vw;white-space:pre-wrap">running…</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+      import { createActor, createScene } from '../src/model.ts';
+      import { createSyntheticLocationScan } from '../src/scanExporters.ts';
+      import { applyRigidToPoint, rigidDeltaMatrix } from '../src/registration.ts';
+      import { multiplyMat4 } from '../src/sceneImport.ts';
+
+      const out = document.getElementById('out');
+      const CURRENT_KEY = 'setview.currentScene';
+      const INDEX_KEY = 'setview.sceneIndex';
+      const SCENE_PREFIX = 'setview.scene.';
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const notes = [];
+      const report = (ok, msg) => {
+        out.textContent = `ALIGN-SMOKE ${ok ? 'PASS' : 'FAIL'} | ${msg}`;
+        out.style.color = ok ? '#9f6' : '#f66';
+      };
+      const until = async (fn, ms = 15000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          const v = await fn();
+          if (v) return v;
+          await sleep(100);
+        }
+        return null;
+      };
+      const close = (a, b, eps = 1e-3) => Math.abs(a - b) < eps;
+
+      const room = createSyntheticLocationScan(6, 5, 2.8, ['couch']);
+      const tex = (() => {
+        const c = document.createElement('canvas');
+        c.width = c.height = 64;
+        c.getContext('2d').fillRect(0, 0, 32, 32);
+        return new THREE.CanvasTexture(c);
+      })();
+      const group = new THREE.Group();
+      for (const m of room.meshes) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(m.positions.slice(), 3));
+        g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array((m.positions.length / 3) * 2), 2));
+        g.setIndex(new THREE.BufferAttribute(m.indices.slice(), 1));
+        group.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ map: tex })));
+      }
+
+      const prevCurrent = localStorage.getItem(CURRENT_KEY);
+      const scene = createScene('align smoke');
+      createActor(scene, { x: 1, y: 0, z: -2 }, 0.3);
+      const cleanup = () => {
+        try {
+          localStorage.removeItem(SCENE_PREFIX + scene.id);
+          const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+          localStorage.setItem(INDEX_KEY, JSON.stringify(index.filter((e) => e.id !== scene.id)));
+          if (prevCurrent) localStorage.setItem(CURRENT_KEY, prevCurrent);
+          else localStorage.removeItem(CURRENT_KEY);
+        } catch {
+          /* storage blocked */
+        }
+      };
+      try {
+        localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
+        const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+        index.push({ id: scene.id, name: scene.name, updatedAt: Date.now(), actors: 0, cameras: 0, hasScan: false });
+        localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+        localStorage.setItem(CURRENT_KEY, scene.id);
+        await import('../src/main.ts');
+        const t = await until(() => window.__setviewTest);
+        if (!t) throw new Error('no __setviewTest hooks (not the dev server?)');
+
+        // 1. Textured import, through the landing card.
+        const glb = await new GLTFExporter().parseAsync(group, { binary: true });
+        const btn = [...document.querySelectorAll('button')].find((b) => /^Import location/.test(b.textContent));
+        const input = btn.parentElement.querySelector('input[type=file]');
+        const dt = new DataTransfer();
+        dt.items.add(new File([glb], 'room.glb'));
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change'));
+        if (!(await until(() => t.photoState() === 'ready'))) throw new Error(`no Photo after import (${t.photoState()})`);
+        const s0 = t.currentScan();
+        const loads0 = t.photoLoads();
+
+        // 2. Apply a move.
+        const delta = { dx: 1.2, dy: 0, dz: 0.5, rotY: 0.65 };
+        if (!t.alignNudge(delta)) throw new Error('Align did not start');
+        const s1 = await until(() => {
+          const s = t.currentScan();
+          return s && s.id !== s0.id ? s : null;
+        });
+        if (!s1) throw new Error('the scan was not rebuilt');
+        await until(() => t.displayedScanId() === s1.id);
+        // Expected bounds: every source vertex through the import transform, then the move.
+        const m0 = s0.source.transform;
+        let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+        for (const mesh of room.meshes) {
+          const p = mesh.positions;
+          for (let i = 0; i < p.length; i += 3) {
+            const v = {
+              x: m0[0] * p[i] + m0[4] * p[i + 1] + m0[8] * p[i + 2] + m0[12],
+              y: m0[1] * p[i] + m0[5] * p[i + 1] + m0[9] * p[i + 2] + m0[13],
+              z: m0[2] * p[i] + m0[6] * p[i + 1] + m0[10] * p[i + 2] + m0[14],
+            };
+            const q = applyRigidToPoint(delta, v);
+            minX = Math.min(minX, q.x);
+            maxX = Math.max(maxX, q.x);
+            minZ = Math.min(minZ, q.z);
+            maxZ = Math.max(maxZ, q.z);
+          }
+        }
+        const boundsOk =
+          close(s1.boundsMin.x, minX) && close(s1.boundsMax.x, maxX) && close(s1.boundsMin.z, minZ) && close(s1.boundsMax.z, maxZ) &&
+          s1.triangles === s0.triangles;
+        const want = multiplyMat4(rigidDeltaMatrix(delta), s0.source.transform);
+        const transformOk = s1.source && s1.source.blobId === s0.source.blobId && want.every((v, i) => close(v, s1.source.transform[i], 1e-6));
+        const pose = t.locationPose();
+        const restOk = close(pose.dx, 0) && close(pose.dz, 0) && close(pose.rotY, 0) && !t.aligning();
+        const photoKept = t.photoState() === 'ready' && t.photoLoads() === loads0 && t.locationMode() === 'photo';
+        notes.push(`bounds=${boundsOk} transform=${!!transformOk} rest=${restOk} photoKept=${photoKept} loads=${t.photoLoads()}`);
+
+        // 3. Undo.
+        t.undo();
+        const back = await until(() => t.currentScan()?.id === s0.id);
+        const undoOk = !!back && t.currentScan().source.transform.every((v, i) => close(v, s0.source.transform[i], 1e-9));
+        notes.push(`undo=${undoOk}`);
+
+        // 4. Everything: the actor rides the same move.
+        const a0 = t.actorPositions()[0];
+        const d2 = { dx: -0.8, dy: 0, dz: 1.1, rotY: -0.4 };
+        t.alignNudge(d2, 'everything');
+        const a1 = await until(() => {
+          const p = t.actorPositions()[0];
+          return p && (p.x !== a0.x || p.z !== a0.z) ? p : null;
+        });
+        const want2 = applyRigidToPoint(d2, a0);
+        const actorOk = !!a1 && close(a1.x, want2.x, 1e-6) && close(a1.z, want2.z, 1e-6) && close(a1.rotationY, a0.rotationY + d2.rotY, 1e-6);
+        t.undo();
+        const a2 = await until(() => {
+          const p = t.actorPositions()[0];
+          return p && close(p.x, a0.x, 1e-9) && close(p.z, a0.z, 1e-9) ? p : null;
+        });
+        notes.push(`everything actor=${actorOk} undo=${!!a2}`);
+
+        report(boundsOk && transformOk && restOk && photoKept && undoOk && actorOk && !!a2, notes.join(' | '));
+      } catch (e) {
+        report(false, `${e.message} | ${notes.join(' | ')}`);
+      } finally {
+        cleanup();
+      }
+    </script>
+  </body>
+</html>
