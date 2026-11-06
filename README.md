@@ -126,6 +126,7 @@ src/
   registration.ts Align: rigid moves, two-point solve, whole-scene move (PURE)
   scanFlow.ts     Scan Room state machine (PURE)
   dropBox.ts      LAN drop box rules (names, ranges, origin) (PURE)
+  units.ts        Feet-inch and metric readouts and typed lengths over meters (PURE)
   recording.ts    Video-take policy + audio track mix math — PURE
   analysis.ts     AI Shot Analysis Assistant prompt payload & parser — PURE
   dof.ts          Depth-of-field shader pass for camera monitor

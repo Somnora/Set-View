@@ -74,6 +74,7 @@ import {
   type TwoPointState,
 } from './registration.ts';
 import { sceneDropName } from './dropBox.ts';
+import { formatDims, type LengthFormat } from './units.ts';
 import type { ScanSourceFile, ScanSummary } from './model.ts';
 import {
   buildWristPanel,
@@ -1652,7 +1653,7 @@ class App {
     this.debug.log(
       `✓ scanned ${scan.meshes.length} mesh${scan.meshes.length === 1 ? '' : 'es'} · ` +
         `${(summary.triangles / 1000).toFixed(1)}k tris · ` +
-        `${(summary.boundsMax.x - summary.boundsMin.x).toFixed(1)}×${(summary.boundsMax.z - summary.boundsMin.z).toFixed(1)} m`,
+        this.roomSize(summary),
     );
   }
 
@@ -1966,6 +1967,12 @@ class App {
     this.debug.log('↷ redo');
   }
 
+  /** A room's floor footprint (width × depth) in this device's units, to the inch or 0.1 m. */
+  private roomSize(b: { boundsMin: Vec3; boundsMax: Vec3 }): string {
+    const fmt: LengthFormat = { system: this.landing.units, fractionIn: 1, decimals: 1 };
+    return formatDims(b.boundsMax.x - b.boundsMin.x, b.boundsMax.z - b.boundsMin.z, undefined, fmt);
+  }
+
   private refreshLanding(): void {
     // Includes scenes whose save failed (and the live scene if the index lacks it):
     // they exist only in memory, and their row is where Export is.
@@ -2066,8 +2073,10 @@ class App {
     }
     this.refreshLanding();
     const s = res.built.stats;
+    // The room size is the quickest check that the units were read right.
+    const size = attached.scene.scan ? `, ${this.roomSize(attached.scene.scan)}` : '';
     const lines = [
-      `Imported "${name}" as the location: ${s.triangles < 1000 ? s.triangles : `${Math.round(s.triangles / 1000)}k`} triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}.`,
+      `Imported "${name}" as the location: ${s.triangles < 1000 ? s.triangles : `${Math.round(s.triangles / 1000)}k`} triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}${size}.`,
       ...res.notes,
     ];
     if (!attached.scanSaved) lines.push('The geometry could not be saved to storage and is lost on reload.');

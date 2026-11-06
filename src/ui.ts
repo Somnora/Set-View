@@ -8,6 +8,7 @@ import type { SupportReport } from './session.ts';
 import type { UnitChoice, UpAxisChoice } from './locationImport.ts';
 import { describeSceneFileKind, sniffSceneFile, SNIFF_BYTES, type SceneFileKind } from './sceneImport.ts';
 import { dropActionsFor, dropRefusal, propExtensionFor, type DropEntry } from './dropBox.ts';
+import { formatDims, otherUnitSystem, readUnitSystem, writeUnitSystem, type UnitSystem } from './units.ts';
 import {
   ASPECT_NAMES,
   MAX_KEYFRAMES,
@@ -883,6 +884,13 @@ export class Landing {
   private dropPhoneUrl: string | null = null;
   /** The scene the landing shows as current (target of a drop-box location import). */
   private currentSceneId: string | null = null;
+  /** The last list shown, so a units switch can redraw it. */
+  private lastScenes: SceneSummary[] = [];
+  /**
+   * How lengths read on this device (P2.2): saved per device, defaulting to
+   * feet and inches for a US browser. Scene data stays in meters.
+   */
+  units: UnitSystem = readUnitSystem(deviceStorage(), typeof navigator === 'undefined' ? undefined : navigator.language);
 
   constructor(root: HTMLElement, cb: LandingCallbacks) {
     this.root = root;
@@ -1116,6 +1124,22 @@ export class Landing {
     file.onchange = () => {
       if (file.files?.[0]) this.cb.onImport(file.files[0]);
       file.value = '';
+    };
+
+    const unitsBtn = el('button', 'small units-toggle', bar) as HTMLButtonElement;
+    const showUnits = () => {
+      const imperial = this.units === 'imperial';
+      unitsBtn.textContent = imperial ? 'Units: ft-in' : 'Units: m';
+      unitsBtn.title = imperial
+        ? 'Lengths read in feet and inches. Click for meters. Saved on this device; scenes always store meters.'
+        : 'Lengths read in meters. Click for feet and inches. Saved on this device; scenes always store meters.';
+    };
+    showUnits();
+    unitsBtn.onclick = () => {
+      this.units = otherUnitSystem(this.units);
+      writeUnitSystem(deviceStorage(), this.units);
+      showUnits();
+      this.refreshScenes(this.lastScenes, this.currentSceneId);
     };
 
     if (this.cb.onPropsLibrary) {
@@ -1365,6 +1389,7 @@ export class Landing {
 
   refreshScenes(scenes: SceneSummary[], currentId: string | null): void {
     this.currentSceneId = currentId;
+    this.lastScenes = scenes;
     // Edits re-render the whole list; keep expanded prep panels expanded so
     // the blocking editor doesn't collapse after every field change.
     const openIds = new Set(
@@ -1527,7 +1552,11 @@ export class Landing {
     scanRow.className = 'cam-edit';
     if (scene.scan) {
       const sc = scene.scan;
-      const size = `${(sc.boundsMax.x - sc.boundsMin.x).toFixed(1)}×${(sc.boundsMax.z - sc.boundsMin.z).toFixed(1)}m`;
+      const size = formatDims(sc.boundsMax.x - sc.boundsMin.x, sc.boundsMax.z - sc.boundsMin.z, undefined, {
+        system: this.units,
+        fractionIn: 1,
+        decimals: 1,
+      });
       const info = document.createElement('span');
       info.className = 'scan-info';
       const tris = sc.triangles < 1000 ? `${sc.triangles}` : `${Math.round(sc.triangles / 1000)}k`;

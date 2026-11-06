@@ -6,7 +6,8 @@ How SetView gets from today to letting a user scan a location, bring it into a s
 
 - **Phase 0 is implemented** on branch `p0/make-existing-honest` ([PR #1](https://github.com/Somnora/Set-View/pull/1)). 498 unit tests pass, typecheck and build are clean, nine headless smoke pages pass, and the S12 Ghost check passes in a headed desktop run. Nothing has been checked on a headset yet.
 - **Phase 1 is implemented** on branch `p1/bring-a-location-in` ([PR #3](https://github.com/Somnora/Set-View/pull/3)), built on Phase 0. 551 unit tests pass, typecheck and build are clean, and 7 headed and 9 headless smoke pages pass. Nothing has been checked on a headset yet; see the Phase 1 table below and `TESTING.md`. The probe answers (spikes S1 to S7) are still needed to confirm the plane labels and which import path the Quest prefers.
-- **Phases 2 to 4 have not started.**
+- **Phase 2 has started** on branch `p2/build-a-set`, built on Phase 1. P2.2 (feet-inch readouts) is done: 559 unit tests pass and the headed `test/units-smoke.html` passes. The other Phase 2 items have not started.
+- **Phases 3 and 4 have not started.**
 - **Before building any Phase 1 to 4 item, read its review notes** in [Review corrections](#review-corrections). An independent review found design problems the item text below does not yet reflect.
 - File and line references are as of commit `cd82a8e`, before Phase 0. Phase 0 moved many of them, so find each site by its content before editing.
 
@@ -225,6 +226,8 @@ Review notes: R9.
 ### P2.2 Units: feet-inch readouts over a meters-only model
 
 Track: build. Effort: S. Depends on: none.
+
+**Status (2026-11-06): done** on `p2/build-a-set`. `src/units.ts` formats and parses; a Units button on the landing page switches ft-in and m per device. The scan summary, the landing scan label and the import banner (new: it now gives the room size, a quick check that units were read right) use it. Two choices beyond the item text: a bare number is feet in imperial and meters in metric, and inches after feet must stay under 12 ("13 16" is refused as a likely typo). The default is imperial for any US region tag (en-US, es-US), not only en-US.
 
 **Outcome.** US crews read 13 ft 6 in and metric crews read 4.11 m, and either form can be typed.
 

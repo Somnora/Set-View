@@ -252,3 +252,16 @@ Run the probe first (section above): its answers decide whether the Quest file p
 - [ ] **Guided capture on Quest (P1.8):** Scan Room captures the room mesh plus planes; walls are not drawn twice. On a scene with an imported location, the first Scan Room press asks for a second.
 - [ ] **Guided capture on Galaxy XR (P1.8):** Scan Room, look across the floor, walls and tables: outlines build up and the wheel reads "Finish Scan (N)"; press again to keep it. Unlabeled planes come out as floor, table, ceiling or wall.
 - [ ] **Empty scene:** a brand-new scene opens its AR session in Dress, with the "Scan Room" chip on the left controller.
+
+## Build a set (roadmap Phase 2)
+
+Branch `p2/build-a-set`. Plan and review notes: `docs/roadmap-scan-import-build.md`.
+
+### Verified headset-free
+
+- `npm test`: the `P2.2` tests (a 4x8 ft sheet is exactly 1.2192 x 2.4384 m, the typed forms crews use, metric unchanged, an exact format and parse round trip for every 1/16 in up to 40 ft, garbage refused, the language default and blocked storage).
+- Headed smoke `test/units-smoke.html`: through the real landing page, the test room's scan label reads in feet and inches, the Units button switches it to meters and back, and the choice is saved on the device.
+
+### On a headset
+
+- [ ] **Units (P2.2):** on the Quest 2D page the Units button starts at ft-in (a US browser) and the choice survives a reload. Scan Room in AR: the log line gives the room size in the chosen units.

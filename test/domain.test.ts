@@ -616,6 +616,7 @@ import * as drop from '../src/dropBox.ts';
 import { fitTextureSize, LocationRenderer as P1LocationRenderer } from '../src/location.ts';
 import * as reg from '../src/registration.ts';
 import * as flow from '../src/scanFlow.ts';
+import * as units from '../src/units.ts';
 import { baseScanLabel, classifyPlane, isPlaneLabel, planeLabel, triangulatePolygon } from '../src/scan.ts';
 import { captureScanFromFrame as p1Capture, PlaneCollector } from '../src/scanner.ts';
 import { createAudioCue as p1CreateAudioCue } from '../src/audioCues.ts';
@@ -15724,6 +15725,111 @@ function p1SpatialPaths(scene: unknown): Map<string, 'vec' | 'quat' | 'triple' |
     loc.setScan({ ...scan, meshes: scan.meshes.slice(1) });
     assert.equal(loc.pickTargets().length, 1);
     assert.ok(loc.group.children.some((c) => c.name === 'scan:plane:wall' && c.visible));
+  });
+}
+
+// --- P2 units (P2.2) ---
+{
+  const imp = { system: 'imperial' as const };
+  const met = { system: 'metric' as const };
+
+  test('P2.2: a 4x8 ft sheet is exactly 1.2192 x 2.4384 m, from every way of typing it', () => {
+    assert.equal(units.parseLength("4'", 'imperial'), 1.2192);
+    assert.equal(units.parseLength("8'", 'imperial'), 2.4384);
+    assert.equal(units.parseLength('48in', 'metric'), 1.2192);
+    assert.equal(units.parseLength('96 inches', 'metric'), 2.4384);
+    assert.equal(units.parseLength('8 ft', 'metric'), 2.4384);
+    assert.equal(units.parseLength(`7' 12"`, 'imperial'), null, 'inches after feet stay under 12');
+    assert.equal(units.inchesToMeters(12 * 8), 2.4384);
+    assert.equal(units.formatDims(1.2192, 2.4384, undefined, imp), '4 ft 0 in × 8 ft 0 in');
+    assert.equal(units.formatDims(1.2192, 2.4384, undefined, met), '1.22 × 2.44 m');
+  });
+
+  test('P2.2: parseLength accepts the forms crews type', () => {
+    const in13ft6 = units.inchesToMeters(13 * 12 + 6);
+    for (const s of [`13'6"`, `13' 6"`, `13'-6"`, `13' - 6"`, '13 ft 6 in', '13 feet 6 inches', '13ft6in', '13 6', `13 6"`, `13' 6`, '162in', '162 "', '13.5 ft', `13′6″`, '13’6”', "13'6''"]) {
+      assert.equal(units.parseLength(s, 'imperial'), in13ft6, s);
+    }
+    // Explicit imperial units work in metric mode too.
+    assert.equal(units.parseLength(`13'6"`, 'metric'), in13ft6);
+    assert.equal(units.parseLength('6 1/2"', 'metric'), units.inchesToMeters(6.5));
+    assert.equal(units.parseLength('3/4 in', 'metric'), units.inchesToMeters(0.75));
+    assert.equal(units.parseLength(`2' 3 7/16"`, 'metric'), units.inchesToMeters(27 + 7 / 16));
+    assert.equal(units.parseLength('1 1/2 ft', 'metric'), units.inchesToMeters(18));
+    assert.equal(units.parseLength('  -2 ft  ', 'metric'), -units.inchesToMeters(24));
+    // A bare number is feet in imperial, meters in metric.
+    assert.equal(units.parseLength('10', 'imperial'), units.inchesToMeters(120));
+    assert.equal(units.parseLength('10', 'metric'), 10);
+    assert.equal(units.parseLength('.5', 'metric'), 0.5);
+  });
+
+  test('P2.2: metric passes through unchanged', () => {
+    assert.equal(units.parseLength('2.6m', 'imperial'), 2.6);
+    assert.equal(units.parseLength('2.6 metres', 'imperial'), 2.6);
+    assert.equal(units.parseLength('260cm', 'imperial'), 2.6);
+    assert.equal(units.parseLength('2600 mm', 'imperial'), 2.6);
+    assert.equal(units.parseLength('4.11', 'metric'), 4.11);
+    assert.equal(units.parseLength('2 m 30 cm', 'metric'), 2.3);
+    assert.equal(units.formatLength(4.11, met), '4.11 m');
+    assert.equal(units.formatLength(4.114, { system: 'metric', decimals: 1 }), '4.1 m');
+    assert.equal(units.formatLength(-0.001, met), '0.00 m', 'no negative zero');
+    for (const m of [0, 0.01, 0.37, 1, 2.6, 4.11, 12.34, 99.99]) {
+      assert.equal(units.parseLength(units.formatLength(m, met), 'metric'), m, `${m} m`);
+    }
+  });
+
+  test('P2.2: imperial format and parse round-trip exactly at 1/16 in', () => {
+    // Every sixteenth from 0 to 40 ft (7681 values), plus negatives.
+    for (let n = -16 * 24; n <= 16 * 12 * 40; n++) {
+      const m = units.inchesToMeters(n / 16);
+      const s = units.formatLength(m, { system: 'imperial', fractionIn: 16 });
+      assert.equal(units.parseLength(s, 'metric'), n === 0 ? 0 : m, `${n}/16 in -> "${s}"`);
+    }
+    // 1/8 in readouts round to the nearest eighth.
+    assert.equal(units.formatLength(units.inchesToMeters(13 * 12 + 6), imp), '13 ft 6 in');
+    assert.equal(units.formatLength(units.inchesToMeters(13 * 12 + 6.5), imp), '13 ft 6 1/2 in');
+    assert.equal(units.formatLength(units.inchesToMeters(13 * 12 + 6 + 7 / 32), imp), '13 ft 6 1/4 in', '7/32 rounds to 2/8');
+    assert.equal(units.formatLength(units.inchesToMeters(13 * 12 + 6 + 5 / 32), imp), '13 ft 6 1/8 in', '5/32 rounds to 1/8');
+    assert.equal(units.formatLength(units.inchesToMeters(0.875), imp), '7/8 in');
+    assert.equal(units.formatLength(units.inchesToMeters(11.97), imp), '1 ft 0 in', 'never 12 in');
+    assert.equal(units.formatLength(units.inchesToMeters(-30), imp), '-2 ft 6 in');
+    assert.equal(units.formatLength(0, imp), '0 in');
+    assert.equal(units.formatLength(units.inchesToMeters(244.4), { system: 'imperial', fractionIn: 1 }), '20 ft 4 in');
+    assert.equal(units.formatLength(Number.NaN, imp), '?');
+  });
+
+  test('P2.2: garbage input is rejected, not guessed at', () => {
+    for (const s of ['', '   ', 'abc', '13 ft abc', '13 ftx', '1/0 in', '6 1/0', '13m 6ft', `2m 3'`, '--3', '3 4 5', `13'6'`, `6" 13'`, '6 in 13 ft', 'NaN', 'Infinity', '1e3', '.', '6/', '13 6 m', '2 30']) {
+      assert.equal(units.parseLength(s, 'imperial'), null, `imperial: "${s}"`);
+    }
+    assert.equal(units.parseLength('13 6', 'metric'), null, 'two bare numbers mean nothing in metric');
+  });
+
+  test('P2.2: the default follows the browser region, and the setting survives blocked storage', () => {
+    assert.equal(units.defaultUnitSystem('en-US'), 'imperial');
+    assert.equal(units.defaultUnitSystem('es-US'), 'imperial');
+    assert.equal(units.defaultUnitSystem('zh-Hant-US'), 'imperial');
+    for (const l of ['en-GB', 'en', 'de-DE', 'es-419', '', null, undefined]) assert.equal(units.defaultUnitSystem(l), 'metric', String(l));
+
+    const mem = new Map<string, string>();
+    const store = { getItem: (k: string) => mem.get(k) ?? null, setItem: (k: string, v: string) => void mem.set(k, v) };
+    assert.equal(units.readUnitSystem(store, 'en-US'), 'imperial', 'unset: language default');
+    assert.equal(units.writeUnitSystem(store, 'metric'), true);
+    assert.equal(units.readUnitSystem(store, 'en-US'), 'metric', 'the saved choice wins');
+    mem.set(units.UNIT_SYSTEM_STORAGE_KEY, 'cubits');
+    assert.equal(units.readUnitSystem(store, 'en-GB'), 'metric', 'an unknown value falls back');
+    const blocked = {
+      getItem: () => {
+        throw new Error('SecurityError');
+      },
+      setItem: () => {
+        throw new Error('QuotaExceededError');
+      },
+    };
+    assert.equal(units.readUnitSystem(blocked, 'en-US'), 'imperial');
+    assert.equal(units.writeUnitSystem(blocked, 'metric'), false);
+    assert.equal(units.writeUnitSystem(null, 'metric'), false);
+    assert.equal(units.otherUnitSystem('imperial'), 'metric');
   });
 }
 
