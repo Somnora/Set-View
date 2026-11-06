@@ -613,6 +613,8 @@ import { BlobStore } from '../src/blobStore.ts';
 import { importLocationBytes, partsFromObject3D } from '../src/locationImport.ts';
 import * as drop from '../src/dropBox.ts';
 import { fitTextureSize, LocationRenderer as P1LocationRenderer } from '../src/location.ts';
+import * as reg from '../src/registration.ts';
+import { applyRigidToScan, meshFootprintCenter as p1FootprintCenter } from '../src/scan.ts';
 import { dropBox as dropBoxPlugin } from '../vite.plugins.ts';
 import * as nodeHttp from 'node:http';
 import * as nodeOs from 'node:os';
@@ -15073,6 +15075,125 @@ async function p1DropBoxServerTest(): Promise<void> {
     s.locationMode = 'photo';
     normalizeScene(s);
     assert.equal(s.locationMode, 'photo');
+  });
+}
+
+// --- P1 align (P1.6) ---
+{
+  const v = (x: number, y: number, z: number) => ({ x, y, z });
+  const near = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }, eps = 1e-6) => {
+    approx(a.x, b.x, eps);
+    approx(a.y, b.y, eps);
+    approx(a.z, b.z, eps);
+  };
+
+  test('P1.6: rigid deltas follow the three.js rotation.y convention and compose and invert', () => {
+    const q = reg.applyRigidToPoint({ dx: 0, dy: 0, dz: 0, rotY: Math.PI / 2 }, v(0, 0, 1));
+    near(q, v(1, 0, 0)); // Ry(90deg) takes +Z to +X, as THREE.Object3D.rotation.y does
+    const m = new THREE.Matrix4().fromArray(reg.rigidDeltaMatrix({ dx: 1, dy: 2, dz: 3, rotY: 0.7 }));
+    const viaThree = new THREE.Vector3(0.3, 0.5, -1.2).applyMatrix4(m);
+    near(reg.applyRigidToPoint({ dx: 1, dy: 2, dz: 3, rotY: 0.7 }, v(0.3, 0.5, -1.2)), viaThree);
+    const a = { dx: 1, dy: 0.1, dz: -2, rotY: 0.4 };
+    const b = { dx: -0.5, dy: 0, dz: 3, rotY: -1.1 };
+    const p = v(2, 1, 5);
+    near(reg.applyRigidToPoint(reg.composeRigid(a, b), p), reg.applyRigidToPoint(b, reg.applyRigidToPoint(a, p)));
+    near(reg.applyRigidToPoint(reg.invertRigid(a), reg.applyRigidToPoint(a, p)), p);
+    approx(reg.wrapAngle(3 * Math.PI), Math.PI, 1e-12);
+    approx(reg.wrapAngle(-Math.PI), Math.PI, 1e-12);
+  });
+
+  test('P1.6: solveTwoPoint recovers a known move within 1 mm and 0.1 degree, and flags bad input', () => {
+    const truth = { dx: 3.2, dy: -0.04, dz: -1.7, rotY: reg.wrapAngle(2.3) };
+    const srcA = v(-2, 0, 1);
+    const srcB = v(4, 0.02, -3);
+    const sol = reg.solveTwoPoint(srcA, srcB, reg.applyRigidToPoint(truth, srcA), reg.applyRigidToPoint(truth, srcB));
+    assert.ok(sol.ok);
+    if (sol.ok) {
+      approx(sol.delta.dx, truth.dx, 1e-3);
+      approx(sol.delta.dz, truth.dz, 1e-3);
+      approx(sol.delta.dy, truth.dy, 1e-3);
+      approx(sol.delta.rotY, truth.rotY, (0.1 * Math.PI) / 180);
+      assert.ok(sol.residual < 1e-6 && !sol.warn);
+    }
+    // 2 cm of hit-test noise at 7 m: still within a degree, and no warning.
+    const noisy = reg.solveTwoPoint(srcA, srcB, reg.applyRigidToPoint(truth, srcA), {
+      ...reg.applyRigidToPoint(truth, srcB),
+      x: reg.applyRigidToPoint(truth, srcB).x + 0.02,
+    });
+    assert.ok(noisy.ok && Math.abs(noisy.delta.rotY - truth.rotY) < (1 * Math.PI) / 180 && !noisy.warn);
+    // Spans that disagree by 40 cm (wrong points, or the wrong units): flagged.
+    const off = reg.solveTwoPoint(v(0, 0, 0), v(4, 0, 0), v(0, 0, 0), v(4.4, 0, 0));
+    assert.ok(off.ok && off.warn);
+    const close = reg.solveTwoPoint(v(0, 0, 0), v(0.3, 0, 0), v(0, 0, 0), v(0.3, 0, 0));
+    assert.ok(!close.ok && /at least 0.5 m/.test(close.reason));
+    assert.ok(!reg.solveTwoPoint(v(NaN, 0, 0), v(1, 0, 0), v(0, 0, 0), v(1, 0, 0)).ok);
+  });
+
+  test('P1.6: the two-point flow steps scan, real, scan, real, preview; refuses close points; steps back', () => {
+    let s = reg.twoPointInitial();
+    assert.match(reg.twoPointPrompt(s), /scan \(point A\)/);
+    s = reg.twoPointAddPoint(s, v(0, 0, 0));
+    assert.equal(s.phase, 'realA');
+    s = reg.twoPointAddPoint(s, v(1, 0, 1));
+    s = reg.twoPointAddPoint(s, v(0.2, 0, 0));
+    s = reg.twoPointAddPoint(s, v(1.2, 0, 1));
+    assert.equal(s.phase, 'scanB', 'too close: back to the second scan point');
+    assert.match(reg.twoPointPrompt(s), /at least 0.5 m/);
+    s = reg.twoPointAddPoint(s, v(4, 0, 0));
+    s = reg.twoPointAddPoint(s, v(5, 0, 1));
+    assert.equal(s.phase, 'preview');
+    assert.ok(s.solution?.ok);
+    assert.match(reg.twoPointPrompt(s), /Fit within 0 cm/);
+    assert.equal(reg.twoPointAddPoint(s, v(9, 9, 9)), s, 'a trigger in preview adds nothing');
+    s = reg.twoPointBack(s);
+    assert.equal(s.phase, 'realB');
+    assert.equal(s.solution, null);
+    for (const ph of ['scanB', 'realA', 'scanA', 'scanA'] as const) {
+      s = reg.twoPointBack(s);
+      assert.equal(s.phase, ph);
+    }
+  });
+
+  // World position of a scan vertex as LocationRenderer.applyPlacements draws it.
+  const drawn = (scan: LocationScan, placements: { meshIndex: number; dx: number; dz: number; rotY: number }[] | undefined, mi: number, vi: number) => {
+    const pos = scan.meshes[mi].positions;
+    const g = { x: pos[vi * 3], y: pos[vi * 3 + 1], z: pos[vi * 3 + 2] };
+    const pl = placements?.find((p) => p.meshIndex === mi);
+    if (!pl) return g;
+    const c = p1FootprintCenter(pos);
+    const r = reg.rotateXZ(pl.rotY, g.x - c.x, g.z - c.z);
+    return { x: c.x + pl.dx + r.x, y: g.y, z: c.z + pl.dz + r.z };
+  };
+
+  test('P1.6: applyRigidToScan moves every vertex, keeps moved furniture exactly where the move takes it', () => {
+    const scan = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
+    const couch = scan.meshes.findIndex((m) => m.label === 'couch');
+    const wall = scan.meshes.findIndex((m) => m.label === 'walls');
+    const placements = [
+      { meshIndex: couch, dx: 0.8, dz: -0.4, rotY: 0.6 },
+      { meshIndex: wall, dx: 0.1, dz: 0, rotY: 0.2 }, // legacy placement on a static piece
+    ];
+    for (const delta of [
+      { dx: 0, dy: 0, dz: 0, rotY: 0 },
+      { dx: 0, dy: 0, dz: 0, rotY: Math.PI / 2 },
+      { dx: 1.5, dy: 0.03, dz: -2, rotY: 0 },
+      { dx: -0.7, dy: 0, dz: 2.2, rotY: 0.65 }, // a non-right angle: footprint centres do not turn with the mesh
+    ]) {
+      const out = applyRigidToScan(scan, placements, delta);
+      assert.notEqual(out.scan.id, scan.id, 'a new blob id, so undo can return to the old one');
+      assert.equal(out.scan.meshes.length, scan.meshes.length);
+      for (const mi of [couch, wall, 0]) {
+        const n = scan.meshes[mi].positions.length / 3;
+        for (const vi of [0, Math.floor(n / 2), n - 1]) {
+          near(drawn(out.scan, out.furniture, mi, vi), reg.applyRigidToPoint(delta, drawn(scan, placements, mi, vi)), 1e-4);
+        }
+      }
+      assert.equal(out.scan.meshes[0].indices, scan.meshes[0].indices, 'topology is shared, not copied');
+    }
+    assert.equal(scan.meshes[0].positions[0], createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']).meshes[0].positions[0], 'input untouched');
+    assert.equal(applyRigidToScan(scan, undefined, reg.IDENTITY_DELTA).furniture, undefined);
+    const bounds = summarizeScan(applyRigidToScan(scan, undefined, { dx: 10, dy: 0, dz: 0, rotY: 0 }).scan);
+    approx(bounds.boundsMin.x, summarizeScan(scan).boundsMin.x + 10, 1e-4);
   });
 }
 

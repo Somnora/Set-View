@@ -24,7 +24,8 @@
 //     f32… positions, then u16|u32… indices
 // ---------------------------------------------------------------------------
 
-import { uid, type ScanSummary, type Vec3 } from './model.ts';
+import { uid, type FurniturePlacement, type ScanSummary, type Vec3 } from './model.ts';
+import { rotateXZ, wrapAngle, type RigidDelta } from './registration.ts';
 
 export interface ScanMeshData {
   /** Semantic label from the platform ('global mesh', 'table', 'couch', …),
@@ -298,6 +299,55 @@ export function meshFootprintCenter(positions: Float32Array): Vec3 {
     if (z > maxZ) maxZ = z;
   }
   return { x: (minX + maxX) / 2, y: 0, z: (minZ + maxZ) / 2 };
+}
+
+/**
+ * Bakes a rigid move (turn about world up, then translate) into a scan: every
+ * position moves, the result gets a new id (the blob store never rewrites a
+ * blob under its id, so undo can return to the old one), and furniture
+ * placements are rewritten so each moved piece lands exactly where the same
+ * move takes it. A placement is relative to its mesh's footprint centre (an
+ * axis-aligned box centre, which does not turn with the mesh), so the offset
+ * picks up a correction: with R the turn, c and c' the centre before and
+ * after, and e = R c + t - c', the new offset is R d + e - Ry(rotY_f) e and the
+ * piece's own yaw is unchanged. Input is not mutated.
+ */
+export function applyRigidToScan(
+  scan: LocationScan,
+  furniture: readonly FurniturePlacement[] | undefined,
+  d: RigidDelta,
+): { scan: LocationScan; furniture: FurniturePlacement[] | undefined } {
+  const c = Math.cos(d.rotY);
+  const s = Math.sin(d.rotY);
+  const meshes = scan.meshes.map((m) => {
+    const p = new Float32Array(m.positions.length);
+    for (let i = 0; i + 2 < m.positions.length; i += 3) {
+      const x = m.positions[i];
+      const z = m.positions[i + 2];
+      p[i] = x * c + z * s + d.dx;
+      p[i + 1] = m.positions[i + 1] + d.dy;
+      p[i + 2] = -x * s + z * c + d.dz;
+    }
+    return { label: m.label, positions: p, indices: m.indices };
+  });
+  let placed: FurniturePlacement[] | undefined;
+  if (furniture && furniture.length) {
+    placed = [];
+    for (const f of furniture) {
+      const before = scan.meshes[f.meshIndex];
+      const after = meshes[f.meshIndex];
+      if (!before || !after) continue;
+      const c0 = meshFootprintCenter(before.positions);
+      const c1 = meshFootprintCenter(after.positions);
+      const rc = rotateXZ(d.rotY, c0.x, c0.z);
+      const ex = rc.x + d.dx - c1.x;
+      const ez = rc.z + d.dz - c1.z;
+      const rd = rotateXZ(d.rotY, f.dx, f.dz);
+      const re = rotateXZ(f.rotY, ex, ez);
+      placed.push({ meshIndex: f.meshIndex, dx: rd.x + ex - re.x, dz: rd.z + ez - re.z, rotY: wrapAngle(f.rotY) });
+    }
+  }
+  return { scan: { version: 1, id: uid(), capturedAt: scan.capturedAt, meshes }, furniture: placed };
 }
 
 /**
