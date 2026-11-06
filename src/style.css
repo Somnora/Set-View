@@ -599,8 +599,15 @@ body {
   bottom: 24px;
   transform: translateX(-50%);
   display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
   align-items: center;
-  gap: 12px;
+  gap: 10px 12px;
+  /* Wrap instead of running off both edges: the full app has 20+ buttons.
+     max-content keeps a fixed, centred bar from shrinking to half the viewport. */
+  width: max-content;
+  max-width: calc(100vw - 32px);
+  box-sizing: border-box;
   padding: 12px 18px;
   background: rgba(10, 13, 20, 0.92);
   border: 1px solid var(--border-accent);

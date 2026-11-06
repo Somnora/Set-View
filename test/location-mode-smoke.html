@@ -84,8 +84,22 @@
           const cycled = roomBtn.textContent;
           await sleep(1200); // markDirty debounce is 800 ms
           const saved = JSON.parse(localStorage.getItem(SCENE_PREFIX + scene.id) || 'null');
-          const ok = restored === 'Room: Solid' && cycled === 'Room: Wireframe' && saved?.locationMode === 'wireframe';
-          report(ok, `restored=${restored} cycled=${cycled} saved=${saved?.locationMode}`);
+          // The real app's toolbar has 20+ buttons; every one must be inside the window.
+          const offscreen = [...document.querySelectorAll('.preview-bar button')]
+            .filter((b) => {
+              const r = b.getBoundingClientRect();
+              return r.left < 0 || r.right > innerWidth || r.top < 0 || r.bottom > innerHeight;
+            })
+            .map((b) => b.textContent.trim());
+          const ok =
+            restored === 'Room: Solid' &&
+            cycled === 'Room: Wireframe' &&
+            saved?.locationMode === 'wireframe' &&
+            offscreen.length === 0;
+          report(
+            ok,
+            `restored=${restored} cycled=${cycled} saved=${saved?.locationMode} offscreen=[${offscreen.join(', ')}]`,
+          );
         }
       } catch (e) {
         report(false, e.message);
