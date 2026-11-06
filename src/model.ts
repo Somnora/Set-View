@@ -983,6 +983,8 @@ export interface ScanSummary {
   furniture?: FurniturePlacement[];
   /** The original file an imported location came from. Absent for headset captures. */
   source?: ScanSourceFile;
+  /** Imported from a file (not captured in the headset): Scan Room asks before replacing it. */
+  imported?: boolean;
 }
 
 /**
@@ -1876,6 +1878,7 @@ export function normalizeScene(s: SceneData): SceneData {
   }
   // A malformed original-file reference only costs Photo mode; drop it, keep the scan.
   if (s.scan && s.scan.source !== undefined && !isScanSourceFile(s.scan.source)) delete s.scan.source;
+  if (s.scan && s.scan.imported !== undefined && typeof s.scan.imported !== 'boolean') delete s.scan.imported;
   // A bad value is dropped rather than failing the import (it is only a view
   // preference); a scene with a scan shows it as Ghost unless told otherwise.
   if (s.locationMode !== undefined && !isLocationDisplayMode(s.locationMode)) delete s.locationMode;

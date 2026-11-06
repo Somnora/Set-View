@@ -30,7 +30,10 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 import type { FurniturePlacement, LocationDisplayMode } from './model.ts';
 import type { RigidDelta } from './registration.ts';
 import {
+  baseScanLabel,
+  GLOBAL_MESH_LABEL,
   isMovableScanMesh,
+  isPlaneLabel,
   meshFootprintCenter,
   normalizeSemanticLabel,
   quatYaw,
@@ -133,6 +136,11 @@ export class LocationRenderer {
   private meshes: THREE.Mesh[] = [];
   /** Tint of meshes[i]. */
   private meshColors: number[] = [];
+  /**
+   * meshes[i] is a plane piece drawn by the room mesh already (Quest captures
+   * both). Kept in the scan for wall conversion, never drawn or picked.
+   */
+  private meshHidden: boolean[] = [];
   /** Bounded furniture meshes, movable in Stage 1. */
   private furniture: FurnitureEntry[] = [];
   /** Footprint center of a static mesh with a saved placement, by mesh index
@@ -285,7 +293,7 @@ export class LocationRenderer {
 
   /** Scan meshes a picking ray can hit (Align's scan points), while shown. */
   pickTargets(): THREE.Object3D[] {
-    return this.mode === 'hidden' ? [] : this.meshes;
+    return this.mode === 'hidden' ? [] : this.meshes.filter((_, i) => !this.meshHidden[i]);
   }
 
   /** Back to the rest pose: scan coordinates are scene coordinates (plus the floor offset). */
@@ -371,6 +379,8 @@ export class LocationRenderer {
     let maxX = -Infinity;
     let maxY = -Infinity;
     let maxZ = -Infinity;
+    // A room mesh draws walls and floor already; plane pieces would double them.
+    const hasRoomMesh = scan.meshes.some((m) => normalizeSemanticLabel(m.label) === GLOBAL_MESH_LABEL);
 
     scan.meshes.forEach((m, meshIndex) => {
       const geo = new THREE.BufferGeometry();
@@ -417,6 +427,7 @@ export class LocationRenderer {
       }
       this.meshes.push(mesh);
       this.meshColors.push(color);
+      this.meshHidden.push(hasRoomMesh && isPlaneLabel(m.label));
       this.group.add(mesh);
       // Wireframe overlay edges are built on first use (ensureWireframes).
     });
@@ -651,7 +662,7 @@ export class LocationRenderer {
     const variant = variantFor(this.mode);
     for (let i = 0; i < this.meshes.length; i++) {
       this.meshes[i].material = this.material(variant, this.meshColors[i]);
-      this.meshes[i].visible = !photo;
+      this.meshes[i].visible = !photo && !this.meshHidden[i];
     }
     this.applyWireVisibility();
   }
@@ -692,6 +703,7 @@ export class LocationRenderer {
     for (const wire of this.wireframeLines) wire.geometry.dispose();
     this.meshes = [];
     this.meshColors = [];
+    this.meshHidden = [];
     this.furniture = [];
     this.staticPivots.clear();
     this.wireframeLines = [];
@@ -750,5 +762,5 @@ function variantFor(mode: LocationMode): MaterialVariant {
 
 function labelColor(label: string): number {
   // Normalized so scans stored before label normalization still tint right.
-  return LABEL_COLORS[normalizeSemanticLabel(label)] ?? DEFAULT_COLOR;
+  return LABEL_COLORS[baseScanLabel(normalizeSemanticLabel(label))] ?? DEFAULT_COLOR;
 }

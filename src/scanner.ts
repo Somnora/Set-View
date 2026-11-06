@@ -11,7 +11,15 @@
 import * as THREE from 'three';
 import { uid } from './model.ts';
 import type { LocationScan, ScanMeshData } from './scan.ts';
-import { GLOBAL_MESH_LABEL, normalizeSemanticLabel, sanitizeMeshBuffers, transformPositions } from './scan.ts';
+import {
+  classifyPlane,
+  GLOBAL_MESH_LABEL,
+  normalizeSemanticLabel,
+  planeLabel,
+  sanitizeMeshBuffers,
+  transformPositions,
+  triangulatePolygon,
+} from './scan.ts';
 
 const _meshMatrix = new THREE.Matrix4();
 
@@ -21,6 +29,8 @@ interface XRPlaneLike {
   polygon: ReadonlyArray<{ x: number; y: number; z?: number }>;
   orientation?: 'horizontal' | 'vertical';
   semanticLabel?: string;
+  /** When the plane's polygon or pose last changed (WebXR plane-detection). */
+  lastChangedTime?: number;
 }
 
 /** Structural interface for extended XRFrame with plane detection. */
@@ -48,31 +58,33 @@ function triangulatePlanePolygon(
 
   const n = poly.length;
   const positions = new Float32Array(n * 3);
+  const xz = new Float32Array(n * 2);
   for (let i = 0; i < n; i++) {
     const pt = poly[i];
     positions[i * 3] = pt.x ?? 0;
     positions[i * 3 + 1] = pt.y ?? 0;
     positions[i * 3 + 2] = pt.z ?? 0;
+    // The polygon lies in the plane's x-z plane (plane-space y is its normal).
+    xz[i * 2] = pt.x ?? 0;
+    xz[i * 2 + 1] = pt.z ?? 0;
   }
 
   transformPositions(positions, _meshMatrix.elements);
 
-  // Triangulate convex polygon as triangle fan
-  const triCount = n - 2;
-  const indices = new Uint32Array(triCount * 3);
-  for (let i = 0; i < triCount; i++) {
-    indices[i * 3] = 0;
-    indices[i * 3 + 1] = i + 1;
-    indices[i * 3 + 2] = i + 2;
-  }
+  // Ear clipping: concave outlines (an L-shaped floor) triangulate correctly,
+  // and the triangles face along the plane normal.
+  const indices = triangulatePolygon(xz);
+  if (indices.length < 3) return null;
 
-  // Unlabeled planes (Chrome may report none) fall back to their orientation.
-  // Both fallbacks are static, so a mislabeled table top can't become grabbable.
+  // Plane pieces are marked 'plane:' (static, never grabbable). Unlabeled planes
+  // (Android XR Chrome reports none) are classified by their normal and height.
+  const e = _meshMatrix.elements;
+  const normalUp = e[5] / (Math.hypot(e[4], e[5], e[6]) || 1);
+  let sumY = 0;
+  for (let i = 0; i < n; i++) sumY += positions[i * 3 + 1];
   const label = plane.semanticLabel?.trim()
-    ? normalizeSemanticLabel(plane.semanticLabel)
-    : plane.orientation === 'horizontal'
-      ? 'floor'
-      : 'wall';
+    ? planeLabel(plane.semanticLabel)
+    : planeLabel(classifyPlane(normalUp, sumY / n));
 
   return {
     label,
@@ -131,8 +143,11 @@ export function captureScanFromFrame(
     }
   }
 
-  // 2. Process WebXR Detected Planes (fallback or complementary capture)
-  if (meshes.length === 0 && hasPlanes) {
+  // 2. WebXR planes, kept alongside meshes (marked 'plane:'): on Quest they are
+  // the labelled walls, doors and windows, kept for turning the room into
+  // editable walls; on Android XR they are the whole capture. The renderer hides
+  // them when a room mesh already draws the same surfaces.
+  if (hasPlanes) {
     for (const plane of detectedPlanes!) {
       const planeMesh = triangulatePlanePolygon(plane, frame, refSpace, worldToScene);
       if (planeMesh) {
@@ -150,4 +165,68 @@ export function captureScanFromFrame(
 
   if (meshes.length === 0) return null;
   return { version: 1, id: uid(), capturedAt: Date.now(), meshes };
+}
+
+/**
+ * Planes-only capture (Android XR): keeps every detected plane as the user
+ * looks around, keyed by the XRPlane object, and re-triangulates one only
+ * when its lastChangedTime moves. The caller refreshes it at most every
+ * SCAN_COLLECT_INTERVAL_MS (scanFlow.ts), never per frame.
+ */
+export class PlaneCollector {
+  private entries = new Map<object, { changed: number; mesh: ScanMeshData }>();
+
+  get count(): number {
+    return this.entries.size;
+  }
+
+  /** Reads this frame's planes into the collection. Returns the plane count. */
+  refresh(frame: XRFrame, refSpace: XRReferenceSpace, worldToScene: THREE.Matrix4): number {
+    const planes = (frame as unknown as XRFrameExtended).detectedPlanes;
+    if (!planes) return this.entries.size;
+    for (const plane of planes) {
+      const changed = plane.lastChangedTime ?? 0;
+      const prev = this.entries.get(plane);
+      if (prev && prev.changed === changed) continue;
+      const piece = triangulatePlanePolygon(plane, frame, refSpace, worldToScene);
+      const clean = piece ? sanitizeMeshBuffers(piece.positions, piece.indices) : null;
+      if (clean && piece) this.entries.set(plane, { changed, mesh: { label: piece.label, positions: clean.positions, indices: clean.indices } });
+    }
+    return this.entries.size;
+  }
+
+  /** The collection as a LocationScan, or null when empty. */
+  toScan(): LocationScan | null {
+    if (!this.entries.size) return null;
+    const meshes = [...this.entries.values()].map((e) => e.mesh);
+    return { version: 1, id: uid(), capturedAt: Date.now(), meshes };
+  }
+
+  /**
+   * Writes every plane outline as line-segment endpoints into out (xyz pairs),
+   * stopping when it is full. Returns the number of vertices written. Reuses
+   * the caller's buffer: no allocation.
+   */
+  writeOutlines(out: Float32Array): number {
+    let o = 0;
+    for (const { mesh } of this.entries.values()) {
+      const p = mesh.positions;
+      const n = p.length / 3;
+      for (let i = 0; i < n; i++) {
+        if (o + 6 > out.length) return o / 3;
+        const j = (i + 1) % n;
+        out[o++] = p[i * 3];
+        out[o++] = p[i * 3 + 1];
+        out[o++] = p[i * 3 + 2];
+        out[o++] = p[j * 3];
+        out[o++] = p[j * 3 + 1];
+        out[o++] = p[j * 3 + 2];
+      }
+    }
+    return o / 3;
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
 }

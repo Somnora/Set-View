@@ -543,6 +543,7 @@ export class Persistence {
     const scene = live && live.id === id ? live : this.loadScene(id);
     if (!scene) return null;
     scene.scan = summarizeScan(scan);
+    scene.scan.imported = true;
     if (source) scene.scan.source = source;
     // A new location starts in its default mode (or the one asked for), not the old scan's Hidden.
     delete scene.locationMode;

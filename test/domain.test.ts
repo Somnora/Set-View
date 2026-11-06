@@ -614,6 +614,9 @@ import { importLocationBytes, partsFromObject3D } from '../src/locationImport.ts
 import * as drop from '../src/dropBox.ts';
 import { fitTextureSize, LocationRenderer as P1LocationRenderer } from '../src/location.ts';
 import * as reg from '../src/registration.ts';
+import * as flow from '../src/scanFlow.ts';
+import { baseScanLabel, classifyPlane, isPlaneLabel, planeLabel, triangulatePolygon } from '../src/scan.ts';
+import { captureScanFromFrame as p1Capture, PlaneCollector } from '../src/scanner.ts';
 import { createAudioCue as p1CreateAudioCue } from '../src/audioCues.ts';
 import { createAcousticsConfig as p1Acoustics, createBoomMicEntity as p1Boom, createLavalierMicEntity as p1Lav } from '../src/acousticsEngine.ts';
 import { createSetDressingConfig as p1Dressing } from '../src/setDressingEngine.ts';
@@ -14160,7 +14163,7 @@ await p0iTestAsync('P0 integration: a scan this page wrote is sized without read
       'coverage cameras end a camera carry before cams.setScene',
     );
     before(
-      mainMethodBody(src, 'updatePendingScan'),
+      mainMethodBody(src, 'commitCapturedScan'),
       'if (this.draggedFurniture) this.cancelActiveManipulation();',
       'this.location.setScan(scan);',
       'a scan capture ends a furniture carry before setScan',
@@ -15444,6 +15447,221 @@ function p1SpatialPaths(scene: unknown): Map<string, 'vec' | 'quat' | 'triple' |
     // And the fixture exercises every rule that moves something (no typo'd paths).
     const moved = [...S.positions, ...S.headings, ...S.orientations, ...S.eulers, ...S.north].filter((p) => !found.has(p));
     assert.deepEqual(moved, [], `schema paths the populated scene does not contain: ${moved.join(', ')}`);
+  });
+}
+
+// --- P1 guided capture (P1.8) ---
+{
+  test('P1.8: guide chips point at Scan Room, explain a scan in progress, and coach Align', () => {
+    const base = { mode: 'full' as const, placeMode: 'none' as const, eyesMode: false, interaction: 'dress' as const };
+    const lower = (ctx: Parameters<typeof guideItems>[0]) => guideItems(ctx).find((i) => i.hand === 'left' && i.anchor === 'lower')?.label;
+    assert.match(lower({ ...base, hasScan: false })!, /Scan Room/);
+    assert.equal(lower({ ...base, hasScan: true }), undefined);
+    assert.equal(lower(base), undefined, 'contexts without the field are unchanged');
+    assert.match(lower({ ...base, hasScan: false, scanning: 'collecting' })!, /again to finish/);
+    assert.match(lower({ ...base, scanning: 'waiting' })!, /reading the room/);
+    const nudge = guideItems({ ...base, aligning: 'nudge' });
+    assert.ok(nudge.some((i) => i.anchor === 'grip' && /carry the room/.test(i.label)));
+    assert.ok(nudge.some((i) => i.anchor === 'upper' && /back one step/.test(i.label)));
+    const two = guideItems({ ...base, aligning: 'two-point' });
+    assert.ok(two.some((i) => i.anchor === 'trigger' && /scan point/.test(i.label)));
+    assert.ok(!two.some((i) => /teleport/.test(i.label)), 'no teleport hint while aligning');
+  });
+
+  test('P1.8: plane pieces are marked, normalized, static, and count as floor evidence', () => {
+    assert.equal(normalizeSemanticLabel('PLANE:Door Frame'), 'plane:door');
+    assert.equal(planeLabel('Wall_Face'), 'plane:wall');
+    assert.ok(isPlaneLabel('plane:table'));
+    assert.equal(baseScanLabel('plane:table'), 'table');
+    assert.equal(isMovableScanMesh('table'), true);
+    assert.equal(isMovableScanMesh('plane:table'), false, 'a plane outline is never grabbable');
+    const floorPlane = { label: 'plane:floor', positions: new Float32Array([0, 0.02, 0, 1, 0.02, 0, 0, 0.02, 1]), indices: new Uint32Array([0, 1, 2]) };
+    approx(scanFloorY({ version: 1, id: 'x', capturedAt: 0, meshes: [floorPlane] })!, 0.02, 1e-6);
+  });
+
+  test('P1.8: unlabeled planes are classified by normal and height', () => {
+    assert.equal(classifyPlane(0.05, 1.2), 'wall');
+    assert.equal(classifyPlane(1, 0.02), 'floor');
+    assert.equal(classifyPlane(-1, 0.75), 'table');
+    assert.equal(classifyPlane(1, 2.6), 'ceiling');
+  });
+
+  const triArea = (xz: number[], ix: Uint32Array) => {
+    let a = 0;
+    for (let k = 0; k < ix.length; k += 3) {
+      const [i, j, m] = [ix[k], ix[k + 1], ix[k + 2]];
+      a += Math.abs((xz[j * 2] - xz[i * 2]) * (xz[m * 2 + 1] - xz[i * 2 + 1]) - (xz[j * 2 + 1] - xz[i * 2 + 1]) * (xz[m * 2] - xz[i * 2])) / 2;
+    }
+    return a;
+  };
+  const facesUp = (xz: number[], ix: Uint32Array) => {
+    for (let k = 0; k < ix.length; k += 3) {
+      const a = new THREE.Vector3(xz[ix[k] * 2], 0, xz[ix[k] * 2 + 1]);
+      const b = new THREE.Vector3(xz[ix[k + 1] * 2], 0, xz[ix[k + 1] * 2 + 1]);
+      const c = new THREE.Vector3(xz[ix[k + 2] * 2], 0, xz[ix[k + 2] * 2 + 1]);
+      if (new THREE.Vector3().subVectors(b, a).cross(new THREE.Vector3().subVectors(c, a)).y <= 0) return false;
+    }
+    return true;
+  };
+
+  test('P1.8: ear clipping triangulates concave plane outlines, either winding, facing the plane normal', () => {
+    const square = [0, 0, 2, 0, 2, 2, 0, 2];
+    const sq = triangulatePolygon(square);
+    assert.equal(sq.length, 6);
+    approx(triArea(square, sq), 4, 1e-9);
+    assert.ok(facesUp(square, sq));
+    // An L-shaped floor (area 3): a fan from vertex 0 would cover the notch.
+    const ell = [0, 0, 2, 0, 2, 1, 1, 1, 1, 2, 0, 2];
+    const l = triangulatePolygon(ell);
+    assert.equal(l.length, 12);
+    approx(triArea(ell, l), 3, 1e-9);
+    assert.ok(facesUp(ell, l));
+    for (let k = 0; k < l.length; k += 3) {
+      const cx = (ell[l[k] * 2] + ell[l[k + 1] * 2] + ell[l[k + 2] * 2]) / 3;
+      const cz = (ell[l[k] * 2 + 1] + ell[l[k + 1] * 2 + 1] + ell[l[k + 2] * 2 + 1]) / 3;
+      assert.ok(!(cx > 1 && cz > 1), 'no triangle inside the notch');
+    }
+    const cw = [0, 2, 1, 2, 1, 1, 2, 1, 2, 0, 0, 0]; // the same L, clockwise
+    const lc = triangulatePolygon(cw);
+    approx(triArea(cw, lc), 3, 1e-9);
+    assert.ok(facesUp(cw, lc));
+    assert.equal(triangulatePolygon([0, 0, 1, 1]).length, 0);
+    assert.doesNotThrow(() => triangulatePolygon([0, 0, 1, 0, 2, 0, 3, 0]), 'collinear outline');
+  });
+
+  const frameIn = (over: Partial<flow.ScanFrameInput> = {}): flow.ScanFrameInput => ({
+    now: 0,
+    fading: false,
+    viewFull: true,
+    shifted: false,
+    visible: true,
+    floorSettled: true,
+    hasData: false,
+    ...over,
+  });
+
+  test('P1.8: the scan flow snapshots meshes, waits for realign and floor, hints, times out, cancels', () => {
+    let s = flow.scanStart(['meshes', 'planes'], true);
+    assert.equal(s.phase, 'realign');
+    assert.equal(s.collect, false, 'meshes available: snapshot, not collect');
+    let r = flow.scanFrame(s, frameIn({ fading: true }));
+    assert.equal(r.action.kind, 'wait');
+    r = flow.scanFrame(r.state, frameIn({ now: 100, floorSettled: false }));
+    assert.equal(r.state.phase, 'waiting');
+    assert.equal(r.action.kind, 'floor-hint');
+    r = flow.scanFrame(r.state, frameIn({ now: 200, floorSettled: false }));
+    assert.equal(r.action.kind, 'wait', 'the floor hint is said once');
+    r = flow.scanFrame(r.state, frameIn({ now: 300, hasData: true }));
+    assert.equal(r.action.kind, 'capture');
+    s = r.state;
+    r = flow.scanFrame(s, frameIn({ now: 100 + flow.SCAN_HINT_AFTER_MS + 1 }));
+    assert.equal(r.action.kind, 'hint');
+    r = flow.scanFrame(r.state, frameIn({ now: 100 + flow.SCAN_TIMEOUT_MS + 1 }));
+    assert.equal(r.action.kind, 'timeout');
+    assert.equal(flow.scanFrame(s, frameIn({ shifted: true })).action.kind, 'cancel');
+    assert.equal(flow.scanFrame(s, frameIn({ viewFull: false })).action.kind, 'cancel');
+    // System UI over the session holds the clock: no timeout during Space Setup.
+    let h = flow.scanStart(['meshes'], false);
+    h = flow.scanFrame(h, frameIn({ now: 0 })).state;
+    h = flow.scanFrame(h, frameIn({ now: 60_000, visible: false })).state;
+    assert.equal(flow.scanFrame(h, frameIn({ now: 61_000 })).action.kind, 'wait');
+    assert.equal(flow.scanPress(null), 'start');
+    assert.equal(flow.scanPress(s), 'cancel');
+    assert.equal(flow.scanSectorLabel(null), 'Scan\nRoom');
+  });
+
+  test('P1.8: planes-only scans collect at most twice a second and finish on the next press', () => {
+    let s = flow.scanStart(['planes'], false);
+    assert.equal(s.phase, 'collecting');
+    let r = flow.scanFrame(s, frameIn({ now: 1000, hasData: true }));
+    assert.equal(r.action.kind, 'collect');
+    s = flow.scanCollected(r.state, 0);
+    assert.equal(flow.scanPress(s), 'cancel', 'nothing collected yet: the press cancels');
+    r = flow.scanFrame(s, frameIn({ now: 1000 + flow.SCAN_COLLECT_INTERVAL_MS - 1, hasData: true }));
+    assert.equal(r.action.kind, 'wait', 'not every frame (review R12)');
+    r = flow.scanFrame(r.state, frameIn({ now: 1000 + flow.SCAN_COLLECT_INTERVAL_MS, hasData: true }));
+    assert.equal(r.action.kind, 'collect');
+    s = flow.scanCollected(r.state, 7);
+    assert.equal(flow.scanPress(s), 'finish');
+    assert.equal(flow.scanSectorLabel(s), 'Finish\nScan (7)');
+    // With planes found it never times out: the user finishes it.
+    let late = flow.scanFrame({ ...s, lastCollectAt: 1e9 }, frameIn({ now: 1000 + flow.SCAN_TIMEOUT_MS * 3 }));
+    assert.notEqual(late.action.kind, 'timeout');
+    late = flow.scanFrame({ ...flow.scanStart(['planes'], false), startedAt: 0, lastCollectAt: 1e12, hinted: true }, frameIn({ now: flow.SCAN_TIMEOUT_MS + 1 }));
+    assert.equal(late.action.kind, 'timeout', 'no planes at all: times out');
+  });
+
+  // A minimal XRFrame / XRPlane stand-in: identity poses in scene space.
+  const identityPose = { transform: { matrix: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) } };
+  const plane = (label: string | undefined, poly: [number, number][], changed: number, y = 0) => ({
+    planeSpace: { y } as unknown as XRSpace,
+    polygon: poly.map(([x, z]) => ({ x, y: 0, z })),
+    semanticLabel: label,
+    lastChangedTime: changed,
+  });
+  const fakeFrame = (planes: ReturnType<typeof plane>[], meshes: unknown[] = []) => {
+    let poses = 0;
+    const frame = {
+      detectedPlanes: new Set(planes),
+      detectedMeshes: new Set(meshes),
+      getPose: (space: { y?: number }) => {
+        poses++;
+        const m = identityPose.transform.matrix.slice();
+        m[13] = space.y ?? 0;
+        return { transform: { matrix: m } };
+      },
+    } as unknown as XRFrame;
+    return { frame, poseCalls: () => poses };
+  };
+
+  test('P1.8: PlaneCollector re-triangulates only changed planes, labels them, and writes outlines into a fixed buffer', () => {
+    const floor = plane(undefined, [[0, 0], [3, 0], [3, 3], [0, 3]], 1);
+    const table = plane(undefined, [[0, 0], [1, 0], [1, 1], [0, 1]], 1, 0.75);
+    const door = plane('door frame', [[0, 0], [1, 0], [1, 2], [0, 2]], 1);
+    const col = new PlaneCollector();
+    const ref = {} as XRReferenceSpace;
+    const ws = new THREE.Matrix4();
+    const f1 = fakeFrame([floor, table, door]);
+    assert.equal(col.refresh(f1.frame, ref, ws), 3);
+    assert.equal(f1.poseCalls(), 3);
+    const f2 = fakeFrame([floor, table, door]);
+    col.refresh(f2.frame, ref, ws);
+    assert.equal(f2.poseCalls(), 0, 'unchanged planes are not re-triangulated');
+    floor.lastChangedTime = 2;
+    const f3 = fakeFrame([floor, table, door]);
+    col.refresh(f3.frame, ref, ws);
+    assert.equal(f3.poseCalls(), 1, 'only the changed plane');
+    const scan = col.toScan()!;
+    assert.deepEqual(scan.meshes.map((m) => m.label).sort(), ['plane:door', 'plane:floor', 'plane:table']);
+    const buf = new Float32Array(1000);
+    assert.equal(col.writeOutlines(buf), 3 * 4 * 2, 'two endpoints per outline edge');
+    assert.equal(col.writeOutlines(new Float32Array(12)), 4, 'stops when the buffer is full');
+    col.clear();
+    assert.equal(col.toScan(), null);
+  });
+
+  test('P1.8: captureScanFromFrame keeps planes alongside meshes; the renderer hides them under a room mesh', () => {
+    const mesh = {
+      meshSpace: {},
+      vertices: new Float32Array([0, 0, 0, 4, 0, 0, 0, 0, 4, 4, 2.5, 0]),
+      indices: new Uint32Array([0, 1, 2, 1, 3, 2]),
+      semanticLabel: undefined,
+    };
+    const wall = plane('wall', [[0, 0], [4, 0], [4, 2.5], [0, 2.5]], 1);
+    const { frame } = fakeFrame([wall], [mesh]);
+    const scan = p1Capture(frame, {} as XRReferenceSpace, new THREE.Matrix4())!;
+    assert.deepEqual(scan.meshes.map((m) => m.label), ['global mesh', 'plane:wall']);
+    const loc = new P1LocationRenderer();
+    loc.setScan(scan);
+    loc.setMode('solid');
+    const drawn = loc.group.children.filter((c) => (c as THREE.Mesh).isMesh && c.name.startsWith('scan:'));
+    assert.equal(drawn.length, 2, 'both kept (mesh indices stay stable)');
+    assert.deepEqual(drawn.map((m) => m.visible), [true, false], 'the wall plane is not drawn twice');
+    assert.equal(loc.pickTargets().length, 1);
+    // Planes only (Android XR): the plane pieces are the room and are drawn.
+    loc.setScan({ ...scan, meshes: scan.meshes.slice(1) });
+    assert.equal(loc.pickTargets().length, 1);
+    assert.ok(loc.group.children.some((c) => c.name === 'scan:plane:wall' && c.visible));
   });
 }
 

@@ -108,6 +108,14 @@ export function sanitizeMeshBuffers(
 
 // --- furniture placement (movable labeled meshes) ---------------------------
 
+/**
+ * Marks scan pieces built from WebXR planes, as opposed to Scene Mesh meshes:
+ * 'plane:wall', 'plane:door'. Carried in the label rather than a codec field so
+ * the scan blob format, file exports and the Unreal importer are unchanged
+ * (review R3). Kept for converting a captured room into editable walls later.
+ */
+export const PLANE_LABEL_PREFIX = 'plane:';
+
 /** The platform's whole-room mesh label (the room shell, never movable). */
 export const GLOBAL_MESH_LABEL = 'global mesh';
 
@@ -139,6 +147,8 @@ const SEMANTIC_LABEL_ALIASES: Record<string, string> = {
  */
 export function normalizeSemanticLabel(raw: string | null | undefined): string {
   if (typeof raw !== 'string') return UNLABELED_SCAN_LABEL;
+  // A plane-sourced piece keeps its marker; only the semantic part is normalized.
+  if (raw.toLowerCase().startsWith(PLANE_LABEL_PREFIX)) return PLANE_LABEL_PREFIX + normalizeSemanticLabel(raw.slice(PLANE_LABEL_PREFIX.length));
   // Trim last: a leading or trailing '_' / '-' becomes a space first.
   const key = raw.toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!key) return UNLABELED_SCAN_LABEL;
@@ -163,9 +173,94 @@ export const MOVABLE_SCAN_LABELS: ReadonlySet<string> = new Set([
   'other',
 ]);
 
-/** True for scan meshes the user can pick up and re-place (Stage 1). */
+/** True for scan meshes the user can pick up and re-place (Stage 1). A plane
+ *  piece is a flat outline, never a grabbable object. */
 export function isMovableScanMesh(label: string): boolean {
-  return MOVABLE_SCAN_LABELS.has(normalizeSemanticLabel(label));
+  const n = normalizeSemanticLabel(label);
+  return !isPlaneLabel(n) && MOVABLE_SCAN_LABELS.has(n);
+}
+
+// --- plane-sourced pieces (P1.8) ------------------------------------------------
+
+export function isPlaneLabel(label: string): boolean {
+  return label.toLowerCase().startsWith(PLANE_LABEL_PREFIX);
+}
+
+/** The semantic part of a label ('plane:wall' -> 'wall'). */
+export function baseScanLabel(label: string): string {
+  return isPlaneLabel(label) ? label.slice(PLANE_LABEL_PREFIX.length) : label;
+}
+
+export function planeLabel(semantic: string): string {
+  return PLANE_LABEL_PREFIX + normalizeSemanticLabel(semantic);
+}
+
+/**
+ * Semantic class for a plane the platform left unlabeled (Android XR Chrome
+ * reports none): vertical planes are walls; horizontal ones are floor near the
+ * floor, ceiling above head height, and a table or counter in between.
+ * normalUp is the plane normal's up component in scene space (|n . +Y|).
+ */
+export function classifyPlane(normalUp: number, heightAboveFloor: number): string {
+  if (Math.abs(normalUp) < 0.7) return 'wall';
+  if (heightAboveFloor < 0.25) return 'floor';
+  if (heightAboveFloor > 1.9) return 'ceiling';
+  return 'table';
+}
+
+/**
+ * Triangulates a simple polygon given as x,z pairs (a WebXR plane polygon in
+ * plane space) by ear clipping, so concave outlines (an L-shaped floor, a wall
+ * with a notch) triangulate correctly; a fan only works for convex ones.
+ * Returns indices into the input vertices. Falls back to a fan for whatever is
+ * left if the outline is degenerate or self-intersecting.
+ */
+export function triangulatePolygon(xz: ArrayLike<number>): Uint32Array {
+  const n = Math.floor(xz.length / 2);
+  if (n < 3) return new Uint32Array(0);
+  const X = (i: number) => xz[i * 2];
+  const Z = (i: number) => xz[i * 2 + 1];
+  let area = 0;
+  for (let i = 0, j = n - 1; i < n; j = i++) area += X(j) * Z(i) - X(i) * Z(j);
+  // Work counter-clockwise in (x, z); the emitted winding is fixed up below.
+  const idx: number[] = [];
+  for (let i = 0; i < n; i++) idx.push(area >= 0 ? i : n - 1 - i);
+  const out: number[] = [];
+  const cross = (a: number, b: number, c: number) => (X(b) - X(a)) * (Z(c) - Z(a)) - (Z(b) - Z(a)) * (X(c) - X(a));
+  const inside = (p: number, a: number, b: number, c: number) =>
+    cross(a, b, p) >= 0 && cross(b, c, p) >= 0 && cross(c, a, p) >= 0;
+  let guard = 0;
+  while (idx.length > 3 && guard++ < n * n) {
+    let clipped = false;
+    for (let k = 0; k < idx.length; k++) {
+      const a = idx[(k + idx.length - 1) % idx.length];
+      const b = idx[k];
+      const c = idx[(k + 1) % idx.length];
+      if (cross(a, b, c) <= 1e-12) continue; // reflex or flat corner
+      let ear = true;
+      for (const p of idx) {
+        if (p === a || p === b || p === c) continue;
+        if (inside(p, a, b, c)) {
+          ear = false;
+          break;
+        }
+      }
+      if (!ear) continue;
+      out.push(a, b, c);
+      idx.splice(k, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) break; // degenerate: fan the rest
+  }
+  for (let k = 1; k + 1 < idx.length; k++) out.push(idx[0], idx[k], idx[k + 1]);
+  // Counter-clockwise in (x, z) faces -y; flip so plane triangles face +y (plane-space up).
+  for (let k = 0; k + 2 < out.length; k += 3) {
+    const tmp = out[k + 1];
+    out[k + 1] = out[k + 2];
+    out[k + 2] = tmp;
+  }
+  return Uint32Array.from(out);
 }
 
 // --- floor height ---------------------------------------------------------------
@@ -180,7 +275,8 @@ export function isMovableScanMesh(label: string): boolean {
 export function scanFloorY(scan: LocationScan): number | null {
   let min = Infinity;
   for (const m of scan.meshes) {
-    if (normalizeSemanticLabel(m.label) !== 'floor') continue;
+    // A labelled floor plane counts too: it is the floor surface itself.
+    if (baseScanLabel(normalizeSemanticLabel(m.label)) !== 'floor') continue;
     const p = m.positions;
     for (let i = 1; i < p.length; i += 3) if (p[i] < min) min = p[i];
   }

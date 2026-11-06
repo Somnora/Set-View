@@ -67,6 +67,8 @@ export interface WheelContext {
   /** Align tool in use (P1.6), and a short hint for the next step (hub sub-label). */
   alignTool?: 'none' | 'nudge' | 'two-point';
   alignHint?: string;
+  /** Scan sector label while a scan is pending ('Finish\nScan (12)'); default 'Scan\nRoom'. */
+  scanLabel?: string;
   /** What Apply moves: the location only, or everything in the scene with it (P1.7). */
   alignScope?: 'room' | 'everything';
   /** Active selected light parameters for light sub-wheel readout. */
@@ -119,7 +121,7 @@ export function wheelMenu(ctx: WheelContext, path: WheelPath): WheelMenu {
   return {
     hub,
     sectors: [
-      { id: 'scan', label: 'Scan\nRoom' },
+      { id: 'scan', label: ctx.scanLabel ?? 'Scan\nRoom' },
       {
         id: 'location',
         label: ctx.hasScan
