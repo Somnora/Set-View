@@ -614,6 +614,14 @@ import { importLocationBytes, partsFromObject3D } from '../src/locationImport.ts
 import * as drop from '../src/dropBox.ts';
 import { fitTextureSize, LocationRenderer as P1LocationRenderer } from '../src/location.ts';
 import * as reg from '../src/registration.ts';
+import { createAudioCue as p1CreateAudioCue } from '../src/audioCues.ts';
+import { createAcousticsConfig as p1Acoustics, createBoomMicEntity as p1Boom, createLavalierMicEntity as p1Lav } from '../src/acousticsEngine.ts';
+import { createSetDressingConfig as p1Dressing } from '../src/setDressingEngine.ts';
+import { createGaussianSplatCloud as p1Cloud } from '../src/gaussianSplat.ts';
+import { createArchitecturalSet as p1Arch, createWallData as p1Wall } from '../src/architecture.ts';
+import { createGripRigConfig as p1Grip } from '../src/cameraGrip.ts';
+import { createLedVolumeConfig as p1Led } from '../src/icvfxEngine.ts';
+import { calculateSolarVector as p1Sun, createSolarEnvironmentConfig as p1Solar } from '../src/solarEngine.ts';
 import { applyRigidToScan, meshFootprintCenter as p1FootprintCenter } from '../src/scan.ts';
 import { dropBox as dropBoxPlugin } from '../vite.plugins.ts';
 import * as nodeHttp from 'node:http';
@@ -15250,7 +15258,7 @@ async function p1DropBoxServerTest(): Promise<void> {
     const align = wheelMenu({ ...WHEEL_BASE, mode: 'dress', alignTool: 'two-point', alignHint: 'scan point A' }, 'align');
     assert.deepEqual(
       align.sectors.map((s) => s.id),
-      ['align-nudge', 'align-2pt', 'align-apply', 'align-back', 'align-exit'],
+      ['align-nudge', 'align-2pt', 'align-apply', 'align-back', 'align-scope', 'align-exit'],
     );
     assert.equal(align.hub.sub, 'scan point A');
     assert.ok(align.sectors.find((s) => s.id === 'align-2pt')!.label.includes('●'), 'the tool in use is marked');
@@ -15269,6 +15277,173 @@ async function p1DropBoxServerTest(): Promise<void> {
     };
     assert.equal(locomotionSuppressed(base), false);
     assert.equal(locomotionSuppressed({ ...base, aligning: true }), true);
+  });
+}
+
+// --- P1 re-register everything (P1.7) ---
+/** A scene with every kind of spatial data the app stores, for the rigid-move tests. */
+function p1PopulatedScene(): SceneData {
+  const s = createScene('populated');
+  const a = createActor(s, { x: 1, y: 0, z: -2 }, 0.3);
+  addKeyframe(a, { x: 2, y: 0, z: -3 }, 0.8);
+  a.ikTargets = { leftHand: { x: 1.2, y: 1.1, z: -2 }, rightHand: { x: 0.8, y: 1.1, z: -2 }, leftFoot: { x: 1.1, y: 0, z: -2 }, rightFoot: { x: 0.9, y: 0, z: -2 } };
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.2, 0.9, 0.05, 'YXZ'));
+  const cam = createCameraSetup(s, { x: -1, y: 1.6, z: 3 }, { x: q.x, y: q.y, z: q.z, w: q.w }, 35, '2.39:1');
+  addCameraKeyframe(cam, { x: -2, y: 1.6, z: 3.5 }, { x: q.x, y: q.y, z: q.z, w: q.w });
+  cam.gripRig = p1Grip('dolly_curved_track', { trackPoints: [{ x: -2, y: 0, z: 3 }, { x: 2, y: 0, z: 3 }], turretBasePos: { x: 0, y: 0, z: 3 } });
+  createLight(s, [3, 2.5, 1], 1.2, -0.4);
+  s.props = [createPropData('apple_box_full', 'box', { x: 0.5, y: 0, z: 1.5 }, { rotationY: 0.4 })];
+  s.audioCues = [p1CreateAudioCue({ name: 'door', position: { x: 4, y: 1, z: -1 } } as Parameters<typeof p1CreateAudioCue>[0])];
+  s.architecture = p1Arch();
+  s.architecture.walls = [p1Wall({ x: -3, y: 0, z: -4 }, { x: 3, y: 0, z: -4 })];
+  const cloud = p1Cloud('scout', [
+    { position: { x: 0, y: 1, z: 0 }, scale: { x: 0.1, y: 0.1, z: 0.1 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, color: { r: 1, g: 1, b: 1 }, opacity: 1 },
+  ]);
+  cloud.transform.position = { x: 0.5, y: 0, z: -0.5 };
+  s.gaussianClouds = [cloud];
+  s.icvfx = p1Led('horseshoe_270');
+  s.acoustics = p1Acoustics('dialogue_soundstage');
+  s.acoustics.boomMics = [p1Boom({ position: { x: 1, y: 2.2, z: 0 } })];
+  s.acoustics.lavalierMics = [p1Lav({ actorId: a.id })];
+  s.solar = p1Solar();
+  s.solar.northHeadingDeg = 30;
+  s.setDressing = p1Dressing({
+    regions: [{ id: 'r', name: 'floor', type: 'floor', bounds: { min: { x: -2, y: 0, z: -1 }, max: { x: 2, y: 0.1, z: 1 } } }],
+    settledItems: [
+      {
+        id: 'i',
+        templateName: 't',
+        propType: 'crate',
+        name: 'crate',
+        position: { x: 1, y: 0.3, z: 1 },
+        rotation: { x: 0.2, y: 0.5, z: -0.1 },
+        scale: { x: 1, y: 1, z: 1 },
+        color: '#888',
+        isSettled: true,
+        stackLevel: 0,
+        surfaceY: 0,
+        weightKg: 5,
+      },
+    ],
+  });
+  return s;
+}
+
+/** Every spatial-looking field of a scene, as schema paths ('a[].b'). */
+function p1SpatialPaths(scene: unknown): Map<string, 'vec' | 'quat' | 'triple' | 'heading'> {
+  const out = new Map<string, 'vec' | 'quat' | 'triple' | 'heading'>();
+  const num = (v: unknown) => typeof v === 'number';
+  const walk = (node: unknown, path: string, key: string) => {
+    if (Array.isArray(node)) {
+      if (node.length === 3 && node.every(num) && key === 'position') out.set(path, 'triple');
+      else for (const el of node) walk(el, `${path}[]`, key);
+      return;
+    }
+    if (!node || typeof node !== 'object') {
+      if (num(node) && (key === 'rotationY' || key === 'northHeadingDeg')) out.set(path, 'heading');
+      return;
+    }
+    const o = node as Record<string, unknown>;
+    if (num(o.x) && num(o.y) && num(o.z)) {
+      out.set(path, num(o.w) ? 'quat' : 'vec');
+      return;
+    }
+    for (const [k, v] of Object.entries(o)) {
+      if (!path && k === 'scan') continue; // replaced by the caller (applyRigidToScan)
+      walk(v, path ? `${path}.${k}` : k, k);
+    }
+  };
+  walk(scene, '', '');
+  return out;
+}
+
+{
+  const v = (x: number, y: number, z: number) => ({ x, y, z });
+  const d: reg.RigidDelta = { dx: 1.4, dy: 0.02, dz: -0.6, rotY: 0.65 };
+
+  test('P1.7: yawQuat and yawEulerXYZ match three.js for tilted orientations', () => {
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.3, -0.7, 0.2));
+    const want = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), d.rotY).multiply(q);
+    const got = reg.yawQuat({ x: q.x, y: q.y, z: q.z, w: q.w }, d.rotY);
+    approx(Math.abs(got.x * want.x + got.y * want.y + got.z * want.z + got.w * want.w), 1, 1e-9);
+    const e = reg.yawEulerXYZ(v(0.3, -0.7, 0.2), d.rotY);
+    const viaEuler = new THREE.Quaternion().setFromEuler(new THREE.Euler(e.x, e.y, e.z));
+    approx(Math.abs(viaEuler.dot(want)), 1, 1e-9);
+    assert.deepEqual(reg.yawEulerXYZ(v(0, 1, 0), 0.5), v(0, 1.5, 0), 'untilted: just adds to y');
+  });
+
+  test('P1.7: transformSceneRigid moves every scheduled field exactly, keeps local ones, and keeps North true', () => {
+    const before = p1PopulatedScene();
+    const after = reg.transformSceneRigid(JSON.parse(JSON.stringify(before)) as SceneData, d);
+    const mv = (p: { x: number; y: number; z: number }) => reg.applyRigidToPoint(d, p);
+    const near = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => {
+      approx(a.x, b.x, 1e-9);
+      approx(a.y, b.y, 1e-9);
+      approx(a.z, b.z, 1e-9);
+    };
+    near(after.actors[0].position, mv(before.actors[0].position));
+    near(after.actors[0].keyframes[0].position, mv(before.actors[0].keyframes[0].position));
+    near(after.actors[0].ikTargets!.leftFoot!, mv(before.actors[0].ikTargets!.leftFoot!));
+    approx(after.actors[0].rotationY, reg.wrapAngle(before.actors[0].rotationY + d.rotY), 1e-12);
+    near(after.cameras[0].position, mv(before.cameras[0].position));
+    near(after.cameras[0].gripRig!.trackPoints![1], mv(before.cameras[0].gripRig!.trackPoints![1]));
+    near(after.cameras[0].gripRig!.turretBasePos!, mv(before.cameras[0].gripRig!.turretBasePos!));
+    const camFwd = (r: { x: number; y: number; z: number; w: number }) =>
+      new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(r.x, r.y, r.z, r.w));
+    const f0 = camFwd(before.cameras[0].rotation);
+    const f1 = camFwd(after.cameras[0].rotation);
+    near(f1, reg.applyRigidToPoint({ ...d, dx: 0, dy: 0, dz: 0 }, f0)); // the camera looks the same way relative to the set
+    const lp = after.lights[0].position;
+    near({ x: lp[0], y: lp[1], z: lp[2] }, mv({ x: before.lights[0].position[0], y: before.lights[0].position[1], z: before.lights[0].position[2] }));
+    approx(after.lights[0].rotationX, before.lights[0].rotationX, 1e-12);
+    near(after.props![0].position, mv(before.props![0].position));
+    near(after.audioCues![0].position!, mv(before.audioCues![0].position!));
+    near(after.architecture!.walls[0].end, mv(before.architecture!.walls[0].end));
+    near(after.gaussianClouds![0].transform.position, mv(before.gaussianClouds![0].transform.position));
+    near(after.gaussianClouds![0].splats[0].position, before.gaussianClouds![0].splats[0].position); // cloud-local
+    near(after.icvfx!.walls[0].center, mv(before.icvfx!.walls[0].center));
+    near(after.acoustics!.boomMics[0].pole.targetPoint, mv(before.acoustics!.boomMics[0].pole.targetPoint));
+    near(after.acoustics!.lavalierMics[0].chestOffset, before.acoustics!.lavalierMics[0].chestOffset); // actor-relative
+    const item0 = before.setDressing!.settledItems[0];
+    const item1 = after.setDressing!.settledItems[0];
+    near(item1.position, mv(item0.position));
+    approx(item1.surfaceY, item0.surfaceY + d.dy, 1e-12);
+    const qi0 = new THREE.Quaternion().setFromEuler(new THREE.Euler(item0.rotation.x, item0.rotation.y, item0.rotation.z));
+    const qi1 = new THREE.Quaternion().setFromEuler(new THREE.Euler(item1.rotation.x, item1.rotation.y, item1.rotation.z));
+    approx(Math.abs(qi1.dot(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), d.rotY).multiply(qi0))), 1, 1e-9);
+    const b = after.setDressing!.regions[0].bounds;
+    for (const x of [-2, 2]) for (const z of [-1, 1]) {
+      const p = mv(v(x, 0, z));
+      assert.ok(p.x >= b.min.x - 1e-9 && p.x <= b.max.x + 1e-9 && p.z >= b.min.z - 1e-9 && p.z <= b.max.z + 1e-9, 'moved box corners stay inside');
+    }
+    // The sun keeps lighting the set from the same real-world side.
+    const sun0 = p1Sun(120, 35, before.solar!.northHeadingDeg);
+    const sun1 = p1Sun(120, 35, after.solar!.northHeadingDeg);
+    const turned = reg.applyRigidToPoint({ ...d, dx: 0, dy: 0, dz: 0 }, sun0);
+    approx(sun1.x, turned.x, 1e-4);
+    approx(sun1.z, turned.z, 1e-4);
+    assert.ok(after.solar!.northHeadingDeg >= 0 && after.solar!.northHeadingDeg < 360);
+    assert.equal(after.scan, before.scan, 'the scan is left to the caller');
+  });
+
+  test('P1.7: every spatial field a scene stores is classified by RIGID_SCENE_SCHEMA (review R5)', () => {
+    const S = reg.RIGID_SCENE_SCHEMA;
+    const known = new Set<string>([
+      ...S.positions,
+      ...S.headings,
+      ...S.orientations,
+      ...S.eulers,
+      ...S.heights,
+      ...S.north,
+      ...S.local,
+      ...S.boxes.flatMap((p) => [`${p}.min`, `${p}.max`]),
+    ]);
+    const found = p1SpatialPaths(p1PopulatedScene());
+    const unknown = [...found.keys()].filter((p) => !known.has(p));
+    assert.deepEqual(unknown, [], `spatial fields with no rigid-move rule: ${unknown.join(', ')}`);
+    // And the fixture exercises every rule that moves something (no typo'd paths).
+    const moved = [...S.positions, ...S.headings, ...S.orientations, ...S.eulers, ...S.north].filter((p) => !found.has(p));
+    assert.deepEqual(moved, [], `schema paths the populated scene does not contain: ${moved.join(', ')}`);
   });
 }
 

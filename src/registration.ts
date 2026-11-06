@@ -200,3 +200,233 @@ export function twoPointPrompt(s: TwoPointState): string {
     }
   }
 }
+
+// --- whole-scene re-registration (P1.7) ----------------------------------------
+
+/** Unit quaternion, x y z w. */
+interface Q {
+  x: number;
+  y: number;
+  z: number;
+  w: number;
+}
+
+/** q_yaw(a) * q: turns an orientation by a about world up. */
+export function yawQuat(q: Q, a: number): Q {
+  const s = Math.sin(a / 2);
+  const c = Math.cos(a / 2);
+  // (0, s, 0, c) * (x, y, z, w)
+  return {
+    x: c * q.x + s * q.z,
+    y: c * q.y + s * q.w,
+    z: c * q.z - s * q.x,
+    w: c * q.w - s * q.y,
+  };
+}
+
+function quatFromEulerXYZ(x: number, y: number, z: number): Q {
+  const c1 = Math.cos(x / 2), c2 = Math.cos(y / 2), c3 = Math.cos(z / 2);
+  const s1 = Math.sin(x / 2), s2 = Math.sin(y / 2), s3 = Math.sin(z / 2);
+  return {
+    x: s1 * c2 * c3 + c1 * s2 * s3,
+    y: c1 * s2 * c3 - s1 * c2 * s3,
+    z: c1 * c2 * s3 + s1 * s2 * c3,
+    w: c1 * c2 * c3 - s1 * s2 * s3,
+  };
+}
+
+function eulerXYZFromQuat(q: Q): { x: number; y: number; z: number } {
+  const { x, y, z, w } = q;
+  const m11 = 1 - 2 * (y * y + z * z), m12 = 2 * (x * y - w * z), m13 = 2 * (x * z + w * y);
+  const m22 = 1 - 2 * (x * x + z * z), m23 = 2 * (y * z - w * x);
+  const m32 = 2 * (y * z + w * x), m33 = 1 - 2 * (x * x + y * y);
+  const ey = Math.asin(Math.max(-1, Math.min(1, m13)));
+  if (Math.abs(m13) < 0.9999999) return { x: Math.atan2(-m23, m33), y: ey, z: Math.atan2(-m12, m11) };
+  return { x: Math.atan2(m32, m22), y: ey, z: 0 };
+}
+
+/** An XYZ-order Euler (three.js default) turned by a about world up. Exact for any tilt. */
+export function yawEulerXYZ(e: { x: number; y: number; z: number }, a: number): { x: number; y: number; z: number } {
+  if (Math.abs(e.x) < 1e-12 && Math.abs(e.z) < 1e-12) return { x: e.x, y: wrapAngle(e.y + a), z: e.z };
+  return eulerXYZFromQuat(yawQuat(quatFromEulerXYZ(e.x, e.y, e.z), a));
+}
+
+/**
+ * The explicit schema transformSceneRigid works to (review R5): every world
+ * position, heading and orientation a scene stores, and the vector fields it
+ * deliberately leaves alone. Paths use [] for "every element". The domain test
+ * walks a fully populated scene and fails on any spatial field not listed here,
+ * so a new positional field cannot be added without deciding how it moves.
+ */
+export const RIGID_SCENE_SCHEMA = {
+  /** Moved by the full delta (turn, then translate). */
+  positions: [
+    'actors[].position',
+    'actors[].keyframes[].position',
+    'actors[].ikTargets.leftHand',
+    'actors[].ikTargets.rightHand',
+    'actors[].ikTargets.leftFoot',
+    'actors[].ikTargets.rightFoot',
+    'cameras[].position',
+    'cameras[].keyframes[].position',
+    'cameras[].gripRig.trackPoints[]',
+    'cameras[].gripRig.turretBasePos',
+    'lights[].position',
+    'props[].position',
+    'audioCues[].position',
+    'architecture.walls[].start',
+    'architecture.walls[].end',
+    'gaussianClouds[].transform.position',
+    'icvfx.walls[].center',
+    'acoustics.boomMics[].position',
+    'acoustics.boomMics[].pole.operatorPosition',
+    'acoustics.boomMics[].pole.targetPoint',
+    'setDressing.settledItems[].position',
+  ],
+  /** Headings (radians about up, rotation.y convention): plus the turn. */
+  headings: [
+    'actors[].rotationY',
+    'actors[].keyframes[].rotationY',
+    'lights[].rotationY',
+    'props[].rotationY',
+    'icvfx.walls[].rotationY',
+  ],
+  /** World orientations (quaternions): turned about world up. */
+  orientations: [
+    'cameras[].rotation',
+    'cameras[].keyframes[].rotation',
+    'gaussianClouds[].transform.rotation',
+    'acoustics.boomMics[].orientation',
+  ],
+  /** XYZ Euler orientations: turned about world up (exact for any tilt). */
+  eulers: ['setDressing.settledItems[].rotation'],
+  /** Heights: plus the vertical shift. */
+  heights: ['setDressing.settledItems[].surfaceY'],
+  /** Axis-aligned boxes: re-bounded around the moved corners (exact for quarter turns, larger otherwise). */
+  boxes: ['setDressing.regions[].bounds'],
+  /** Scene True North (degrees, solarEngine convention): north stays fixed to the real world. */
+  north: ['solar.northHeadingDeg'],
+  /**
+   * Deliberately untouched: local offsets, sizes and derived data.
+   * The scan summary is replaced by the caller (applyRigidToScan) and is not walked.
+   */
+  local: [
+    'acoustics.lavalierMics[].chestOffset',
+    'gaussianClouds[].floorAlignment.originOffset',
+    'gaussianClouds[].bounds.min',
+    'gaussianClouds[].bounds.max',
+    'gaussianClouds[].splats[].position',
+    'gaussianClouds[].splats[].scale',
+    'gaussianClouds[].splats[].rotation',
+    'props[].scale',
+    'setDressing.settledItems[].scale',
+    'setDressing.scatterConfig.templates[].defaultScale',
+  ],
+} as const;
+
+type AnyRec = Record<string, unknown>;
+const isObj = (v: unknown): v is AnyRec => !!v && typeof v === 'object' && !Array.isArray(v);
+const isVec = (v: unknown): v is { x: number; y: number; z: number } =>
+  isObj(v) && typeof v.x === 'number' && typeof v.y === 'number' && typeof v.z === 'number';
+
+/** Calls fn on every value at a schema path ('a[].b.c'). */
+function visitPath(root: unknown, path: string, fn: (parent: AnyRec, key: string, value: unknown) => void): void {
+  const parts = path.split('.');
+  const walk = (node: unknown, i: number): void => {
+    if (node == null) return;
+    const part = parts[i];
+    const isArr = part.endsWith('[]');
+    const key = isArr ? part.slice(0, -2) : part;
+    if (!isObj(node)) return;
+    const value = node[key];
+    if (i === parts.length - 1) {
+      if (isArr) {
+        if (Array.isArray(value)) value.forEach((_, j) => fn(value as unknown as AnyRec, String(j), value[j]));
+      } else if (value !== undefined) {
+        fn(node, key, value);
+      }
+      return;
+    }
+    if (isArr) {
+      if (Array.isArray(value)) for (const el of value) walk(el, i + 1);
+    } else {
+      walk(value, i + 1);
+    }
+  };
+  walk(root, 0);
+}
+
+/**
+ * Bakes a rigid move into every world position, heading and orientation of a
+ * scene (RIGID_SCENE_SCHEMA), in place: the "Everything" scope of Align, for
+ * returning to a room on another day. Positions given as [x, y, z] arrays
+ * (lights) are handled too. The scan is left to the caller (applyRigidToScan
+ * plus the Photo source transform), and anchors must be re-queued afterwards.
+ */
+export function transformSceneRigid<T extends object>(scene: T, d: RigidDelta): T {
+  const S = RIGID_SCENE_SCHEMA;
+  const moveVec = (v: { x: number; y: number; z: number }) => {
+    const p = applyRigidToPoint(d, v);
+    v.x = p.x;
+    v.y = p.y;
+    v.z = p.z;
+  };
+  for (const path of S.positions) {
+    visitPath(scene, path, (parent, key, value) => {
+      if (isVec(value)) moveVec(value);
+      else if (Array.isArray(value) && value.length === 3 && value.every((n) => typeof n === 'number')) {
+        const p = applyRigidToPoint(d, { x: value[0], y: value[1], z: value[2] });
+        parent[key] = [p.x, p.y, p.z];
+      }
+    });
+  }
+  for (const path of S.headings) {
+    visitPath(scene, path, (parent, key, value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) parent[key] = wrapAngle(value + d.rotY);
+    });
+  }
+  for (const path of S.orientations) {
+    visitPath(scene, path, (parent, key, value) => {
+      const q = value as Q;
+      if (isObj(q) && typeof q.w === 'number' && typeof q.x === 'number') parent[key] = yawQuat(q, d.rotY);
+    });
+  }
+  for (const path of S.eulers) {
+    visitPath(scene, path, (parent, key, value) => {
+      if (isVec(value)) parent[key] = yawEulerXYZ(value, d.rotY);
+    });
+  }
+  for (const path of S.heights) {
+    visitPath(scene, path, (parent, key, value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) parent[key] = value + d.dy;
+    });
+  }
+  for (const path of S.boxes) {
+    visitPath(scene, path, (_parent, _key, value) => {
+      const b = value as { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } };
+      if (!isObj(b) || !isVec(b.min) || !isVec(b.max)) return;
+      const xs: number[] = [];
+      const zs: number[] = [];
+      for (const x of [b.min.x, b.max.x]) {
+        for (const z of [b.min.z, b.max.z]) {
+          const p = applyRigidToPoint(d, { x, y: 0, z });
+          xs.push(p.x);
+          zs.push(p.z);
+        }
+      }
+      b.min = { x: Math.min(...xs), y: b.min.y + d.dy, z: Math.min(...zs) };
+      b.max = { x: Math.max(...xs), y: b.max.y + d.dy, z: Math.max(...zs) };
+    });
+  }
+  for (const path of S.north) {
+    visitPath(scene, path, (parent, key, value) => {
+      // calculateSolarVector uses heading = azimuth + north with -Z north; turning
+      // the scene by a turns that direction to heading - a.
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const deg = value - (d.rotY * 180) / Math.PI;
+        parent[key] = ((deg % 360) + 360) % 360;
+      }
+    });
+  }
+  return scene;
+}

@@ -64,6 +64,7 @@ import { disposeModel, importLocationBytes, parseModelBytes, type UnitChoice, ty
 import { multiplyMat4, type SceneFileKind } from './sceneImport.ts';
 import {
   rigidDeltaMatrix,
+  transformSceneRigid,
   twoPointAddPoint,
   twoPointBack,
   twoPointInitial,
@@ -324,6 +325,12 @@ class App {
     grabbing: boolean;
   } | null = null;
   private alignApplying = false;
+  /**
+   * What Align moves (P1.7): the location only (lining a scan up the first
+   * time), or everything in the scene with it (returning to the same room on
+   * another day). Kept between uses of Align.
+   */
+  private alignScope: 'room' | 'everything' = 'room';
   /** Photo originals parsed so far (the align smoke checks an Apply does not re-parse one). */
   private photoLoadCount = 0;
   /** Picked-point markers: scan A, scan B (on the scan), real A, real B (in the room). */
@@ -1356,14 +1363,24 @@ class App {
         next.source = { ...summary.source, transform: multiplyMat4(rigidDeltaMatrix(delta), summary.source.transform) };
       }
       const moved = Math.hypot(delta.dx, delta.dz);
+      const everything = this.alignScope === 'everything';
       this.exitAlign(); // restores the display mode and the rest pose
       this.sceneData.scan = next;
-      this.syncLocation();
+      if (everything) {
+        // The whole set rides the same move (P1.7): every world position,
+        // heading and orientation the scene stores (RIGID_SCENE_SCHEMA). The
+        // restore path reloads every subsystem from the data and re-queues
+        // every actor and camera anchor at its new place.
+        transformSceneRigid(this.sceneData, delta);
+        this.restoreScene(this.sceneData);
+      } else {
+        this.syncLocation();
+      }
       this.history.record(this.sceneData);
       this.markDirty();
       this.contentVersion++;
       this.alignSay(
-        `Aligned: moved ${moved.toFixed(2)} m, turned ${Math.round((delta.rotY * 180) / Math.PI)} degrees. Undo reverts it.`,
+        `Aligned ${everything ? 'everything' : 'the location'}: moved ${moved.toFixed(2)} m, turned ${Math.round((delta.rotY * 180) / Math.PI)} degrees. Undo reverts it.`,
       );
     } finally {
       this.alignApplying = false;
@@ -2122,6 +2139,14 @@ class App {
           break;
         case 'align-back':
           this.alignBack();
+          break;
+        case 'align-scope':
+          this.alignScope = this.alignScope === 'room' ? 'everything' : 'room';
+          this.alignSay(
+            this.alignScope === 'everything'
+              ? 'Apply will move everything: the location, actors, cameras, props, lights, walls and marks together.'
+              : 'Apply will move the location only.',
+          );
           break;
         case 'align-exit':
           this.exitAlign('Align closed; nothing changed.');
@@ -3388,6 +3413,7 @@ class App {
           locationMode: this.location.mode,
           alignTool: this.align?.tool ?? 'none',
           alignHint: this.alignHint(),
+          alignScope: this.alignScope,
           lensFocal: activeCam?.data.lensFocalLength ?? 35,
           tStop: activeCam?.data.tStop ?? this.cams.currentTStop,
           formatShort: sensorFormat(activeCam?.data.formatId ?? this.cams.currentFormat).short,
@@ -4156,7 +4182,8 @@ class App {
       photoTextureSizes: () => this.location.photoTextureSizes(),
       photoLoads: () => this.photoLoadCount,
       // test/align-smoke.html: the Grab & Turn path with a scripted move (no XR input on a desktop).
-      alignNudge: (d: RigidDelta) => {
+      alignNudge: (d: RigidDelta, scope: 'room' | 'everything' = 'room') => {
+        this.alignScope = scope;
         this.alignStartNudge();
         if (!this.align) return false;
         this.location.previewDelta(d);
@@ -4164,6 +4191,7 @@ class App {
         return true;
       },
       aligning: () => this.align !== null,
+      actorPositions: () => this.sceneData.actors.map((a) => ({ ...a.position, rotationY: a.rotationY })),
       locationPose: () => this.location.poseDelta(),
     };
   }

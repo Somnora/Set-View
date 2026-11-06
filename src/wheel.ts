@@ -67,6 +67,8 @@ export interface WheelContext {
   /** Align tool in use (P1.6), and a short hint for the next step (hub sub-label). */
   alignTool?: 'none' | 'nudge' | 'two-point';
   alignHint?: string;
+  /** What Apply moves: the location only, or everything in the scene with it (P1.7). */
+  alignScope?: 'room' | 'everything';
   /** Active selected light parameters for light sub-wheel readout. */
   activeLightKelvin?: number;
   activeLightIntensity?: number;
@@ -142,6 +144,7 @@ const SUBMENUS: Record<Exclude<WheelPath, 'root'>, (ctx: WheelContext) => WheelS
     { id: 'align-2pt', label: ctx.alignTool === 'two-point' ? 'Two-\npoint ●' : 'Two-\npoint' },
     { id: 'align-apply', label: 'Apply' },
     { id: 'align-back', label: 'Undo\nstep' },
+    { id: 'align-scope', label: ctx.alignScope === 'everything' ? 'Moves:\nEverything' : 'Moves:\nRoom only' },
     { id: 'align-exit', label: 'Exit\nAlign' },
   ],
   lens: (ctx) => [
@@ -264,6 +267,7 @@ export const WHEEL_SECTOR_HANDLERS: Readonly<Record<string, WheelSectorRoute>> =
   'align-2pt': 'wheel',
   'align-apply': 'wheel',
   'align-back': 'wheel',
+  'align-scope': 'wheel',
   'align-exit': 'wheel',
   // Lens
   'focal-down': 'wheel',

@@ -10,6 +10,8 @@
           with the move, the photo is re-placed (not parsed again), and the
           location is back at its rest pose with Align closed;
        3. Undo returns the previous scan id and transform.
+       4. With Moves: Everything (P1.7), the same kind of move also carries an
+          actor: its position and heading follow the move exactly; Undo restores.
      Headed (vite.http.config.ts): http://localhost:5174/test/align-smoke.html -->
 <html>
   <head><meta charset="utf-8" /><title>align smoke</title></head>
@@ -20,7 +22,7 @@
     <script type="module">
       import * as THREE from 'three';
       import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
-      import { createScene } from '../src/model.ts';
+      import { createActor, createScene } from '../src/model.ts';
       import { createSyntheticLocationScan } from '../src/scanExporters.ts';
       import { applyRigidToPoint, rigidDeltaMatrix } from '../src/registration.ts';
       import { multiplyMat4 } from '../src/sceneImport.ts';
@@ -64,6 +66,7 @@
 
       const prevCurrent = localStorage.getItem(CURRENT_KEY);
       const scene = createScene('align smoke');
+      createActor(scene, { x: 1, y: 0, z: -2 }, 0.3);
       const cleanup = () => {
         try {
           localStorage.removeItem(SCENE_PREFIX + scene.id);
@@ -140,7 +143,24 @@
         const undoOk = !!back && t.currentScan().source.transform.every((v, i) => close(v, s0.source.transform[i], 1e-9));
         notes.push(`undo=${undoOk}`);
 
-        report(boundsOk && transformOk && restOk && photoKept && undoOk, notes.join(' | '));
+        // 4. Everything: the actor rides the same move.
+        const a0 = t.actorPositions()[0];
+        const d2 = { dx: -0.8, dy: 0, dz: 1.1, rotY: -0.4 };
+        t.alignNudge(d2, 'everything');
+        const a1 = await until(() => {
+          const p = t.actorPositions()[0];
+          return p && (p.x !== a0.x || p.z !== a0.z) ? p : null;
+        });
+        const want2 = applyRigidToPoint(d2, a0);
+        const actorOk = !!a1 && close(a1.x, want2.x, 1e-6) && close(a1.z, want2.z, 1e-6) && close(a1.rotationY, a0.rotationY + d2.rotY, 1e-6);
+        t.undo();
+        const a2 = await until(() => {
+          const p = t.actorPositions()[0];
+          return p && close(p.x, a0.x, 1e-9) && close(p.z, a0.z, 1e-9) ? p : null;
+        });
+        notes.push(`everything actor=${actorOk} undo=${!!a2}`);
+
+        report(boundsOk && transformOk && restOk && photoKept && undoOk && actorOk && !!a2, notes.join(' | '));
       } catch (e) {
         report(false, `${e.message} | ${notes.join(' | ')}`);
       } finally {
