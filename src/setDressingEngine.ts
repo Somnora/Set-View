@@ -791,10 +791,13 @@ export function detectSemanticRegions(
   // 3. Wall / Perimeter Regions
   if (sceneData?.architecture?.walls && sceneData.architecture.walls.length > 0) {
     for (const w of sceneData.architecture.walls) {
+      // WallData baselines are scene-space Vec3: x and z on the floor, y is the
+      // floor height under the wall (same reading as calculateWallBoundingBox).
       const minX = Math.min(w.start.x, w.end.x);
       const maxX = Math.max(w.start.x, w.end.x);
-      const minZ = Math.min(w.start.y, w.end.y);
-      const maxZ = Math.max(w.start.y, w.end.y);
+      const minZ = Math.min(w.start.z, w.end.z);
+      const maxZ = Math.max(w.start.z, w.end.z);
+      const baseY = Math.min(w.start.y, w.end.y);
 
       regions.push({
         id: `region_wall_${w.id}`,
@@ -802,8 +805,8 @@ export function detectSemanticRegions(
         type: 'wall',
         anchorEntityId: w.id,
         bounds: {
-          min: { x: minX - 0.2, y: 0, z: minZ - 0.2 },
-          max: { x: maxX + 0.2, y: w.heightM || 3.0, z: maxZ + 0.2 },
+          min: { x: minX - 0.2, y: baseY, z: minZ - 0.2 },
+          max: { x: maxX + 0.2, y: baseY + (w.heightM || 3.0), z: maxZ + 0.2 },
         },
       });
     }
