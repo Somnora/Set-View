@@ -199,7 +199,7 @@ export class Persistence {
   constructor() {
     this.scans.onError = (m) => this.onError(m);
     this.blobs.onError = (m) => this.onError(m);
-    this.scans.onNotice = (m) => {
+    this.scans.onNotice = this.blobs.onNotice = (m) => {
       this.storageReportCache = null;
       this.onNotice(m);
     };

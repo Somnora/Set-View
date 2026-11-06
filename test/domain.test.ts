@@ -14969,6 +14969,40 @@ function p1MakeGlb(opts: { generator?: string; textured?: boolean; translation?:
   });
 }
 
+/** Async: imported originals held in memory while storage was slow reach it when it opens. */
+async function p1BlobLateOpenTest(): Promise<void> {
+  const idb = new FakeIndexedDb();
+  const opts = { indexedDB: asFactory(idb), openTimeoutMs: 20 };
+  const earlier = new BlobStore(opts);
+  const first = await earlier.putBlob({ id: 'blob-saved', data: new Uint8Array([9, 8, 7]), format: 'glb', name: 'a.glb' });
+  assert.equal(first.saved, true, 'session 1: storage is fine');
+
+  idb.hold();
+  const store = new BlobStore(opts);
+  const warnings: string[] = [];
+  const notices: string[] = [];
+  store.onError = (m) => warnings.push(m);
+  store.onNotice = (m) => notices.push(m);
+  assert.equal(await store.getBytes('blob-saved'), null, 'not readable before storage opens');
+  assert.equal(store.storageState, 'waiting');
+  const put = await store.putBlob({ data: new Uint8Array([1, 2, 3, 4]), format: 'glb', name: 'room.glb' });
+  assert.equal(put.saved, false);
+  assert.match(warnings[0] ?? '', /held in memory and saved when it opens/);
+  assert.equal(await store.pruneOrphans(new Set()), 0, 'the launch prune cannot see, so cannot delete, the saved original');
+
+  idb.release();
+  assert.equal(await store.whenStorageOpens(), true);
+  assert.deepEqual(new Uint8Array((await store.getBytes('blob-saved'))!), new Uint8Array([9, 8, 7]), 'the earlier original loads');
+  await settleSoon(() => notices.length > 0);
+  assert.match(notices[0], /the original file held in memory is now saved/);
+  const rows = idb.rows('setview_blobs', 'blobs');
+  assert.ok(rows.has(put.id) && rows.has('blob-saved'));
+  const later = new BlobStore(opts);
+  assert.deepEqual(new Uint8Array((await later.getBytes(put.id))!), new Uint8Array([1, 2, 3, 4]), 'a later session reads it back');
+  passed++;
+  console.log('  ✓ Storage: BlobStore loads saved originals and saves held ones when storage opens late');
+}
+
 /** Async: the adapter end to end on OBJ, PLY and GLB bytes, and attaching an import to a scene. */
 async function p1LocationImportTest(): Promise<void> {
   const room = createSyntheticLocationScan(6, 5, 2.8, ['couch', 'table']);
@@ -15913,6 +15947,7 @@ function p1SpatialPaths(scene: unknown): Map<string, 'vec' | 'quat' | 'triple' |
 void Promise.all([scanStoreFallback(), propStoreFallback(), p0ImportReadsTest(), p0SyntheticScanLiveTest()])
   .then(() => storageLateOpenTest())
   .then(() => p1BlobStoreTest())
+  .then(() => p1BlobLateOpenTest())
   .then(() => p1LocationImportTest())
   .then(() => p1DropBoxServerTest())
   .then(

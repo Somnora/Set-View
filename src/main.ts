@@ -1134,6 +1134,20 @@ class App {
     void (async () => {
       const bytes = await this.persistence.blobs.getBytes(source.blobId);
       if (token !== this.locationSyncToken) return;
+      if (!bytes && this.persistence.blobs.storageState !== 'open') {
+        // Not proof the original is gone: storage has not opened. Photo keeps
+        // drawing Solid and loads once it does.
+        this.debug.log('Photo mode waiting: storage is slow to open');
+        const opened = await this.persistence.blobs.whenStorageOpens();
+        if (token !== this.locationSyncToken) return;
+        if (opened) {
+          this.loadLocationPhoto(token);
+        } else {
+          this.location.markPhotoFailed();
+          this.debug.log('Photo mode unavailable: storage did not open (reload to try again)');
+        }
+        return;
+      }
       if (!bytes) {
         this.location.markPhotoFailed();
         this.debug.log('Photo mode unavailable: the original file is not on this device (scene exports do not carry it)');
@@ -1358,7 +1372,11 @@ class App {
     try {
       const scan = await this.persistence.scans.getScan(summary.id);
       if (!scan) {
-        this.exitAlign('Align failed: the scan geometry is missing on this device.');
+        this.exitAlign(
+          this.persistence.scans.storageState === 'open'
+            ? 'Align failed: the scan geometry is missing on this device.'
+            : 'Align failed: storage has not opened yet. Try again in a moment.',
+        );
         return;
       }
       const out = applyRigidToScan(scan, summary.furniture, delta);
@@ -2091,7 +2109,13 @@ class App {
       `Imported "${name}" as the location: ${s.triangles < 1000 ? s.triangles : `${Math.round(s.triangles / 1000)}k`} triangles in ${s.meshes} mesh${s.meshes === 1 ? '' : 'es'}.`,
       ...res.notes,
     ];
-    if (!attached.scanSaved) lines.push('The geometry could not be saved to storage and is lost on reload.');
+    if (!attached.scanSaved) {
+      lines.push(
+        this.persistence.scans.storageState === 'waiting'
+          ? 'Storage is slow to open: the geometry is held in memory and saved when it opens.'
+          : 'The geometry could not be saved to storage and is lost on reload.',
+      );
+    }
     this.debug.log(lines.join(' '));
     this.landing.showBanner(lines.join(' '), res.budget.level === 'warn' || !attached.scanSaved ? 'warn' : 'info', key);
     if (bytes.byteLength > 5 * 1024 * 1024) this.requestPersistentStorage();
