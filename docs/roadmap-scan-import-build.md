@@ -6,7 +6,8 @@ How SetView gets from today to letting a user scan a location, bring it into a s
 
 - **Phase 0 is implemented** on branch `p0/make-existing-honest` ([PR #1](https://github.com/Somnora/Set-View/pull/1)). 498 unit tests pass, typecheck and build are clean, nine headless smoke pages pass, and the S12 Ghost check passes in a headed desktop run. Nothing has been checked on a headset yet.
 - **Phase 1 is implemented** on branch `p1/bring-a-location-in` ([PR #3](https://github.com/Somnora/Set-View/pull/3)), built on Phase 0. 551 unit tests pass, typecheck and build are clean, and 7 headed and 9 headless smoke pages pass. Nothing has been checked on a headset yet; see the Phase 1 table below and `TESTING.md`. The probe answers (spikes S1 to S7) are still needed to confirm the plane labels and which import path the Quest prefers.
-- **Phases 2 to 4 have not started.**
+- **Phase 2 has started** on branch `p2/build-a-set`, built on Phase 1. P2.1 (walls drawn on the Quest budget) and P2.2 (feet-inch readouts) are done: 563 unit tests pass, and the headed `test/walls-smoke.html`, `test/preview-smoke.html?walls` and `test/units-smoke.html` pass. The 72 fps check on a Quest is still to do. The other Phase 2 items have not started.
+- **Phases 3 and 4 have not started.**
 - **Before building any Phase 1 to 4 item, read its review notes** in [Review corrections](#review-corrections). An independent review found design problems the item text below does not yet reflect.
 - File and line references are as of commit `cd82a8e`, before Phase 0. Phase 0 moved many of them, so find each site by its content before editing.
 
@@ -214,6 +215,11 @@ Goal: A user can block out walls, openings, flats, platforms, steps and props in
 Track: build. Effort: M. Depends on: none.
 Review notes: R9.
 
+**Status (2026-11-06): done on `p2/build-a-set`, except the on-device frame-time check.**
+- **Rendering.** `src/architectureRenderer.ts` now uses flat MeshLambertMaterial, cached per color (glass is transparent Lambert), with no shadows or canvas textures. Each wall's fixed parts are merged per material, so a plain wall is one draw call. The three-wall test room (one window, one door) is 8 meshes and 8 draw calls; a door leaf stays its own mesh so it can still swing. Every mesh carries `userData.wallId`.
+- **Wiring.** The renderer sits under contentRoot. It rebuilds from `data.architecture` in applySceneToSubsystems (load, undo, redo, restore, Moves: Everything) and after a 3DGS Studio save, but only when the walls changed. A collab `architecture_` patch now refreshes the walls and the splat floorplan overlay instead of every subsystem. A 3DGS Studio save that changes the walls sends `architecture_update`. The `architecture_patch` sender comes with P2.3 and P2.4, the first per-wall edits. The preview and miniature framing (sceneBounds) now include walls.
+- **Found: Extract Walls writes walls in the splat's own frame.** fitArchitecturalPlanesFromSplats takes x and z from untransformed splat positions and sets y to 0, not the splat's floor. Walls drawn in scene space (the WallData contract) therefore sit off the splat unless the cloud transform is identity and its floor is at y = 0. The studio's floorplan overlay hides this because it is drawn inside the cloud's transformed group. Fix: convert the walls to scene space at extraction (apply the cloud transform, base them on the detected floor), and draw the overlay in scene space.
+
 **Outcome.** Walls, doors and windows in scene data become visible in AR and in the desktop preview, including walls from 3DGS Extract Walls, at a cost that holds 72 fps.
 
 **Implementation.** Review src/architectureRenderer.ts before building on it; it has only ever run in tests. Replace getOrCreatePbrMaterial and the canvas PBR textures (about 29-94), plus the glass and hardware MeshStandardMaterials, with cached MeshLambertMaterial: one per finish tint, and glass as transparent Lambert. Drop castShadow and receiveShadow, and merge each wall's solid parts with BufferGeometryUtils.mergeGeometries so there is about one draw call per wall. Instantiate it in src/main.ts under contentRoot, rebuild it from data.architecture in applySceneToSubsystems (994-1036) and on the existing 'architecture_' collab refresh (3566-3579), and add architecture_update and architecture_patch senders (collab.ts:299-303; receivers exist at 770-792). Tag wall meshes with userData.wallId for raycasting.
@@ -225,6 +231,8 @@ Review notes: R9.
 ### P2.2 Units: feet-inch readouts over a meters-only model
 
 Track: build. Effort: S. Depends on: none.
+
+**Status (2026-11-06): done** on `p2/build-a-set`. `src/units.ts` formats and parses; a Units button on the landing page switches ft-in and m per device. The scan summary, the landing scan label and the import banner (new: it now gives the room size, a quick check that units were read right) use it. Two choices beyond the item text: a bare number is feet in imperial and meters in metric, and inches after feet must stay under 12 ("13 16" is refused as a likely typo). The default is imperial for any US region tag (en-US, es-US), not only en-US.
 
 **Outcome.** US crews read 13 ft 6 in and metric crews read 4.11 m, and either form can be typed.
 

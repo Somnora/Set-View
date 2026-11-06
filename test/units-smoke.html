@@ -1,0 +1,107 @@
+<!doctype html>
+<!-- Units switch on the landing page (roadmap P2.2), through the REAL app.
+       1. starts in feet and inches (the device setting), adds the test room to
+          a fresh scene, and checks the scan label reads its footprint in feet
+          and inches, computed from the scan summary with src/units.ts;
+       2. clicks the units button: it reads "Units: m", the label redraws in
+          meters, and the choice is saved on this device;
+       3. clicks again to go back to feet and inches.
+     The device setting and the scene are restored afterwards.
+     Headed (vite.http.config.ts): http://localhost:5174/test/units-smoke.html -->
+<html>
+  <head><meta charset="utf-8" /><title>units smoke</title></head>
+  <body>
+    <div id="landing"></div>
+    <div id="overlay" hidden></div>
+    <pre id="out" style="position:fixed;top:4px;right:8px;z-index:99;color:#9f6;max-width:60vw;white-space:pre-wrap">running…</pre>
+    <script type="module">
+      import { createScene } from '../src/model.ts';
+      import { formatDims, UNIT_SYSTEM_STORAGE_KEY } from '../src/units.ts';
+
+      const out = document.getElementById('out');
+      const CURRENT_KEY = 'setview.currentScene';
+      const INDEX_KEY = 'setview.sceneIndex';
+      const SCENE_PREFIX = 'setview.scene.';
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const notes = [];
+      const report = (ok, msg) => {
+        out.textContent = `UNITS-SMOKE ${ok ? 'PASS' : 'FAIL'} | ${msg}`;
+        out.style.color = ok ? '#9f6' : '#f66';
+      };
+      const until = async (fn, ms = 15000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          const v = await fn();
+          if (v) return v;
+          await sleep(100);
+        }
+        return null;
+      };
+      const buttonByText = (re) => [...document.querySelectorAll('#landing button')].find((b) => re.test(b.textContent ?? ''));
+      const scanLabel = () =>
+        [...document.querySelectorAll('#landing .scan-info')].map((e) => e.textContent ?? '').find((t) => t.includes('Location Scan')) ?? '';
+
+      const prevCurrent = localStorage.getItem(CURRENT_KEY);
+      const prevUnits = localStorage.getItem(UNIT_SYSTEM_STORAGE_KEY);
+      const scene = createScene('units smoke');
+      const cleanup = () => {
+        try {
+          localStorage.removeItem(SCENE_PREFIX + scene.id);
+          const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+          localStorage.setItem(INDEX_KEY, JSON.stringify(index.filter((e) => e.id !== scene.id)));
+          if (prevCurrent) localStorage.setItem(CURRENT_KEY, prevCurrent);
+          else localStorage.removeItem(CURRENT_KEY);
+          if (prevUnits) localStorage.setItem(UNIT_SYSTEM_STORAGE_KEY, prevUnits);
+          else localStorage.removeItem(UNIT_SYSTEM_STORAGE_KEY);
+        } catch {
+          /* storage blocked */
+        }
+      };
+      try {
+        localStorage.setItem(SCENE_PREFIX + scene.id, JSON.stringify(scene));
+        const index = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+        index.push({ id: scene.id, name: scene.name, updatedAt: Date.now(), actors: 0, cameras: 0, hasScan: false });
+        localStorage.setItem(INDEX_KEY, JSON.stringify(index));
+        localStorage.setItem(CURRENT_KEY, scene.id);
+        localStorage.setItem(UNIT_SYSTEM_STORAGE_KEY, 'imperial');
+        await import('../src/main.ts');
+        const t = await until(() => window.__setviewTest);
+        if (!t) throw new Error('no __setviewTest hooks (not the dev server?)');
+
+        // 1. Feet and inches.
+        const unitsBtn = await until(() => buttonByText(/^Units:/));
+        if (!unitsBtn) throw new Error('no units button');
+        const addRoom = await until(() => buttonByText(/Add Test Room/));
+        if (!addRoom) throw new Error('no Add Test Room button');
+        addRoom.click();
+        const scan = await until(() => t.currentScan());
+        if (!scan) throw new Error('the test room was not attached');
+        const w = scan.boundsMax.x - scan.boundsMin.x;
+        const d = scan.boundsMax.z - scan.boundsMin.z;
+        const wantFt = formatDims(w, d, undefined, { system: 'imperial', fractionIn: 1 });
+        const wantM = formatDims(w, d, undefined, { system: 'metric', decimals: 1 });
+        const ftLabel = await until(() => (scanLabel().includes(wantFt) ? scanLabel() : null));
+        const ftOk = !!ftLabel && unitsBtn.textContent === 'Units: ft-in';
+        notes.push(`ft-in: "${ftLabel ?? scanLabel()}" (want ${wantFt}) button="${unitsBtn.textContent}"`);
+
+        // 2. Meters.
+        unitsBtn.click();
+        const mLabel = await until(() => (scanLabel().includes(wantM) ? scanLabel() : null));
+        const mOk = !!mLabel && unitsBtn.textContent === 'Units: m' && localStorage.getItem(UNIT_SYSTEM_STORAGE_KEY) === 'metric';
+        notes.push(`m: "${mLabel ?? scanLabel()}" (want ${wantM}) saved=${localStorage.getItem(UNIT_SYSTEM_STORAGE_KEY)}`);
+
+        // 3. Back.
+        unitsBtn.click();
+        const back = await until(() => scanLabel().includes(wantFt));
+        const backOk = !!back && localStorage.getItem(UNIT_SYSTEM_STORAGE_KEY) === 'imperial';
+        notes.push(`back=${backOk}`);
+
+        report(ftOk && mOk && backOk, notes.join(' | '));
+      } catch (e) {
+        report(false, `${e.message} | ${notes.join(' | ')}`);
+      } finally {
+        cleanup();
+      }
+    </script>
+  </body>
+</html>

@@ -253,3 +253,19 @@ Run the probe first (section above): its answers decide whether the Quest file p
 - [ ] **Guided capture on Quest (P1.8):** Scan Room captures the room mesh plus planes; walls are not drawn twice. On a scene with an imported location, the first Scan Room press asks for a second.
 - [ ] **Guided capture on Galaxy XR (P1.8):** Scan Room, look across the floor, walls and tables: outlines build up and the wheel reads "Finish Scan (N)"; press again to keep it. Unlabeled planes come out as floor, table, ceiling or wall.
 - [ ] **Empty scene:** a brand-new scene opens its AR session in Dress, with the "Scan Room" chip on the left controller.
+
+## Build a set (roadmap Phase 2)
+
+Branch `p2/build-a-set`. Plan and review notes: `docs/roadmap-scan-import-build.md`.
+
+### Verified headset-free
+
+- `npm test`: the `P2.2` tests (a 4x8 ft sheet is exactly 1.2192 x 2.4384 m, the typed forms crews use, metric unchanged, an exact format and parse round trip for every 1/16 in up to 40 ft, garbage refused, the language default and blocked storage).
+- Headed smoke `test/units-smoke.html`: through the real landing page, the test room's scan label reads in feet and inches, the Units button switches it to meters and back, and the choice is saved on the device.
+- `npm test`: the `P2.1` renderer test checks flat Lambert with no shadows or textures, and the merged mesh count (a wall with a window and a door is 6 meshes, a plain wall 1). It also checks the wall's 6 solid blocks, a wall placed along +z on a raised floor, the door hinge, that two walls of one color share a material, and that unchanged walls are not rebuilt.
+- Headed smoke `test/walls-smoke.html` (P2.1), through the real app: a scene with three walls (window, door) loads with them under contentRoot as 8 Lambert meshes tagged with their wall id. A collaborator's `architecture_patch` removal and `architecture_update` are followed, and the scene card's Preview frames the whole room (screenshot). `test/preview-smoke.html?walls` renders the same room in the preview harness and counts 8 draw calls for it.
+
+### On a headset
+
+- [ ] **Walls (P2.1):** load a scene with 20 to 40 walls with openings (3DGS Studio Extract Walls, or an imported scene file), add 4 actors, open Camera View, and confirm 72 fps on the Quest 3. Walls should stand on the floor where the data puts them and appear in the Camera View monitor. Walls extracted from a splat may sit off the splat (see the P2.1 status in the roadmap).
+- [ ] **Units (P2.2):** on the Quest 2D page the Units button starts at ft-in (a US browser) and the choice survives a reload. Scan Room in AR: the log line gives the room size in the chosen units.

@@ -14,7 +14,13 @@
 
      ?scan adds the synthetic test room the way a reload restores it (scene
      JSON normalized, so locationMode defaults to Ghost) and asserts it is
-     visible and that the toolbar's Room button cycles the display mode. -->
+     visible and that the toolbar's Room button cycles the display mode.
+
+     ?walls adds three walls of a room around the actors (a window in the back
+     wall, a door in the left wall, the open side toward the camera) through
+     ArchitectureRenderer, and asserts flat Lambert materials, the merged mesh
+     count (8: plain wall 1, window wall 3, door wall 4) and the draw calls one
+     frame of walls costs. -->
 <html>
   <head><meta charset="utf-8" /><title>desktop preview smoke</title>
   <link rel="stylesheet" href="../src/style.css" /></head>
@@ -32,6 +38,8 @@
       import { LocationRenderer } from '../src/location.ts';
       import { createSyntheticLocationScan } from '../src/scanExporters.ts';
       import { summarizeScan } from '../src/scan.ts';
+      import { createArchitecturalSet, createDoorData, createWallData, createWindowData } from '../src/architecture.ts';
+      import { ArchitectureRenderer } from '../src/architectureRenderer.ts';
 
       const out = document.getElementById('out');
       try {
@@ -97,11 +105,29 @@
           preview.getLocationMode = () => scanLoc.mode;
           preview.onCycleLocationMode = () => scanLoc.cycleMode();
         }
+        let walls = null;
+        if (params.has('walls')) {
+          // Back wall at z = -3 with a window, left wall at x = -3.5 with a door, right wall at x = 4.
+          scene.architecture = createArchitecturalSet('smoke room', {
+            walls: [
+              createWallData({ name: 'Back', start: { x: -3.5, y: 0, z: -3 }, end: { x: 4, y: 0, z: -3 }, heightM: 2.7, thicknessM: 0.12,
+                windows: [createWindowData({ type: 'sash', offsetAlongWallM: 4.2, widthM: 1.4, heightM: 1.3 })] }),
+              createWallData({ name: 'Left', start: { x: -3.5, y: 0, z: 3 }, end: { x: -3.5, y: 0, z: -3 }, heightM: 2.7, thicknessM: 0.12,
+                doors: [createDoorData({ type: 'single_swing', offsetAlongWallM: 3.6, widthM: 0.9, heightM: 2.1, openAngleDeg: 30 })] }),
+              createWallData({ name: 'Right', start: { x: 4, y: 0, z: -3 }, end: { x: 4, y: 0, z: 1.5 }, heightM: 2.7, thicknessM: 0.12, tintHex: '#cbd5e1' }),
+            ],
+          });
+          walls = new ArchitectureRenderer();
+          contentRoot.add(walls.group);
+          walls.setArchitecture(normalizeScene(JSON.parse(JSON.stringify(scene))).architecture);
+        }
         // ?focus=x,z zooms the orbit onto one spot (stance close-ups).
         const focus = params.get('focus');
         let bounds = new THREE.Box3(new THREE.Vector3(-2, 0, -2), new THREE.Vector3(2, 1.8, 2.2));
         if (params.has('gallery')) {
           bounds = new THREE.Box3(new THREE.Vector3(-11.5, 0, -1), new THREE.Vector3(11.5, 1.9, 1));
+        } else if (walls) {
+          bounds = new THREE.Box3(new THREE.Vector3(-3.6, 0, -3.1), new THREE.Vector3(4.1, 2.7, 3));
         } else if (focus) {
           const [fx, fz] = focus.split(',').map(Number);
           bounds = new THREE.Box3(new THREE.Vector3(fx - 0.8, 0, fz - 0.8), new THREE.Vector3(fx + 0.8, 1.6, fz + 0.8));
@@ -146,15 +172,34 @@
             })
             .map((b) => b.textContent.trim());
           if (offscreen.length) scanNote += ` offscreen=[${offscreen.join(', ')}]`;
+          let wallsOk = true;
+          if (walls) {
+            const meshes = [];
+            walls.group.traverse((o) => o.isMesh && meshes.push(o));
+            const lambert = meshes.every((m) => m.material.type === 'MeshLambertMaterial' && !m.castShadow);
+            // Draw calls for the walls alone, from the preview camera.
+            const hidden = [];
+            for (const c of contentRoot.children) if (c !== walls.group && c.visible) { c.visible = false; hidden.push(c); }
+            for (const c of scene3.children) if (c !== contentRoot && !c.isLight && c.visible) { c.visible = false; hidden.push(c); }
+            renderer.info.reset();
+            renderer.info.autoReset = false;
+            renderer.render(scene3, preview['camera']);
+            const calls = renderer.info.render.calls;
+            renderer.info.autoReset = true;
+            for (const c of hidden) c.visible = true;
+            wallsOk = walls.wallCount === 3 && meshes.length === 8 && lambert && calls <= meshes.length;
+            scanNote += ` walls=${walls.wallCount} meshes=${meshes.length} lambert=${lambert} wallDrawCalls=${calls}`;
+          }
           const ok =
             err === 0 &&
             preview.active &&
             document.querySelector('.preview-bar') !== null &&
             offscreen.length === 0 &&
             scanOk &&
+            wallsOk &&
             (params.has('gallery') || keyframes.duration > 0); // gallery has no moves
           out.textContent = ok
-            ? `PREVIEW-SMOKE PASS${scanLoc ? ' (scan)' : ''}`
+            ? `PREVIEW-SMOKE PASS${scanLoc ? ' (scan)' : ''}${walls ? ` (walls)${scanNote}` : ''}`
             : `PREVIEW-SMOKE FAIL: glError=${err} active=${preview.active} dur=${keyframes.duration}${scanNote}`;
           out.style.color = ok ? '#9f6' : '#f66';
         };
