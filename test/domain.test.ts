@@ -582,6 +582,7 @@ import {
   detectSemanticRegions,
   generatePoissonScatter2D,
   generateSetDressingDeckHtml,
+  generateThemeScatter,
   generateSetDressingManifestCsv,
   isSetDressingConfig,
   normalizeSetDressingConfig,
@@ -11070,6 +11071,67 @@ test('Set Dressing Engine: Semantic Region Detection from Stage & Furniture Prop
   assert.ok(tableReg);
   assert.equal(tableReg?.anchorEntityId, tableProp.id);
   assert.equal(tableReg?.bounds.min.y, 0.8);
+});
+
+test('R9: wall regions follow the wall on the floor (x and z), not its height (y)', () => {
+  // The four perimeter walls the 3DGS Studio writes into scene.architecture on
+  // Save & Apply (gaussianSplat.ts): floor positions in x and z, y = floor.
+  // Wall regions used to read y as z, so every wall became the same 0.4 m strip
+  // through z = 0 and wall props were scattered down the middle of the room.
+  const corners = { minX: -3, maxX: 3, minZ: -2.5, maxZ: 2.5 };
+  const walls = [
+    createWallData({ name: 'North Wall', start: { x: corners.minX, y: 0, z: corners.minZ }, end: { x: corners.maxX, y: 0, z: corners.minZ }, heightM: 2.8 }),
+    createWallData({ name: 'East Wall', start: { x: corners.maxX, y: 0, z: corners.minZ }, end: { x: corners.maxX, y: 0, z: corners.maxZ }, heightM: 2.8 }),
+    createWallData({ name: 'South Wall', start: { x: corners.maxX, y: 0, z: corners.maxZ }, end: { x: corners.minX, y: 0, z: corners.maxZ }, heightM: 2.8 }),
+    createWallData({ name: 'West Wall', start: { x: corners.minX, y: 0, z: corners.maxZ }, end: { x: corners.minX, y: 0, z: corners.minZ }, heightM: 2.8 }),
+  ];
+  const scene = createScene('R9 walls');
+  scene.architecture = createArchitecturalSet('Splat walls', walls);
+
+  const regions = detectSemanticRegions(scene);
+  const wallRegions = regions.filter((r) => r.type === 'wall');
+  assert.equal(wallRegions.length, 4);
+  assert.equal(regions.filter((r) => r.type === 'perimeter').length, 0, 'real walls replace the stage perimeter');
+  for (const w of walls) {
+    const r = wallRegions.find((x) => x.anchorEntityId === w.id);
+    assert.ok(r, `a region for ${w.name}`);
+    const b = r!.bounds;
+    for (const p of [w.start, w.end]) {
+      assert.ok(b.min.x <= p.x && p.x <= b.max.x, `${w.name}: x ${p.x} inside [${b.min.x}, ${b.max.x}]`);
+      assert.ok(b.min.z <= p.z && p.z <= b.max.z, `${w.name}: z ${p.z} inside [${b.min.z}, ${b.max.z}]`);
+    }
+    // A padded band around the baseline, not the whole room.
+    const across = Math.min(b.max.x - b.min.x, b.max.z - b.min.z);
+    assert.ok(across < 0.5, `${w.name}: band ${across} m across`);
+    assert.equal(b.min.y, 0);
+    assert.equal(b.max.y, 2.8);
+  }
+
+  // End to end: props scattered for the north wall land along the north wall.
+  const north = wallRegions.find((r) => r.anchorEntityId === walls[0].id)!;
+  const items = generateThemeScatter('film_noir_office', north, {
+    theme: 'film_noir_office',
+    density: 'dense',
+    minDistanceM: 0.3,
+    seed: 9,
+    alignToWalls: true,
+    enablePhysicsSettling: false,
+    groundY: 0,
+    maxItems: 12,
+  });
+  assert.ok(items.length > 0);
+  for (const it of items) {
+    assert.ok(Math.abs(it.position.z - corners.minZ) <= 0.25, `${it.name} at z ${it.position.z}, north wall at ${corners.minZ}`);
+  }
+});
+
+test('R9: a wall on a raised floor gets a region from its base to its top', () => {
+  const scene = createScene('R9 raised');
+  const w = createWallData({ start: { x: 0, y: 0.6, z: 1 }, end: { x: 0, y: 0.6, z: 4 }, heightM: 2.4 });
+  scene.architecture = createArchitecturalSet('Riser', [w]);
+  const r = detectSemanticRegions(scene).find((x) => x.anchorEntityId === w.id)!;
+  assert.ok(r.bounds.min.z <= 1 && r.bounds.max.z >= 4, 'spans the wall along z');
+  assert.ok(Math.abs(r.bounds.min.y - 0.6) < 1e-9 && Math.abs(r.bounds.max.y - 3.0) < 1e-9, `y [${r.bounds.min.y}, ${r.bounds.max.y}]`);
 });
 
 test('Set Dressing Engine: Impulse Physics Settling & Overlap Resolution', () => {
